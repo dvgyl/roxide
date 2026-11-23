@@ -154,6 +154,7 @@ impl Scalar {
                     None
                 }
             },
+            Self::Cplx(z) => (!z.is_na()).then_some(z.re != 0.0 || z.im != 0.0),
             _ => {
                 let x = self.real(session, warn)?;
                 (!x.is_nan()).then_some(x != 0.0)

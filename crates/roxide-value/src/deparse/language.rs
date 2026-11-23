@@ -25,7 +25,7 @@ impl Deparser<'_> {
                 let mut args = self.session.pairlist_iter(tail).take(3);
                 let count = args.by_ref().count();
                 return Ok(match (op, count) {
-                    ("[" | "[[", 1..) => prec::SUBSET,
+                    ("[" | "[[", 1..) => prec::EXTRACT,
                     ("if" | "while" | "for" | "repeat" | "function", _) => Prec(0),
                     (_, 1) => ops::unary(op).filter(|_| op != "?").unwrap_or(Prec(19)),
                     (_, 2) => display_binary(op).map_or(Prec(19), |(p, _)| p),

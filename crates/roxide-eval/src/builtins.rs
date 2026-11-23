@@ -625,7 +625,7 @@ fn prim_dput(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
         ));
     }
     let val = args.get(0);
-    let lines = deparse(&ctx.session, val, DeparseOpts::default())?;
+    let lines = roxide_value::dput(&ctx.session, val, DeparseOpts::default())?;
     for line in lines {
         let _ = ctx.host.write_out(line.as_bytes());
         let _ = ctx.host.write_out(b"\n");

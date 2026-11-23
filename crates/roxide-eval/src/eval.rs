@@ -228,30 +228,7 @@ impl Ctx {
     }
 
     pub(crate) fn sym_from_sexp(&mut self, id: SexpId) -> Result<Sym, Unwind> {
-        let name = {
-            if self.session.type_of(id)? != SexpType::Sym {
-                return Err(self.stop(SEXP_NIL, "expected symbol"));
-            }
-            // All interned SYMSXPs have their name retrievable through intern; look up directly.
-            let dummy = self.session.intern("")?;
-            let _ = dummy;
-            id
-        };
-        // Interned SYMSXPs are permanent; reconstruct via RSession::intern using its name.
-        let sym_str = self.session.sym_name_from_sexp(name)?;
-        Ok(self.session.intern(&sym_str)?)
-    }
-}
-
-/// Extension helper to read a symbol's name from a raw `SexpId`.
-trait SymNameHelper {
-    fn sym_name_from_sexp(&self, id: SexpId) -> Result<String, roxide_value::ValueError>;
-}
-
-impl SymNameHelper for roxide_value::RSession {
-    fn sym_name_from_sexp(&self, id: SexpId) -> Result<String, roxide_value::ValueError> {
-        // Deconstruct using `deparse` on a `SYMSXP`, which returns its exact symbol text.
-        let lines = roxide_value::deparse(self, id, roxide_value::DeparseOpts::default())?;
-        Ok(lines.into_iter().next().unwrap_or_default())
+        let name = self.session.sym_name_of(id)?.to_owned();
+        Ok(self.session.intern(&name)?)
     }
 }

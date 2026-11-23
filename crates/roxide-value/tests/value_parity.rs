@@ -374,14 +374,9 @@ fn coerces_scalars_and_lists() {
     let (logical, warn) = s.coerce(complex, SexpType::Lgl).unwrap();
     assert_eq!(
         s.lgl(logical).unwrap().to_vec(),
-        [
-            RLogical::TRUE,
-            RLogical::TRUE,
-            RLogical::FALSE,
-            RLogical::NA
-        ],
+        [RLogical::TRUE, RLogical::TRUE, RLogical::TRUE, RLogical::NA],
     );
-    assert!(warn.imaginary_discarded);
+    assert!(!warn.imaginary_discarded);
     let words = strings(&mut s, &[Some("NaN")]);
     let (value, warn) = s.coerce(words, SexpType::Int).unwrap();
     assert_eq!(s.int(value).unwrap().get(0), 0);
