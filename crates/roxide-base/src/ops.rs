@@ -145,14 +145,70 @@ pub const MODULE: Module = Module {
         primitive!("character", types::character),
         primitive!("complex", types::complex),
         primitive!("raw", types::raw),
-        primitive!("as.logical", types::as_logical),
-        primitive!("as.integer", types::as_integer),
-        primitive!("as.double", types::as_double),
-        primitive!("as.numeric", types::as_double),
-        primitive!("as.complex", types::as_complex),
-        primitive!("as.character", types::as_character),
-        primitive!("as.raw", types::as_raw),
-        primitive!("as.list", types::as_list),
+        primitive!(
+            "as.logical",
+            types::as_logical,
+            Eval,
+            Any,
+            Dispatch::Internal("as.logical"),
+            On
+        ),
+        primitive!(
+            "as.integer",
+            types::as_integer,
+            Eval,
+            Any,
+            Dispatch::Internal("as.integer"),
+            On
+        ),
+        primitive!(
+            "as.double",
+            types::as_double,
+            Eval,
+            Any,
+            Dispatch::Internal("as.double"),
+            On
+        ),
+        primitive!(
+            "as.numeric",
+            types::as_double,
+            Eval,
+            Any,
+            Dispatch::Internal("as.double"),
+            On
+        ),
+        primitive!(
+            "as.complex",
+            types::as_complex,
+            Eval,
+            Any,
+            Dispatch::Internal("as.complex"),
+            On
+        ),
+        primitive!(
+            "as.character",
+            types::as_character,
+            Eval,
+            Any,
+            Dispatch::Internal("as.character"),
+            On
+        ),
+        primitive!(
+            "as.raw",
+            types::as_raw,
+            Eval,
+            Any,
+            Dispatch::Internal("as.raw"),
+            On
+        ),
+        primitive!(
+            "as.list",
+            types::as_list,
+            Eval,
+            Any,
+            Dispatch::Internal("as.list"),
+            On
+        ),
         primitive!(
             "as.vector",
             types::as_vector,
@@ -181,24 +237,80 @@ pub const MODULE: Module = Module {
         primitive!("attributes<-", attributes::set_attributes),
         primitive!("attr", attributes::attr),
         primitive!("attr<-", attributes::set_attr),
-        primitive!("names", attributes::names),
-        primitive!("names<-", attributes::set_names),
+        primitive!(
+            "names",
+            attributes::names,
+            Eval,
+            Exact(1),
+            Dispatch::Internal("names"),
+            On
+        ),
+        primitive!(
+            "names<-",
+            attributes::set_names,
+            Eval,
+            Exact(2),
+            Dispatch::Internal("names<-"),
+            On
+        ),
         primitive!("class", attributes::class),
         primitive!("class<-", attributes::set_class),
         primitive!("oldClass", attributes::old_class),
-        primitive!("dim", attributes::dim),
-        primitive!("dim<-", attributes::set_dim),
-        primitive!("dimnames", attributes::dimnames),
-        primitive!("dimnames<-", attributes::set_dimnames),
+        primitive!(
+            "dim",
+            attributes::dim,
+            Eval,
+            Exact(1),
+            Dispatch::Internal("dim"),
+            On
+        ),
+        primitive!(
+            "dim<-",
+            attributes::set_dim,
+            Eval,
+            Exact(2),
+            Dispatch::Internal("dim<-"),
+            On
+        ),
+        primitive!(
+            "dimnames",
+            attributes::dimnames,
+            Eval,
+            Exact(1),
+            Dispatch::Internal("dimnames"),
+            On
+        ),
+        primitive!(
+            "dimnames<-",
+            attributes::set_dimnames,
+            Eval,
+            Exact(2),
+            Dispatch::Internal("dimnames<-"),
+            On
+        ),
         primitive!("rownames", attributes::rownames),
         primitive!("colnames", attributes::colnames),
-        primitive!("levels", attributes::levels),
-        primitive!("levels<-", attributes::set_levels),
+        primitive!(
+            "levels",
+            attributes::levels,
+            Eval,
+            Exact(1),
+            Dispatch::Internal("levels"),
+            On
+        ),
+        primitive!(
+            "levels<-",
+            attributes::set_levels,
+            Eval,
+            Exact(2),
+            Dispatch::Internal("levels<-"),
+            On
+        ),
         primitive!("structure", attributes::structure),
         primitive!("unname", attributes::unname),
         primitive!("unclass", attributes::unclass),
         primitive!("inherits", attributes::inherits),
-        primitive!("c", types::combine),
+        primitive!("c", types::combine, Eval, Any, Dispatch::Internal("c"), On),
     ],
     prelude: r#"
 `colnames<-` <- function(x, value) {

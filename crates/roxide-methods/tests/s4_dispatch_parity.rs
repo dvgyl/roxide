@@ -3,13 +3,14 @@
 #[path = "../src/dispatch/rank.rs"]
 mod rank;
 
-use std::path::PathBuf;
 use std::process::Command;
 
 use rank::{Ranked, distances};
+use roxide_eval::Ctx;
 use roxide_gc::GcPolicy;
+use roxide_host::PureHost;
 use roxide_methods::registry::ClassInfo;
-use roxide_value::SEXP_NIL;
+use roxide_value::{GLOBAL_ENV, SEXP_NIL};
 
 struct Probe {
     target: &'static [&'static str],
@@ -268,37 +269,35 @@ probe <- function(i, target, signatures) {
 }
 
 #[test]
-fn differential_scripts_under_torture_gc() -> Result<(), Box<dyn std::error::Error>> {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let default_bin = root.join("target/debug/roxide-harness");
-    let harness = std::env::var_os("ROXIDE_TEST_HARNESS").map_or(default_bin, PathBuf::from);
-    if !harness.is_file() || std::env::var_os("ROXIDE_ORACLE_RSCRIPT").is_none() {
-        return Ok(());
-    }
-    let policy = GcPolicy::Torture;
-    for file in [
-        "04_s4_dispatch_resolver.rcase",
-        "05_s4_callnextmethod_show.rcase",
-    ] {
-        let mut command = Command::new(&harness);
-        if matches!(policy, GcPolicy::Torture) {
-            command.env("ROXIDE_GC_TORTURE", "1");
-        }
-        let output = command
-            .current_dir(&root)
-            .args([
-                "--file",
-                &format!("conformance/layer3/{file}"),
-                "--timeout-ms",
-                "30000",
-            ])
-            .output()?;
-        assert!(
-            output.status.success(),
-            "{}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
+fn s4_dispatch_and_call_next_method_survive_torture_gc() -> Result<(), Box<dyn std::error::Error>> {
+    let mut ctx = Ctx::new(Box::new(PureHost::new()), GcPolicy::Torture)
+        .map_err(|e| format!("ctx: {e:?}"))?;
+    roxide_base::register_all(&mut ctx).map_err(|e| format!("base: {e:?}"))?;
+    roxide_methods::register(&mut ctx).map_err(|e| format!("methods: {e:?}"))?;
+    let (res, output) = ctx
+        .capture_streams(true, false, false, |ctx| {
+            Ok(ctx.run_script(
+                "s4_dispatch_torture.R",
+                r#"
+setClass("BaseA", slots = c(v = "numeric"))
+setClass("MidB", contains = "BaseA")
+setClass("MidC", contains = "BaseA")
+setClass("LeafD", contains = c("MidB", "MidC"))
+setGeneric("rxStep", function(x, y) standardGeneric("rxStep"))
+setMethod("rxStep", c("BaseA", "numeric"), function(x, y) paste0("Base:", x@v + y))
+setMethod("rxStep", c("MidB", "numeric"), function(x, y) paste0("MidB>", callNextMethod()))
+setMethod("rxStep", c("LeafD", "numeric"), function(x, y) paste0("LeafD>", callNextMethod()))
+obj <- new("LeafD", v = 10)
+stopifnot(identical(rxStep(obj, 5), "LeafD>MidB>Base:15"))
+setMethod("show", "BaseA", function(object) cat("BaseA=", object@v, "\n", sep = ""))
+show(obj)
+"#,
+                GLOBAL_ENV,
+                false,
+            ))
+        })
+        .map_err(|e| format!("capture: {e:?}"))?;
+    res.map_err(|e| format!("eval: {e:?}"))?;
+    assert_eq!(String::from_utf8(output)?, "BaseA=10\n");
     Ok(())
 }

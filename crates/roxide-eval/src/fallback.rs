@@ -127,6 +127,11 @@ fn attribute(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     let op = ctx.prims[usize::from(call.prim.0)].name;
     let value = args.get(0);
     if op == "class" {
+        let class_tag = ctx.session.intern("class")?;
+        let explicit = ctx.session.attr(value, class_tag);
+        if explicit != SEXP_NIL && ctx.session.xlength(explicit)? > 0 {
+            return Ok(explicit);
+        }
         let mut classes = ctx.classes(value, false)?;
         if classes.is_empty() {
             classes = ctx.classes(value, true)?;

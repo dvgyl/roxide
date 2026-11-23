@@ -832,10 +832,24 @@ fn slot_get(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
         if ctx.session.type_of(obj)? == SexpType::Obj {
             return Ok(SEXP_NIL);
         }
-        let copy = ctx.session.shallow_duplicate(obj)?;
-        ctx.session.clear_attrs(copy)?;
-        ctx.session.set_s4_flag(copy, false)?;
-        return Ok(copy);
+        return ctx.scoped(|ctx| {
+            ctx.protect(obj);
+            let dim_sym = ctx.session.intern("dim")?;
+            let dimnames_sym = ctx.session.intern("dimnames")?;
+            let dim = ctx.session.attr(obj, dim_sym);
+            let dimnames = ctx.session.attr(obj, dimnames_sym);
+            let copy = ctx.session.shallow_duplicate(obj)?;
+            ctx.protect(copy);
+            ctx.session.clear_attrs(copy)?;
+            if dim != SEXP_NIL {
+                ctx.session.set_attrib(copy, dim_sym, dim)?;
+                if dimnames != SEXP_NIL {
+                    ctx.session.set_attrib(copy, dimnames_sym, dimnames)?;
+                }
+            }
+            ctx.session.set_s4_flag(copy, false)?;
+            Ok(copy)
+        });
     }
     let sym = ctx.session.intern(&name)?;
     let val = ctx.session.attr(obj, sym);
@@ -912,11 +926,29 @@ fn slot_set(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
         ctx.protect(obj);
         ctx.protect(checked);
         if name == ".Data" && ctx.session.type_of(obj)? != SexpType::Obj {
+            let dim_sym = ctx.session.intern("dim")?;
+            let dimnames_sym = ctx.session.intern("dimnames")?;
+            let names_sym = ctx.session.intern("names")?;
+            let new_dim = ctx.session.attr(checked, dim_sym);
+            let new_dimnames = ctx.session.attr(checked, dimnames_sym);
+            let new_names = ctx.session.attr(checked, names_sym);
             let target = ctx.session.shallow_duplicate(checked)?;
             ctx.protect(target);
             ctx.session.clear_attrs(target)?;
+            if new_dim != SEXP_NIL {
+                ctx.session.set_attrib(target, dim_sym, new_dim)?;
+            }
             for (k, v) in ctx.session.attrs(obj)? {
+                if k == dim_sym || k == dimnames_sym || k == names_sym {
+                    continue;
+                }
                 ctx.session.set_attrib(target, k, v)?;
+            }
+            if new_dim != SEXP_NIL && new_dimnames != SEXP_NIL {
+                ctx.session.set_attrib(target, dimnames_sym, new_dimnames)?;
+            }
+            if new_names != SEXP_NIL {
+                ctx.session.set_attrib(target, names_sym, new_names)?;
             }
             ctx.session.set_s4_flag(target, true)?;
             return Ok(target);

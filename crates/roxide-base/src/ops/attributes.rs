@@ -437,6 +437,10 @@ fn class_names(s: &RSession, x: SexpId) -> Result<std::vec::Vec<String>, roxide_
 
 pub(super) fn class(ctx: &mut Ctx, _: &Call, args: &mut Args) -> EvalResult {
     let s = ctx.session_mut();
+    let explicit = get(s, args.get(0), "class");
+    if explicit != SEXP_NIL && s.xlength(explicit)? > 0 {
+        return Ok(explicit);
+    }
     let names = class_names(s, args.get(0))?;
     let names = names
         .iter()

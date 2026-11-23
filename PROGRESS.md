@@ -10,7 +10,7 @@
 | **M0 — Bootstrap, Oracle, Clean-Room Guardrails & Core Contracts** | **Completed** | Dual licences (`MIT OR Apache-2.0`), clean-room scanner, official GNU R 4.6.2 binary oracle, ADRs 0001–0007, 8-crate Rust workspace, 12/12 smoke parity (incl. `ROXIDE_GC_TORTURE=1`) |
 | **M1 — Complete R 4.6.2 Language Core & `base` Foundation** | **Completed (174 / 174 = 100%)** | Full R 4.6.2 syntax/`deparse`, cycle-safe GC + copy-on-modify + ALTREP, 4-state lazy promises/NSE/conditions/S3/active bindings, complete `roxide-base` (`ops`, `subset`, `strings`, `datetime`, `io_os`, `serialize` XDR v2/v3), **174/174 Layer 1 byte-for-byte parity** (normal & `ROXIDE_GC_TORTURE=1`), **100% cross-engine `.rds`/`.RData` roundtrip parity**, all cross-model review P0/P1/P2 findings closed |
 | **M2 — Clean-Room `roxide-math`, `roxide-stats` & `roxide-utils`** | **Completed (293 / 293 = 100%)** | 12-crate `#![forbid(unsafe_code)]` workspace (0 new deps), ADRs 0009–0011, 100% bit-exact PRNG across all 7 uniform generators + all 22 distribution RNGs (incl. R 4.6.2 large-$N$ `rhyper`), full `d/p/q/r*` continuous/discrete/noncentral/Tukey & special/Bessel functions, LINPACK/LAPACK-parity `qr`/`svd`/`eigen`/`chol`/`solve`/complex/FFT, `stats` (`formula`/`terms`/`model.matrix`/`lm`/`glm`/11 `htest`/`optim`/`nlminb`/`nlm`/`uniroot`/`integrate`/`ts`/`multivar`/`density`/`loess`), `utils` (`read.table`/`str`/`head`/`tail`/`capture.output`/`sessionInfo`/`dump`/`dput`), `base::dcf`, `tools` (`parse_Rd`/`Rd2txt`/`analyze_license`), **293/293 Layer 2 parity** + all W10A–W10E peer-review hardening waves closed |
-| **M3 — S4 (`methods`), Graphics & Pure-R Packages** | **In Progress** | Clean-room empirical oracle spec & zero-new-dependency architecture blueprint complete (`roxide-methods`, `roxide-pkg`, `roxide-graphics`); starting W0 coordinator contracts |
+| **M3 — S4 (`methods`), Graphics & Pure-R Packages** | **In Progress (Wave 1 Complete: 51 / 51 Layer 3)** | 15-crate `#![forbid(unsafe_code)]` workspace (0 new deps), ADRs 0012–0016; W0 contracts & dynamic namespaces + W1 S4 classes/dispatch/`callNextMethod`/`show`, `roxide-pkg` namespace/library/deferred-S3 loader, headless PDF/SVG/PNG devices, `grDevices` colors/palettes (115 analytical BSD-3-Clause HCL palettes)/`dev.*`/`pretty`/`boxplot.stats` — **51/51 Layer 3** (normal & `ROXIDE_GC_TORTURE=1`); starting Wave 2 |
 | **M4 — R 4.6.2 Public C API (`roxide-capi`), Compiled CRAN & Perf** | Planned | Isolated `unsafe` `libR` ABI, compiled CRAN corpus, bytecode VM, fuzzing |
 
 ## Differential Oracle Scoreboard (Live GNU R 4.6.2)
@@ -55,3 +55,22 @@
 | Layer 2 | `18_base_dcf.rcase` | 5 | 0 | 5 | UTF-8 `read.dcf` / `write.dcf` with `#` comments |
 | Layer 2 | `19_tools_rd_license.rcase` | 15 | 0 | 15 | `tools::parse_Rd`, `tools::Rd2txt` (R 4.6.2), `tools::analyze_license` |
 | **Total** | **Layer 2 (Suites 00–19)** | **293** | **0** | **293** | **100.0% — Milestone 2 Closed!** |
+
+### Layer 3 — Object Systems (`methods`), Packages (`roxide-pkg`) & Graphics (`roxide-graphics`)
+
+| Layer | Suite | Pass | Fail | Total | Notes |
+| --- | --- | ---: | ---: | ---: | --- |
+| Layer 3 | `00_m3_smoke.rcase` | 1 | 0 | 1 | W0 namespace & `search()` smoke (normal & `ROXIDE_GC_TORTURE=1`) |
+| Layer 3 | `01_s4_classes_slots.rcase` | 4 | 0 | 4 | S4 `setClass`, slots, prototypes, `.Data` (normal & torture GC) |
+| Layer 3 | `02_s4_new_initialize_validity.rcase` | 3 | 0 | 3 | `new`, `initialize`, `validObject` (normal & torture GC) |
+| Layer 3 | `03_s4_virtual_union_oldclass_as.rcase` | 3 | 0 | 3 | `VIRTUAL`, `setClassUnion`, `setOldClass`, `is`/`extends`/`as`/`setAs` |
+| Layer 3 | `04_s4_dispatch_resolver.rcase` | 3 | 0 | 3 | Multiple dispatch, diamond resolver, missing/lazy args |
+| Layer 3 | `05_s4_callnextmethod_show.rcase` | 4 | 0 | 4 | `callNextMethod()`, `show()`, method tables |
+| Layer 3 | `07_namespace_directives.rcase` | 1 | 0 | 1 | `NAMESPACE` `export`/`import`/`importFrom`/`except` |
+| Layer 3 | `08_load_attach_unload.rcase` | 2 | 0 | 2 | `loadNamespace`/`attachNamespace`/`unloadNamespace`/hooks |
+| Layer 3 | `09_library_require_use.rcase` | 1 | 0 | 1 | `library()`, `require()`, R 4.4+ `use()`, version checks |
+| Layer 3 | `10_s3_registration_deferred.rcase` | 1 | 0 | 1 | Immediate & deferred cross-package `S3method()` |
+| Layer 3 | `13_grdevices_colors_palette.rcase` | 23 | 0 | 23 | 657 named colors, `col2rgb`/`rgb`/`hsv`/`hcl`, 115 analytical HCL palettes, `pretty`/`nclass.*`/`boxplot.stats`/`xy.coords` |
+| Layer 3 | `14_device_table.rcase` | 2 | 0 | 2 | `dev.cur`/`dev.list`/`dev.next`/`dev.prev`/`dev.set`/`dev.off`/`dev.size`/`graphics.off` |
+| Layer 3 | `15_device_files_pdf_svg_png.rcase` | 3 | 0 | 3 | Headless PDF 1.4, SVG 1.1, PNG rasterizer + AFM/Hershey metrics |
+| **Total** | **Layer 3 (Wave 1)** | **51** | **0** | **51** | **100.0% normal & `ROXIDE_GC_TORTURE=1`** |

@@ -53,3 +53,10 @@ rust_2018_idioms = { level = "warn", priority = -1 }
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
+
+# Keep GC and SEXP value storage fast under debug builds and ROXIDE_GC_TORTURE=1.
+[profile.dev.package.roxide-gc]
+opt-level = 2
+
+[profile.dev.package.roxide-value]
+opt-level = 2

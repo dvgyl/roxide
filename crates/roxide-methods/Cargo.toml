@@ -11,5 +11,8 @@ roxide-eval.workspace = true
 roxide-gc.workspace = true
 roxide-value.workspace = true
 
+[dev-dependencies]
+roxide-host.workspace = true
+
 [lints]
 workspace = true

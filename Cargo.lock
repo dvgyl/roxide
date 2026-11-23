@@ -338,6 +338,7 @@ dependencies = [
  "roxide-base",
  "roxide-eval",
  "roxide-gc",
+ "roxide-host",
  "roxide-value",
 ]
 
