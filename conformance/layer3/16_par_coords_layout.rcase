@@ -1,0 +1,79 @@
+=== case: pdf_defaults_and_parameter_visibility ===
+#@ tags: layer3,graphics
+#@ compare: exact
+pdf(file.path(tempdir(), "par.pdf"))
+dput(names(par()))
+dput(names(par(no.readonly = TRUE)))
+dput(par(c("cin", "cra", "din", "mfrow", "page")))
+dput(withVisible(par(mar = c(1, 2, 3, 4), mex = 2)))
+dput(round(par("mai"), 6))
+dput(withVisible(par("mai")))
+dput(round(par("pin"), 6))
+invisible(dev.off())
+
+=== case: physical_regions_and_user_coordinates ===
+#@ tags: layer3,graphics
+#@ compare: exact
+pdf(file.path(tempdir(), "coordinates.pdf"), 8, 4)
+par(omi = c(.2, .3, .4, .5), fig = c(.1,.9,.2,.8), mar = c(1,2,2,1))
+plot.new()
+plot.window(c(10, 0), c(2, 4))
+dput(round(par("omd"), 8))
+dput(round(par("fig"), 8))
+dput(round(par("fin"), 8))
+dput(round(par("plt"), 8))
+dput(round(par("pin"), 8))
+dput(round(par("usr"), 8))
+dput(round(grconvertX(c(10,0), "user", "inches"), 8))
+dput(round(grconvertY(c(0,1), "nfc", "nic"), 8))
+dput(round(grconvertY(c(0,1), "npc", "device"), 8))
+dput(round(axTicks(1), 8))
+invisible(dev.off())
+
+=== case: frame_aspect_log_ticks_and_text_metrics ===
+#@ tags: layer3,graphics
+#@ compare: exact
+pdf(file.path(tempdir(), "text.pdf"), 8, 4)
+par(mar = rep(0, 4))
+plot.new()
+dput(round(par("usr"), 8))
+plot.window(c(0,1), c(0,1), asp = 1)
+dput(round(par("usr"), 8))
+plot.window(c(1,100), c(.01,100), log = "xy")
+dput(round(par("usr"), 8))
+dput(par("xaxp"))
+dput(round(axTicks(1), 8))
+dput(round(grconvertX(c(1,10,100), "user", "npc"), 8))
+dput(round(grconvertY(c(0,.5,1), "npc", "user"), 8))
+dput(round(strwidth(c("AV", "A\nV", NA), "inches"), 8))
+dput(round(strheight(c("g", "A\nV", NA), "figure"), 8))
+dput(round(axTicks(1, axp = c(10, 100, 3), usr = c(0, 3), log = TRUE), 8))
+options(warn = -1)
+plot.new()
+plot.window(c(10, 0), c(1, 2), log = "x")
+dput(round(par("usr"), 8))
+dput(par("xaxp"))
+invisible(dev.off())
+
+=== case: layout_order_scale_and_fixed_tracks ===
+#@ tags: layer3,graphics
+#@ compare: exact
+pdf(file.path(tempdir(), "layout.pdf"), 8, 4)
+par(mar = rep(0, 4), mfcol = c(3,2))
+dput(par(c("cex", "mex", "mfg", "page")))
+for (i in 1:3) {
+    plot.new()
+    dput(par("mfg"))
+}
+dput(withVisible(layout(matrix(c(1,2,1,3), 2), widths = c(1,2))))
+for (i in 1:3) {
+    plot.new()
+    dput(round(par("fig"), 8))
+}
+layout(matrix(1:4, 2), widths = c(lcm(2.54),3), heights = c(2,2),
+       respect = matrix(c(1,0,0,0), 2))
+for (i in 1:4) {
+    plot.new()
+    dput(round(par("fin"), 8))
+}
+invisible(dev.off())
