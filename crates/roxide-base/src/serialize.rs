@@ -1,9 +1,415 @@
-//! XDR v2/v3 `.rds` and `.RData` serialization (`serialize`, `unserialize`, `readRDS`, `saveRDS`, `save`, `load`).
+#![forbid(unsafe_code)]
 
-use roxide_eval::Module;
+//! XDR v2 and v3 serialization for raw vectors, RDS files, and R workspaces.
 
-/// Primitives and prelude exported by `roxide-base::serialize`.
-pub const MODULE: Module = Module {
-    prims: &[],
-    prelude: "",
+mod files;
+mod read;
+mod write;
+
+use std::fmt;
+use std::path::{Path, PathBuf};
+
+use roxide_eval::{
+    ArgEval, Args, Arity, Call, Ctx, Dispatch, EvalResult, Module, PrimDef, PrimFn, PrimKind,
+    Visibility,
 };
+use roxide_gc::SexpId;
+use roxide_host::Limits;
+use roxide_value::{
+    CharId, RLogical, SEXP_MISSING, SEXP_NIL, SEXP_UNBOUND, SexpType, ValueApi, ValueError,
+};
+
+use files::Compression;
+
+const REF: u32 = 255;
+const NIL: u32 = 254;
+const GLOBAL: u32 = 253;
+const UNBOUND: u32 = 252;
+const MISSING: u32 = 251;
+const BASE_NS: u32 = 250;
+const NAMESPACE: u32 = 249;
+const PACKAGE: u32 = 248;
+const EMPTY: u32 = 242;
+const BASE: u32 = 241;
+const ALTREP: u32 = 238;
+
+const OBJECT: u32 = 1 << 8;
+const ATTR: u32 = 1 << 9;
+const TAG: u32 = 1 << 10;
+const S4: u32 = 1 << 16;
+const ASCII: u32 = 1 << 18;
+const UTF8: u32 = 1 << 15;
+const LATIN1: u32 = 1 << 14;
+const BYTES: u32 = 1 << 13;
+const LOCKED_BINDING: u32 = 1 << 26;
+const ACTIVE_BINDING: u32 = 1 << 27;
+const MAX_INLINE_REF: u32 = 0x007f_ffff;
+
+struct CodecError(String);
+
+impl From<ValueError> for CodecError {
+    fn from(error: ValueError) -> Self {
+        Self(error.to_string())
+    }
+}
+
+impl From<std::io::Error> for CodecError {
+    fn from(error: std::io::Error) -> Self {
+        Self(error.to_string())
+    }
+}
+
+type WireResult<T> = Result<T, CodecError>;
+
+fn invalid(message: impl fmt::Display) -> CodecError {
+    CodecError(message.to_string())
+}
+
+/// Primitives and R wrappers for serialization and workspace I/O.
+pub const MODULE: Module = Module {
+    prims: &[
+        internal("rox_serialize", serialize, 6, Visibility::On),
+        internal("rox_unserialize", unserialize, 2, Visibility::On),
+        internal("rox_save_rds", save_rds, 6, Visibility::Off),
+        internal("rox_read_rds", read_rds, 2, Visibility::On),
+        internal("rox_save", save, 7, Visibility::Off),
+        internal("rox_load", load, 3, Visibility::Off),
+    ],
+    prelude: r#"
+serialize <- function(object, connection, ascii = FALSE, xdr = TRUE, version = NULL, refhook = NULL)
+    .Internal(rox_serialize(object, connection, ascii, xdr, version, refhook))
+unserialize <- function(connection, refhook = NULL)
+    .Internal(rox_unserialize(connection, refhook))
+saveRDS <- function(object, file = "", ascii = FALSE, version = NULL, compress = TRUE, refhook = NULL)
+    .Internal(rox_save_rds(object, file, ascii, version, compress, refhook))
+readRDS <- function(file, refhook = NULL)
+    .Internal(rox_read_rds(file, refhook))
+save <- function(..., list = character(), file = stop("'file' must be specified"),
+                 ascii = FALSE, version = NULL, envir = parent.frame(), compress = !ascii,
+                 compression_level = NULL, eval.promises = TRUE, precheck = TRUE)
+    .Internal(rox_save(substitute(list(...)), list, file, ascii, version, envir,
+                       list(compress, compression_level, eval.promises)))
+load <- function(file, envir = parent.frame(), verbose = FALSE)
+    .Internal(rox_load(file, envir, verbose))
+"#,
+};
+
+const fn internal(name: &'static str, fun: PrimFn, n: usize, visibility: Visibility) -> PrimDef {
+    PrimDef {
+        name,
+        fun,
+        kind: PrimKind::Internal,
+        args: ArgEval::Eval,
+        arity: Arity::Exact(n),
+        dispatch: Dispatch::None,
+        visibility,
+    }
+}
+
+fn checked<T>(ctx: &mut Ctx, call: &Call, result: WireResult<T>) -> EvalResult<T> {
+    result.map_err(|error| ctx.stop(call.err_call(), error.0))
+}
+
+fn limits(ctx: &mut Ctx) -> Limits {
+    let expressions = ctx.opts().expressions;
+    let mut limits = ctx.host().limits().clone();
+    // Pairlist tails use a loop. Bound native stack use for nested objects.
+    limits.max_expressions = limits.max_expressions.min(expressions).min(128);
+    limits
+}
+
+fn flag(ctx: &mut Ctx, call: &Call, value: SexpId) -> EvalResult<bool> {
+    let result = (|| {
+        let (x, _) = ctx.session_mut().coerce(value, SexpType::Lgl)?;
+        let view = ctx.session().lgl(x)?;
+        match (view.len() == 1).then(|| view.get(0)) {
+            Some(RLogical::TRUE) => Ok(true),
+            Some(RLogical::FALSE) => Ok(false),
+            _ => Err(invalid("invalid logical argument")),
+        }
+    })();
+    checked(ctx, call, result)
+}
+
+fn version(ctx: &mut Ctx, call: &Call, value: SexpId) -> EvalResult<u32> {
+    if value == SEXP_NIL {
+        return Ok(3);
+    }
+    let result = (|| {
+        let (x, _) = ctx.session_mut().coerce(value, SexpType::Int)?;
+        let view = ctx.session().int(x)?;
+        match (view.len() == 1).then(|| view.get(0)) {
+            Some(v @ (2 | 3)) => Ok(v as u32),
+            _ => Err(invalid("unsupported serialization version")),
+        }
+    })();
+    checked(ctx, call, result)
+}
+
+fn validate_format(ctx: &mut Ctx, call: &Call, ascii: SexpId, hook: SexpId) -> EvalResult<()> {
+    if flag(ctx, call, ascii)? {
+        return Err(ctx.stop(call.err_call(), "ASCII serialization is unavailable"));
+    }
+    validate_hook(ctx, call, hook)
+}
+
+fn validate_hook(ctx: &mut Ctx, call: &Call, hook: SexpId) -> EvalResult<()> {
+    if hook != SEXP_NIL {
+        return Err(ctx.stop(
+            call.err_call(),
+            "serialization reference hooks are unavailable",
+        ));
+    }
+    Ok(())
+}
+
+fn path(ctx: &mut Ctx, call: &Call, value: SexpId) -> EvalResult<PathBuf> {
+    let result = (|| {
+        if let [ch] = ctx.session().str_slice(value)?
+            && *ch != CharId::NA
+            && let Ok(s) = std::str::from_utf8(ctx.session().char_bytes(*ch)?)
+            && !s.is_empty()
+        {
+            return Ok(PathBuf::from(s));
+        }
+        Err(invalid("'file' must be a non-empty path"))
+    })();
+    checked(ctx, call, result)
+}
+
+fn compression(ctx: &mut Ctx, call: &Call, value: SexpId) -> EvalResult<Compression> {
+    if ctx.session().type_of(value)? == SexpType::Str {
+        let result = (|| match ctx.session().str_slice(value)? {
+            [x] => Compression::from_name(ctx.session().char_bytes(*x)?),
+            _ => Err(invalid("invalid 'compress' argument")),
+        })();
+        return checked(ctx, call, result);
+    }
+    if flag(ctx, call, value)? {
+        Ok(Compression::Gzip)
+    } else {
+        Ok(Compression::None)
+    }
+}
+
+fn encode(
+    ctx: &mut Ctx,
+    call: &Call,
+    value: SexpId,
+    version: u32,
+    workspace: bool,
+) -> EvalResult<Vec<u8>> {
+    let limits = limits(ctx);
+    let result = write::encode(ctx.session_mut(), value, version, workspace, &limits);
+    checked(ctx, call, result)
+}
+
+fn decode(ctx: &mut Ctx, call: &Call, bytes: &[u8], workspace: bool) -> EvalResult {
+    let limits = limits(ctx);
+    let result = read::decode(ctx.session_mut(), bytes, workspace, &limits);
+    checked(ctx, call, result)
+}
+
+fn serialize(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    validate_format(ctx, call, args.get(2), args.get(5))?;
+    if !flag(ctx, call, args.get(3))? {
+        return Err(ctx.stop(
+            call.err_call(),
+            "native binary serialization is unavailable",
+        ));
+    }
+    if args.get(1) != SEXP_NIL {
+        return Err(ctx.stop(call.err_call(), "serialize() requires a NULL connection"));
+    }
+    let version = version(ctx, call, args.get(4))?;
+    let bytes = encode(ctx, call, args.get(0), version, false)?;
+    Ok(ctx.session_mut().alloc_raw_from(&bytes)?)
+}
+
+fn unserialize(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    validate_hook(ctx, call, args.get(1))?;
+    let limits = limits(ctx);
+    let raw = ctx.session().raw(args.get(0));
+    let bytes = match raw.as_ref().ok().and_then(|view| view.as_slice()) {
+        Some(bytes) if bytes.len() <= limits.max_decompress_bytes.min(limits.max_vector_bytes) => {
+            bytes.to_vec()
+        }
+        Some(_) => return Err(ctx.stop(call.err_call(), "serialized input exceeds the byte limit")),
+        None => return Err(ctx.stop(call.err_call(), "unserialize() requires a raw vector")),
+    };
+    decode(ctx, call, &bytes, false)
+}
+
+fn read_file(ctx: &mut Ctx, call: &Call, path: &Path, workspace: bool) -> EvalResult {
+    let result = files::read(ctx.host(), path);
+    let bytes = checked(ctx, call, result)?;
+    decode(ctx, call, &bytes, workspace)
+}
+
+fn save_rds(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    validate_format(ctx, call, args.get(2), args.get(5))?;
+    let path = path(ctx, call, args.get(1))?;
+    let version = version(ctx, call, args.get(3))?;
+    let compress = compression(ctx, call, args.get(4))?;
+    let bytes = encode(ctx, call, args.get(0), version, false)?;
+    let result = files::write(ctx.host(), &path, &bytes, compress, None);
+    checked(ctx, call, result)?;
+    Ok(SEXP_NIL)
+}
+
+fn read_rds(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    validate_hook(ctx, call, args.get(1))?;
+    let path = path(ctx, call, args.get(0))?;
+    read_file(ctx, call, &path, false)
+}
+
+fn save(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    let path = path(ctx, call, args.get(2))?;
+    validate_format(ctx, call, args.get(3), SEXP_NIL)?;
+    let version = version(ctx, call, args.get(4))?;
+    let env = args.get(5);
+    if ctx.session().type_of(env)? != SexpType::Env {
+        return Err(ctx.stop(call.err_call(), "invalid 'envir' argument"));
+    }
+    let options = args.get(6);
+    let compress = ctx.session().list_get(options, 0)?;
+    let compress = compression(ctx, call, compress)?;
+    let level = ctx.session().list_get(options, 1)?;
+    let level = if level == SEXP_NIL {
+        None
+    } else {
+        let (x, _) = ctx.session_mut().coerce(level, SexpType::Int)?;
+        let view = ctx.session().int(x)?;
+        match (view.len() == 1).then(|| view.get(0)) {
+            Some(n @ 0..=9) => Some(n as u32),
+            _ => return Err(ctx.stop(call.err_call(), "invalid compression level")),
+        }
+    };
+    let force = ctx.session().list_get(options, 2)?;
+    let force = flag(ctx, call, force)?;
+    let result = save_names(ctx.session_mut(), args.get(0), args.get(1));
+    let names = checked(ctx, call, result)?;
+
+    let mut values = Vec::with_capacity(names.len());
+    for name in names {
+        let mut current = env;
+        let value = loop {
+            if current == SEXP_NIL {
+                let name = ctx.session().sym_name(name)?.to_owned();
+                return Err(ctx.stop(call.err_call(), format!("object '{name}' not found")));
+            }
+            if let Some(binding) = ctx.session().env_get(current, name)
+                && binding.value != SEXP_UNBOUND
+            {
+                break binding.value;
+            }
+            current = ctx.session().env_enclos(current)?;
+        };
+        let value = if force && ctx.session().type_of(value)? == SexpType::Prom {
+            ctx.force(value)?
+        } else {
+            value
+        };
+        ctx.protect(value);
+        values.push((name, value));
+    }
+    let mut frame = SEXP_NIL;
+    for (name, value) in values.into_iter().rev() {
+        frame = ctx.session_mut().cons(value, frame, name.as_sexp())?;
+    }
+    let bytes = encode(ctx, call, frame, version, true)?;
+    let result = files::write(ctx.host(), &path, &bytes, compress, level);
+    checked(ctx, call, result)?;
+    Ok(SEXP_NIL)
+}
+
+fn save_names(
+    session: &mut roxide_value::RSession,
+    dots: SexpId,
+    list: SexpId,
+) -> WireResult<Vec<roxide_value::Sym>> {
+    let (_, tail, _) = session.cons_parts(dots)?;
+    let mut names = Vec::new();
+    for (_, value) in session.pairlist_iter(tail) {
+        if matches!(value, SEXP_MISSING | SEXP_UNBOUND) {
+            return Err(invalid("invalid object name in '...'"));
+        }
+        if let Ok(name) = session.sym_name_of(value) {
+            names.push(name.to_owned());
+        } else if let Ok([ch]) = session.str_slice(value)
+            && *ch != CharId::NA
+        {
+            let name = std::str::from_utf8(session.char_bytes(*ch)?)
+                .map_err(|_| invalid("invalid object name in '...'"))?;
+            names.push(name.to_owned());
+        } else {
+            return Err(invalid("invalid object name in '...'"));
+        }
+    }
+    let listed = if list == SEXP_NIL {
+        &[]
+    } else {
+        session.str_slice(list)?
+    };
+    for &ch in listed {
+        if ch == CharId::NA {
+            return Err(invalid("invalid object name in 'list'"));
+        }
+        let name = std::str::from_utf8(session.char_bytes(ch)?)
+            .map_err(|_| invalid("invalid object name in 'list'"))?;
+        names.push(name.to_owned());
+    }
+    names
+        .into_iter()
+        .map(|name| Ok(session.intern(&name)?))
+        .collect()
+}
+
+fn load(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    let path = path(ctx, call, args.get(0))?;
+    let env = args.get(1);
+    if ctx.session().type_of(env)? != SexpType::Env {
+        return Err(ctx.stop(call.err_call(), "invalid 'envir' argument"));
+    }
+    let verbose = flag(ctx, call, args.get(2))?;
+    let mut frame = read_file(ctx, call, &path, true)?;
+    ctx.protect(frame);
+    let mut bindings = Vec::new();
+    while frame != SEXP_NIL {
+        if ctx.session().type_of(frame)? != SexpType::List {
+            return Err(ctx.stop(call.err_call(), "invalid workspace binding list"));
+        }
+        let (value, tail, tag) = ctx.session().cons_parts(frame)?;
+        let Ok(name) = ctx.session().sym_name_of(tag).map(str::to_owned) else {
+            return Err(ctx.stop(call.err_call(), "invalid workspace binding name"));
+        };
+        if name.is_empty() {
+            return Err(ctx.stop(call.err_call(), "empty workspace binding name"));
+        }
+        let name = ctx.session_mut().intern(&name)?;
+        bindings.push((name, value));
+        frame = tail;
+    }
+    let mut names = Vec::with_capacity(bindings.len());
+    if verbose {
+        let result = ctx.host().write_out(b"Loading objects:\n").map_err(invalid);
+        checked(ctx, call, result)?;
+    }
+    for (name, value) in bindings {
+        ctx.assign(name, value, env)?;
+        let text = ctx.session().sym_name(name)?.to_owned();
+        if verbose {
+            let result = ctx
+                .host()
+                .write_out(format!("  {text}\n").as_bytes())
+                .map_err(invalid);
+            checked(ctx, call, result)?;
+        }
+        let ch = ctx
+            .session_mut()
+            .mk_char(text.as_bytes(), roxide_value::Encoding::Utf8)?;
+        ctx.protect(ch.as_sexp());
+        names.push(ch);
+    }
+    Ok(ctx.session_mut().alloc_str_from(&names)?)
+}
