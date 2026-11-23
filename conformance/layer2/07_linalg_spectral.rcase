@@ -1,0 +1,186 @@
+=== case: spectral_svd_square ===
+#@ tags: base,linalg
+#@ compare: rel=1e-11,abs=1e-12
+num <- function(x) cat(sprintf("%.17g",x),"\n")
+A <- rbind(c(1,2,3),c(4,5,6),c(7,8,10))
+s <- svd(A)
+num(s$d)
+num(sign(s$u) %*% diag(sign(s$u[1,])))
+num(sign(s$v) %*% diag(sign(s$u[1,])))
+num(crossprod(s$u))
+num(crossprod(s$v))
+num(s$u %*% diag(s$d) %*% t(s$v) - A)
+
+=== case: spectral_svd_tall_and_wide ===
+#@ tags: base,linalg
+#@ compare: rel=1e-11,abs=1e-12
+num <- function(x) cat(sprintf("%.17g",x),"\n")
+B <- rbind(c(1,2,3),c(4,5,6),c(7,8,10),c(2,0,1))
+check <- function(A) {
+    s <- svd(A,nu=99,nv=99)
+    k <- length(s$d)
+    num(s$d)
+    dput(dim(s$u))
+    dput(dim(s$v))
+    num(crossprod(s$u))
+    num(crossprod(s$v))
+    num(s$u[,seq_len(k),drop=FALSE] %*% diag(s$d) %*% t(s$v[,seq_len(k),drop=FALSE]) - A)
+}
+check(B)
+check(t(B))
+
+=== case: spectral_svd_values_only_and_la_shapes ===
+#@ tags: base,linalg
+#@ compare: rel=1e-11,abs=1e-12
+num <- function(x) cat(sprintf("%.17g",x),"\n")
+A <- matrix(1:6,2,dimnames=list(c("a","b"),c("x","y","z")))
+s <- La.svd(A,nu=0,nv=3)
+dput(names(s))
+num(s$d)
+dput(dim(s$vt))
+dput(dimnames(s$vt))
+dput(identical(t(s$vt), svd(A,nu=0,nv=3)$v))
+dput(names(svd(A,nu=0,nv=0)))
+dput(names(La.svd(A,nv=0)))
+num(svd(c(TRUE,FALSE))$d)
+
+=== case: spectral_svd_scale_rank_and_scalar ===
+#@ tags: base,linalg
+#@ compare: rel=1e-11,abs=1e-12
+num <- function(x) cat(sprintf("%.17g",x),"\n")
+A <- rbind(c(1,2),c(2,4),c(3,6))
+for (f in c(1e-200,1e200)) {
+    s <- svd(A*f)
+    num(s$d / f)
+    num(s$u %*% diag(s$d/f) %*% t(s$v) - A)
+}
+num(svd(matrix(0,2,4))$d)
+num(svd(matrix(-7,1))$d)
+
+=== case: spectral_symmetric_eigen ===
+#@ tags: base,linalg
+#@ compare: rel=1e-11,abs=1e-12
+num <- function(x) cat(sprintf("%.17g",x),"\n")
+A <- matrix(c(2,1,0,1,2,0,0,0,-4),3)
+e <- eigen(A)
+dput(class(e))
+dput(names(e))
+num(e$values)
+num(crossprod(e$vectors))
+num(A %*% e$vectors - e$vectors %*% diag(e$values))
+
+=== case: spectral_symmetric_eigen_lower_triangle ===
+#@ tags: base,linalg
+#@ compare: rel=1e-11,abs=1e-12
+num <- function(x) cat(sprintf("%.17g",x),"\n")
+A <- matrix(c(2,3,99,2),2)
+B <- matrix(c(2,3,3,2),2)
+e <- eigen(A,symmetric=TRUE)
+num(e$values)
+num(B %*% e$vectors - e$vectors %*% diag(e$values))
+num(eigen(diag(c(-8,3,1)),only.values=TRUE)$values)
+num(eigen(diag(c(-8,3,1)),symmetric=FALSE,only.values=TRUE)$values)
+dput(class(eigen(B,only.values=TRUE)))
+
+=== case: spectral_general_eigen_real ===
+#@ tags: base,linalg
+#@ compare: rel=1e-11,abs=1e-12
+num <- function(x) cat(sprintf("%.17g",x),"\n")
+A <- matrix(c(2,0,0,4,-8,0,6,10,1),3)
+e <- eigen(A,EISPACK=TRUE)
+num(e$values)
+num(colSums(e$vectors^2))
+num(A %*% e$vectors - e$vectors %*% diag(e$values))
+
+=== case: spectral_general_eigen_complex_pair ===
+#@ tags: base,linalg
+#@ compare: rel=1e-11,abs=1e-12
+num <- function(x) cat(sprintf("%.17g",x),"\n")
+A <- matrix(c(0,1,-1,0),2)
+e <- eigen(A)
+dput(typeof(e$values))
+num(Re(e$values))
+num(Im(e$values))
+num(Re(e$vectors))
+num(Im(e$vectors))
+num(Mod(A %*% e$vectors - e$vectors %*% diag(e$values)))
+num(eigen(matrix(c(1,1e-18,-1e-18,1),2),symmetric=FALSE,only.values=TRUE)$values)
+
+=== case: spectral_symmetry_tolerance_and_missing ===
+#@ tags: base,linalg
+#@ compare: exact
+dput(isSymmetric(matrix(c(1,1e-14,0,1),2)))
+dput(isSymmetric(matrix(c(1,1e-12,0,1),2)))
+dput(isSymmetric(matrix(c(1,1e-14,0,1),2),tol1=0))
+dput(isSymmetric(matrix(c(1,NA,NaN,1),2)))
+dput(isSymmetric(matrix(c(1,NA,0,1),2)))
+dput(isSymmetric(matrix(numeric(),0,0)))
+dput(isSymmetric(matrix(1,1,2)))
+
+=== case: spectral_symmetry_dimnames_and_complex ===
+#@ tags: base,linalg
+#@ compare: exact
+A <- matrix(c(1,2,2,1),2,dimnames=list(left=c("x","y"),right=c("x","y")))
+dput(isSymmetric(A))
+dput(isSymmetric(A,check.attributes=FALSE))
+dput(eigen(A,only.values=TRUE))
+H <- matrix(c(2,1+2i,1-2i,3),2)
+dput(isSymmetric(H))
+dput(isSymmetric(H,trans="T"))
+dput(isSymmetric(matrix(1i,1)))
+
+=== case: spectral_matrix_norms ===
+#@ tags: base,linalg
+#@ compare: rel=1e-11,abs=1e-12
+num <- function(x) cat(sprintf("%.17g",x),"\n")
+A <- matrix(1:4,2)
+num(c(norm(A),norm(A,"1"),norm(A,"i"),norm(A,"F"),norm(A,"m"),norm(A,"2")))
+num(norm(A*1e200,"f")/1e200)
+num(norm(A*1e-200,"2")/1e-200)
+num(norm(matrix(c(3+4i,1i),1),"f"))
+num(norm(matrix(c(3+4i,1i),1),"2"))
+num(norm(1:3,"2"))
+num(norm(matrix(numeric(),0,3),"2"))
+
+=== case: spectral_norm_missing_values ===
+#@ tags: base,linalg
+#@ compare: exact
+dput(norm(matrix(NA_real_,1)))
+dput(norm(matrix(NaN,1)))
+dput(norm(matrix(Inf,1),"F"))
+dput(norm(matrix(NaN,1),"2"))
+tryCatch(norm(matrix(Inf,1),"2"),error=function(e) cat(conditionMessage(e),"\n"))
+tryCatch(norm(1:2),error=function(e) cat(conditionMessage(e),"\n"))
+tryCatch(norm(diag(2),"bad"),error=function(e) cat(conditionMessage(e),"\n"))
+
+=== case: spectral_condition_numbers ===
+#@ tags: base,linalg
+#@ compare: rel=1e-11,abs=1e-12
+num <- function(x) cat(sprintf("%.17g",x),"\n")
+A <- matrix(1:4,2)
+num(kappa(A))
+num(kappa.default(A))
+num(kappa(qr(A)))
+num(kappa(A,norm="I"))
+num(kappa(A,method="direct"))
+num(kappa(A,exact=TRUE))
+num(kappa(A,exact=TRUE,norm="I"))
+num(kappa(A,exact=TRUE,norm="F",inv_z=diag(2)))
+num(kappa(matrix(1:6,2)))
+num(kappa(matrix(1:6,3)))
+num(kappa(matrix(numeric(),0,2)))
+num(kappa(diag(c(1,0)),exact=TRUE))
+
+=== case: spectral_decomposition_argument_errors ===
+#@ tags: base,linalg
+#@ compare: exact
+err <- function(x) tryCatch(force(x),error=function(e) cat(conditionMessage(e),"\n"))
+err(svd(diag(2),LINPACK=FALSE))
+err(svd(diag(2),nu=-1))
+err(La.svd(diag(2),nv=NA))
+err(svd(matrix(numeric(),2,0)))
+err(svd(matrix(NA_real_,1)))
+err(eigen(matrix(1,2,3)))
+err(eigen(matrix(numeric(),0,0)))
+err(eigen(matrix(Inf,1)))
+err(eigen(diag(2),only.values=NA))

@@ -6,6 +6,7 @@ mod factor;
 mod matrix;
 mod product;
 mod qr;
+mod spectral;
 
 use roxide_eval::{
     ArgEval, Arity, Call, Ctx, Dispatch, EvalResult, GroupGeneric, Module, PrimDef, PrimFn,
@@ -43,6 +44,11 @@ pub const MODULE: Module = Module {
         internal("rcond", 2, factor::rcond),
         internal("determinant", 2, factor::determinant),
         internal("backsolve", 5, factor::backsolve),
+        internal("spectral_svd", 4, spectral::svd),
+        internal("spectral_eigen", 4, spectral::eigen),
+        internal("spectral_symmetric", 5, spectral::is_symmetric),
+        internal("spectral_norm", 2, spectral::norm),
+        internal("spectral_kappa", 6, spectral::kappa),
         internal("transpose", 1, matrix::transpose),
         internal("matrix_diag", 4, matrix::diag),
         internal("matrix_diag_set", 2, matrix::diag_set),
@@ -90,6 +96,40 @@ backsolve <- function(r, x, k = ncol(r), upper.tri = TRUE, transpose = FALSE)
     .Internal(backsolve(r, x, if (missing(k)) if (is.matrix(r)) ncol(r) else 1L else k, upper.tri, transpose))
 forwardsolve <- function(l, x, k = ncol(l), upper.tri = FALSE, transpose = FALSE)
     .Internal(backsolve(l, x, if (missing(k)) if (is.matrix(l)) ncol(l) else 1L else k, upper.tri, transpose))
+svd <- function(x, nu = min(n, p), nv = min(n, p), LINPACK = FALSE) {
+    if (!missing(LINPACK)) stop("the LINPACK argument has been defunct since R 3.1.0")
+    n <- if (is.matrix(x)) nrow(x) else length(x)
+    p <- if (is.matrix(x)) ncol(x) else 1L
+    .Internal(spectral_svd(x, nu, nv, FALSE))
+}
+La.svd <- function(x, nu = min(n, p), nv = min(n, p)) {
+    n <- if (is.matrix(x)) nrow(x) else length(x)
+    p <- if (is.matrix(x)) ncol(x) else 1L
+    .Internal(spectral_svd(x, nu, nv, TRUE))
+}
+eigen <- function(x, symmetric, only.values = FALSE, EISPACK = FALSE)
+    .Internal(spectral_eigen(x, if (missing(symmetric)) NULL else if (symmetric) TRUE else FALSE,
+                             only.values, missing(symmetric)))
+isSymmetric <- function(object, ...) UseMethod("isSymmetric")
+isSymmetric.matrix <- function(object, tol = 100 * 2^-52, tol1 = 8 * tol,
+                               trans = "C", ..., check.attributes = TRUE)
+    .Internal(spectral_symmetric(object, tol, tol1, trans, check.attributes))
+norm <- function(x, type = c("O", "I", "F", "M", "2"))
+    .Internal(spectral_norm(x, type))
+kappa <- function(z, ...) UseMethod("kappa")
+kappa.default <- function(z, exact = FALSE, norm = NULL, method = c("qr", "direct"),
+                          inv_z = solve(z), triangular = FALSE, uplo = "U", ...) {
+    if (exact && !is.null(norm) && norm != "2") {
+        if (!is.matrix(z)) z <- matrix(z, ncol = 1L)
+        return(.Internal(spectral_norm(z, norm)) * .Internal(spectral_norm(inv_z, norm)))
+    }
+    .Internal(spectral_kappa(z, exact, norm, if (exact) NULL else method, triangular, uplo))
+}
+kappa.matrix <- kappa.default
+kappa.qr <- function(z, ...) {
+    if (!is.qr(z)) stop("argument is not a QR decomposition")
+    kappa.default(qr.R(z), triangular = TRUE, ...)
+}
 t <- function(x) UseMethod("t")
 t.default <- function(x) .Internal(transpose(x))
 diag <- function(x = 1, nrow, ncol, names = TRUE) {
