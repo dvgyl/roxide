@@ -1,0 +1,197 @@
+=== case: linalg_matrix_product_fma ===
+#@ tags: base,linalg
+#@ compare: exact
+x <- 1 + 2^-27
+cat(sprintf("%a", c(-1,x) %*% c(1,x)), "\n")
+
+=== case: linalg_matrix_product_shapes_and_names ===
+#@ tags: base,linalg
+#@ compare: exact
+A <- matrix(1:6, 2, dimnames=list(c("a","b"),c("x","y","z")))
+dput(c(left=2,right=3) %*% A)
+dput(A %*% c(x=2,y=3,z=4))
+dput(crossprod(A,c(2,3)))
+dput(tcrossprod(1:3,A))
+dput(crossprod(A))
+dput(matrix(numeric(),2,0) %*% matrix(numeric(),0,3))
+tryCatch(tcrossprod(A,1:3),error=function(e) cat(conditionMessage(e),"\n"))
+
+=== case: linalg_matrix_products_complex_and_missing ===
+#@ tags: base,linalg
+#@ compare: exact
+dput(crossprod(1i))
+dput(tcrossprod(c(1i,2)))
+dput((1+2i) %*% (3-1i))
+dput(NA_real_ %*% 0)
+dput(NaN %*% 0)
+dput(c(NA_real_,NaN) %*% c(0,0))
+
+=== case: linalg_linpack_qr_structure ===
+#@ tags: base,linalg
+#@ compare: exact
+A <- matrix(c(1,2,3,4,2,1,0,3,3,3,3,7),4,
+    dimnames=list(c("a","b","c","d"),c("A","B","C")))
+q <- qr(A)
+dput(is.qr(q))
+dput(names(q))
+dput(dimnames(q$qr))
+dput(q$pivot)
+dput(q$rank)
+cat(sprintf("%a", q$qr), "\n")
+cat(sprintf("%a", q$qraux), "\n")
+D <- diag(c(1,1,0))
+dput(c(qr(D,tol=0)$rank,qr(D,tol=1)$rank,qr(D,tol=1+2^-52)$rank))
+
+=== case: linalg_linpack_qr_operations ===
+#@ tags: base,linalg
+#@ compare: rel=1e-12,abs=1e-14
+A <- matrix(c(1,2,3,4,2,1,0,3,3,3,3,7),4,
+    dimnames=list(c("a","b","c","d"),c("A","B","C")))
+b <- c(a=2,b=1,c=4,d=0)
+q <- qr(A)
+show <- function(x) { dput(attributes(x)); cat(sprintf("%.17g",x),"\n") }
+show(qr.Q(q))
+show(qr.Q(q,complete=TRUE,Dvec=1:4))
+show(qr.R(q))
+show(qr.X(q))
+show(qr.coef(q,b))
+show(qr.resid(q,b))
+show(qr.fitted(q,b))
+show(qr.qy(q,b))
+show(qr.qty(q,b))
+show(qr.solve(A[,1:2],b))
+tryCatch(qr.solve(q,b),error=function(e) cat(conditionMessage(e),"\n"))
+
+=== case: linalg_lapack_qr_operations ===
+#@ tags: base,linalg
+#@ compare: rel=1e-12,abs=1e-14
+A <- matrix(c(1,2,3,4,2,1,0,3,3,2,4,7),4,
+    dimnames=list(c("a","b","c","d"),c("A","B","C")))
+q <- qr(A,LAPACK=TRUE)
+show <- function(x) { dput(attributes(x)); cat(sprintf("%.17g",x),"\n") }
+b <- c(a=2,b=1,c=4,d=0)
+dput(attr(q,"useLAPACK"))
+dput(q$rank)
+dput(q$pivot)
+show(q$qraux)
+dput(dimnames(q$qr))
+show(qr.Q(q,complete=TRUE))
+show(qr.R(q))
+show(qr.X(q))
+show(qr.coef(q,b))
+show(qr.qy(q,b))
+show(qr.qty(q,b))
+tryCatch(qr.resid(q,b),error=function(e) cat(conditionMessage(e),"\n"))
+
+=== case: linalg_cholesky_and_inverse ===
+#@ tags: base,linalg
+#@ compare: rel=1e-13
+P <- matrix(c(4,2,2,3),2,dimnames=list(c("r","s"),c("x","y")))
+S <- matrix(c(1,2,2,4),2,dimnames=dimnames(P))
+dput(chol(P))
+dput(chol2inv(chol(P)))
+got <- function(x) withCallingHandlers(chol(x,pivot=TRUE),warning=function(w) {
+    cat(conditionMessage(w),"\n")
+    invokeRestart("muffleWarning")
+})
+dput(got(S))
+dput(got(diag(c(1,2^-52))))
+dput(got(diag(c(1,2^-52 + 2^-104))))
+tryCatch(chol(S),error=function(e) cat(conditionMessage(e),"\n"))
+tryCatch(chol2inv(got(S)),error=function(e) cat(conditionMessage(e),"\n"))
+
+=== case: linalg_linear_solve_and_determinant ===
+#@ tags: base,linalg
+#@ compare: rel=1e-13
+P <- matrix(c(4,2,2,3),2,dimnames=list(c("r","s"),c("x","y")))
+S <- matrix(c(1,2,2,4),2)
+dput(solve(P))
+dput(solve(P,c(a=2,b=4)))
+dput(solve(P,matrix(1:4,2,dimnames=list(NULL,c("a","b")))))
+dput(determinant(P))
+dput(determinant(P,logarithm=FALSE))
+dput(determinant(S))
+dput(det(P))
+dput(det(matrix(c(1,2,2,1),2)))
+tryCatch(solve(S,tol=0),error=function(e) cat(conditionMessage(e),"\n"))
+tryCatch(solve(diag(c(1,1e-17))),error=function(e) cat(conditionMessage(e),"\n"))
+dput(solve(diag(c(1,1e-17)),tol=0))
+cat(sprintf("%a",solve(diag(c(1,2^-52)))),"\n")
+
+=== case: linalg_condition_estimates ===
+#@ tags: base,linalg
+#@ compare: exact
+H <- outer(1:6,1:6,function(i,j) 1/(i+j-1))
+A <- matrix(c(-1,1,1,-1,1,-3,-3,-3,0),3)
+for (x in list(H,A, matrix(c(1,2,3,7),2),matrix(c(1,2,2,4),2)))
+    cat(sprintf("%a",rcond(x,"O")),sprintf("%a",rcond(x,"I")),"\n")
+dput(rcond(matrix(1e-308,1)))
+
+=== case: linalg_triangular_solve_and_utilities ===
+#@ tags: base,linalg
+#@ compare: rel=1e-13
+A <- matrix(c(4,2,2,3),2,dimnames=list(c("r","s"),c("x","y")))
+dput(backsolve(A,c(2,4)))
+dput(forwardsolve(A,c(2,4)))
+dput(backsolve(A,matrix(1:6,3),transpose=TRUE))
+dput(forwardsolve(A,matrix(1:6,3),transpose=TRUE))
+tryCatch(forwardsolve(diag(c(0,1)),1:2),error=function(e) cat(conditionMessage(e),"\n"))
+dput(t(A))
+dput(diag(A))
+B <- A
+diag(B) <- c(5,6)
+dput(B)
+dput(lower.tri(A,diag=TRUE))
+dput(upper.tri(A))
+dput(rowSums(A))
+dput(colSums(A))
+dput(rowMeans(A))
+dput(colMeans(A))
+dput(outer(c(a=1,b=2), 3:4))
+dput(kronecker(A,matrix(1:2,1),make.dimnames=TRUE))
+
+=== case: linalg_lapack_qr_near_singular_bits ===
+#@ tags: base,linalg
+#@ compare: exact
+A <- matrix(c(1,2,3,4,2,1,0,3,3,3,3,7),4)
+q <- qr(A,LAPACK=TRUE)
+cat(sprintf("%a", q$qr), "\n")
+cat(sprintf("%a", q$qraux), "\n")
+cat(sprintf("%a", qr.coef(q,c(2,1,4,0))), "\n")
+
+=== case: linalg_complex_solve_and_condition ===
+#@ tags: base,linalg
+#@ compare: rel=1e-14
+dput(solve(matrix(1:4,2),c(1i,2)))
+dput(solve(diag(c(1i,2))))
+cat(sprintf("%.17g",rcond(diag(c(1+1i,2)))),"\n")
+tryCatch(solve(diag(c(1i,0))),error=function(e) cat(conditionMessage(e),"\n"))
+tryCatch(solve(diag(c(1i,1e-20))),error=function(e) cat(conditionMessage(e),"\n"))
+tryCatch(solve(diag(2),NULL),error=function(e) cat(conditionMessage(e),"\n"))
+
+=== case: linalg_named_dimension_axes ===
+#@ tags: base,linalg
+#@ compare: exact
+A <- matrix(1:4,2,dimnames=list(rows=c("a","b"),cols=c("c","d")))
+B <- matrix(1:4,2,dimnames=list(rows2=c("e","f"),cols2=c("g","h")))
+dput(dimnames(A %*% B))
+dput(dimnames(crossprod(A,B)))
+dput(dimnames(tcrossprod(A,B)))
+dput(dimnames(qr.R(qr(A))))
+dput(dimnames(qr.qty(qr(A),B)))
+dput(dimnames(chol(crossprod(A))))
+dput(attributes(outer(A,1:2)))
+dput(attributes(kronecker(c(a=1,b=2),c(x=3,y=4),make.dimnames=TRUE)))
+
+=== case: linalg_matrix_group_dispatch ===
+#@ tags: base,linalg
+#@ compare: exact
+matrixOps.demo <- function(x, y = NULL, ...) .Generic
+x <- structure(2,class="demo")
+dput(x %*% 1)
+dput(crossprod(x,1))
+dput(tcrossprod(x))
+dput(typeof(crossprod))
+dput(typeof(tcrossprod))
+tryCatch(crossprod(),error=function(e) cat(conditionMessage(e),"\n"))
+tryCatch(tcrossprod(1,),error=function(e) cat(conditionMessage(e),"\n"))
