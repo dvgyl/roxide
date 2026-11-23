@@ -1,7 +1,7 @@
 binom.test <- function(x, n, p = 0.5, alternative = c("two.sided", "less", "greater"),
                        conf.level = 0.95) {
     alternative <- .htest_alt(alternative)
-    .htest_level(conf.level)
+    .htest_level(conf.level, TRUE)
     if (length(p) != 1L || !is.finite(p) || p < 0 || p > 1)
         stop("'p' must be a single number between 0 and 1")
     label <- deparse1(substitute(x))
@@ -62,7 +62,7 @@ binom.test <- function(x, n, p = 0.5, alternative = c("two.sided", "less", "grea
 prop.test <- function(x, n, p = NULL, alternative = c("two.sided", "less", "greater"),
                       conf.level = 0.95, correct = TRUE) {
     alternative <- .htest_alt(alternative)
-    .htest_level(conf.level)
+    .htest_level(conf.level, TRUE)
     label <- deparse1(substitute(x))
     x <- .htest_limit(x)
     if (is.matrix(x)) {
@@ -116,7 +116,7 @@ prop.test <- function(x, n, p = NULL, alternative = c("two.sided", "less", "grea
     method <- if (k == 1L) "1-sample proportions test" else
         paste0(k, "-sample test for ", if (given) "given proportions" else "equality of proportions")
     method <- paste(method, if (correction > 0) "with" else "without", "continuity correction")
-    labels <- if (k == 1L) "p" else paste("prop", seq_len(k))
+    labels <- if (k == 1L) "p" else paste("prop", seq_along(keep)[keep])
     null <- if (is.null(p)) NULL else setNames(p, labels)
     expected <- n * if (is.null(p)) sum(x)/sum(n) else p
     failures <- (n-expected)
@@ -204,13 +204,24 @@ fisher.test <- function(x, y = NULL, workspace = 2e5, hybrid = FALSE,
     two <- all(dim(x) == 2L)
     if (two) {
         if (length(or) != 1L || is.na(or) || or < 0) stop("'or' must be a single number between 0 and Inf")
-        if (conf.int) .htest_level(conf.level)
+        if (conf.int) .htest_level(conf.level, TRUE)
     }
     b <- if (!two && simulate.p.value) B else NULL
+    hypp <- NULL
+    if (two && hybrid) warning("'hybrid' is ignored for a 2 x 2 table")
+    if (!two && is.null(b) && hybrid) {
+        hypp <- as.double(hybridPars)
+        stopifnot(length(hypp) == 3L, hypp[1] > 0, 0 <= hypp[2],
+                  hypp[2] <= 100, hypp[3] >= 0)
+    }
     h <- .Internal(C_htest_fisher(x, or, .model_match(alternative, .htest_alternatives),
-                                  if (two && conf.int) conf.level else NULL, b, workspace))
+                                  if (two && conf.int) conf.level else NULL, b, workspace, hypp))
     method <- "Fisher's Exact Test for Count Data"
     if (!is.null(b)) method <- paste0(method, " with simulated p-value\n\t (based on ", B, " replicates)")
+    if (!is.null(hypp)) {
+        method <- paste0(method, " hybrid using asym.chisq. iff (exp=", hypp[[1L]],
+                         ", perc=", hypp[[2L]], ", Emin=", hypp[[3L]], ")")
+    }
     if (two) {
         result <- .htest_make(p.value = h[[1L]], conf.int = if (conf.int) structure(h[3L:4L], conf.level = conf.level) else NULL,
                               estimate = c("odds ratio" = h[[2L]]), null.value = c("odds ratio" = or),

@@ -76,8 +76,8 @@ fn shapiro(x: &[f64]) -> [f64; 2] {
     } else {
         1.0
     };
-    let center = x[0] * scale;
-    let normalized = |v: f64| (v * scale - center) / range;
+    // Divide by the range before centering to match the reference rounding.
+    let normalized = |v: f64| v * scale / range;
     let average = x.iter().map(|&v| normalized(v)).sum::<f64>() / n;
     let cross: f64 = weights
         .iter()

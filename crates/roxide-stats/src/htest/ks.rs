@@ -29,24 +29,17 @@ pub(super) fn test(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     let n = x.len();
     if !two {
         let ties = x.windows(2).any(|pair| pair[0] == pair[1]);
-        if ties {
-            ctx.warn_now(
-                call.err_call(),
-                "ties should not be present for the one-sample Kolmogorov-Smirnov test",
-            )?;
-        }
-        if y.len() == 1 {
-            y.resize(n, y[0]);
-        }
-        if y.len() != n || y.iter().any(|v| !v.is_finite()) {
+        if y.is_empty() || y.iter().any(|v| !v.is_finite()) {
             return Err(ctx.stop(
                 call.err_call(),
                 "invalid one-sample distribution function values",
             ));
         }
-        let dist = y.iter().enumerate().fold(0.0_f64, |distance, (i, &f)| {
-            let less = f - i as f64 / n as f64;
-            let greater = (i + 1) as f64 / n as f64 - f;
+        let dist = (0..n.max(y.len())).fold(0.0_f64, |distance, i| {
+            let f = y[i % y.len()];
+            let rank = (i % n) as f64 / n as f64;
+            let less = f - rank;
+            let greater = rank + 1.0 / n as f64 - f;
             distance.max(direction(alt, less, greater))
         });
         let exact = exact.unwrap_or(n < 100 && !ties);

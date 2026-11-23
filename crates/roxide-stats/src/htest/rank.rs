@@ -5,7 +5,7 @@ use roxide_math::{
     core::Flags,
     dist::{
         continuous::pt,
-        normal::{pnorm, qnorm},
+        normal::{dnorm, pnorm, qnorm},
     },
     roots::zeroin,
 };
@@ -59,6 +59,7 @@ struct RankTest {
     sample_size: Option<usize>,
     mean: f64,
     deviation: f64,
+    tied: bool,
 }
 
 impl RankTest {
@@ -66,6 +67,7 @@ impl RankTest {
         let m = x.len();
         let mut values: Vec<_> = x.iter().map(|&v| rounded(v - shift, digits)).collect();
         if y.is_empty() {
+            let zeros = values.contains(&0.0);
             if !exact {
                 values.retain(|&v| v != 0.0);
             }
@@ -95,6 +97,7 @@ impl RankTest {
                 sample_size: None,
                 mean,
                 deviation,
+                tied: zeros || scores.ties.iter().any(|&size| size > 1),
             }
         } else {
             values.extend(y.iter().map(|&v| rounded(v, digits)));
@@ -116,6 +119,7 @@ impl RankTest {
                 sample_size: Some(m),
                 mean: product / 2.0,
                 deviation,
+                tied: scores.ties.iter().any(|&size| size > 1),
             }
         }
     }
@@ -138,6 +142,56 @@ impl RankTest {
             0.0
         };
         (d - adjustment) / self.deviation
+    }
+
+    fn asymptotic_tail(&self, alt: Alternative, correction: Correction) -> f64 {
+        let z = self.standard(alt, correction.enabled);
+        if self.tied || correction.terms == 0 {
+            return normal_tail(z, alt);
+        }
+        let cumulant = |power| {
+            if let Some(m) = self.sample_size {
+                let n = self.weights.len() - m;
+                let coefficient = if power == 4 {
+                    -1.0 / 120.0
+                } else {
+                    1.0 / 252.0
+                };
+                coefficient
+                    * (1..=m)
+                        .map(|i| {
+                            (((n + i) as f64) / self.deviation).powi(power)
+                                - ((i as f64) / self.deviation).powi(power)
+                        })
+                        .sum::<f64>()
+            } else {
+                let coefficient = if power == 4 { -2.0 } else { 16.0 };
+                coefficient
+                    * self
+                        .weights
+                        .iter()
+                        .map(|&w| (w as f64 / (4.0 * self.deviation)).powi(power))
+                        .sum::<f64>()
+            }
+        };
+        let fourth = cumulant(4);
+        let mut hermite = [1.0, z, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        for i in 2..hermite.len() {
+            hermite[i] = z * hermite[i - 1] - (i - 1) as f64 * hermite[i - 2];
+        }
+        let mut series = fourth * hermite[3] / 24.0;
+        if correction.terms >= 2 {
+            series += cumulant(6) * hermite[5] / 720.0;
+        }
+        if correction.terms >= 3 {
+            series += fourth.powi(2) * hermite[7] / 1152.0;
+        }
+        let mut flags = Flags::default();
+        let change = dnorm(z, 0.0, 1.0, false, &mut flags) * series;
+        alt.probability(
+            (pnorm(z, 0.0, 1.0, LOWER, &mut flags) - change).clamp(0.0, 1.0),
+            (pnorm(z, 0.0, 1.0, UPPER, &mut flags) + change).clamp(0.0, 1.0),
+        )
     }
 
     fn distribution(&self, ctx: &mut Ctx, call: &Call) -> EvalResult<(Vec<f64>, usize)> {
@@ -189,6 +243,43 @@ impl RankTest {
     }
 }
 
+#[derive(Clone, Copy)]
+struct Correction {
+    enabled: bool,
+    terms: u8,
+}
+
+impl Correction {
+    fn read(ctx: &mut Ctx, call: &Call, args: &Args) -> EvalResult<Self> {
+        let id = args.get(5);
+        if matches!(
+            ctx.session().type_of(id)?,
+            roxide_value::SexpType::Int | roxide_value::SexpType::Real
+        ) {
+            if ctx.session().xlength(id)? > 1 {
+                return Err(ctx.stop(call.err_call(), "the condition has length > 1"));
+            }
+            let n = number(ctx, call, id)?;
+            if !(0.0..=3.0).contains(&n) || n.fract() != 0.0 {
+                return Err(ctx.stop(
+                    call.err_call(),
+                    "'correct' must be an integer between 0 and 3",
+                ));
+            }
+            return Ok(Self {
+                enabled: true,
+                terms: n as u8,
+            });
+        }
+        Ok(Self {
+            enabled: ctx.session().type_of(id)? == roxide_value::SexpType::Lgl
+                && ctx.session().xlength(id)? == 1
+                && logical(ctx, call, id)? == Some(true),
+            terms: 0,
+        })
+    }
+}
+
 pub(super) fn wilcox(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     let mut x = numbers(ctx, call, args.get(0))?;
     let mut y = if args.get(1) == SEXP_NIL {
@@ -210,9 +301,17 @@ pub(super) fn wilcox(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult 
     if exact && x.len() + y.len() > 1000 {
         return Err(ctx.stop(call.err_call(), "exact Wilcoxon test size limit exceeded"));
     }
-    let correction = number(ctx, call, args.get(5))?;
-    let correct = correction != 0.0;
+    let correction = Correction::read(ctx, call, args)?;
+    let interval_requested = args.get(6) != SEXP_NIL;
     let level = number(ctx, call, args.get(6))?;
+    if interval_requested
+        && (ctx.session().xlength(args.get(6))? != 1 || !(level > 0.0 && level < 1.0))
+    {
+        return Err(ctx.stop(
+            call.err_call(),
+            "'conf.level' must be a single number between 0 and 1",
+        ));
+    }
     let tol = number(ctx, call, args.get(7))?;
     let digits = number(ctx, call, args.get(8))?;
     let ranks = RankTest::at(&x, &y, mu, digits, exact);
@@ -220,8 +319,7 @@ pub(super) fn wilcox(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult 
         let (distribution, at) = ranks.distribution(ctx, call)?;
         exact_tail(&distribution, at, alt)
     } else {
-        let z = ranks.standard(alt, correct);
-        normal_tail(z, alt)
+        ranks.asymptotic_tail(alt, correction)
     };
     let mut out = [
         ranks.statistic as f64 / 2.0,
@@ -231,8 +329,9 @@ pub(super) fn wilcox(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult 
         NA_REAL,
         NA_REAL,
         level,
+        f64::from(correction.enabled),
     ];
-    if !level.is_nan() {
+    if interval_requested {
         if !tol.is_finite() || tol <= 0.0 {
             return Err(ctx.stop(call.err_call(), "invalid 'tol.root'"));
         }
@@ -244,11 +343,8 @@ pub(super) fn wilcox(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult 
             )?;
             [f64::NAN, f64::NAN, x[0], 0.0]
         } else if exact {
-            let mut scores = ranks.weights;
-            scores.sort_unstable();
-            let signed_conditioned =
-                y.is_empty() && (scores.len() < x.len() || scores.windows(2).any(|w| w[0] == w[1]));
-            exact_interval(ctx, call, &x, &y, alt, level, signed_conditioned)?
+            let conditioned = y.is_empty() && ranks.tied;
+            exact_interval(ctx, call, &x, &y, alt, level, conditioned)?
         } else {
             if x.len() + y.len() > 50_000 {
                 return Err(ctx.stop(
@@ -256,13 +352,14 @@ pub(super) fn wilcox(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult 
                     "Wilcoxon confidence interval size limit exceeded",
                 ));
             }
-            let interval = approximate_interval(&x, &y, alt, level, correct, tol, digits);
+            let interval =
+                approximate_interval(&x, &y, alt, level, correction.enabled, tol, digits);
             if interval[3] != level {
                 ctx.warn_now(call.err_call(), "requested conf.level not achievable")?;
             }
             interval
         };
-        out[3..].copy_from_slice(&interval);
+        out[3..7].copy_from_slice(&interval);
     }
     Ok(ctx.session_mut().alloc_real_from(&out)?)
 }
@@ -318,17 +415,20 @@ fn exact_interval(
     }
     shifts.sort_by(f64::total_cmp);
     let med = shifts[(count - 1) / 2] / 2.0 + shifts[count / 2] / 2.0;
-    if signed_conditioned && shifts[0] == shifts[count - 1] {
-        return Ok([
-            if alt == Alternative::Less {
-                f64::NEG_INFINITY
-            } else {
-                med
-            },
-            f64::INFINITY,
-            med,
-            1.0,
-        ]);
+    if signed_conditioned {
+        let a = alt.alpha(level);
+        shifts.dedup();
+        let (lower, left) = if alt == Alternative::Less {
+            (f64::NEG_INFINITY, 0.0)
+        } else {
+            signed_bound(ctx, call, x, &shifts, a, true)?
+        };
+        let (upper, right) = if alt == Alternative::Greater {
+            (f64::INFINITY, 0.0)
+        } else {
+            signed_bound(ctx, call, x, &shifts, a, false)?
+        };
+        return Ok([lower, upper, med, 1.0 - left - right]);
     }
     // Invert the continuous-null reference distribution at integer order statistics.
     let size = x.len() + y.len();
@@ -353,7 +453,7 @@ fn exact_interval(
         k = i / 2 + 1;
     }
     k = k.min(count);
-    let lower = if alt == Alternative::Less || (k == 0 && !signed_conditioned) {
+    let lower = if alt == Alternative::Less || k == 0 {
         f64::NEG_INFINITY
     } else {
         shifts[k.saturating_sub(1)]
@@ -374,6 +474,87 @@ fn exact_interval(
                 1.0
             },
     ])
+}
+
+fn signed_bound(
+    ctx: &mut Ctx,
+    call: &Call,
+    x: &[f64],
+    shifts: &[f64],
+    alpha: f64,
+    lower: bool,
+) -> EvalResult<(f64, f64)> {
+    let count = shifts.len();
+    let p_min = 0.5_f64.powi(x.len() as i32);
+    if p_min > alpha {
+        return Ok((if lower { shifts[0] } else { f64::INFINITY }, 0.0));
+    }
+    // Test both the Walsh averages and the open intervals between them.
+    let probe = |ctx: &mut Ctx, i: usize| -> EvalResult<(f64, f64)> {
+        let at = if lower { i } else { 2 * (count - 1) - i };
+        let mut shift = shifts[at / 2];
+        if at % 2 != 0 {
+            shift = shift / 2.0 + shifts[at / 2 + 1] / 2.0;
+        }
+        let rank = RankTest::at(x, &[], shift, f64::INFINITY, true);
+        let (p, at) = rank.distribution(ctx, call)?;
+        let index = if lower { p.len() - 1 - at } else { at };
+        let mut cdf = 0.0;
+        let mut rejected = 0.0;
+        let tail: f64 = p[..=index].iter().sum();
+        for mass in p {
+            cdf += mass;
+            if cdf > alpha + 1e-15 {
+                break;
+            }
+            rejected = cdf;
+        }
+        Ok((tail, rejected))
+    };
+    let mut first = 0;
+    let mut end = 2 * count - 1;
+    while first < end {
+        let mid = first + (end - first) / 2;
+        if probe(ctx, mid)?.0 > alpha + 1e-15 {
+            end = mid;
+        } else {
+            first = mid + 1;
+        }
+    }
+    if first == 2 * count - 1 {
+        return Ok((
+            if lower {
+                shifts[count - 1]
+            } else {
+                f64::INFINITY
+            },
+            0.0,
+        ));
+    }
+    if lower {
+        // At a unique minimum, the zero rank is absent at the boundary.
+        // Use the first interval to include the rank as it changes sign.
+        if first == 0 && count > 1 && x.iter().filter(|&&v| v == shifts[0]).count() == 1 {
+            first = 1;
+        }
+        let rejected = probe(ctx, first)?.1;
+        Ok((shifts[first.div_ceil(2)], rejected))
+    } else {
+        let index = count - 1 - first / 2;
+        // Use the endpoint tail if it rejects and all signed ranks are present.
+        let zeros = x.iter().filter(|&&v| v == shifts[index]).count();
+        let endpoint_tail = probe(ctx, 2 * (count - 1 - index))?.0;
+        let rejected = if zeros == 0 && endpoint_tail <= alpha + 1e-15 {
+            endpoint_tail
+        } else if index + 1 < count {
+            probe(ctx, 2 * (count - index - 1) - 1)?.1
+        } else if zeros == 1 {
+            probe(ctx, 0)?.1
+        } else {
+            p_min
+        };
+        Ok((shifts[index], rejected))
+    }
 }
 
 fn approximate_interval(
@@ -438,7 +619,10 @@ fn approximate_interval(
     let low_score = z(lo, Alternative::Greater, correct);
     let high_score = z(hi, Alternative::Less, correct);
     // Reduce coverage when the standardized statistic cannot reach a requested bound.
-    while coverage > 0.0 {
+    for _ in 0..=10 {
+        if coverage <= 0.0 {
+            break;
+        }
         let target = bound(coverage);
         if (alt == Alternative::Less || target <= low_score)
             && (alt == Alternative::Greater || -target >= high_score)
@@ -486,22 +670,17 @@ pub(super) fn cor(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
         if x.len() > 10_000 {
             return Err(ctx.stop(call.err_call(), "Kendall test size limit exceeded"));
         }
-        kendall_test(
-            &x,
-            &y,
-            rx,
-            ry,
-            alt,
-            exact && !ties && x.len() <= 100,
-            correction,
-        )
+        kendall_test(ctx, call, &x, &y, rx, ry, alt, exact && !ties, correction)?
     } else {
         spearman(&rx.values, &ry.values, alt, exact && !ties, correction)
     };
     Ok(ctx.session_mut().alloc_real_from(&answer)?)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn kendall_test(
+    ctx: &mut Ctx,
+    call: &Call,
     x: &[f64],
     y: &[f64],
     rx: Ranks,
@@ -509,7 +688,7 @@ fn kendall_test(
     alt: Alternative,
     exact: bool,
     correct: bool,
-) -> [f64; 4] {
+) -> EvalResult<[f64; 4]> {
     let len = x.len();
     let n = len as f64;
     let mut s = 0_i64;
@@ -537,19 +716,34 @@ fn kendall_test(
     let denom = n * (n - 1.0);
     let tau = 2.0 * s as f64 / ((denom - ax) * (denom - ay)).sqrt();
     if exact {
-        let mut dp = vec![0.0; pairs + 1];
+        let t = ((pairs as i64 + s) / 2) as usize;
+        let tail = t.min(pairs - t);
+        if (tail + 1)
+            .saturating_mul(len)
+            .saturating_mul(len.min(tail + 1))
+            > 120_000_000
+        {
+            return Err(ctx.stop(call.err_call(), "exact Kendall test size limit exceeded"));
+        }
+        limit::<f64>(ctx, call, 2 * (tail + 1))?;
+        let mut dp = vec![0.0; tail + 1];
+        let mut next = vec![0.0; tail + 1];
         dp[0] = 1.0;
-        let mut max = 0;
         for i in 2..=len {
-            max += i - 1;
-            let mut next = vec![0.0; pairs + 1];
+            let max = tail.min(i * (i - 1) / 2);
             for (j, value) in next.iter_mut().enumerate().take(max + 1) {
                 *value = dp[j.saturating_sub(i - 1)..=j].iter().sum::<f64>() / i as f64;
             }
-            dp = next;
+            std::mem::swap(&mut dp, &mut next);
         }
-        let t = ((pairs as i64 + s) / 2) as usize;
-        return [t as f64, exact_tail(&dp, t, alt), tau, 1.0];
+        let small: f64 = dp.iter().sum();
+        let large = 1.0 - (small - dp[tail]);
+        let (lower, upper) = if t <= pairs / 2 {
+            (small, large)
+        } else {
+            (large, small)
+        };
+        return Ok([t as f64, alt.probability(lower, upper), tau, 1.0]);
     }
     let var = (denom * (2.0 * n + 5.0) - cx - cy) / 18.0
         + ax * ay / (2.0 * denom)
@@ -560,7 +754,7 @@ fn kendall_test(
         };
     let s = s as f64;
     let z = (s - if correct && s != 0.0 { s.signum() } else { 0.0 }) / var.sqrt();
-    [z, normal_tail(z, alt), tau, 0.0]
+    Ok([z, normal_tail(z, alt), tau, 0.0])
 }
 
 fn spearman(x: &[usize], y: &[usize], alt: Alternative, exact: bool, correct: bool) -> [f64; 4] {
@@ -579,7 +773,7 @@ fn spearman(x: &[usize], y: &[usize], alt: Alternative, exact: bool, correct: bo
     if sx == 0.0 || sy == 0.0 {
         return [NA_REAL, NA_REAL, NA_REAL, 0.0];
     }
-    let r = (cross / (sx * sy).sqrt()).clamp(-1.0, 1.0);
+    let r = (cross / (sx.sqrt() * sy.sqrt())).clamp(-1.0, 1.0);
     let scale = n * (n * n - 1.0) / 6.0;
     let s = (1.0 - r) * scale;
     let p = if exact && x.len() <= 9 {
@@ -593,7 +787,7 @@ fn spearman(x: &[usize], y: &[usize], alt: Alternative, exact: bool, correct: bo
         let upper = 1.0 - spearman_upper(n, s.round() + 2.0);
         alt.probability(lower, upper)
     } else {
-        let adjusted = (r - if correct { 1.0 / scale } else { 0.0 }).clamp(-1.0, 1.0);
+        let adjusted = 1.0 - s / (scale + f64::from(correct));
         let t = adjusted * ((n - 2.0) / (1.0 - adjusted * adjusted)).sqrt();
         let mut flags = Flags::default();
         alt.probability(

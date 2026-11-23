@@ -7,18 +7,15 @@ pub(super) fn adjust(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult 
     let mut p = numbers(ctx, call, args.get(0))?;
     let method = number(ctx, call, args.get(1))? as usize;
     let n = number(ctx, call, args.get(2))?;
-    if n.is_nan() || n < p.len() as f64 {
+    let len = p.iter().filter(|value| !value.is_nan()).count();
+    if n.is_nan() || n < len as f64 {
         return Err(ctx.stop(call.err_call(), "n >= lp is not TRUE"));
     }
-    if n <= 1.0 || method == 8 {
+    if len == 0 || n <= 1.0 || method == 8 {
         return Ok(ctx.session_mut().alloc_real_from(&p)?);
     }
     let mut order: Vec<_> = (0..p.len()).filter(|&i| !p[i].is_nan()).collect();
     order.sort_by(|&i, &j| p[i].total_cmp(&p[j]));
-    let len = order.len();
-    if len == 0 {
-        return Ok(ctx.session_mut().alloc_real_from(&p)?);
-    }
     let mut prior = f64::INFINITY;
     match method {
         1 => {

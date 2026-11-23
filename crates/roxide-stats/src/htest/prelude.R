@@ -110,7 +110,7 @@ var.test.default <- function(x, y, ratio = 1, alternative = c("two.sided", "less
                              conf.level = 0.95, ...) {
     alternative <- .htest_alt(alternative)
     if (length(ratio) != 1L || !is.finite(ratio) || ratio <= 0) stop("'ratio' must be a single positive number")
-    .htest_level(conf.level)
+    .htest_level(conf.level, TRUE)
     label <- paste(deparse1(substitute(x)), "and", deparse1(substitute(y)))
     x <- .htest_limit(x)
     y <- .htest_limit(y)
@@ -176,7 +176,7 @@ wilcox.test.default <- function(x, y = NULL, alternative = c("two.sided", "less"
     signed <- is.null(y)
     method <- paste("Wilcoxon", if (signed) "signed rank" else "rank sum",
                     if (w[[3L]] == 1) "exact test" else "test")
-    if (w[[3L]] == 0 && correct) method <- paste(method, "with continuity correction")
+    if (w[[3L]] == 0 && w[[8L]] == 1) method <- paste(method, "with continuity correction")
     result <- .htest_make(statistic = setNames(w[[1L]], if (signed) "V" else "W"),
                           parameter = NULL, p.value = w[[2L]],
                           null.value = setNames(mu, if (signed && !paired) "location" else "location shift"),
@@ -263,7 +263,12 @@ ks.test.default <- function(x, y, ..., alternative = c("two.sided", "less", "gre
         if (is.character(y)) y <- get(y, mode = "function", envir = parent.frame())
         if (!is.function(y)) stop("'y' must be numeric or a function or a string naming a valid function")
         x <- sort(x)
+        ties <- any(x[-1L] == x[-length(x)])
+        if (ties) warning("ties should not be present for the one-sample Kolmogorov-Smirnov test")
+        if (is.null(exact)) exact <- length(x) < 100L && !ties
         values <- y(x, ...)
+        if (length(values) > 0L && max(length(x), length(values)) %% min(length(x), length(values)) != 0L)
+            warning("longer object length is not a multiple of shorter object length")
     }
     b <- if (two && simulate.p.value) B else NULL
     a <- .Internal(C_htest_ks(x, values, two, .model_match(alternative, .htest_alternatives), exact, b))
@@ -278,9 +283,10 @@ ks.test.default <- function(x, y, ..., alternative = c("two.sided", "less", "gre
 }
 
 p.adjust.methods <- c("holm", "hochberg", "hommel", "bonferroni", "BH", "BY", "fdr", "none")
-p.adjust <- function(p, method = p.adjust.methods, n = length(p)) {
+p.adjust <- function(p, method = p.adjust.methods, n = sum(!is.na(p))) {
     method <- .htest_choice(method, p.adjust.methods)
     labels <- names(p)
+    p <- as.double(.htest_limit(p))
     ans <- .Internal(C_htest_adjust(p, .model_match(method, p.adjust.methods), n))
     names(ans) <- labels
     ans

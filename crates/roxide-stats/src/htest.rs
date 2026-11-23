@@ -27,7 +27,7 @@ pub const MODULE: Module = Module {
         internal("C_htest_ks", 6, ks::test),
         internal("C_htest_table", 2, tables::table),
         internal("C_htest_chisq", 4, tables::chisq),
-        internal("C_htest_fisher", 6, tables::fisher),
+        internal("C_htest_fisher", 7, tables::fisher),
         internal("C_htest_format", 3, print::format),
         internal("C_htest_wrap", 3, print::wrap),
         internal("C_htest_limit", 1, limit_input),
@@ -91,11 +91,12 @@ fn limit_input(ctx: &mut Ctx, call: &Call, args: &mut roxide_eval::Args) -> Eval
 fn frame_call(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     let input = args.get(0);
     let names = attr(ctx, input, "names")?;
-    let labels = ctx.session().str_slice(names)?.to_vec();
-    let values = ctx.session().list_slice(input)?.to_vec();
-    if labels.len() != values.len() || values.len() > 4 {
+    let count = ctx.session().xlength(input)?;
+    if count > 4 || ctx.session().xlength(names)? != count {
         return Err(ctx.stop(call.err_call(), "invalid model frame arguments"));
     }
+    let labels = ctx.session().str_slice(names)?.to_vec();
+    let values = ctx.session().list_slice(input)?.to_vec();
     ctx.scoped(|ctx| {
         let mut tail = SEXP_NIL;
         for (&label, &value) in labels.iter().zip(&values).rev() {
