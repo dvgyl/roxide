@@ -1,0 +1,72 @@
+=== case: seed_query_and_remove ===
+#@ tags: layer2,rng
+dput(RNGkind())
+dput(exists(".Random.seed", envir = .GlobalEnv, inherits = FALSE))
+set.seed(42L, "Super-Duper", "Box-Muller")
+rm(.Random.seed)
+dput(exists(".Random.seed", envir = .GlobalEnv, inherits = FALSE))
+dput(RNGkind())
+dput(exists(".Random.seed", envir = .GlobalEnv, inherits = FALSE))
+invisible(sample.int(1L))
+dput(c(length(.Random.seed), .Random.seed[1]))
+=== case: seed_copy_restore_and_local_shadow ===
+#@ tags: layer2,rng
+set.seed(42L)
+old <- .Random.seed
+first <- sample.int(100L, 5L)
+dput(identical(old, .Random.seed))
+.Random.seed <- old
+dput(identical(first, sample.int(100L, 5L)))
+.Random.seed <- old
+draw <- function() {
+    .Random.seed <- "ignored"
+    sample.int(100L, 5L)
+}
+dput(identical(first, draw()))
+dput(old[1:4])
+=== case: seed_noninteger_warning ===
+#@ tags: layer2,rng
+.Random.seed <- 200
+result <- withCallingHandlers(RNGkind(), warning = function(w) {
+    dput(conditionMessage(w))
+    invokeRestart("muffleWarning")
+})
+dput(result)
+=== case: seed_na_header_warning ===
+#@ tags: layer2,rng
+.Random.seed <- NA_integer_
+dput(RNGkind())
+=== case: seed_invalid_uniform_warning ===
+#@ tags: layer2,rng
+.Random.seed <- c(10408L, 0L)
+dput(RNGkind())
+=== case: seed_invalid_normal_warning ===
+#@ tags: layer2,rng
+.Random.seed <- c(10603L, 0L)
+dput(RNGkind())
+=== case: seed_wrong_length_error ===
+#@ tags: layer2,rng
+#@ expect_error: true
+.Random.seed <- c(10403L, 624L, 1L)
+sample.int(10L, 3L)
+=== case: seed_truncated_to_kind_length ===
+#@ tags: layer2,rng
+set.seed(42L)
+.Random.seed[1] <- 10400L
+.Random.seed[2:4] <- c(0L, 1L, 42L)
+dput(sample.int(100L, 5L))
+dput(.Random.seed)
+=== case: set_seed_ignores_wrong_length ===
+#@ tags: layer2,rng
+.Random.seed <- c(10400L, 0L)
+set.seed(42L)
+dput(.Random.seed)
+=== case: selected_kind_warnings ===
+#@ tags: layer2,rng
+withCallingHandlers({
+    set.seed(42L, "Marsaglia", sample.kind = "Rounding")
+    dput(RNGkind())
+}, warning = function(w) {
+    dput(conditionMessage(w))
+    invokeRestart("muffleWarning")
+})

@@ -1,0 +1,67 @@
+=== case: uniform_kinds_and_seed_layouts ===
+#@ tags: layer2,rng
+options(warn = -1L)
+kinds <- c("Wichmann-Hill", "Marsaglia-Multicarry", "Super-Duper",
+           "Mersenne-Twister", "Knuth-TAOCP", "Knuth-TAOCP-2002", "L'Ecuyer-CMRG")
+for (kind in kinds) {
+    set.seed(42L, kind)
+    dput(c(length(.Random.seed), .Random.seed[1:4]))
+    dput(sample.int(127L, 5L, TRUE))
+    dput(.Random.seed[1:4])
+}
+=== case: explicit_kind_switches ===
+#@ tags: layer2,rng
+set.seed(42L)
+dput(withVisible(RNGkind("Wichmann")))
+dput(.Random.seed)
+dput(sample.int(100L, 5L))
+dput(withVisible(RNGkind("Wichmann")))
+dput(.Random.seed)
+dput(withVisible(RNGkind(normal.kind = "Box", sample.kind = "Rej")))
+dput(.Random.seed)
+=== case: sample_numeric_and_vector_populations ===
+#@ tags: layer2,rng
+set.seed(42L)
+dput(sample(10L))
+set.seed(42L)
+dput(sample.int(100L, 10L))
+dput(sample(c("x","y","z"), 5L, TRUE))
+dput(sample("x", 3L, TRUE))
+dput(sample(1.9, 1L))
+=== case: sample_rejection_chunk_boundaries ===
+#@ tags: layer2,rng
+for (n in c(1, 65535, 65536, 65537, 2^31, 2^40)) {
+    set.seed(42L)
+    dput(sample.int(n, 5L, TRUE))
+    dput(.Random.seed[2])
+}
+=== case: sample_rounding_cutoffs ===
+#@ tags: layer2,rng
+options(warn = -1L)
+for (kind in c("Mersenne-Twister", "Knuth-TAOCP-2002")) {
+    for (n in c(2^25 - 1, 2^25, 2^31 - 1, 2^31)) {
+        set.seed(42L, kind, sample.kind = "Rounding")
+        dput(sample.int(n, 5L, TRUE))
+    }
+}
+=== case: sample_weighted_linear_and_removal ===
+#@ tags: layer2,rng
+set.seed(42L)
+dput(sample.int(8L, 8L, TRUE, rep(1, 8L)))
+dput(sample.int(6L, 5L, FALSE, c(5, 1, 0, 1, 3, 10)))
+dput(sample.int(256L, 5L, TRUE, c(rep(1, 200L), rep(0, 56L))))
+=== case: sample_weighted_alias ===
+#@ tags: layer2,rng
+options(warn = -1L)
+for (kind in c("Rejection", "Rounding")) {
+    set.seed(42L, sample.kind = kind)
+    dput(sample.int(256L, 15L, TRUE, c(rep(1, 201L), rep(0, 55L))))
+    dput(.Random.seed[2])
+}
+=== case: sample_large_population_hash ===
+#@ tags: layer2,rng
+set.seed(42L)
+dput(sample.int(10000001L, 12L))
+dput(sample.int(2^40, 12L))
+set.seed(42L)
+dput(sample.int(17L, 8L, useHash = TRUE))
