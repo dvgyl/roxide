@@ -24,7 +24,7 @@ pub const CORE_MODULE: Module = Module {
             arity: Arity::Exact(2),
             dispatch: Dispatch::None,
             visibility: Visibility::Off,
-            fun: prim_assign,
+            fun: crate::control::assign,
         },
         PrimDef {
             name: "=",
@@ -33,7 +33,7 @@ pub const CORE_MODULE: Module = Module {
             arity: Arity::Exact(2),
             dispatch: Dispatch::None,
             visibility: Visibility::Off,
-            fun: prim_assign,
+            fun: crate::control::assign,
         },
         PrimDef {
             name: "(",
@@ -165,18 +165,6 @@ pub const CORE_MODULE: Module = Module {
     prelude: "",
 };
 
-fn prim_assign(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
-    if args.len() != 2 {
-        return Err(ctx.stop(call.err_call(), "invalid assignment"));
-    }
-    let lhs = args.get(0);
-    let rhs_expr = args.get(1);
-    let sym = ctx.sym_from_sexp(lhs)?;
-    let val = ctx.eval(rhs_expr, call.env)?;
-    ctx.assign(sym, val, call.env)?;
-    Ok(val)
-}
-
 fn prim_paren(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     if args.len() != 1 {
         return Err(ctx.stop(call.err_call(), "incorrect number of arguments to '('"));
@@ -232,6 +220,7 @@ fn prim_pow(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
 }
 
 fn unary_sign(ctx: &mut Ctx, call: &Call, x: SexpId, negate: bool) -> EvalResult {
+    ctx.check_vector_len(ctx.session.xlength(x)?, size_of::<f64>(), call.err_call())?;
     match ctx.session.type_of(x)? {
         SexpType::Int => {
             let vals: Vec<i32> = ctx
@@ -294,9 +283,10 @@ fn binary_arith(ctx: &mut Ctx, call: &Call, a: SexpId, b: SexpId, op: BinOp) -> 
         };
     }
     let out_len = la.max(lb);
+    ctx.check_vector_len(out_len, size_of::<f64>(), call.err_call())?;
     let min_len = la.min(lb);
     if !out_len.is_multiple_of(min_len) {
-        ctx.warn(call.err_call(), msg::RECYCLE_MISMATCH);
+        ctx.warn_now(call.err_call(), msg::RECYCLE_MISMATCH)?;
     }
 
     // Integer path for +, -, * when neither operand is Real.
@@ -321,7 +311,7 @@ fn binary_arith(ctx: &mut Ctx, call: &Call, a: SexpId, b: SexpId, op: BinOp) -> 
             out.push(r);
         }
         if overflow {
-            ctx.warn(call.err_call(), msg::INT_OVERFLOW);
+            ctx.warn_now(call.err_call(), msg::INT_OVERFLOW)?;
         }
         return Ok(ctx.session.alloc_int_from(&out)?);
     }
@@ -433,11 +423,14 @@ fn type_rank(t: SexpType) -> u8 {
     }
 }
 
-fn prim_c(ctx: &mut Ctx, _call: &Call, args: &mut Args) -> EvalResult {
+fn prim_c(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     let mut target_rank = 0u8;
+    let mut len = 0usize;
     for &v in args.values() {
         target_rank = target_rank.max(type_rank(ctx.session.type_of(v)?));
+        len = len.saturating_add(ctx.session.xlength(v)?);
     }
+    ctx.check_vector_len(len, size_of::<SexpId>(), call.err_call())?;
     match target_rank {
         0 => Ok(SEXP_NIL),
         2 => {
@@ -523,6 +516,12 @@ fn prim_c(ctx: &mut Ctx, _call: &Call, args: &mut Args) -> EvalResult {
 /// Core default printer used by both `print()` and top-level auto-printing.
 pub(crate) fn print_value(ctx: &mut Ctx, val: SexpId, digits: usize) -> EvalResult<()> {
     let ty = ctx.session.type_of(val)?;
+    if matches!(
+        ty,
+        SexpType::Lgl | SexpType::Int | SexpType::Real | SexpType::Str
+    ) {
+        ctx.check_vector_len(ctx.session.xlength(val)?, size_of::<String>(), SEXP_NIL)?;
+    }
     let fmt_opts = FormatOpts {
         digits,
         scipen: ctx.opts.scipen,

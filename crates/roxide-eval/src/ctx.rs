@@ -4,7 +4,7 @@ use std::any::{Any, TypeId};
 use std::collections::HashMap;
 
 use roxide_diag::{SourceMap, SrcFileId, format as diag_format};
-use roxide_gc::{GcPolicy, ProtectMark, RootSet, SexpId, Tracer};
+use roxide_gc::{GcPolicy, RootSet, SexpId, Tracer};
 use roxide_host::Host;
 use roxide_syntax::{ParseStep, Parser};
 use roxide_value::{
@@ -97,14 +97,16 @@ impl Args {
 }
 
 /// Active evaluation frame metadata.
-#[allow(dead_code)]
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct Frame {
     pub(crate) id: FrameId,
     pub(crate) call: SexpId,
     pub(crate) cloenv: SexpId,
     pub(crate) on_exit: Vec<SexpId>,
-    pub(crate) protect_top: ProtectMark,
+    pub(crate) fun: SexpId,
+    pub(crate) caller: SexpId,
+    pub(crate) actuals: Args,
+    pub(crate) dispatch: Option<crate::dispatch::MethodFrame>,
 }
 
 pub(crate) struct ExtEntry {
@@ -121,9 +123,13 @@ pub struct Ctx {
     pub(crate) prims: Vec<&'static PrimDef>,
     pub(crate) internals: HashMap<&'static str, PrimId>,
     pub(crate) frames: Vec<Frame>,
-    #[allow(dead_code)]
+    pub(crate) loops: Vec<(FrameId, SexpId)>,
+    pub(crate) conditions: crate::conditions::Conditions,
+    pub(crate) options: Vec<(Sym, SexpId)>,
+    pub(crate) utils: SexpId,
     pub(crate) next_frame_id: u64,
     pub(crate) expr_depth: usize,
+    pub(crate) eval_env: SexpId,
     pub(crate) visible: bool,
     pub(crate) pending_warnings: Vec<(Option<Vec<String>>, String)>,
     pub(crate) extensions: HashMap<TypeId, ExtEntry>,
@@ -133,6 +139,11 @@ pub struct Ctx {
 
 struct CtxRoots<'a> {
     frames: &'a [Frame],
+    loops: &'a [(FrameId, SexpId)],
+    eval_env: SexpId,
+    conditions: &'a crate::conditions::Conditions,
+    options: &'a [(Sym, SexpId)],
+    utils: SexpId,
     extensions: &'a HashMap<TypeId, ExtEntry>,
 }
 
@@ -141,7 +152,22 @@ impl RootSet for CtxRoots<'_> {
         for frame in self.frames {
             tracer.edge(frame.call);
             tracer.edge(frame.cloenv);
+            tracer.edge(frame.fun);
+            tracer.edge(frame.caller);
+            tracer.edges(frame.actuals.values());
+            if let Some(dispatch) = &frame.dispatch {
+                dispatch.trace(tracer);
+            }
             tracer.edges(&frame.on_exit);
+        }
+        for &(_, env) in self.loops {
+            tracer.edge(env);
+        }
+        tracer.edge(self.eval_env);
+        self.conditions.trace(tracer);
+        tracer.edge(self.utils);
+        for &(_, value) in self.options {
+            tracer.edge(value);
         }
         for entry in self.extensions.values() {
             (entry.trace_fn)(entry.boxed.as_ref(), tracer);
@@ -152,7 +178,8 @@ impl RootSet for CtxRoots<'_> {
 impl Ctx {
     /// Construct a new [`Ctx`] with the given [`Host`] and [`GcPolicy`], registering core M0 primitives.
     pub fn new(host: Box<dyn Host>, policy: GcPolicy) -> Result<Self, InternalError> {
-        let session = RSession::new(policy)?;
+        let mut session = RSession::new(policy)?;
+        let utils = session.alloc_env(BASE_ENV)?;
         let max_expressions = host.limits().max_expressions;
         let opts = OptionsCache {
             expressions: max_expressions,
@@ -166,16 +193,35 @@ impl Ctx {
             prims: Vec::new(),
             internals: HashMap::new(),
             frames: Vec::new(),
+            loops: Vec::new(),
+            conditions: Default::default(),
+            options: Vec::new(),
+            utils,
             next_frame_id: 1,
             expr_depth: 0,
+            eval_env: GLOBAL_ENV,
             visible: true,
             pending_warnings: Vec::new(),
             extensions: HashMap::new(),
             s4_hooks: None,
             interactive: false,
         };
+        let global = ctx.session.intern(".GlobalEnv")?;
+        ctx.session.env_define(BASE_ENV, global, GLOBAL_ENV)?;
         ctx.register_module(&builtins::CORE_MODULE)?;
+        ctx.register_module(&crate::control::MODULE)?;
+        ctx.register_module(&crate::language::MODULE)?;
+        ctx.register_module(&crate::environment::MODULE)?;
+        ctx.register_module(&crate::fallback::MODULE)?;
+        ctx.register_module(&crate::conditions::MODULE)?;
+        ctx.register_module(&crate::dispatch::MODULE)?;
         Ok(ctx)
+    }
+
+    pub(crate) fn next_frame(&mut self) -> FrameId {
+        let id = FrameId(self.next_frame_id);
+        self.next_frame_id += 1;
+        id
     }
 
     /// Register a [`Module`]'s primitives and `.Internal` entries in `BASE_ENV`.
@@ -240,16 +286,13 @@ impl Ctx {
     }
 
     /// Emit a diagnostic message (signaling `simpleMessage` when handlers are installed).
-    pub fn message(&mut self, _call: SexpId, text: impl Into<String>) -> EvalResult<()> {
-        let s = text.into();
-        let _ = self.host.write_err(s.as_bytes());
-        Ok(())
+    pub fn message(&mut self, call: SexpId, text: impl Into<String>) -> EvalResult<()> {
+        self.emit_condition("message", call, text.into(), false)
     }
 
-    /// Emit a warning that participates in calling/exiting condition handlers (`muffleWarning`).
+    /// Emit a warning that participates in condition handlers and restarts.
     pub fn warn_now(&mut self, call: SexpId, msg: impl Into<String>) -> EvalResult<()> {
-        self.warn(call, msg);
-        Ok(())
+        self.emit_condition("warning", call, msg.into(), false)
     }
 
     /// Print a value using Roxide's core default vector printer.
@@ -328,6 +371,11 @@ impl Ctx {
         if self.session.heap.wants_collection() {
             let roots = CtxRoots {
                 frames: &self.frames,
+                loops: &self.loops,
+                eval_env: self.eval_env,
+                conditions: &self.conditions,
+                options: &self.options,
+                utils: self.utils,
                 extensions: &self.extensions,
             };
             let _ = self.session.collect(&roots);
@@ -355,18 +403,9 @@ impl Ctx {
         let _ = self.host.write_err(text.as_bytes());
     }
 
-    /// Raise an R error, printing the GNU R formatted message to stderr and returning [`Unwind::TopLevel`].
+    /// Signal an R error and return the resulting unwind.
     pub fn stop(&mut self, call: SexpId, msg: impl Into<String>) -> Unwind {
-        self.flush_warnings();
-        let msg = msg.into();
-        let call_lines = if call == SEXP_NIL {
-            None
-        } else {
-            deparse(&self.session, call, DeparseOpts::default()).ok()
-        };
-        let formatted = diag_format::error(call_lines.as_deref(), &msg);
-        let _ = self.host.write_err(formatted.as_bytes());
-        Unwind::TopLevel
+        self.error_condition(call, msg.into())
     }
 
     /// Parse and execute a complete R script string in `env`.
