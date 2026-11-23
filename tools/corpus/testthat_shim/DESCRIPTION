@@ -1,0 +1,9 @@
+Package: testthat
+Version: 3.2.99
+Title: Clean-Room MIT testthat Compatibility Shim for Roxide
+Authors@R: person("Roxide", "Contributors", email = "devg@users.noreply.github.com", role = c("aut", "cre"))
+Description: Run pure R package tests with a small set of testthat expectations,
+    condition handlers, and an ASCII reporter.
+License: MIT + file LICENSE
+Encoding: UTF-8
+Config/roxide/shim: true
