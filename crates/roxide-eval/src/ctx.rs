@@ -161,6 +161,7 @@ struct StreamCapture {
     capture_out: bool,
     capture_err: bool,
     split: bool,
+    persistent: bool,
     exceeded: bool,
     received: usize,
     bytes: Vec<u8>,
@@ -654,6 +655,49 @@ impl Ctx {
         .map(|(value, _)| value)
     }
 
+    /// Push a persistent stream diversion (used by `base::sink()`).
+    pub fn push_stream_sink(
+        &mut self,
+        capture_out: bool,
+        capture_err: bool,
+        split: bool,
+        sink: impl FnMut(&mut Self, &[u8]) -> EvalResult<()> + 'static,
+    ) {
+        self.host.captures.push(StreamCapture {
+            capture_out,
+            capture_err,
+            split,
+            persistent: true,
+            exceeded: false,
+            received: 0,
+            bytes: Vec::new(),
+            sink: Some(Box::new(sink)),
+            flushing: false,
+        });
+    }
+
+    /// Flush buffered output and pop the topmost persistent diversion for stdout (`message = false`)
+    /// or stderr (`message = true`). Returns `true` if a matching sink was popped.
+    pub fn pop_stream_sink(&mut self, message: bool) -> EvalResult<bool> {
+        let flushed = self.flush_stream_captures();
+        let pos = self.host.captures.iter().rposition(|capture| {
+            capture.persistent
+                && if message {
+                    capture.capture_err
+                } else {
+                    capture.capture_out
+                }
+        });
+        let removed = pos.map(|index| self.host.captures.remove(index)).is_some();
+        flushed?;
+        Ok(removed)
+    }
+
+    /// Flush all buffered bytes queued on active stream sinks.
+    pub fn flush_stream_sinks(&mut self) -> EvalResult<()> {
+        self.flush_stream_captures()
+    }
+
     fn with_stream_capture<R>(
         &mut self,
         capture_out: bool,
@@ -666,6 +710,7 @@ impl Ctx {
             capture_out,
             capture_err,
             split,
+            persistent: false,
             exceeded: false,
             received: 0,
             bytes: Vec::new(),
@@ -673,9 +718,15 @@ impl Ctx {
             flushing: false,
         });
         let result = f(self);
-        let Some(capture) = self.host.captures.pop() else {
+        let Some(pos) = self
+            .host
+            .captures
+            .iter()
+            .rposition(|capture| !capture.persistent)
+        else {
             return Err(self.stop(SEXP_NIL, "missing output capture"));
         };
+        let capture = self.host.captures.remove(pos);
         if capture.exceeded {
             return Err(self.stop(SEXP_NIL, "output capture exceeds the vector size limit"));
         }
@@ -999,7 +1050,9 @@ impl Ctx {
                             let _ = self.host.write_out(b"\n");
                         }
                     }
+                    let _ = self.flush_stream_captures();
                     self.flush_warnings();
+                    let _ = self.flush_stream_captures();
                     return Ok(());
                 }
                 ParseStep::Incomplete => {
@@ -1070,7 +1123,9 @@ impl Ctx {
                         Ok(v)
                     })?;
                     let _ = val;
+                    let _ = self.flush_stream_captures();
                     self.flush_warnings();
+                    let _ = self.flush_stream_captures();
                 }
             }
         }
