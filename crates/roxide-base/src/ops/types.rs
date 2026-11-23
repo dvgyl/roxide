@@ -1,0 +1,551 @@
+use roxide_eval::{Args, Call, Ctx, EvalResult};
+use roxide_gc::SexpId;
+use roxide_value::{
+    CharId, IdenticalOpts, NA_INTEGER, RComplex, RLogical, RSession, SEXP_MISSING, SEXP_NIL,
+    SexpType, ValueApi, identical as same, is_nan_not_na,
+};
+
+use super::common::{
+    self, atomic, attr as get, ch, chars, concatenate, count, element, error, flag, formals, list,
+    number, rank, set, string, tag, text, vector_limit,
+};
+
+macro_rules! predicate {
+    ($($name:ident: $test:expr),* $(,)?) => {$(
+        pub(super) fn $name(ctx: &mut Ctx, _: &Call, args: &mut Args) -> EvalResult {
+            let s = ctx.session_mut();
+            let x = args.get(0);
+            let ty = s.type_of(x)?;
+            let result = ($test)(&*s, x, ty);
+            Ok(s.scalar_lgl(RLogical::from_option(Some(result)))?)
+        }
+    )*};
+}
+
+use super::attributes::has_class;
+
+use SexpType::*;
+predicate!(
+    is_null: |_, _, ty| ty == Nil,
+    is_logical: |_, _, ty| ty == Lgl,
+    is_integer: |_, _, ty| ty == Int,
+    is_double: |_, _, ty| ty == Real,
+    is_numeric: |s, x, ty| matches!(ty, Int | Real) && !has_class(s, x, "factor"),
+    is_complex: |_, _, ty| ty == Cplx,
+    is_character: |_, _, ty| ty == Str,
+    is_raw: |_, _, ty| ty == Raw,
+    is_list: |_, _, ty| matches!(ty, Vec | List),
+    is_atomic: |_, _, ty| atomic(ty),
+    is_function: |_, _, ty| matches!(ty, Clo | Builtin | Special),
+    is_environment: |_, _, ty| ty == Env,
+    is_matrix: |s: &RSession, x, _| s.xlength(get(s, x, "dim")).ok() == Some(2),
+    is_array: |s, x, _| get(s, x, "dim") != SEXP_NIL,
+    is_factor: |s, x, _| has_class(s, x, "factor"),
+    is_data_frame: |s, x, _| has_class(s, x, "data.frame"),
+);
+
+pub(super) fn is_vector(ctx: &mut Ctx, _: &Call, args: &mut Args) -> EvalResult {
+    let [x, mode] = formals(ctx.session(), args, ["x", "mode"]);
+    let s = ctx.session_mut();
+    let ty = s.type_of(x)?;
+    let mode = string(s, mode);
+    let valid = match mode.as_deref().unwrap_or("any") {
+        "any" => atomic(ty) || matches!(ty, Vec | Expr),
+        "numeric" => matches!(ty, Real | Int),
+        "list" => ty == Vec,
+        "pairlist" => ty == List,
+        name => (atomic(ty) || ty == Expr) && name == ty.type_name(false),
+    };
+    let attrs = s.attrs(x)?;
+    let valid = valid
+        && attrs
+            .iter()
+            .all(|(sym, _)| s.sym_name(*sym).ok() == Some("names"));
+    Ok(s.scalar_lgl(RLogical::from_option(Some(valid)))?)
+}
+
+#[derive(Clone, Copy)]
+enum MissingTest {
+    Na,
+    Nan,
+    Finite,
+    Infinite,
+}
+
+macro_rules! missing_test {
+    ($($name:ident:$op:ident),*) => {$(
+        pub(super) fn $name(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+            missing(ctx, call, args.get(0), MissingTest::$op)
+        }
+    )*};
+}
+
+missing_test!(is_na:Na, is_nan:Nan, is_finite:Finite, is_infinite:Infinite);
+
+fn missing(ctx: &mut Ctx, call: &Call, x: SexpId, op: MissingTest) -> EvalResult {
+    let s = ctx.session_mut();
+    let ty = s.type_of(x)?;
+    let len = s.xlength(x)?;
+    let mut out = std::vec::Vec::with_capacity(len);
+    for i in 0..len {
+        let result = if matches!(ty, Vec | List | Expr) && matches!(op, MissingTest::Na) {
+            let v = element(s, x, i)?;
+            s.xlength(v)? == 1 && atomic(s.type_of(v)?) && test_at(s, v, 0, op)?
+        } else {
+            test_at(s, x, i, op)?
+        };
+        out.push(RLogical::from_option(Some(result)));
+    }
+    if !atomic(ty) && !matches!(ty, Nil | Vec | List | Expr) && matches!(op, MissingTest::Na) {
+        ctx.warn_now(
+            call.err_call(),
+            format!(
+                "is.na() applied to non-(list or vector) of type '{}'",
+                ty.type_name(false)
+            ),
+        )?;
+    } else if !atomic(ty) && ty != Nil && !matches!(op, MissingTest::Na) {
+        return Err(error(
+            ctx,
+            call,
+            format!(
+                "default method not implemented for type '{}'",
+                ty.type_name(false)
+            ),
+        ));
+    }
+    let s = ctx.session_mut();
+    let out = s.alloc_lgl_from(&out)?;
+    common::copy_attrs(s, x, out, |n| matches!(n, "names" | "dim" | "dimnames"))?;
+    Ok(out)
+}
+
+pub(crate) fn is_missing(s: &RSession, x: SexpId, i: usize) -> bool {
+    test_at(s, x, i, MissingTest::Na).unwrap_or(false)
+}
+
+fn test_at(
+    s: &RSession,
+    x: SexpId,
+    i: usize,
+    op: MissingTest,
+) -> Result<bool, roxide_value::ValueError> {
+    let real_test = match op {
+        MissingTest::Na => f64::is_nan,
+        MissingTest::Nan => is_nan_not_na,
+        MissingTest::Finite => f64::is_finite,
+        MissingTest::Infinite => f64::is_infinite,
+    };
+    Ok(match s.type_of(x)? {
+        Real => real_test(s.real(x)?.get(i)),
+        Cplx => {
+            let v = s.cplx(x)?.get(i);
+            match op {
+                MissingTest::Finite => v.re.is_finite() && v.im.is_finite(),
+                MissingTest::Nan => !v.is_na() && (real_test(v.re) || real_test(v.im)),
+                _ => real_test(v.re) || real_test(v.im),
+            }
+        }
+        Int | Lgl => {
+            let na = if s.type_of(x)? == Int {
+                s.int(x)?.get(i) == NA_INTEGER
+            } else {
+                s.lgl(x)?.get(i).get().is_none()
+            };
+            match op {
+                MissingTest::Na => na,
+                MissingTest::Finite => !na,
+                _ => false,
+            }
+        }
+        Str => matches!(op, MissingTest::Na) && s.str_slice(x)?[i] == CharId::NA,
+        _ => false,
+    })
+}
+
+pub(super) fn typeof_(ctx: &mut Ctx, _: &Call, args: &mut Args) -> EvalResult {
+    let s = ctx.session_mut();
+    let x = args.get(0);
+    Ok(s.scalar_str(s.type_of(x)?.type_name(s.is_s4(x)?))?)
+}
+
+pub(super) fn storage_mode(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    typeof_(ctx, call, args)
+}
+
+pub(super) fn mode(ctx: &mut Ctx, _: &Call, args: &mut Args) -> EvalResult {
+    let s = ctx.session_mut();
+    let ty = s.type_of(args.get(0))?;
+    let name = match ty {
+        Int | Real => "numeric",
+        Builtin | Special | Clo => "function",
+        Sym => "name",
+        Lang => "call",
+        _ => ty.type_name(false),
+    };
+    Ok(s.scalar_str(name)?)
+}
+
+pub(super) fn identical(ctx: &mut Ctx, _: &Call, args: &mut Args) -> EvalResult {
+    let [x, y, num, na, attrs, code, env, src] = formals(
+        ctx.session(),
+        args,
+        [
+            "x",
+            "y",
+            "num.eq",
+            "single.NA",
+            "attrib.as.set",
+            "ignore.bytecode",
+            "ignore.environment",
+            "ignore.srcref",
+        ],
+    );
+    let opts = IdenticalOpts {
+        num_eq: flag(ctx, num, true)?,
+        single_na: flag(ctx, na, true)?,
+        attrib_as_set: flag(ctx, attrs, true)?,
+        ignore_bytecode: flag(ctx, code, true)?,
+        ignore_environment: flag(ctx, env, false)?,
+        ignore_srcref: flag(ctx, src, true)?,
+    };
+    let s = ctx.session_mut();
+    let yes = same(s, x, y, opts)?;
+    Ok(s.scalar_lgl(RLogical::from_option(Some(yes)))?)
+}
+
+macro_rules! constructor {
+    ($($name:ident:$ty:ident),*) => {$(
+        pub(super) fn $name(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+            construct(ctx, call, args, SexpType::$ty)
+        }
+    )*};
+}
+constructor!(logical:Lgl, integer:Int, double:Real, character:Str, raw:Raw);
+
+fn construct(ctx: &mut Ctx, call: &Call, args: &Args, ty: SexpType) -> EvalResult {
+    let [n] = formals(ctx.session(), args, ["length"]);
+    let n = if n == SEXP_MISSING {
+        0.0
+    } else {
+        number(ctx.session_mut(), n)?
+    };
+    let n = count(ctx, call, n)?;
+    vector_limit(
+        ctx,
+        call,
+        n,
+        match ty {
+            Raw => 1,
+            Int | Lgl => 4,
+            _ => 8,
+        },
+    )?;
+    let s = ctx.session_mut();
+    Ok(match ty {
+        Raw => s.alloc_raw_from(&vec![0; n])?,
+        Lgl => s.alloc_lgl_from(&vec![RLogical::FALSE; n])?,
+        Int => s.alloc_int_from(&vec![0; n])?,
+        Real => s.alloc_real_from(&vec![0.0; n])?,
+        _ => s.alloc_str_from(&vec![CharId::BLANK; n])?,
+    })
+}
+
+pub(super) fn complex(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    let [n, re, im] = formals(ctx.session(), args, ["length.out", "real", "imaginary"]);
+    let numeric = |s: &mut RSession, v| {
+        if v == SEXP_MISSING {
+            return Ok(std::vec::Vec::new());
+        }
+        let (v, _) = s.coerce(v, Real)?;
+        Ok::<_, roxide_value::ValueError>(s.real(v)?.to_vec())
+    };
+    let re = numeric(ctx.session_mut(), re)?;
+    let im = numeric(ctx.session_mut(), im)?;
+    let n = if n == SEXP_MISSING {
+        0
+    } else {
+        let n = number(ctx.session_mut(), n)?;
+        count(ctx, call, n)?
+    };
+    let n = n.max(re.len()).max(im.len());
+    vector_limit(ctx, call, n, size_of::<RComplex>())?;
+    let at = |v: &[f64], i| if v.is_empty() { 0.0 } else { v[i % v.len()] };
+    let vals: std::vec::Vec<_> = (0..n)
+        .map(|i| RComplex {
+            re: at(&re, i),
+            im: at(&im, i),
+        })
+        .collect();
+    Ok(ctx.session_mut().alloc_cplx_from(&vals)?)
+}
+
+macro_rules! coercion {
+    ($($name:ident:$ty:ident),*) => {$(
+        pub(super) fn $name(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+            convert(ctx, call, args.get(0), SexpType::$ty)
+        }
+    )*};
+}
+coercion!(as_logical:Lgl, as_integer:Int, as_double:Real, as_complex:Cplx,
+    as_character:Str, as_raw:Raw, as_list:Vec);
+
+pub(super) fn convert(ctx: &mut Ctx, call: &Call, x: SexpId, ty: SexpType) -> EvalResult {
+    let s = ctx.session_mut();
+    let from = s.type_of(x)?;
+    if ty == Vec && matches!(from, List | Lang | Expr | Env) {
+        let pairs: std::vec::Vec<_> = match from {
+            Env => s
+                .env_entries(x)?
+                .into_iter()
+                .map(|(n, v)| (Some(n), v.value))
+                .collect(),
+            Expr => s
+                .list_slice(x)?
+                .iter()
+                .copied()
+                .map(|v| (None, v))
+                .collect(),
+            _ => s.pairlist_iter(x).collect(),
+        };
+        let (tags, values): (std::vec::Vec<_>, std::vec::Vec<_>) = pairs.into_iter().unzip();
+        let out = list(s, &values)?;
+        if tags.iter().any(Option::is_some) {
+            let names = tags
+                .into_iter()
+                .map(|n| {
+                    let name = tag(s, n).unwrap_or("").to_owned();
+                    ch(s, &name)
+                })
+                .collect::<Result<std::vec::Vec<_>, _>>()?;
+            common::set_names(s, out, &names)?;
+        }
+        return Ok(out);
+    }
+    if ty == Str && has_class(s, x, "factor") {
+        let levels = chars(s, get(s, x, "levels"));
+        let values: std::vec::Vec<_> = s
+            .int(x)?
+            .iter()
+            .map(|v| {
+                usize::try_from(v.saturating_sub(1))
+                    .ok()
+                    .and_then(|i| levels.get(i))
+                    .copied()
+                    .unwrap_or(CharId::NA)
+            })
+            .collect();
+        return Ok(s.alloc_str_from(&values)?);
+    }
+    if ty == Str && matches!(from, Sym | Lang) {
+        if from == Sym {
+            let name = s.sym_name_of(x)?.to_owned();
+            return Ok(s.scalar_str(&name)?);
+        }
+        let items: std::vec::Vec<_> = s.pairlist_iter(x).map(|(_, v)| v).collect();
+        let mut values = std::vec::Vec::with_capacity(items.len());
+        for v in items {
+            let lines = roxide_value::deparse(s, v, Default::default())?;
+            let value = if let Ok(symbol) = s.sym_name_of(v) {
+                symbol.to_owned()
+            } else {
+                lines.join(" ")
+            };
+            values.push(ch(s, &value)?);
+        }
+        return Ok(s.alloc_str_from(&values)?);
+    }
+    let raw_invalid = if ty == Raw && from != Raw {
+        let (ints, _) = s.coerce(x, Int)?;
+        s.int(ints)?.iter().any(|v| !(0..=255).contains(&v))
+    } else {
+        false
+    };
+    let (mut out, warnings) = s.coerce(x, ty)?;
+    if out == x
+        && s.attrs(x)?
+            .iter()
+            .any(|(key, _)| ty != Vec || s.sym_name(*key).ok() != Some("names"))
+    {
+        out = s.shallow_duplicate(x)?;
+        if ty == Vec {
+            let names = get(s, x, "names");
+            s.clear_attrs(out)?;
+            set(s, out, "names", names)?;
+        } else {
+            s.clear_attrs(out)?;
+        }
+    }
+    ctx.protect(out);
+    if warnings.na_introduced {
+        ctx.warn_now(call.err_call(), "NAs introduced by coercion")?;
+    }
+    if warnings.imaginary_discarded {
+        ctx.warn_now(call.err_call(), "imaginary parts discarded in coercion")?;
+    }
+    if raw_invalid {
+        ctx.warn_now(
+            call.err_call(),
+            "out-of-range values treated as 0 in coercion to raw",
+        )?;
+    }
+    Ok(out)
+}
+
+pub(super) fn combine(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    let option = |ctx: &Ctx, name| args.named(ctx.session(), name).unwrap_or(SEXP_MISSING);
+    let recursive = flag(ctx, option(ctx, "recursive"), false)?;
+    let use_names = flag(ctx, option(ctx, "use.names"), true)?;
+    let work: std::vec::Vec<_> = args
+        .iter()
+        .filter_map(|(n, v)| {
+            let name = tag(ctx.session(), n).unwrap_or("");
+            (!matches!(name, "recursive" | "use.names")).then(|| (name.to_owned(), v))
+        })
+        .collect();
+    let s = ctx.session();
+    if work.iter().all(|(name, v)| {
+        s.type_of(*v).is_ok_and(|ty| {
+            (atomic(ty) || ty == Nil)
+                && (!use_names || (name.is_empty() && get(s, *v, "names") == SEXP_NIL))
+        })
+    }) {
+        let mut ty = Nil;
+        let mut len = 0usize;
+        let mut values = std::vec::Vec::with_capacity(work.len());
+        for (_, val) in work {
+            let t = s.type_of(val)?;
+            if rank(t) > rank(ty) {
+                ty = t;
+            }
+            len = len.saturating_add(s.xlength(val)?);
+            values.push(val);
+        }
+        vector_limit(ctx, call, len, if ty == Cplx { 16 } else { 8 })?;
+        return Ok(concatenate(ctx.session_mut(), &values, ty)?);
+    }
+    let limit = ctx.host().limits().max_vector_bytes / size_of::<(SexpId, String)>();
+    let s = ctx.session_mut();
+    let mut parts = Parts {
+        values: std::vec::Vec::new(),
+        ty: Nil,
+        recursive,
+        limit,
+    };
+    for (name, val) in work {
+        parts.push(s, val, name, 0, true)?;
+    }
+    let (names, values): (std::vec::Vec<_>, std::vec::Vec<_>) = parts.values.into_iter().unzip();
+    let out = concatenate(s, &values, parts.ty)?;
+    if use_names && out != SEXP_NIL && names.iter().any(|n| !n.is_empty()) {
+        let ids = names
+            .iter()
+            .map(|n| ch(s, n))
+            .collect::<Result<std::vec::Vec<_>, _>>()?;
+        common::set_names(s, out, &ids)?;
+    }
+    vector_limit(ctx, call, values.len(), size_of::<SexpId>())?;
+    Ok(out)
+}
+
+struct Parts {
+    values: std::vec::Vec<(String, SexpId)>,
+    ty: SexpType,
+    recursive: bool,
+    limit: usize,
+}
+
+impl Parts {
+    fn push(
+        &mut self,
+        s: &mut RSession,
+        x: SexpId,
+        prefix: String,
+        depth: usize,
+        flatten: bool,
+    ) -> Result<(), roxide_value::ValueError> {
+        let ty = s.type_of(x)?;
+        if depth >= 256 || self.values.len() >= self.limit {
+            return Err(roxide_value::ValueError::InvalidAttribute(
+                "concatenation limit exceeded".into(),
+            ));
+        }
+        if flatten && ty == Nil {
+            return Ok(());
+        }
+        if !flatten || (!atomic(ty) && !matches!(ty, Vec | List | Expr)) {
+            self.ty = Vec;
+            self.values.push((prefix, x));
+            return Ok(());
+        }
+        let container = matches!(ty, Vec | List | Expr);
+        if !container || !self.recursive {
+            let ty = if ty == List { Vec } else { ty };
+            if rank(ty) > rank(self.ty) {
+                self.ty = ty;
+            }
+        }
+        let len = s.xlength(x)?;
+        if len > self.limit.saturating_sub(self.values.len()) {
+            return Err(roxide_value::ValueError::InvalidAttribute(
+                "concatenation limit exceeded".into(),
+            ));
+        }
+        let start = self.values.len();
+        let pair_tags: std::vec::Vec<_> = if ty == List {
+            s.pairlist_iter(x)
+                .map(|(n, _)| tag(s, n).unwrap_or("").to_owned())
+                .collect()
+        } else {
+            vec![]
+        };
+        let mut generated = std::vec::Vec::new();
+        for i in 0..len {
+            let name = common::names(s, x)
+                .get(i)
+                .copied()
+                .filter(|id| *id != CharId::NA)
+                .map(|id| text(s, id))
+                .or_else(|| pair_tags.get(i).cloned())
+                .unwrap_or_default();
+            let val = element(s, x, i)?;
+            if container && self.recursive {
+                let path = join_name(&prefix, &name);
+                let from = self.values.len();
+                self.push(s, val, path, depth + 1, true)?;
+                if name.is_empty() && !prefix.is_empty() {
+                    for j in from..self.values.len() {
+                        if self.values[j].0.starts_with(&prefix)
+                            && !self.values[j].0[prefix.len()..].starts_with('.')
+                        {
+                            generated.push(j);
+                        }
+                    }
+                }
+            } else if name.is_empty() && !prefix.is_empty() {
+                generated.push(self.values.len());
+                self.values.push((prefix.clone(), val));
+            } else {
+                self.values.push((join_name(&prefix, &name), val));
+            }
+        }
+        if self.values.len() - start > 1 {
+            for j in generated {
+                self.values[j].0 = format!("{prefix}{}", j - start + 1);
+            }
+        } else if let [j] = generated.as_slice() {
+            self.values[*j].0 = prefix;
+        }
+        Ok(())
+    }
+}
+
+fn join_name(prefix: &str, suffix: &str) -> String {
+    if prefix.is_empty() {
+        return suffix.to_owned();
+    }
+    if suffix.is_empty() {
+        return prefix.to_owned();
+    }
+    format!("{prefix}.{suffix}")
+}
