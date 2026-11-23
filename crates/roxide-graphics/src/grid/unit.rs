@@ -3,11 +3,9 @@
 use std::collections::HashMap;
 
 use roxide_eval::{Args, Call, Ctx, EvalResult};
-use roxide_value::{CharId, Encoding, NA_INTEGER, SexpType, ValueApi};
+use roxide_value::{CharId, NA_INTEGER, SexpType, ValueApi};
 
-use crate::engine::{Device, GContext, GraphicsExt};
-
-use super::gpar::text_context;
+use crate::engine::{Device, GContext};
 
 pub(super) fn match_indices(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     let input = ctx.session().xlength(args.get(0))?;
@@ -51,35 +49,12 @@ pub(super) fn match_indices(ctx: &mut Ctx, call: &Call, args: &mut Args) -> Eval
     })
 }
 
-pub(super) fn metrics(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
-    let (code, _) = ctx.session_mut().coerce(args.get(0), SexpType::Int)?;
-    let code = ctx.session().int(code)?.iter().next();
-    let gc = text_context(ctx, call, args.get(2), args.get(3))?;
-    if ctx.session().type_of(args.get(1))? != SexpType::Str {
-        return Err(ctx.stop(call.err_call(), "invalid string unit data"));
-    }
-    let Some(&id) = ctx.session().str_slice(args.get(1))?.first() else {
-        return Ok(ctx.session_mut().scalar_real(0.0)?);
-    };
-    let text = if id == CharId::NA {
-        String::from("NA")
-    } else {
-        let bytes = ctx.session().char_bytes(id)?;
-        if ctx.session().char_encoding(id)? == Encoding::Latin1 {
-            bytes.iter().copied().map(char::from).collect()
-        } else {
-            String::from_utf8_lossy(bytes).into_owned()
-        }
-    };
-    let device = match ctx.ext::<GraphicsExt>().active() {
-        Some(slot) => slot,
-        None => return Err(ctx.stop(call.err_call(), "no active graphics device")),
-    };
-    let result = string_metric(device.device.as_ref(), &gc, &text, code);
-    Ok(ctx.session_mut().scalar_real(result / 72.0)?)
-}
-
-fn string_metric(device: &dyn Device, gc: &GContext, text: &str, code: Option<i32>) -> f64 {
+pub(super) fn string_metric(
+    device: &dyn Device,
+    gc: &GContext,
+    text: &str,
+    code: Option<i32>,
+) -> f64 {
     let cap_height = device.metric_info('M', gc).0;
     let line_step = 1.2 * gc.lineheight * gc.ps * gc.cex;
     let mut width: f64 = 0.0;

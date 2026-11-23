@@ -1,7 +1,11 @@
 //! Grid units, graphical parameters, and viewport geometry.
 
+mod draw;
+mod fields;
 mod gpar;
+mod grob;
 mod layout;
+mod measure;
 mod unit;
 mod viewport;
 
@@ -16,17 +20,35 @@ use roxide_value::{SexpType, ValueApi};
 pub const MODULE: Module = Module {
     prims: &[
         internal("C_grid_s3", 5, register_s3),
-        internal("C_grid_device", 0, viewport::device_info),
+        internal("C_grid_unit", 3, measure::create),
+        internal("C_grid_items", 1, measure::items),
+        internal("C_grid_add", 2, measure::add),
+        internal("C_grid_unit_text", 1, measure::as_char),
+        internal("C_grid_unit_types", 2, measure::types),
+        internal("C_grid_unit_extrema", 2, measure::extrema),
+        internal("C_grid_convert", 8, measure::convert),
         internal("C_grid_state", 0, viewport::state),
-        internal("C_grid_set_state", 1, viewport::set_state),
+        internal("C_grid_select", 2, viewport::select),
         internal("C_grid_page", 0, viewport::page),
         internal("C_grid_clip", 1, viewport::clip),
-        internal("C_grid_colors", 2, gpar::validate_colors),
         internal("C_grid_match", 2, unit::match_indices),
-        internal("C_grid_metrics", 4, unit::metrics),
-        internal("C_grid_layout_tracks", 7, layout::tracks),
+        internal("C_grid_grob_name", 3, grob::next_name),
+        internal("C_grid_grob_validate", 2, grob::validate),
+        internal("C_grid_glist", 1, grob::create_list),
+        internal("C_grid_children", 2, grob::children),
+        internal("C_grid_draw", 3, draw::draw),
+        internal("C_grid_bounds", 5, draw::bounds),
+        internal("C_grid_viewport", 19, viewport::create),
+        internal("C_grid_push", 4, viewport::push),
+        internal("C_grid_up", 3, viewport::up),
+        internal("C_grid_record", 4, viewport::record),
+        internal("C_grid_gp", 2, gpar::merge),
     ],
-    prelude: include_str!("prelude.R"),
+    prelude: concat!(
+        include_str!("prelude.R"),
+        include_str!("grob.R"),
+        include_str!("display.R"),
+    ),
 };
 
 const fn internal(name: &'static str, arity: usize, fun: PrimFn) -> PrimDef {

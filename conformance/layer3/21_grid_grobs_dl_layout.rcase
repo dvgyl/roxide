@@ -1,0 +1,186 @@
+=== case: grid_grob_constructors_and_paths ===
+#@ tags: layer3,grid
+#@ compare: exact
+library(grid)
+dput(c(grob()$name, rectGrob()$name, gTree()$name))
+dput(class(grob(name = "custom", cl = "example")))
+dput(names(textGrob("a", name = "text")))
+
+=== case: grid_line_and_shape_constructors ===
+#@ tags: layer3,grid
+#@ compare: exact
+library(grid)
+dput(names(linesGrob(name = "line")))
+dput(names(polylineGrob(name = "polyline")))
+dput(names(segmentsGrob(name = "segments")))
+dput(names(polygonGrob(name = "polygon")))
+dput(names(pathGrob(0:1, 0:1, name = "path")))
+dput(names(circleGrob(name = "circle")))
+dput(unitType(pointsGrob(1:2, 2:3, name = "points")$x))
+
+=== case: grid_glist_and_gpath ===
+#@ tags: layer3,grid
+#@ compare: exact
+library(grid)
+dput(names(nullGrob(name = "null")))
+dput(names(rasterGrob(matrix("red"), name = "raster")))
+children <- gList(rectGrob(name = "same"), NULL, circleGrob(name = "same"))
+dput(childNames(gTree(name = "tree", children = children)))
+dput(gPath("tree", "same"))
+dput(tryCatch(gList(1), error = function(e) conditionMessage(e)))
+
+=== case: grid_grob_geometry ===
+#@ tags: layer3,grid
+#@ compare: exact
+library(grid)
+pdf(tempfile(), width = 7, height = 7)
+grid.newpage()
+text <- textGrob("hello", name = "t")
+dput(unitType(grobWidth(text)))
+dput(round(convertWidth(grobWidth(text), "in", TRUE), 5))
+dput(round(convertHeight(grobHeight(text), "in", TRUE), 5))
+dput(round(convertWidth(grobWidth(textGrob("hello", rot = 90, name = "rot")), "in", TRUE), 5))
+dput(round(convertWidth(grobWidth(textGrob("hello", gp = gpar(fontsize = 24), name = "big")), "in", TRUE), 5))
+invisible(dev.off())
+
+=== case: grid_grob_ascent_and_descent ===
+#@ tags: layer3,grid
+#@ compare: exact
+library(grid)
+pdf(tempfile(), width = 7, height = 7)
+grid.newpage()
+dput(round(convertHeight(grobAscent(textGrob("g", name = "a")), "bigpts", TRUE), 5))
+dput(round(convertHeight(grobDescent(textGrob("g", name = "d")), "bigpts", TRUE), 5))
+invisible(dev.off())
+
+=== case: grid_grob_positions ===
+#@ tags: layer3,grid
+#@ compare: exact
+library(grid)
+pdf(tempfile(), width = 7, height = 7)
+grid.newpage()
+rect <- rectGrob(name = "rect", vp = viewport(name = "small", width = .5))
+dput(convertWidth(grobWidth(rect), "in", TRUE))
+dput(convertX(grobX(rect, "east"), "in", TRUE))
+invisible(dev.off())
+
+=== case: grid_grob_west_and_north ===
+#@ tags: layer3,grid
+#@ compare: exact
+library(grid)
+pdf(tempfile(), width = 7, height = 7)
+grid.newpage()
+rect <- rectGrob(name = "rect", vp = viewport(name = "small", width = .5))
+dput(convertX(grobX(rect, "west"), "in", TRUE))
+dput(convertY(grobY(rect, 90), "in", TRUE))
+invisible(dev.off())
+
+=== case: grid_grob_circle_and_empty_tree_widths ===
+#@ tags: layer3,grid
+#@ compare: exact
+library(grid)
+pdf(tempfile(), width = 7, height = 7)
+grid.newpage()
+dput(convertWidth(grobWidth(circleGrob(r = unit(1, "in"), name = "circle")), "in", TRUE))
+dput(convertWidth(grobWidth(gTree(name = "empty")), "in", TRUE))
+invisible(dev.off())
+
+=== case: grid_display_list_and_capture ===
+#@ tags: layer3,grid
+#@ compare: exact
+library(grid)
+pdf(tempfile())
+grid.newpage()
+pushViewport(viewport(name = "area"))
+grid.draw(gTree(name = "tree", children = gList(rectGrob(name = "box"))))
+upViewport()
+ax <- grid.xaxis(name = "axis")
+dput(class(ax))
+dput(names(ax))
+dput(length(grid.get("axis")$children))
+dput(grid.ls(viewports = TRUE, print = FALSE))
+dput(getNames())
+dput(grid.get(gPath("tree", "box"))$name)
+invisible(dev.off())
+
+=== case: grid_edit_and_remove ===
+#@ tags: layer3,grid
+#@ compare: exact
+library(grid)
+pdf(tempfile())
+grid.newpage()
+grid.draw(gTree(name = "tree", children = gList(rectGrob(name = "box"))))
+grid.edit("tree::box", gp = gpar(fill = "red"), redraw = FALSE)
+dput(grid.get("box")$gp$fill)
+grid.remove("tree::box", redraw = FALSE)
+dput(is.null(grid.get("box")))
+invisible(dev.off())
+
+=== case: grid_capture ===
+#@ tags: layer3,grid
+#@ compare: exact
+library(grid)
+pdf(tempfile())
+grid.newpage()
+pushViewport(viewport(name = "area"))
+grid.rect(name = "box")
+popViewport()
+cap <- grid.grab(name = "capture")
+dput(childNames(cap))
+dput(as.character(cap$children[[1]]$vp))
+dput(class(cap$childrenvp))
+invisible(dev.off())
+
+=== case: grid_capture_expression ===
+#@ tags: layer3,grid
+#@ compare: exact
+library(grid)
+pdf(tempfile())
+dput(childNames(grid.grabExpr(grid.circle(name = "offscreen"), name = "capture")))
+invisible(dev.off())
+
+=== case: grid_hooks_and_frame ===
+#@ tags: layer3,grid
+#@ compare: exact
+library(grid)
+pdf(tempfile())
+grid.newpage()
+validDetails.probe <- function(x) { x$validated <- TRUE; x }
+makeContext.probe <- function(x) { x$vp <- viewport(name = "hook"); x }
+makeContent.probe <- function(x) {
+    x$children <- gList(rectGrob(name = "generated"))
+    x$childrenOrder <- "generated"
+    x
+}
+obj <- gTree(name = "custom", cl = "probe")
+grid.draw(obj)
+dput(obj$validated)
+dput(grid.ls(viewports = TRUE, print = FALSE)$name)
+dput(childNames(grid.get("custom")))
+invisible(dev.off())
+
+=== case: grid_frame_layout ===
+#@ tags: layer3,grid
+#@ compare: exact
+library(grid)
+pdf(tempfile())
+grid.newpage()
+f <- frameGrob(grid.layout(2, 2), name = "frame")
+f <- placeGrob(f, circleGrob(name = "placed"), row = 1, col = 2)
+grid.draw(f)
+dput(f$children[[1]]$row)
+dput(f$children[[1]]$col)
+dput(grid.get("placed")$name)
+invisible(dev.off())
+
+=== case: grid_axis_explicit_ticks_and_edits ===
+#@ tags: layer3,grid
+#@ compare: exact
+library(grid)
+axis <- yaxisGrob(at = c(.2, .8), label = c("A", "B"), name = "axis",
+    edits = gEditList(gEdit("labels", gp = gpar(col = "red"))))
+dput(childNames(axis))
+dput(as.character(axis$children$ticks$y0))
+dput(axis$children$labels$label)
+dput(axis$children$labels$just)
+dput(axis$children$labels$gp$col)

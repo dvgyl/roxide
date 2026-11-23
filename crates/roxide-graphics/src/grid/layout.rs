@@ -1,35 +1,18 @@
 //! Allocate fixed and relative grid layout tracks in inches.
 
-use roxide_eval::{Args, Call, Ctx, EvalResult};
-use roxide_value::ValueApi;
+use roxide_eval::{Ctx, EvalResult};
+use roxide_gc::SexpId;
+use roxide_value::{SEXP_NIL, ValueApi};
+
+use super::{
+    fields::*,
+    measure::{Space, Units},
+};
 
 #[derive(Clone, Copy)]
 enum Track {
     Fixed(f64),
     Relative { weight: f64, respected: bool },
-}
-
-fn axis(fixed: Vec<f64>, weights: Vec<f64>, respect: Vec<f64>) -> Option<Vec<Track>> {
-    if fixed.len() != weights.len() || fixed.len() != respect.len() {
-        return None;
-    }
-    Some(
-        fixed
-            .into_iter()
-            .zip(weights)
-            .zip(respect)
-            .map(|((inches, weight), mark)| {
-                if weight.is_nan() {
-                    Track::Fixed(inches)
-                } else {
-                    Track::Relative {
-                        weight,
-                        respected: mark != 0.0,
-                    }
-                }
-            })
-            .collect(),
-    )
 }
 
 fn space_and_weight(tracks: &[Track], size: f64) -> (f64, f64) {
@@ -69,28 +52,9 @@ fn distribute(tracks: &[Track], available: f64, scale: f64) -> impl Iterator<Ite
     })
 }
 
-pub(super) fn tracks(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
-    let size = super::numbers(ctx, call, args.get(0))?;
-    let [width, height] = size.as_slice() else {
-        return Err(ctx.stop(call.err_call(), "invalid layout size"));
-    };
-    let mut axes = Vec::with_capacity(2);
-    for offset in [1, 4] {
-        let fixed = super::numbers(ctx, call, args.get(offset))?;
-        let weights = super::numbers(ctx, call, args.get(offset + 1))?;
-        let respect = super::numbers(ctx, call, args.get(offset + 2))?;
-        axes.push(
-            axis(fixed, weights, respect)
-                .ok_or_else(|| ctx.stop(call.err_call(), "invalid layout tracks"))?,
-        );
-    }
-    if axes[0].len().saturating_add(axes[1].len())
-        > ctx.host().limits().max_vector_bytes / size_of::<f64>()
-    {
-        return Err(ctx.stop(call.err_call(), "vector size limit exceeded"));
-    }
-    let (x_space, x_weight) = space_and_weight(&axes[0], *width);
-    let (y_space, y_weight) = space_and_weight(&axes[1], *height);
+fn distribute_axes(axes: &[Vec<Track>; 2], [width, height]: [f64; 2]) -> [Vec<f64>; 2] {
+    let (x_space, x_weight) = space_and_weight(&axes[0], width);
+    let (y_space, y_weight) = space_and_weight(&axes[1], height);
     let x_scale = if x_weight == 0.0 {
         f64::INFINITY
     } else {
@@ -103,8 +67,52 @@ pub(super) fn tracks(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult 
     };
     let scale = x_scale.min(y_scale);
     let scale = if scale.is_finite() { scale } else { 0.0 };
-    let result: Vec<_> = distribute(&axes[0], x_space, scale)
-        .chain(distribute(&axes[1], y_space, scale))
-        .collect();
-    Ok(ctx.session_mut().alloc_real_from(&result)?)
+    [
+        distribute(&axes[0], x_space, scale).collect(),
+        distribute(&axes[1], y_space, scale).collect(),
+    ]
+}
+
+pub(super) fn tracks(ctx: &mut Ctx, layout: SexpId, space: Space) -> EvalResult {
+    if layout == SEXP_NIL {
+        return Ok(SEXP_NIL);
+    }
+    let cols = num(ctx, layout, "ncol", 0, 0.0)? as usize;
+    let rows = num(ctx, layout, "nrow", 0, 0.0)? as usize;
+    let respect = num(ctx, layout, "valid.respect", 0, 0.0)? as i32;
+    let matrix = get(ctx, layout, "respect.mat")?;
+    let limit = ctx.host().limits().max_vector_bytes;
+    if cols.saturating_add(rows) > limit / size_of::<Track>()
+        || rows.saturating_mul(cols) > limit / size_of::<i32>()
+    {
+        return Err(ctx.stop(SEXP_NIL, "vector size limit exceeded"));
+    }
+    let mut marks = [vec![respect == 1; cols], vec![respect == 1; rows]];
+    if respect == 2 {
+        let marks_matrix = ctx.session().int(matrix)?;
+        for (i, mark) in marks_matrix.iter().take(rows * cols).enumerate() {
+            if mark != 0 {
+                marks[0][i / rows] = true;
+                marks[1][i % rows] = true;
+            }
+        }
+    }
+    let mut axes = [Vec::with_capacity(cols), Vec::with_capacity(rows)];
+    for (axis, name) in ["widths", "heights"].into_iter().enumerate() {
+        let value = get(ctx, layout, name)?;
+        let units = Units::read(ctx, value)?;
+        for (i, &respected) in marks[axis].iter().enumerate() {
+            let unit = units.at(ctx, i)?;
+            let weight = unit.weight(ctx, 0)?;
+            axes[axis].push(if weight.is_nan() {
+                Track::Fixed(space.measure(ctx, unit, axis, false, i)?)
+            } else {
+                Track::Relative { weight, respected }
+            });
+        }
+    }
+    let [widths, heights] = distribute_axes(&axes, space.size);
+    let widths = ctx.session_mut().alloc_real_from(&widths)?;
+    let heights = ctx.session_mut().alloc_real_from(&heights)?;
+    named(ctx, &[("widths", widths), ("heights", heights)])
 }
