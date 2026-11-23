@@ -1,0 +1,142 @@
+=== case: serialize_null_in_both_versions ===
+#@ tags: serialize,rds
+for (version in 2:3) {
+    bytes <- serialize(NULL, NULL, version = version)
+    dput(typeof(bytes))
+    dput(identical(unserialize(bytes), NULL))
+}
+
+=== case: serialize_logical_and_integer_vectors ===
+#@ tags: serialize,rds
+values <- list(c(TRUE, NA, FALSE), c(-2147483647L, 0L, 2147483647L, NA_integer_))
+for (version in 2:3) {
+    for (x in values) {
+        dput(identical(unserialize(serialize(x, NULL, version = version)), x))
+    }
+}
+
+=== case: serialize_double_special_values_and_negative_zero ===
+#@ tags: serialize,rds
+x <- c(1.25, NA_real_, NaN, Inf, -Inf, -0.0, 0.0)
+for (version in 2:3) {
+    value <- unserialize(serialize(x, NULL, version = version))
+    dput(identical(value, x))
+    dput(1 / value[6:7])
+}
+
+=== case: serialize_complex_vector ===
+#@ tags: serialize,rds
+x <- complex(real = c(1, NA_real_, 0), imaginary = c(-2, 4, Inf))
+for (version in 2:3) {
+    dput(identical(unserialize(serialize(x, NULL, version = version)), x))
+}
+
+=== case: serialize_utf8_and_missing_strings ===
+#@ tags: serialize,rds
+x <- c("caf\u00e9", "\u754c", "", NA_character_)
+for (version in 2:3) {
+    value <- unserialize(serialize(x, NULL, version = version))
+    dput(identical(value, x))
+    dput(Encoding(value))
+}
+
+=== case: serialize_raw_vector ===
+#@ tags: serialize,rds
+x <- as.raw(c(0L, 1L, 127L, 128L, 255L))
+for (version in 2:3) {
+    dput(identical(unserialize(serialize(x, NULL, version = version)), x))
+}
+
+=== case: serialize_nested_named_lists ===
+#@ tags: serialize,rds
+x <- list(site = list(name = "ridge", counts = c(oak = 5L, ash = 2L)),
+          empty = list(), marker = NULL)
+for (version in 2:3) {
+    dput(identical(unserialize(serialize(x, NULL, version = version)), x))
+}
+
+=== case: serialize_s3_object_and_attributes ===
+#@ tags: serialize,rds
+x <- structure(c(first = 12.5, second = 14), class = c("sample_mass", "numeric"),
+               unit = "g", limits = c(0, 100))
+for (version in 2:3) {
+    value <- unserialize(serialize(x, NULL, version = version))
+    dput(identical(value, x, attrib.as.set = FALSE))
+}
+
+=== case: serialize_data_frame_with_row_names ===
+#@ tags: serialize,rds
+x <- data.frame(site = c("ridge", "shore"), score = c(9L, NA_integer_),
+                row.names = c("r1", "r2"))
+for (version in 2:3) {
+    dput(identical(unserialize(serialize(x, NULL, version = version)), x))
+}
+
+=== case: serialize_ordered_factor_with_unused_level ===
+#@ tags: serialize,rds
+x <- ordered(c("medium", NA_character_, "low"), levels = c("low", "medium", "high"))
+for (version in 2:3) {
+    dput(identical(unserialize(serialize(x, NULL, version = version)), x))
+}
+
+=== case: serialize_compact_integer_sequence ===
+#@ tags: serialize,rds
+x <- 1:100
+for (version in 2:3) {
+    value <- unserialize(serialize(x, NULL, version = version))
+    dput(identical(value, x))
+    dput(value[c(100L, 1L, 42L)])
+}
+
+=== case: serialize_closures_with_shared_lexical_environment ===
+#@ tags: serialize,rds
+scope <- new.env(parent = baseenv())
+scope$total <- 6L
+x <- evalq(list(add = function(step = 2L) {
+    total <<- total + step
+    total
+}, get_total = function() total), scope)
+for (version in 2:3) {
+    value <- unserialize(serialize(x, NULL, version = version))
+    dput(identical(value$add, x$add, ignore.environment = TRUE))
+    dput(identical(value$get_total, x$get_total, ignore.environment = TRUE))
+    dput(identical(environment(value$add), environment(value$get_total)))
+    dput(c(value$get_total(), value$add(), value$get_total(), x$get_total()))
+}
+
+=== case: serialize_pairlists_and_calls ===
+#@ tags: serialize,rds
+call <- quote(combine(site, , count = 3L))
+values <- list(pairlist(site = "shore", count = 3L, action = call), call)
+for (version in 2:3) {
+    for (x in values) {
+        dput(identical(unserialize(serialize(x, NULL, version = version)), x))
+    }
+}
+
+=== case: save_rds_and_read_rds_with_each_compression ===
+#@ tags: serialize,rds
+(function() {
+    path <- tempfile()
+    on.exit(unlink(path))
+    x <- list(id = 27L, region = c("caf\u00e9", NA_character_), present = TRUE)
+    for (compression in list(FALSE, "gzip", "bzip2", "xz")) {
+        saveRDS(x, path, compress = compression)
+        dput(identical(readRDS(path), x))
+    }
+})()
+
+=== case: save_and_load_objects_in_fresh_environment ===
+#@ tags: serialize,rds
+(function() {
+    path <- tempfile()
+    on.exit(unlink(path))
+    counts <- c(oak = 3L, elm = NA_integer_)
+    notes <- list(site = "ridge", sampled = c(TRUE, FALSE))
+    save(notes, counts, file = path)
+    target <- new.env(parent = emptyenv())
+    dput(load(path, envir = target))
+    dput(ls(target))
+    dput(identical(target$counts, counts))
+    dput(identical(target$notes, notes))
+})()

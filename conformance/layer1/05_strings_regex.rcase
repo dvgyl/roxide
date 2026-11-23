@@ -1,0 +1,179 @@
+=== case: paste_separator_collapse_and_recycling ===
+#@ tags: strings,regex
+dput(paste(c("west", "east", "north"), 4:6, c("up", "down"), sep = ":"))
+dput(paste(c("west", "east"), c(4L, 6L), sep = "=", collapse = " | "))
+
+=== case: paste0_recycling_and_missing_values ===
+#@ tags: strings,regex
+x <- c("bay", NA_character_, "")
+dput(paste0(x, c("1", "2")))
+dput(paste0(x, collapse = "/"))
+dput(paste(x, NA_character_, sep = "--"))
+
+=== case: paste_recycle_zero_length_arguments ===
+#@ tags: strings,regex
+dput(paste("bay", character(), 1:2, sep = ":", recycle0 = FALSE))
+dput(paste("bay", character(), 1:2, sep = ":", recycle0 = TRUE))
+dput(paste0(character(), "bay", recycle0 = FALSE))
+dput(paste0(character(), "bay", recycle0 = TRUE))
+dput(paste(character(), "bay", collapse = ",", recycle0 = TRUE))
+dput(paste0(character(), "bay", collapse = ",", recycle0 = TRUE))
+
+=== case: sprintf_integer_padding_and_literal_percent ===
+#@ tags: strings,regex
+dput(sprintf("%d/%05d %%", c(7L, -42L, NA_integer_), c(-42L, 7L, NA_integer_)))
+
+=== case: sprintf_fixed_scientific_and_general ===
+#@ tags: strings,regex
+x <- c(-0.125, 1000000, NA_real_, NaN, Inf, -Inf)
+dput(sprintf("%.2f", x))
+dput(sprintf("%e", x))
+dput(sprintf("%g", x))
+
+=== case: sprintf_numbered_arguments_and_recycling ===
+#@ tags: strings,regex
+dput(sprintf("%2$s/%1$d/%2$s", c(3L, 5L, 7L, 9L), c("north", NA_character_)))
+dput(sprintf(c("%s", "<%s>"), c("north", "south", "east", "west")))
+
+=== case: sprintf_integer_format_rejects_fraction ===
+#@ tags: strings,regex
+#@ expect_error: true
+dput(sprintf("%d", 1.25))
+
+=== case: nchar_counts_characters_bytes_and_width ===
+#@ tags: strings,regex
+x <- c("caf\u00e9", "\u754c", "e\u0301", "", NA_character_)
+dput(nchar(x, type = "chars"))
+dput(nchar(x, type = "bytes"))
+dput(nchar(x, type = "width"))
+
+=== case: nchar_and_nzchar_keep_na ===
+#@ tags: strings,regex
+x <- c("", NA_character_, " ")
+dput(nchar(x, type = "chars", keepNA = TRUE))
+dput(nchar(x, type = "chars", keepNA = FALSE))
+dput(nchar(x, type = "width", keepNA = TRUE))
+dput(nchar(x, type = "width", keepNA = FALSE))
+dput(nzchar(x, keepNA = TRUE))
+dput(nzchar(x, keepNA = FALSE))
+
+=== case: substr_bounds_and_missing_indices ===
+#@ tags: strings,regex
+x <- c("caf\u00e9", "pond", "lake", "sea", NA_character_)
+dput(substr(x, c(2L, 0L, 9L, NA_integer_, 1L), c(3L, 20L, 10L, 2L, 3L)))
+dput(substr("pond", 3L, 1L))
+
+=== case: substring_recycles_text_and_indices ===
+#@ tags: strings,regex
+dput(substring(c("marsh", "shore"), c(1L, 3L, 5L, 6L), 4L))
+dput(substring("island", c(2L, 4L)))
+
+=== case: starts_with_and_ends_with_recycle ===
+#@ tags: strings,regex
+x <- c("redwood", "driftwood", "Redwood", NA_character_)
+dput(startsWith(x, c("red", "drift")))
+dput(endsWith(x, c("wood", "")))
+dput(startsWith("redwood", NA_character_))
+dput(endsWith("redwood", NA_character_))
+
+=== case: change_case_and_translate_characters ===
+#@ tags: strings,regex
+x <- c("Cab-101", "BAY", "", NA_character_)
+dput(tolower(x))
+dput(toupper(x))
+dput(chartr("A-C0-2", "x-z7-9", x))
+
+=== case: trimws_sides_and_custom_whitespace ===
+#@ tags: strings,regex
+x <- c(" \tbay \r\n", "\n\t", NA_character_)
+dput(trimws(x))
+dput(trimws(x, which = "left"))
+dput(trimws(x, which = "right"))
+dput(trimws(c("--bay--", "__sea-_", "a-b"), whitespace = "[-_]"))
+
+=== case: strsplit_fixed_and_trailing_delimiters ===
+#@ tags: strings,regex
+x <- c("bay..sea.", ".pond", "", NA_character_)
+dput(strsplit(x, ".", fixed = TRUE))
+
+=== case: strsplit_regex_and_empty_match ===
+#@ tags: strings,regex
+dput(strsplit(c("west,,east;sea;", "north"), "[,;]+"))
+dput(strsplit(c("a\u00e9", "", NA_character_), ""))
+dput(strsplit("bay sea", "[ ]*"))
+
+=== case: grep_fixed_indices_values_and_invert ===
+#@ tags: strings,regex
+x <- c(a = "run.log", b = "run-log", c = NA_character_, d = "old.LOG")
+dput(grep(".log", x, fixed = TRUE))
+dput(grep(".log", x, fixed = TRUE, value = TRUE))
+dput(grep(".log", x, fixed = TRUE, value = TRUE, invert = TRUE))
+dput(grepl(".log", x, fixed = TRUE))
+
+=== case: grep_posix_ignore_case_and_missing_values ===
+#@ tags: strings,regex
+x <- c(a = "Bay-7", b = "bay-x", c = NA_character_, d = "BAY-32")
+pattern <- "^bay-[[:digit:]]+$"
+dput(grep(pattern, x, ignore.case = TRUE))
+dput(grep(pattern, x, ignore.case = TRUE, invert = TRUE))
+dput(grepv(pattern, x, ignore.case = TRUE))
+dput(grepl(pattern, x, ignore.case = TRUE))
+
+=== case: grep_perl_lookbehind_and_invert ===
+#@ tags: strings,regex
+x <- c(a = "Lot:37", b = "lot:5", c = "row:12", d = NA_character_)
+pattern <- "(?<=lot:)\\d+$"
+dput(grep(pattern, x, perl = TRUE, ignore.case = TRUE))
+dput(grepv(pattern, x, perl = TRUE, ignore.case = TRUE, invert = TRUE))
+dput(grepl(pattern, x, perl = TRUE, ignore.case = TRUE))
+
+=== case: grepv_fixed_values_and_missing_pattern ===
+#@ tags: strings,regex
+x <- c(a = "v+1", b = NA_character_, c = "v11", d = "r+2")
+dput(grepv("+", x, fixed = TRUE))
+dput(grepv("+", x, fixed = TRUE, value = FALSE, invert = TRUE))
+dput(grepl(NA_character_, x, fixed = TRUE))
+
+=== case: sub_and_gsub_posix_backreferences ===
+#@ tags: strings,regex
+x <- c("oak:17 ash:4", "fern", NA_character_)
+pattern <- "([[:alpha:]]+):([[:digit:]]+)"
+dput(sub(pattern, "\\2<\\1>", x))
+dput(gsub(pattern, "\\2<\\1>", x))
+
+=== case: sub_and_gsub_fixed_and_perl ===
+#@ tags: strings,regex
+x <- c("a.b.c", "abc", NA_character_)
+dput(sub(".", "-", x, fixed = TRUE))
+dput(gsub(".", "-", x, fixed = TRUE))
+y <- c("row-12 and row-34", "row-x", NA_character_)
+pattern <- "(?<=row-)(\\d)(\\d)"
+dput(sub(pattern, "\\2\\1", y, perl = TRUE))
+dput(gsub(pattern, "\\2\\1", y, perl = TRUE))
+
+=== case: regexpr_character_and_byte_offsets ===
+#@ tags: strings,regex
+x <- c("\u00e9:27", "none", NA_character_)
+dput(regexpr("[[:digit:]]+", x))
+dput(regexpr("[[:digit:]]+", x, useBytes = TRUE))
+
+=== case: gregexpr_positions_and_regmatches ===
+#@ tags: strings,regex
+x <- c("sec12 min4", "idle", NA_character_, "hour007")
+pattern <- "[[:digit:]]+"
+first <- regexpr(pattern, x)
+all <- gregexpr(pattern, x)
+dput(all)
+dput(regmatches(x, first))
+dput(regmatches(x, all))
+
+=== case: enc2utf8_converts_latin1_and_preserves_missing_values ===
+#@ tags: strings,regex
+latin1 <- rawToChar(as.raw(c(0x63, 0x61, 0x66, 0xe9)))
+Encoding(latin1) <- "latin1"
+x <- c(latin1, "d\u00e9j\u00e0", "plain", NA_character_)
+y <- enc2utf8(x)
+dput(Encoding(x))
+dput(Encoding(y))
+dput(charToRaw(y[1L]))
+dput(y)

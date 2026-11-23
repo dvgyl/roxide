@@ -1,0 +1,225 @@
+=== case: write_and_read_lines_in_file ===
+#@ tags: io,datetime
+(function() {
+    path <- tempfile()
+    on.exit(unlink(path))
+    writeLines(c("ridge", "", "valley"), path)
+    dput(readLines(path, n = 2L))
+    dput(readLines(path, n = -1L))
+})()
+
+=== case: read_lines_keeps_text_connection_position ===
+#@ tags: io,datetime
+(function() {
+    input <- textConnection(c("spring", "", "summer"))
+    on.exit(close(input))
+    dput(readLines(input, n = 1L))
+    dput(readLines(input, n = 2L))
+    dput(readLines(input, n = 1L))
+})()
+
+=== case: write_lines_to_text_connection ===
+#@ tags: io,datetime
+(function() {
+    output <- textConnection("lines", open = "w", local = TRUE)
+    on.exit(close(output))
+    writeLines(c("red", "green"), output)
+    writeLines(c("", "blue"), output)
+    dput(textConnectionValue(output))
+})()
+
+=== case: read_lines_without_final_newline ===
+#@ tags: io,datetime
+(function() {
+    path <- tempfile()
+    on.exit(unlink(path))
+    writeBin(charToRaw("top\n\nbottom"), path)
+    dput(readLines(path, warn = FALSE))
+})()
+
+=== case: binary_integers_in_both_byte_orders ===
+#@ tags: io,datetime
+x <- c(258L, -2L, NA_integer_)
+little <- writeBin(x, raw(), size = 4L, endian = "little")
+big <- writeBin(x, raw(), size = 4L, endian = "big")
+dput(little)
+dput(big)
+dput(readBin(little, integer(), n = 3L, size = 4L, endian = "little"))
+dput(readBin(big, integer(), n = 3L, size = 4L, endian = "big"))
+
+=== case: binary_short_signed_and_unsigned_integers ===
+#@ tags: io,datetime
+x <- c(-1L, -32768L, 258L)
+bytes <- writeBin(x, raw(), size = 2L, endian = "big")
+dput(bytes)
+dput(readBin(bytes, integer(), n = 3L, size = 2L, signed = TRUE, endian = "big"))
+dput(readBin(bytes, integer(), n = 3L, size = 2L, signed = FALSE, endian = "big"))
+
+=== case: binary_doubles_preserve_special_values ===
+#@ tags: io,datetime
+x <- c(1.5, -0.0, Inf, NA_real_)
+for (order in c("little", "big")) {
+    bytes <- writeBin(x, raw(), size = 8L, endian = order)
+    dput(bytes[1:16])
+    value <- readBin(bytes, double(), n = 5L, size = 8L, endian = order)
+    dput(value)
+    dput(1 / value[2L])
+}
+
+=== case: binary_raw_file_roundtrip_and_end_of_file ===
+#@ tags: io,datetime
+(function() {
+    path <- tempfile()
+    on.exit(unlink(path))
+    writeBin(as.raw(c(0L, 1L, 127L, 128L, 255L)), path)
+    dput(readBin(path, raw(), n = 8L))
+    dput(readBin(path, raw(), n = 2L))
+})()
+
+=== case: read_and_write_char_with_fixed_width ===
+#@ tags: io,datetime
+(function() {
+    path <- tempfile()
+    on.exit(unlink(path))
+    writeChar(c("slope", "lake", "bay"), path, nchars = c(3L, 4L, 2L), eos = NULL)
+    dput(readChar(path, nchars = c(3L, 4L, 2L)))
+    dput(readBin(path, raw(), n = 20L))
+})()
+
+=== case: read_and_write_char_count_utf8_characters ===
+#@ tags: io,datetime
+(function() {
+    path <- tempfile()
+    on.exit(unlink(path))
+    x <- c("caf\u00e9!", "\u754cx", "end")
+    writeChar(x, path, nchars = c(4L, 1L, 3L), eos = NULL, useBytes = FALSE)
+    dput(readChar(path, nchars = c(4L, 1L, 3L), useBytes = FALSE))
+    dput(readBin(path, raw(), n = 20L))
+})()
+
+=== case: gzip_connection_roundtrip ===
+#@ tags: io,datetime
+(function() {
+    path <- tempfile()
+    on.exit(unlink(path))
+    output <- gzfile(path, open = "wt")
+    tryCatch(writeLines(c("orchard", "", "meadow"), output), finally = close(output))
+    input <- gzfile(path, open = "rt")
+    dput(tryCatch(readLines(input), finally = close(input)))
+})()
+
+=== case: bzip2_connection_roundtrip ===
+#@ tags: io,datetime
+(function() {
+    path <- tempfile()
+    on.exit(unlink(path))
+    output <- bzfile(path, open = "wt")
+    tryCatch(writeLines(c("alpha", "beta"), output), finally = close(output))
+    input <- bzfile(path, open = "rt")
+    dput(tryCatch(readLines(input), finally = close(input)))
+})()
+
+=== case: xz_connection_roundtrip ===
+#@ tags: io,datetime
+(function() {
+    path <- tempfile()
+    on.exit(unlink(path))
+    x <- as.raw(c(0L, 128L, 255L, 0L))
+    output <- xzfile(path, open = "wb")
+    tryCatch(writeBin(x, output), finally = close(output))
+    input <- xzfile(path, open = "rb")
+    dput(tryCatch(readBin(input, raw(), n = 8L), finally = close(input)))
+})()
+
+=== case: list_files_regex_and_fixed_patterns ===
+#@ tags: io,datetime
+(function() {
+    root <- tempfile()
+    on.exit(unlink(root, recursive = TRUE))
+    dir.create(root)
+    stopifnot(file.create(file.path(root, c("a.1", "ab1", "c.2", ".hidden"))))
+    dput(list.files(root, pattern = ".1$", full.names = FALSE))
+    dput(list.files(root, pattern = ".1", fixed = TRUE, full.names = FALSE))
+    dput(sort(list.files(root, all.files = TRUE, no.. = TRUE), method = "radix"))
+})()
+
+=== case: list_files_recursive_relative_names ===
+#@ tags: io,datetime
+(function() {
+    root <- tempfile()
+    on.exit(unlink(root, recursive = TRUE))
+    dir.create(root)
+    dir.create(file.path(root, "nest"))
+    stopifnot(file.create(file.path(root, c("nest/inside.txt", "outer.txt"))))
+    dput(list.files(root, recursive = FALSE, full.names = FALSE))
+    dput(list.files(root, recursive = TRUE, full.names = FALSE))
+    dput(list.files(root, recursive = TRUE, include.dirs = TRUE, full.names = FALSE))
+})()
+
+=== case: file_metadata_and_path_components ===
+#@ tags: io,datetime
+(function() {
+    root <- tempfile()
+    on.exit(unlink(root, recursive = TRUE))
+    dir.create(root)
+    folder <- file.path(root, "data")
+    dir.create(folder)
+    path <- file.path(folder, "sample.bin")
+    writeBin(as.raw(c(1L, 0L, 255L, 2L)), path)
+    paths <- c(path, folder, file.path(root, "missing"))
+    dput(file.exists(paths))
+    dput(dir.exists(paths))
+    dput(file.info(path)$size)
+    dput(basename(path))
+    dput(basename(dirname(path)))
+    canonical <- normalizePath(file.path(folder, "..", "data", "sample.bin"), mustWork = TRUE)
+    dput(c(basename(dirname(canonical)), basename(canonical)))
+    dput(identical(canonical, normalizePath(path, mustWork = TRUE)))
+})()
+
+=== case: date_parsing_formatting_and_origins ===
+#@ tags: io,datetime
+x <- as.Date(c("28/02/2000", "29/02/2000", NA_character_), format = "%d/%m/%Y")
+dput(unclass(x))
+dput(format(x, "%Y-%m-%d"))
+dput(format(as.Date(c(-1, 0, 1), origin = "1970-01-01"), "%Y-%m-%d"))
+
+=== case: date_sequences_and_differences ===
+#@ tags: io,datetime
+x <- seq(as.Date("2024-02-27"), by = "2 days", length.out = 3L)
+dput(format(x, "%Y-%m-%d"))
+dput(format(seq(as.Date("2024-01-01"), by = "month", length.out = 3L), "%Y-%m-%d"))
+delta <- diff(x, lag = 2L)
+dput(as.numeric(delta))
+dput(units(delta))
+
+=== case: difftime_in_seconds_and_days ===
+#@ tags: io,datetime
+start <- as.POSIXct("2024-02-28 12:00:00", tz = "UTC")
+end <- as.POSIXct("2024-03-01 00:00:00", tz = "UTC")
+seconds <- difftime(end, start, units = "secs")
+days <- difftime(end, start, units = "days")
+dput(c(as.numeric(seconds), as.numeric(days)))
+dput(c(units(seconds), units(days)))
+
+=== case: posixct_epoch_and_utc_format ===
+#@ tags: io,datetime
+x <- as.POSIXct(c("1969-12-31 23:59:59", "1970-01-01 00:00:00",
+                  "2000-02-29 12:34:56", NA_character_),
+                format = "%Y-%m-%d %H:%M:%S", tz = "UTC")
+dput(as.numeric(x))
+dput(format(x, "%Y-%m-%d %H:%M:%S %z", tz = "UTC"))
+
+=== case: posixlt_utc_calendar_fields ===
+#@ tags: io,datetime
+x <- as.POSIXct(c("2000-02-29 12:34:56", "2000-03-01 00:00:00"), tz = "UTC")
+y <- as.POSIXlt(x, tz = "UTC")
+dput(unclass(y)[c("sec", "min", "hour", "mday", "mon", "year", "wday", "yday", "isdst")])
+dput(as.numeric(as.POSIXct(y, tz = "UTC")))
+
+=== case: strptime_and_strftime_with_utc_and_offset ===
+#@ tags: io,datetime
+x <- strptime(c("2000-02-29 01:30:00 +0130", "2000-03-01 00:15:00 -0230", "invalid"),
+              format = "%Y-%m-%d %H:%M:%S %z", tz = "UTC")
+dput(as.numeric(as.POSIXct(x, tz = "UTC")))
+dput(strftime(x, format = "%Y-%m-%d %H:%M:%S %z", tz = "UTC"))
