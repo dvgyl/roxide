@@ -121,8 +121,36 @@ pub(super) fn log_chisq_scale(w: f64, df: f64) -> f64 {
     };
     let center = if a >= 8.0 {
         0.5 * std::f64::consts::LN_2 - LOG_SQRT_2PI - stirlerr(a)
+    } else if a == 0.0 {
+        0.5 * df.ln()
     } else {
         a.mul_add(a.ln(), -a) + 0.5 * df.ln() - lgamma1p(a)
     };
     center - deviance
+}
+
+// Integrate a log-concave function with log value zero at its mode.
+pub(super) fn centered_integral(log_relative: impl Fn(f64) -> f64) -> f64 {
+    let integrate = |direction: f64| {
+        let mut edge = 1.0;
+        for _ in 0..16 {
+            let end = log_relative(direction * edge);
+            let mid = log_relative(direction * (edge * 0.5));
+            // Concavity bounds the remaining integral by the chord's exponential tail.
+            let slope = (end - mid) / (edge * 0.5);
+            if slope < 0.0 && end - (-slope).ln() < -40.0 {
+                break;
+            }
+            edge *= 2.0;
+        }
+        let f = |x| log_relative(direction * x).exp();
+        let mut sum = panel(0.0, 1.0, &f);
+        let mut start = 1.0;
+        while start < edge {
+            sum += panel(start, 2.0 * start, &f);
+            start *= 2.0;
+        }
+        sum
+    };
+    (integrate(-1.0) + integrate(1.0)).ln()
 }

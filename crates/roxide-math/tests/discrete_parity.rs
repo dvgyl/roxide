@@ -563,8 +563,8 @@ fn invalid_inputs_and_integer_tolerance() {
     let mut flags = Flags::default();
     assert_eq!(dsignrank(2.25, 4.0, false, &mut flags), 0.0);
     assert!(!flags.has(Flags::NONINT_X));
-    assert!(dwilcox(0.0, 10_000.0, 10_000.0, false, &mut flags).is_nan());
-    assert!(dsignrank(0.0, 1e6, true, &mut flags).is_nan());
+    assert!(dwilcox(2.0, 10_000.0, 10_000.0, false, &mut flags).is_nan());
+    assert!(dsignrank(2.0, 1e6, true, &mut flags).is_nan());
     assert!(flags.has(Flags::NAN_PRODUCED));
     let mut rng = Rng::seeded(42, Kinds::default());
     let mut out = [3, 5];
@@ -590,4 +590,39 @@ fn probabilities_with_exact_combinatorial_references() {
     assert!((tiny_hyper / 2.781_926_381_787_558e-300 - 1.0).abs() < 1e-14);
     let multi = dmultinom(&[150.0, 153.0, 697.0], &[1.0, 1.0, 4.0], false, &mut flags);
     assert!((multi / 0.000_151_063_071_559_746_83 - 1.0).abs() < 1e-14);
+}
+
+#[test]
+fn extreme_discrete_tails_and_endpoints() {
+    let mut flags = Flags::default();
+    let log_upper = Tail {
+        lower: false,
+        log: true,
+    };
+    let value = pnbinom_mu(1.0, 1e-12, 1e-30, log_upper, &mut flags);
+    assert!((value + 111.217_231_644_273_14).abs() < 2e-12, "{value}");
+    assert_eq!(qnbinom_mu(-110.0, 1e-12, 1e-30, log_upper, &mut flags), 1.0);
+    let large = 2.0_f64.powi(54);
+    let value = phyper(
+        large / 2.0,
+        large,
+        large,
+        large,
+        Tail::default(),
+        &mut flags,
+    );
+    assert!((value - 0.5).abs() < 1e-8, "{value}");
+    let value = phyper(1.0, 2.0, large, large / 2.0, Tail::default(), &mut flags);
+    assert!((value - 0.75).abs() < 1e-15, "{value}");
+    assert_eq!(qwilcox(0.0, 400.0, 400.0, Tail::default(), &mut flags), 0.0);
+    assert_eq!(dwilcox(-1.0, 400.0, 400.0, false, &mut flags), 0.0);
+    assert_eq!(
+        dsignrank(0.0, 1100.0, true, &mut flags),
+        -1100.0 * std::f64::consts::LN_2
+    );
+    assert_eq!(dbinom(1.0, INF, 0.4, false, &mut flags), 0.0);
+    assert_eq!(dhyper(-1.5, 10.0, 10.0, 10.0, false, &mut flags), 0.0);
+    assert_eq!(flags.bits(), 0);
+    assert!(pbinom(1.0, 2.4, 0.5, Tail::default(), &mut flags).is_nan());
+    assert!(flags.has(Flags::NONINT_X));
 }

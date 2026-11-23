@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::rng::Rng;
+use crate::special::lchoose;
 
 const MAX_SUPPORT: f64 = 1_000_000.0;
 const MAX_UPDATES: f64 = 50_000_000.0;
@@ -146,12 +147,19 @@ pub fn dwilcox(x: f64, m: f64, n: f64, log: bool, flags: &mut Flags) -> f64 {
     if x.is_nan() || m.is_nan() || n.is_nan() {
         return x + m + n;
     }
-    mass(
-        x,
-        log,
-        RankMasses::wilcox(m.round_ties_even(), n.round_ties_even()),
-        flags,
-    )
+    let (m, n) = (m.round_ties_even(), n.round_ties_even());
+    if !positive_ranks(m) || !positive_ranks(n) {
+        return invalid(flags);
+    }
+    let max = m * n;
+    if x < 0.0 || x > max || !integral(x) {
+        return zero(log);
+    }
+    let x = x.round_ties_even();
+    if x == 0.0 || x == max {
+        return on_scale(-lchoose(m + n, m.min(n), flags), log);
+    }
+    mass(x, log, RankMasses::wilcox(m, n), flags)
 }
 
 /// Return the requested Wilcoxon rank sum tail probability at `q`.
@@ -159,12 +167,19 @@ pub fn pwilcox(q: f64, m: f64, n: f64, tail: Tail, flags: &mut Flags) -> f64 {
     if q.is_nan() || m.is_nan() || n.is_nan() {
         return q + m + n;
     }
-    cumulative(
-        q,
-        tail,
-        RankMasses::wilcox(m.round_ties_even(), n.round_ties_even()),
-        flags,
-    )
+    let (m, n) = (m.round_ties_even(), n.round_ties_even());
+    if !positive_ranks(m) || !positive_ranks(n) {
+        return invalid(flags);
+    }
+    let max = m * n;
+    let q = count_floor(q);
+    if q < 0.0 || q >= max {
+        return step(q >= 0.0, tail);
+    }
+    if q == 0.0 || q == max - 1.0 {
+        return from_log(-lchoose(m + n, m.min(n), flags), q == 0.0, tail);
+    }
+    cumulative(q, tail, RankMasses::wilcox(m, n), flags)
 }
 
 /// Return the smallest Wilcoxon rank sum at the requested probability.
@@ -172,12 +187,14 @@ pub fn qwilcox(p: f64, m: f64, n: f64, tail: Tail, flags: &mut Flags) -> f64 {
     if p.is_nan() || m.is_nan() || n.is_nan() {
         return p + m + n;
     }
-    quantile(
-        p,
-        tail,
-        RankMasses::wilcox(m.round_ties_even(), n.round_ties_even()),
-        flags,
-    )
+    let (m, n) = (m.round_ties_even(), n.round_ties_even());
+    if !positive_ranks(m) || !positive_ranks(n) || !p.is_finite() || !valid_probability(p, tail) {
+        return invalid(flags);
+    }
+    if let Some(boundary) = endpoints(p, tail, 0.0, m * n) {
+        return boundary;
+    }
+    quantile(p, tail, RankMasses::wilcox(m, n), flags)
 }
 
 /// Draw a Wilcoxon rank sum using the sampling method in `rng`.
@@ -197,12 +214,31 @@ pub fn rwilcox(rng: &mut Rng, m: f64, n: f64, flags: &mut Flags) -> f64 {
     ranks.iter().sum::<u64>() as f64 - n * (n + 1.0) / 2.0
 }
 
+fn positive_ranks(n: f64) -> bool {
+    n > 0.0 && n.is_finite()
+}
+
 /// Return the Wilcoxon signed rank mass at `x`.
 pub fn dsignrank(x: f64, n: f64, log: bool, flags: &mut Flags) -> f64 {
     if x.is_nan() || n.is_nan() {
         return x + n;
     }
-    mass(x, log, RankMasses::signrank(n.round_ties_even()), flags)
+    let n = n.round_ties_even();
+    if !positive_ranks(n) {
+        return invalid(flags);
+    }
+    let max = n * (n + 1.0) / 2.0;
+    if x < 0.0 || x > max {
+        return zero(log);
+    }
+    if x.round_ties_even() == 0.0 || x.round_ties_even() == max {
+        return if integral(x) {
+            on_scale(-n * std::f64::consts::LN_2, log)
+        } else {
+            zero(log)
+        };
+    }
+    mass(x, log, RankMasses::signrank(n), flags)
 }
 
 /// Return the requested Wilcoxon signed rank tail probability at `q`.
@@ -210,7 +246,19 @@ pub fn psignrank(q: f64, n: f64, tail: Tail, flags: &mut Flags) -> f64 {
     if q.is_nan() || n.is_nan() {
         return q + n;
     }
-    cumulative(q, tail, RankMasses::signrank(n.round_ties_even()), flags)
+    let n = n.round_ties_even();
+    if !positive_ranks(n) {
+        return invalid(flags);
+    }
+    let max = n * (n + 1.0) / 2.0;
+    let q = count_floor(q);
+    if q < 0.0 || q >= max {
+        return step(q >= 0.0, tail);
+    }
+    if q == 0.0 || q == max - 1.0 {
+        return from_log(-n * std::f64::consts::LN_2, q == 0.0, tail);
+    }
+    cumulative(q, tail, RankMasses::signrank(n), flags)
 }
 
 /// Return the smallest Wilcoxon signed rank at the requested probability.
@@ -218,7 +266,14 @@ pub fn qsignrank(p: f64, n: f64, tail: Tail, flags: &mut Flags) -> f64 {
     if p.is_nan() || n.is_nan() {
         return p + n;
     }
-    quantile(p, tail, RankMasses::signrank(n.round_ties_even()), flags)
+    let n = n.round_ties_even();
+    if !positive_ranks(n) || !p.is_finite() || !valid_probability(p, tail) {
+        return invalid(flags);
+    }
+    if let Some(boundary) = endpoints(p, tail, 0.0, n * (n + 1.0) / 2.0) {
+        return boundary;
+    }
+    quantile(p, tail, RankMasses::signrank(n), flags)
 }
 
 /// Draw a Wilcoxon signed rank sum from `rng`.

@@ -317,7 +317,12 @@ pub fn qnorm(p: f64, mean: f64, sd: f64, tail: Tail, flags: &mut Flags) -> f64 {
     if sd == 0.0 {
         return mean;
     }
-    sd.mul_add(standard_quantile(p, tail), mean)
+    let value = sd.mul_add(standard_quantile(p, tail), mean);
+    if value.is_nan() {
+        invalid(flags)
+    } else {
+        value
+    }
 }
 
 /// Draw from the normal distribution with the specified mean and standard deviation.
@@ -329,4 +334,16 @@ pub fn rnorm(rng: &mut Rng, mean: f64, sd: f64, flags: &mut Flags) -> f64 {
         return mean;
     }
     sd.mul_add(rng.norm_rand(), mean)
+}
+
+/// Return the ratio of the normal density at `z` to its upper tail.
+pub(crate) fn mills_ratio(z: f64, log_tail: f64) -> f64 {
+    if z >= 8.0 {
+        let fraction = (1..=64)
+            .rev()
+            .fold(0.0, |value, k| f64::from(k) / (z + value));
+        z + fraction
+    } else {
+        (-0.5 * z * z - 0.918_938_533_204_672_8 - log_tail).exp()
+    }
 }

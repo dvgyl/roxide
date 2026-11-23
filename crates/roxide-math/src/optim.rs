@@ -146,8 +146,10 @@ pub fn sann_with_report<F: Anneal>(
         return Ok(out);
     }
     let tmax = tmax.max(1);
+    // Preserve the decimal offset measured from the first proposal in GNU R.
+    const SCHEDULE_OFFSET: f64 = 27_182_818.0 / 10_000_000.0;
     for i in 1..maxit {
-        let scale = (f64::from((i - 1) / tmax * tmax) + std::f64::consts::E)
+        let scale = (f64::from((i - 1) / tmax * tmax) + SCHEDULE_OFFSET)
             .ln()
             .recip();
         f.candidate(&current, scale, &mut next)?;

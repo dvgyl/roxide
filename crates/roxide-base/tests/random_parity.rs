@@ -61,3 +61,66 @@ fn query_has_no_seed_side_effect_and_pure_host_reseed_is_deterministic() {
         integers(&mut second, ".Random.seed")
     );
 }
+
+#[test]
+fn active_seed_and_seed_vector_use_the_global_stream() {
+    let mut ctx = Ctx::new(Box::new(roxide_host::NativeHost::new()), GcPolicy::Torture).unwrap();
+    roxide_base::register_all(&mut ctx).unwrap();
+    ctx.run_script(
+        "Active seed",
+        r#"
+set.seed(1L)
+expected <- sample.int(100, 10)
+set.seed(c(1, 2))
+stopifnot(identical(sample.int(100, 10), expected))
+set.seed(1L)
+saved <- .Random.seed
+rm(.Random.seed)
+writes <- 0L
+reads <- 0L
+makeActiveBinding(".Random.seed", function(x) {
+    if (missing(x)) {
+        reads <<- reads + 1L
+        return(saved)
+    }
+    saved <<- x
+    writes <<- writes + 1L
+}, .GlobalEnv)
+actual <- sample.int(100, 10)
+stopifnot(identical(actual, expected), writes == 1L, reads == 2L)
+.Random.seed <- c(10401L, -1872166913L, 1179647999L)
+draw <- sample.int(3, 1)
+stopifnot(draw >= 1L, draw <= 3L)
+"#,
+        GLOBAL_ENV,
+        false,
+    )
+    .unwrap();
+}
+
+#[test]
+fn sampling_checks_compact_lengths_and_hash_storage() {
+    let limits = roxide_host::Limits {
+        max_vector_bytes: 128,
+        ..roxide_host::Limits::default()
+    };
+    let mut ctx = Ctx::new(
+        Box::new(roxide_host::NativeHost::with_limits(limits)),
+        GcPolicy::Torture,
+    )
+    .unwrap();
+    roxide_base::register_all(&mut ctx).unwrap();
+    ctx.run_script(
+        "Sample limits",
+        r#"
+err <- function(expr) tryCatch(expr, error = function(e) conditionMessage(e))
+stopifnot(identical(err(sample.int(1, seq_len(32))), "invalid 'size' argument"))
+stopifnot(identical(err(sample.int(100, 5, useHash=TRUE)),
+                  "sampling allocation exceeds the vector size limit"))
+stopifnot(!exists(".Random.seed", envir=.GlobalEnv, inherits=FALSE))
+"#,
+        GLOBAL_ENV,
+        false,
+    )
+    .unwrap();
+}

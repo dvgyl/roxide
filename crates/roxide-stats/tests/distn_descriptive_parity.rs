@@ -76,3 +76,155 @@ stopifnot(!exists(".Random.seed", envir = .GlobalEnv, inherits = FALSE))
 "#,
     );
 }
+
+#[test]
+fn beta_and_noncentral_draws_match_oracle_bit_for_bit() {
+    use roxide_value::ValueApi;
+    use std::fmt::Write as _;
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let Some(oracle) = std::env::var_os("ROXIDE_ORACLE_RSCRIPT") else {
+        return;
+    };
+    let cases = [
+        "rbeta(100,2,3)",
+        "rbeta(100,.5,.5)",
+        "rbeta(100,1.01,1.02)",
+        "rbeta(100,3,2)",
+        "rbeta(100,.2,4)",
+        "rbeta(100,4,.2)",
+        "rbeta(100,1,1)",
+        "rbeta(100,0,0)",
+        "rbeta(100,0,1)",
+        "rbeta(100,Inf,Inf)",
+        "rbeta(100,3,Inf)",
+        "rbeta(100,-1,3)",
+        "rchisq(100,3,20)",
+        "rchisq(100,3,0)",
+        "rchisq(100,0,0)",
+        "rchisq(100,0,2)",
+        "rchisq(100,Inf,0)",
+        "rchisq(100,Inf,20)",
+        "rchisq(100,3,.1)",
+        "rchisq(100,3,100)",
+        "rchisq(100,3,Inf)",
+        "rchisq(100,c(0,3,Inf),c(0,2))",
+        "rbeta(100,2,3,2)",
+        "rbeta(100,2,3,0)",
+        "rbeta(100,.5,.5,2)",
+        "rbeta(100,0,1,2)",
+        "rbeta(100,2,Inf,0)",
+        "rbeta(100,c(.5,2),c(1,3,4),2)",
+        "rf(100,3,5,2)",
+        "rf(100,3,5,0)",
+        "rf(100,1,1,20)",
+        "rf(100,3,Inf,2)",
+        "rf(100,Inf,5,2)",
+        "rf(100,c(3,5),c(1,3,5),2)",
+        "rt(100,3,2)",
+        "rt(100,3,0)",
+        "rt(100,Inf,2)",
+        "rt(100,3,-2)",
+        "rt(100,3,Inf)",
+        "rt(100,c(3,5,Inf),c(-2,2))",
+    ];
+    let mut script = String::from("options(warn=-1)\n");
+    let mut print = String::from("stopifnot(getRversion() == '4.6.2')\n");
+    for (i, case) in cases.iter().enumerate() {
+        writeln!(
+            script,
+            "set.seed(42L); draw{i} <- {case}; seed{i} <- .Random.seed"
+        )
+        .unwrap();
+        writeln!(print, "cat(sprintf('%.17g',draw{i}), seed{i}, '\\n')").unwrap();
+    }
+    let mut child = Command::new(oracle)
+        .args(["--vanilla", "/dev/stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("Start the oracle");
+    let mut input = child.stdin.take().expect("Open oracle input");
+    let output = std::thread::scope(|scope| {
+        let writer = scope.spawn(|| {
+            input.write_all(script.as_bytes()).unwrap();
+            input.write_all(print.as_bytes()).unwrap();
+            drop(input);
+        });
+        let output = child.wait_with_output().unwrap();
+        writer.join().unwrap();
+        output
+    });
+    assert!(output.status.success());
+    let output = String::from_utf8(output.stdout).unwrap();
+    let mut lines = output.lines();
+
+    let mut ctx = Ctx::new(Box::new(NativeHost::new()), GcPolicy::default()).unwrap();
+    roxide_base::register_all(&mut ctx).unwrap();
+    roxide_stats::register(&mut ctx).unwrap();
+    ctx.run_script("Streams", &script, GLOBAL_ENV, false)
+        .unwrap();
+    let mut mismatches = Vec::new();
+    for (i, case) in cases.iter().enumerate() {
+        let value = |ctx: &mut Ctx, name| {
+            let sym = ctx.session_mut().intern(&format!("{name}{i}")).unwrap();
+            ctx.session().env_get(GLOBAL_ENV, sym).unwrap().value
+        };
+        let line = lines.next().unwrap();
+        let mut expected = line.split_whitespace();
+        let draw = value(&mut ctx, "draw");
+        let draw: Vec<_> = ctx.session().real(draw).unwrap().iter().collect();
+        assert_eq!(draw.len(), 100, "{case}");
+        for (j, actual) in draw.into_iter().enumerate() {
+            let expected = expected.next().unwrap().parse::<f64>().unwrap();
+            if actual.to_bits() != expected.to_bits() && !(actual.is_nan() && expected.is_nan()) {
+                mismatches.push(format!(
+                    "{case}, draw {j}: {actual:.17e} != {expected:.17e}"
+                ));
+                break;
+            }
+        }
+        let seed = value(&mut ctx, "seed");
+        let seed = ctx.session().int(seed).unwrap().to_vec();
+        let expected: Vec<i32> = line
+            .split_whitespace()
+            .skip(100)
+            .map(|word| word.parse().unwrap())
+            .collect();
+        assert_eq!(seed.len(), 626, "{case}");
+        assert_eq!(expected.len(), 626, "{case}");
+        if seed != expected {
+            mismatches.push(format!(
+                "{case}, seed cursor: {} != {}",
+                seed[1], expected[1]
+            ));
+        }
+    }
+    assert!(lines.next().is_none());
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+}
+
+#[test]
+fn distribution_warnings_and_parameter_validation() {
+    check(
+        Box::new(PureHost::new()),
+        "Boundary warnings",
+        r#"
+warnings <- character()
+record <- function(expr) withCallingHandlers(expr, warning=function(w) {
+    warnings <<- c(warnings, conditionMessage(w))
+    invokeRestart("muffleWarning")
+})
+stopifnot(is.nan(record(pbinom(1,2.4,.5))))
+stopifnot(identical(warnings,c("non-integer n = 2.400000","NaNs produced")))
+warnings <- character()
+stopifnot(is.finite(record(dgamma(1,2,rate=49,scale=1/49))))
+stopifnot(identical(warnings,"specify 'rate' or 'scale' but not both"))
+warnings <- character()
+stopifnot(identical(record(dhyper(-1.5,10,10,10)),0), length(warnings)==0L)
+message <- tryCatch(rmultinom(1,5,c(1e308,1e308)), error=function(e) conditionMessage(e))
+stopifnot(identical(message, "rbinom: probability sum should be 1, but is 0"))
+"#,
+    );
+}

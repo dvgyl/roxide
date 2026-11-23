@@ -15,6 +15,7 @@ pub const MODULE: Module = bindings::MODULE;
 #[derive(Default)]
 struct RngExt {
     bm_saved: Option<f64>,
+    revision: u64,
 }
 
 impl Trace for RngExt {
@@ -36,9 +37,7 @@ impl CtxExt for LastKinds {}
 fn seed_binding(ctx: &mut Ctx) -> EvalResult<(Sym, Option<SexpId>)> {
     let symbol = ctx.session_mut().intern(".Random.seed")?;
     let value = ctx
-        .session()
-        .env_get(GLOBAL_ENV, symbol)
-        .map(|binding| binding.value)
+        .get_local(symbol, GLOBAL_ENV)?
         .filter(|&value| value != SEXP_UNBOUND);
     Ok((symbol, value))
 }
@@ -163,9 +162,16 @@ pub fn put_rng(ctx: &mut Ctx, rng: &Rng) -> EvalResult<()> {
         let value = session.alloc_int_from(&words)?;
         ctx.assign(symbol, value, GLOBAL_ENV)?;
     }
-    ctx.ext::<RngExt>().bm_saved = rng.bm_saved;
+    let state = ctx.ext::<RngExt>();
+    state.bm_saved = rng.bm_saved;
+    state.revision = state.revision.wrapping_add(1);
     ctx.ext::<LastKinds>().0 = rng.kinds;
     Ok(())
+}
+
+/// Return the revision of the saved stream. A completed write advances it.
+pub fn rng_revision(ctx: &mut Ctx) -> u64 {
+    ctx.ext::<RngExt>().revision
 }
 
 /// Load the stream, run a sequence of draws, and save the updated stream.

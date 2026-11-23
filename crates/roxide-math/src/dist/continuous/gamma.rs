@@ -1,8 +1,8 @@
 //! Gamma density, incomplete gamma ratios, and sampling.
 
-use crate::dist::normal::{pnorm, standard_quantile};
+use crate::dist::normal::{mills_ratio, pnorm, standard_quantile};
 use crate::rng::Rng;
-use crate::special::aux::{bd0, lgamma1p, log1pmx, stirlerr};
+use crate::special::aux::{EULER, bd0, lgamma1p, log1pmx, stirlerr};
 use crate::special::lgamma;
 
 use super::*;
@@ -65,7 +65,7 @@ pub fn pgamma(x: f64, shape: f64, scale: f64, tail: Tail, flags: &mut Flags) -> 
     }
     let z = x / scale;
     if z.is_nan() {
-        return f64::NAN;
+        return invalid(flags);
     }
     if x <= 0.0 || z.is_infinite() {
         return step(x > 0.0, tail);
@@ -74,22 +74,42 @@ pub fn pgamma(x: f64, shape: f64, scale: f64, tail: Tail, flags: &mut Flags) -> 
         return step(true, tail);
     }
     if shape.is_infinite() {
-        return if z < 1.0 { f64::NAN } else { step(false, tail) };
+        return if z < 1.0 {
+            invalid(flags)
+        } else {
+            step(false, tail)
+        };
     }
-    if z < f64::MIN_POSITIVE {
-        let lp = shape * (x.ln() - scale.ln()) - lgamma1p(shape);
-        return from_log(lp.min(0.0), true, tail);
-    }
-    let (lp, lower) = gamma_tail(z, shape, flags);
-    from_log(lp.min(0.0), lower, tail)
+    let lz = if z < f64::MIN_POSITIVE {
+        x.ln() - scale.ln()
+    } else {
+        z.ln()
+    };
+    let (lp, lower) = if z == 0.0 && shape > 0.5 {
+        (shape * lz - lgamma1p(shape), true)
+    } else {
+        gamma_tail(z, lz, shape, flags)
+    };
+    let lp = if (0.0..=8.0 * TOL).contains(&lp) {
+        0.0
+    } else {
+        lp
+    };
+    from_log(lp, lower, tail)
 }
 
-fn gamma_tail(z: f64, a: f64, flags: &mut Flags) -> (f64, bool) {
+fn gamma_tail(z: f64, lz: f64, a: f64, flags: &mut Flags) -> (f64, bool) {
     if a == 1.0 {
         return (-z, false);
     }
     if a <= 0.5 && z <= 1.1 {
-        let h = a * z.ln() - lgamma1p(a);
+        let correction = if a < f64::EPSILON {
+            -EULER
+        } else {
+            lgamma1p(a) / a
+        };
+        let h_per_shape = lz - correction;
+        let h = a * h_per_shape;
         let mut term = -z;
         let mut sum = term / (a + 1.0);
         for k in 2..=64 {
@@ -101,9 +121,10 @@ fn gamma_tail(z: f64, a: f64, flags: &mut Flags) -> (f64, bool) {
                 break;
             }
         }
-        let q = -h.exp_m1() - (h.exp() * sum) * a;
-        if q < 0.75 {
-            return (q.ln(), false);
+        let exprel = if h == 0.0 { 1.0 } else { h.exp_m1() / h };
+        let log_q = a.ln() + (-h_per_shape * exprel - h.exp() * sum).ln();
+        if log_q < 0.75_f64.ln() {
+            return (log_q, false);
         }
         return (h + (a * sum).ln_1p(), true);
     }
@@ -111,7 +132,6 @@ fn gamma_tail(z: f64, a: f64, flags: &mut Flags) -> (f64, bool) {
     if a >= 1000.0 && delta.abs() <= 0.25 {
         return temme(a, delta);
     }
-    let lz = z.ln();
     if z < a + 1.0 {
         let mut term = 1.0;
         let mut sum = 1.0;
@@ -128,23 +148,23 @@ fn gamma_tail(z: f64, a: f64, flags: &mut Flags) -> (f64, bool) {
         (gamma_factor(z, lz, a) - a.ln() + sum.ln(), true)
     } else {
         let first = (z - a) + 1.0;
-        let mut value = first;
-        let mut c = first;
+        let mut value = 1.0;
+        let mut c = 1.0;
         let mut d = 0.0;
         for k in 1..=100_000 {
             let n = f64::from(k);
-            let b = first + 2.0 * n;
-            let alpha = n * (a - n);
+            let b = 1.0 + (2.0 * n) / first;
+            let alpha = (n / first) * ((a - n) / first);
             d = floor_magnitude(alpha.mul_add(d, b)).recip();
             c = floor_magnitude(alpha / c + b);
             let ratio = c * d;
             value *= ratio;
             if (ratio - 1.0).abs() <= TOL {
-                return (gamma_factor(z, lz, a) - value.ln(), false);
+                return (gamma_factor(z, lz, a) - first.ln() - value.ln(), false);
             }
         }
         flags.set(Flags::NO_CONVERGENCE);
-        (gamma_factor(z, lz, a) - value.ln(), false)
+        (gamma_factor(z, lz, a) - first.ln() - value.ln(), false)
     }
 }
 
@@ -217,7 +237,7 @@ fn temme(a: f64, delta: f64) -> (f64, bool) {
     if base.is_infinite() {
         return (base, lower);
     }
-    let relative = (-deviance - base - 0.5 * a.ln() - LOG_SQRT_2PI).exp() * correction;
+    let relative = mills_ratio(-z, base) / a.sqrt() * correction;
     (
         base + if lower {
             (-relative).ln_1p()

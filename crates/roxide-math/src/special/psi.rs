@@ -7,6 +7,8 @@ use crate::Flags;
 use super::domain;
 use super::gamma::lgamma_positive;
 
+const SCALED_EXPONENT_LIMIT: f64 = 700.617_442_068_873;
+
 /// Return the first logarithmic derivative of the gamma function.
 pub fn digamma(x: f64, flags: &mut Flags) -> f64 {
     psigamma(x, 0, flags)
@@ -60,7 +62,7 @@ pub fn psigamma(x: f64, deriv: i32, flags: &mut Flags) -> f64 {
         let sign = if deriv % 2 == 0 { 1.0 } else { -1.0 };
         return (-PI.powi(deriv + 1)).mul_add(correction, sign * reflected);
     }
-    if -x.ln() * f64::from(deriv + 1) > 700.617_442_068_873 {
+    if -x.ln() * f64::from(deriv + 1) > SCALED_EXPONENT_LIMIT {
         return domain(flags);
     }
     positive(x, deriv)
@@ -86,6 +88,22 @@ fn positive(x: f64, deriv: i32) -> f64 {
     // Euler–Maclaurin expansion of the Hurwitz zeta function in DLMF 5.15.1.
     // Factor out x^(-s) to keep the terms in range for large orders.
     let s = deriv + 1;
+    let log_x = x.ln();
+    let factorial = (1..=deriv).map(f64::from).product::<f64>();
+    let sign = if deriv % 2 == 0 { -1.0 } else { 1.0 };
+    // At very large x the first integral term gives the scaled zeta sum.
+    if x >= f64::from(s) / (2.0 * f64::EPSILON) {
+        let order = f64::from(deriv);
+        let scaled = (-order * log_x - order.ln()).exp();
+        return if scaled == 0.0 {
+            0.0
+        } else {
+            sign * (factorial * scaled)
+        };
+    }
+    if f64::from(s) * log_x > SCALED_EXPONENT_LIMIT {
+        return 0.0;
+    }
     let steps = (12.0 + 0.5 * f64::from(s) - x).ceil().max(0.0) as u32;
     let end = x + f64::from(steps);
     let mut sum = 0.0;
@@ -101,18 +119,13 @@ fn positive(x: f64, deriv: i32) -> f64 {
     }
     sum += (x / end).powi(s) * tail;
 
-    let factorial = (1..=deriv).map(f64::from).product::<f64>();
     let power = x.powi(s);
     let magnitude = if power.is_normal() {
         (factorial / power) * sum
     } else {
-        ((-f64::from(s)).mul_add(x.ln(), lgamma_positive(f64::from(s))) + sum.ln()).exp()
+        ((-f64::from(s)).mul_add(log_x, lgamma_positive(f64::from(s))) + sum.ln()).exp()
     };
-    if deriv % 2 == 0 {
-        -magnitude
-    } else {
-        magnitude
-    }
+    sign * magnitude
 }
 
 fn digamma_positive(mut x: f64) -> f64 {

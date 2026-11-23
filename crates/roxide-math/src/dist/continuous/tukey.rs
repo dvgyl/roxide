@@ -116,11 +116,14 @@ pub fn ptukey(q: f64, nmeans: f64, df: f64, nranges: f64, tail: Tail, flags: &mu
     if q <= 0.0 {
         return step(false, tail);
     }
-    if !valid(nmeans, df, nranges) {
+    if df < 2.0 || nmeans < 2.0 || nranges < 1.0 {
         return invalid(flags);
     }
     if q.is_infinite() {
         return step(true, tail);
+    }
+    if !valid(nmeans, df, nranges) {
+        return invalid(flags);
     }
     on_scale(
         tukey_log_tail(q.ln(), nmeans, df, nranges, tail.lower),
@@ -133,11 +136,25 @@ pub fn qtukey(p: f64, nmeans: f64, df: f64, nranges: f64, tail: Tail, flags: &mu
     if p.is_nan() || nmeans.is_nan() || df.is_nan() || nranges.is_nan() {
         return p + nmeans + df + nranges;
     }
-    if !valid(nmeans, df, nranges) || !probability_valid(p, tail) {
+    if df < 2.0 || nmeans < 2.0 || nranges < 1.0 || !probability_valid(p, tail) {
         return invalid(flags);
     }
     if let Some(x) = endpoints(p, tail, 0.0, INF) {
         return x;
+    }
+    if !valid(nmeans, df, nranges) {
+        flags.set(Flags::NO_CONVERGENCE);
+        return invalid(flags);
+    }
+    if nmeans == 2.0 && nranges == 1.0 {
+        let (lp, lq) = probability_logs(p, tail);
+        let t = if lp < -20.0 {
+            // Invert the linear term of the central interval near zero.
+            (lp - std::f64::consts::LN_2 - super::dt(0.0, df, true, flags)).exp()
+        } else {
+            super::qt(lq - std::f64::consts::LN_2, df, LOG_UPPER, flags)
+        };
+        return std::f64::consts::SQRT_2 * t;
     }
     let (lp, lq) = probability_logs(p, tail);
     let lower = lp <= lq;

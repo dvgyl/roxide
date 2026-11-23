@@ -104,7 +104,7 @@ pub fn lgamma1p(a: f64) -> f64 {
 
 // The standard library constant is unstable.
 #[allow(clippy::approx_constant)]
-const EULER: f64 = 0.577_215_664_901_532_9;
+pub(crate) const EULER: f64 = 0.577_215_664_901_532_9;
 
 /// Return the error of Stirling's leading approximation to `ln(Gamma(n+1))`.
 ///

@@ -446,7 +446,9 @@ fn minimize<F: Objective>(
             .zip(&g)
             .zip(bounds)
             .fold(0.0_f64, |acc, ((&x, &g), &(lo, hi))| {
-                let component = if g > 0.0 {
+                let component = if g.is_nan() {
+                    0.0
+                } else if g > 0.0 {
                     g.min(x - lo)
                 } else {
                     g.max(x - hi)

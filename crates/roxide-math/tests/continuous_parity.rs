@@ -596,3 +596,79 @@ fn studentized_range_independent_checks() {
         );
     }
 }
+
+#[test]
+fn extreme_gamma_beta_f_and_t_tails() {
+    let mut flags = Flags::default();
+    let values = [
+        pgamma(
+            f64::from_bits(0x7fe4_d288_ce70_3afc),
+            2.0_f64.powi(1016),
+            1.0,
+            UPPER,
+            &mut flags,
+        ),
+        pbeta(0.5, 0.5, f64::from_bits(1), LOWER, &mut flags),
+        qf(0.5, 0.25, 1e308, Tail::default(), &mut flags),
+        qnf(0.5, 0.25, 1e308, 2.0, Tail::default(), &mut flags),
+        dt(0.0, 1e-310, true, &mut flags),
+        dnt(1e12, 5.0, 1e12, true, &mut flags),
+        dnf(1.0, INF, 5.0, 2.0, false, &mut flags),
+        dnt(0.0, 5.0, INF, true, &mut flags),
+        pnt(0.0, 5.0, -INF, Tail::default(), &mut flags),
+        ptukey(INF, INF, 10.0, 1.0, Tail::default(), &mut flags),
+        qtukey(0.0, 2.0, 10.0, INF, Tail::default(), &mut flags),
+        qtukey(1.0, 2.0, 10.0, INF, Tail::default(), &mut flags),
+        qtukey(0.95, 2.0, 10.0, 1.0, Tail::default(), &mut flags),
+    ];
+    let Some(expected) = oracle(
+        r#"
+        # Use the limit of the exact density integral at x = ncp -> Inf.
+        cat(sprintf("%.17g", c(
+          pgamma(0x1.4d288ce703afcp1023, shape=0x1p1016, lower.tail=FALSE, log.p=TRUE),
+          pbeta(.5,.5,5e-324,log.p=TRUE),
+          qf(.5,.25,1e308), qf(.5,.25,1e308,ncp=2),
+          dt(0,1e-310,log=TRUE), log(10*dchisq(5,5))-log(1e12),
+          df(1,Inf,5,ncp=2), dt(0,5,ncp=Inf,log=TRUE), pt(0,5,ncp=-Inf),
+          ptukey(Inf,Inf,10), qtukey(c(0,1),2,10,nranges=Inf),
+          sqrt(2)*qt(.975,10))))
+    "#,
+    ) else {
+        return;
+    };
+    assert_eq!(values.len(), expected.len());
+    for (actual, expected) in values.into_iter().zip(expected) {
+        assert!(
+            relative_error(actual, expected) < 2e-12,
+            "{actual} != {expected}"
+        );
+    }
+    let tiny = pgamma(0.5, f64::from_bits(1), 1.0, UPPER, &mut flags);
+    // Limit Q(a, z)/a = E1(z), with E1(0.5) = 0.5597735947761608.
+    assert!((tiny - (f64::from_bits(1).ln() + 0.559_773_594_776_160_8_f64.ln())).abs() < 2e-13);
+    assert_eq!(qlogis(1e-320, 2.0, 0.0, Tail::default(), &mut flags), 2.0);
+    assert_eq!(dlnorm(0.0, -INF, 0.0, false, &mut flags), INF);
+}
+
+#[test]
+fn invalid_continuous_boundaries_set_warning_flags() {
+    let cases: &[fn(&mut Flags) -> f64] = &[
+        |f| roxide_math::dist::normal::qnorm(0.5, 0.0, INF, Tail::default(), f),
+        |f| pgamma(INF, 2.0, INF, Tail::default(), f),
+        |f| pgamma(0.5, INF, 1.0, Tail::default(), f),
+        |f| pexp(INF, 0.0, Tail::default(), f),
+        |f| dexp(INF, 0.0, false, f),
+        |f| dexp(0.0, -0.0, false, f),
+        |f| pexp(0.0, -0.0, Tail::default(), f),
+        |f| qexp(0.0, -0.0, Tail::default(), f),
+        |f| dlogis(INF, INF, 1.0, false, f),
+        |f| plogis(INF, INF, 1.0, Tail::default(), f),
+        |f| dcauchy(INF, INF, 1.0, false, f),
+        |f| pcauchy(INF, INF, 1.0, Tail::default(), f),
+    ];
+    for case in cases {
+        let mut flags = Flags::default();
+        assert!(case(&mut flags).is_nan());
+        assert!(flags.has(Flags::NAN_PRODUCED));
+    }
+}

@@ -307,6 +307,7 @@ fn adaptive<F: VecFn>(
     let mut shortest = (b - a).abs() * 0.375;
     let mut roundoff = 0;
     let mut best = None;
+    let mut direct_converged = false;
     let status = loop {
         if !value.is_finite() || !error.is_finite() {
             break Status::NonFinite;
@@ -317,6 +318,7 @@ fn adaptive<F: VecFn>(
         if error == 0.0
             || (error <= tolerance(value) && (panels.len() > 1 || error != first.variation))
         {
+            direct_converged = true;
             break Status::Ok;
         }
         if roundoff >= 10
@@ -350,10 +352,15 @@ fn adaptive<F: VecFn>(
                 let start = (sequence.len() + 1) % 2;
                 if let Some(extrapolated) = epsilon(&sequence[start..]) {
                     if history.len() >= 3 {
-                        let estimate = history
+                        let history_error = history
                             .iter()
                             .map(|x| (extrapolated - x).abs())
-                            .sum::<f64>()
+                            .sum::<f64>();
+                        // Higher-order estimates can agree while retaining the same bias.
+                        // Compare with the extrapolation of the latest three subdivisions.
+                        let local = epsilon(&sequence[sequence.len() - 3..]).unwrap_or(value);
+                        let estimate = history_error
+                            .max((extrapolated - local).abs())
                             .max(5.0 * f64::EPSILON * extrapolated.abs());
                         if best.is_none_or(|(_, error)| estimate < error) {
                             best = Some((extrapolated, estimate));
@@ -394,7 +401,9 @@ fn adaptive<F: VecFn>(
     };
     let mut status = status;
     if let Some((estimate, uncertainty)) = best.filter(|&(v, e)| {
-        e < error && (v == 0.0 || value == 0.0 || e / v.abs() <= error / value.abs())
+        !direct_converged
+            && e < error
+            && (v == 0.0 || value == 0.0 || e / v.abs() <= error / value.abs())
     }) {
         let ratio = estimate / value;
         let cancellation = estimate.abs().max(value.abs()) <= 0.01 * first.magnitude;

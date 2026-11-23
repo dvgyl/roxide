@@ -24,7 +24,7 @@ impl Rng {
             SampleKind::Rejection => {
                 let bits = dn.log2().ceil() as u32;
                 let mask = (1u64 << bits) - 1;
-                loop {
+                for _ in 0..1024 {
                     let mut value = 0;
                     for _ in 0..=bits / 16 {
                         value = (value << 16) | (65536.0 * self.unif_rand()) as u64;
@@ -34,6 +34,7 @@ impl Rng {
                         return value as f64;
                     }
                 }
+                0.0
             }
         }
     }
@@ -48,6 +49,7 @@ impl Rng {
 
     /// Draw one-based indices without replacement from `n` elements.
     /// Select hashing to use memory proportional to the sample size.
+    /// Return an empty vector if the hashing retry limit is reached.
     /// The caller must validate the population and output sizes.
     pub fn sample_without_replacement(&mut self, n: u64, size: usize, use_hash: bool) -> Vec<u64> {
         if size == 0 || size as u64 > n {
@@ -59,11 +61,14 @@ impl Rng {
         let mut out = Vec::with_capacity(size);
         if use_hash {
             let mut seen = HashSet::with_capacity(size);
-            while out.len() < size {
-                let index = self.unif_index(n as f64) as u64 + 1;
-                if seen.insert(index) {
-                    out.push(index);
-                }
+            for _ in 0..size {
+                let Some(index) = (0..1024)
+                    .map(|_| self.unif_index(n as f64) as u64 + 1)
+                    .find(|&index| seen.insert(index))
+                else {
+                    return Vec::new();
+                };
+                out.push(index);
             }
         } else {
             let mut pool: Vec<_> = (1..=n).collect();

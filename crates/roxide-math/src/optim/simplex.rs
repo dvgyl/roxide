@@ -35,7 +35,7 @@ pub fn nelder_mead_with_report<F: Objective>(
     out.value = value;
     let c = control.common;
     let n = out.par.len();
-    if c.maxit == 0 || n == 0 || !value.is_finite() {
+    if c.maxit == 0 || n == 0 || !value.is_finite() || out.par.iter().any(|x| !x.is_finite()) {
         out.fncount = u32::from(c.maxit != 0);
         return Ok(out);
     }
@@ -53,7 +53,10 @@ pub fn nelder_mead_with_report<F: Objective>(
     for i in 0..n {
         let mut x = out.par.clone();
         let mut step = initial;
-        while out.par[i] + step == out.par[i] {
+        for _ in 0..32 {
+            if out.par[i] + step != out.par[i] {
+                break;
+            }
             step *= 10.0;
         }
         x[i] += step;

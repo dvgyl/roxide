@@ -86,7 +86,7 @@ pub fn rpois(rng: &mut Rng, lambda: f64, flags: &mut Flags) -> f64 {
     }
     if lambda < 10.0 {
         let initial = (-lambda).exp();
-        loop {
+        for _ in 0..100_000 {
             let u = rng.unif_rand();
             let mut mass = initial;
             let mut total = mass;
@@ -101,11 +101,13 @@ pub fn rpois(rng: &mut Rng, lambda: f64, flags: &mut Flags) -> f64 {
                 }
             }
         }
+        flags.set(Flags::NO_CONVERGENCE);
+        return f64::NAN;
     }
-    modified_normal(rng, lambda)
+    modified_normal(rng, lambda, flags)
 }
 
-fn modified_normal(rng: &mut Rng, lambda: f64) -> f64 {
+fn modified_normal(rng: &mut Rng, lambda: f64, flags: &mut Flags) -> f64 {
     // Ahrens and Dieter (1982), algorithm PD. Use the Poisson mass directly.
     let sd = lambda.sqrt();
     let normal_count = (lambda + sd * rng.norm_rand()).floor();
@@ -139,7 +141,7 @@ fn modified_normal(rng: &mut Rng, lambda: f64) -> f64 {
     {
         return normal_count;
     }
-    loop {
+    for _ in 0..100_000 {
         let e = rng.exp_rand();
         let u = 2.0 * rng.unif_rand() - 1.0;
         let t = 1.8 + e.copysign(u);
@@ -153,4 +155,6 @@ fn modified_normal(rng: &mut Rng, lambda: f64) -> f64 {
             return x;
         }
     }
+    flags.set(Flags::NO_CONVERGENCE);
+    f64::NAN
 }

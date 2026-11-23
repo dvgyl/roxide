@@ -165,7 +165,7 @@ impl Parameters {
         if q == INF || self.atom() {
             return step(true, tail);
         }
-        if self.size == INF || (self.prob == 1.0 && self.from_mean) {
+        if self.size == INF {
             return ppois(q, self.mean, tail, flags);
         }
         if q == 0.0 && tail.log && !tail.lower && self.prob <= 0.5 {
@@ -190,7 +190,7 @@ impl Parameters {
         if self.size == INF && !self.from_mean {
             return invalid(flags);
         }
-        if self.size == INF || (self.prob == 1.0 && self.from_mean) {
+        if self.size == INF {
             return qpois(p, self.mean, tail, flags);
         }
         let sd = self.mean.sqrt() / self.prob.sqrt();

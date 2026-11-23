@@ -80,7 +80,7 @@ pub fn dexp(x: f64, rate: f64, log: bool, flags: &mut Flags) -> f64 {
     if x.is_nan() || rate.is_nan() {
         return x + rate;
     }
-    if rate < 0.0 || rate.is_infinite() {
+    if rate.is_sign_negative() || rate.is_infinite() || x == INF && rate == 0.0 {
         return invalid(flags);
     }
     if x < 0.0 {
@@ -99,7 +99,7 @@ pub fn pexp(x: f64, rate: f64, tail: Tail, flags: &mut Flags) -> f64 {
     if x.is_nan() || rate.is_nan() {
         return x + rate;
     }
-    if rate < 0.0 {
+    if rate.is_sign_negative() || x == INF && rate == 0.0 {
         return invalid(flags);
     }
     if x <= 0.0 {
@@ -113,7 +113,7 @@ pub fn qexp(p: f64, rate: f64, tail: Tail, flags: &mut Flags) -> f64 {
     if p.is_nan() || rate.is_nan() {
         return p + rate;
     }
-    if rate < 0.0 || !probability_valid(p, tail) {
+    if rate.is_sign_negative() || !probability_valid(p, tail) {
         return invalid(flags);
     }
     if endpoints(p, tail, 0.0, INF) == Some(0.0) {
@@ -142,11 +142,11 @@ pub fn dlnorm(x: f64, meanlog: f64, sdlog: f64, log: bool, flags: &mut Flags) ->
     if sdlog < 0.0 {
         return invalid(flags);
     }
-    if x <= 0.0 {
-        return zero(log);
-    }
     if sdlog == 0.0 {
         return if x == meanlog.exp() { INF } else { zero(log) };
+    }
+    if x <= 0.0 {
+        return zero(log);
     }
     let density = dnorm(x.ln(), meanlog, sdlog, log, flags);
     if log { density - x.ln() } else { density / x }
@@ -185,6 +185,9 @@ pub fn dlogis(x: f64, location: f64, scale: f64, log: bool, flags: &mut Flags) -
         return invalid(flags);
     }
     let z = ((x - location) / scale).abs();
+    if z.is_nan() {
+        return invalid(flags);
+    }
     let e = (-z).exp();
     if log {
         -z - 2.0 * e.ln_1p() - scale.ln()
@@ -202,6 +205,9 @@ pub fn plogis(x: f64, location: f64, scale: f64, tail: Tail, flags: &mut Flags) 
         return invalid(flags);
     }
     let z = (x - location) / scale;
+    if z.is_nan() {
+        return invalid(flags);
+    }
     let z = if tail.lower { -z } else { z };
     if tail.log {
         -log1pexp(z)
@@ -225,13 +231,12 @@ pub fn qlogis(p: f64, location: f64, scale: f64, tail: Tail, flags: &mut Flags) 
         return invalid(flags);
     }
     let (lp, lq) = probability_logs(p, tail);
-    let odds = if tail.log {
-        lp - lq
+    let value = scale.mul_add(lp - lq, location);
+    if value.is_nan() {
+        invalid(flags)
     } else {
-        let logit = (p / complement(p)).ln();
-        if tail.lower { logit } else { -logit }
-    };
-    scale.mul_add(odds, location)
+        value
+    }
 }
 
 /// Draw from a logistic distribution.
@@ -255,6 +260,9 @@ pub fn dcauchy(x: f64, location: f64, scale: f64, log: bool, flags: &mut Flags) 
         return invalid(flags);
     }
     let z = (x - location) / scale;
+    if z.is_nan() {
+        return invalid(flags);
+    }
     if log {
         let shape = if z.abs() > 1e150 {
             2.0 * z.abs().ln()
@@ -278,6 +286,9 @@ pub fn pcauchy(x: f64, location: f64, scale: f64, tail: Tail, flags: &mut Flags)
         return invalid(flags);
     }
     let z = (x - location) / scale;
+    if z.is_nan() {
+        return invalid(flags);
+    }
     let z = if tail.lower { z } else { -z };
     if z.abs() <= 1.0 {
         let p = 0.5 + z.atan() / PI;

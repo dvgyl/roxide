@@ -133,3 +133,73 @@ fn limited_memory_search_with_numerical_gradients() {
     assert!((out.par[0] - 0.9998000378).abs() < 1e-7);
     assert!((out.par[1] - 0.9996001158).abs() < 1e-7);
 }
+
+struct InteriorSingularity;
+
+impl VecFn for InteriorSingularity {
+    type Err = Infallible;
+
+    fn eval(&mut self, x: &[f64], out: &mut [f64]) -> Result<(), Self::Err> {
+        for (y, &x) in out.iter_mut().zip(x) {
+            *y = (x - 0.231).abs().powf(-0.7);
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn interior_extrapolation_reports_a_valid_error() {
+    let tolerance = f64::EPSILON.sqrt().sqrt();
+    let out = quadpack::dqags(
+        &mut InteriorSingularity,
+        0.0,
+        1.0,
+        tolerance,
+        tolerance,
+        100,
+    )
+    .unwrap();
+    let exact = (0.231_f64.powf(0.3) + 0.769_f64.powf(0.3)) / 0.3;
+    assert_eq!(out.status, quadpack::Status::Ok, "{out:?}");
+    assert!((out.value - exact).abs() <= out.abs_error, "{out:?}");
+    assert!(
+        (out.value - 5.228_219_101_338_566).abs() <= 0.00061,
+        "{out:?}"
+    );
+}
+
+struct InfiniteGradient;
+
+impl Objective for InfiniteGradient {
+    type Err = Infallible;
+
+    fn value(&mut self, x: &[f64]) -> Result<f64, Infallible> {
+        Ok(x[0] * x[0])
+    }
+
+    fn gradient(&mut self, _: &[f64], g: &mut [f64]) -> Result<(), Infallible> {
+        g.fill(f64::INFINITY);
+        Ok(())
+    }
+}
+
+#[test]
+fn infinite_gradients_stop_without_an_infinite_backtrack() {
+    let control = optim::Control {
+        maxit: 10,
+        abstol: f64::NEG_INFINITY,
+        reltol: 1e-8,
+    };
+    let bfgs = optim::bfgs(&mut InfiniteGradient, vec![1.0], control).unwrap();
+    let cg = optim::cg(
+        &mut InfiniteGradient,
+        vec![1.0],
+        control,
+        optim::CgFormula::FletcherReeves,
+    )
+    .unwrap();
+    for out in [bfgs, cg] {
+        assert_eq!(out.par, [1.0]);
+        assert_eq!(out.fncount, 1);
+    }
+}

@@ -1,11 +1,11 @@
-use roxide_base::random::with_rng;
+use roxide_base::random::{get_rng, put_rng, rng_revision};
 use roxide_eval::{Args, Call, Ctx, EvalResult, Unwind};
 use roxide_gc::SexpId;
-use roxide_math::Objective;
 use roxide_math::fmin::fmin;
 use roxide_math::optim::{
     self, Anneal, BoxControl, CgFormula, Control, OptimOut, Progress, SimplexControl,
 };
+use roxide_math::{Objective, rng::Rng};
 use roxide_value::{NA_INTEGER, NA_REAL, SEXP_NIL, ValueApi};
 
 use super::{callback, named_list, scalar::string, strings};
@@ -121,9 +121,25 @@ struct RObjective<'a> {
     bounds: Option<Vec<(f64, f64)>>,
     method: Method,
     initial_error: Option<&'static str>,
+    anneal_rng: Option<(Rng, u64)>,
 }
 
 impl RObjective<'_> {
+    fn annealing_rng(&mut self) -> EvalResult<&mut Rng> {
+        let revision = rng_revision(self.ctx);
+        if self
+            .anneal_rng
+            .as_ref()
+            .is_none_or(|(_, saved)| *saved != revision)
+        {
+            self.anneal_rng = Some((get_rng(self.ctx, self.call)?, revision));
+        }
+        self.anneal_rng.as_mut().map(|(rng, _)| rng).ok_or_else(|| {
+            self.ctx
+                .stop(self.call.err_call(), "cannot load random stream")
+        })
+    }
+
     fn evaluate(&mut self, x: &[f64]) -> EvalResult<f64> {
         let point: Vec<_> = x
             .iter()
@@ -233,17 +249,16 @@ impl Anneal for RObjective<'_> {
                 *out = value / scale;
             }
         } else {
-            with_rng(self.ctx, self.call, |rng| {
-                for (next, &x) in next.iter_mut().zip(x) {
-                    *next = scale.mul_add(rng.norm_rand(), x);
-                }
-            })?;
+            let rng = self.annealing_rng()?;
+            for (next, &x) in next.iter_mut().zip(x) {
+                *next = scale.mul_add(rng.norm_rand(), x);
+            }
         }
         Ok(())
     }
 
     fn uniform(&mut self) -> EvalResult<f64> {
-        with_rng(self.ctx, self.call, |rng| rng.unif_rand())
+        Ok(self.annealing_rng()?.unif_rand())
     }
 }
 
@@ -333,6 +348,7 @@ fn make_objective<'a>(
         bounds: None,
         method,
         initial_error: None,
+        anneal_rng: None,
     })
 }
 
@@ -380,7 +396,6 @@ pub(super) fn optim(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
             method = Method::Bounded;
         }
         let controls = Settings::new(ctx, call, args.get(6), true)?;
-        let hessian = logical(ctx, call, args.get(7))?.ok_or_else(|| ctx.stop(call.err_call(), "missing value where TRUE/FALSE needed"))?;
         if method == Method::Bounded && (controls.get("reltol").is_some() || controls.get("abstol").is_some()) {
             ctx.warn_now(call.err_call(), "method L-BFGS-B uses 'factr' (and 'pgtol') instead of 'reltol' and 'abstol'")?;
         }
@@ -395,13 +410,21 @@ pub(super) fn optim(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
         if method == Method::Brent && n != 1 {
             return Err(ctx.stop(call.err_call(), "method = \"Brent\" is only available for one-dimensional optimization"));
         }
-        if matches!(method, Method::Bfgs | Method::Simplex) || hessian {
+        if matches!(method, Method::Bfgs | Method::Simplex) {
             limit::<f64>(ctx, call, n.saturating_mul(n))?;
         }
-        let needs_steps = hessian || (args.get(2) == SEXP_NIL && matches!(method, Method::Bfgs | Method::Cg | Method::Bounded));
+        let needs_steps = args.get(2) == SEXP_NIL && matches!(method, Method::Bfgs | Method::Cg | Method::Bounded);
         let mut f = make_objective(ctx, call, args, &controls, n, method, needs_steps)?;
         let scaled: Vec<_> = x.iter().zip(&f.parscale).map(|(x, s)| x / s).collect();
         let result = run(&mut f, scaled, interval, &controls)?;
+        let hessian = logical(f.ctx, call, args.get(7))?
+            .ok_or_else(|| f.ctx.stop(call.err_call(), "missing value where TRUE/FALSE needed"))?;
+        if hessian {
+            limit::<f64>(f.ctx, call, n.saturating_mul(n))?;
+            if !needs_steps && method != Method::Brent {
+                f.ndeps = controls.vector(f.ctx, call, "ndeps", n, 0.001)?;
+            }
+        }
         finish(&mut f, result, hessian, &controls)
     })
 }
@@ -525,9 +548,15 @@ fn run(
                 return Err(ctx.stop(call.err_call(), "'tmax' is not a positive integer"));
             }
             output.tmax = tmax;
-            optim::sann_with_report(f, par, control.maxit, temp, tmax, |f, event| {
+            f.annealing_rng()?;
+            let result = optim::sann_with_report(f, par, control.maxit, temp, tmax, |f, event| {
                 output.write(f, event)
-            })
+            })?;
+            f.annealing_rng()?;
+            if let Some((rng, _)) = f.anneal_rng.take() {
+                put_rng(f.ctx, &rng)?;
+            }
+            Ok(result)
         }
         Method::Brent => {
             let (lo, hi) = interval[0];

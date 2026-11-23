@@ -120,12 +120,12 @@ impl Bracket {
         let mut db = 0.01 * self.b.abs().max(0.0001);
         for i in 1..=maxit {
             let lower = if direction == "yes" {
-                self.fa.is_finite()
+                self.a.is_finite()
             } else {
                 sign * self.fa > 0.0
             };
             let upper = if direction == "yes" {
-                self.fb.is_finite()
+                self.b.is_finite()
             } else {
                 sign * self.fb < 0.0
             };
@@ -188,9 +188,18 @@ pub(super) fn root(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
             }
         }
         let direction = string(ctx, args.get(5))?;
-        let check = logical(ctx, call, args.get(6))?.unwrap_or(false);
+        let check = logical(ctx, call, args.get(6))?;
         let tol = number(ctx, call, args.get(7))?;
         let iteration_limit = number(ctx, call, args.get(8))?;
+        if !iteration_limit.is_finite() || iteration_limit > f64::from(i32::MAX) {
+            if !iteration_limit.is_nan() {
+                ctx.warn_now(
+                    call.err_call(),
+                    "NAs introduced by coercion to integer range",
+                )?;
+            }
+            return Err(ctx.stop(call.err_call(), "'maxiter' must be positive"));
+        }
         let maxit = (iteration_limit as i32).max(0) as u32;
         let trace = number(ctx, call, args.get(9))?;
         let init = if direction == "no" {
@@ -215,10 +224,7 @@ pub(super) fn root(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
         }
         let mut evaluate = |x| {
             let v = scalar_value(ctx, call, fun, x, "zeroin")?;
-            if v.is_nan() {
-                return Err(ctx.stop(call.err_call(), "invalid function value in 'zeroin'"));
-            }
-            Ok(v.clamp(-f64::MAX, f64::MAX))
+            finite_for_brent(ctx, call, v)
         };
         let result = zeroin(
             &mut evaluate,
@@ -235,6 +241,8 @@ pub(super) fn root(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
                 "invalid format '%d'; use format %f, %e, %g or %a for numeric objects",
             ));
         }
+        let check = check
+            .ok_or_else(|| ctx.stop(call.err_call(), "missing value where TRUE/FALSE needed"))?;
         if !result.converged && check {
             return Err(ctx.stop(
                 call.err_call(),

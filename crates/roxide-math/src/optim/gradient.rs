@@ -3,6 +3,7 @@ use crate::Objective;
 
 const REDUCTION: f64 = 0.2;
 const ARMIJO: f64 = 0.0001;
+const MAX_BACKTRACKS: usize = 512;
 
 /// Minimize with the Broyden–Fletcher–Goldfarb–Shanno inverse Hessian update.
 pub fn bfgs<F: Objective>(f: &mut F, par: Vec<f64>, c: Control) -> Result<OptimOut, F::Err> {
@@ -45,23 +46,28 @@ pub fn bfgs_with_report<F: Objective>(
             *d = -dot(&inverse[i * n..(i + 1) * n], &g);
         }
         let slope = dot(&direction, &g);
-        let mut step = 1.0;
+        let mut step: f64 = 1.0;
         let mut value = out.value;
-        if slope < 0.0 {
-            loop {
+        if slope < 0.0 && slope.is_finite() {
+            let mut progress = false;
+            for _ in 0..MAX_BACKTRACKS {
+                if step == 0.0 || !step.is_finite() {
+                    break;
+                }
                 move_to(&mut next, &x, &direction, step);
                 if unchanged(&next, &x) {
                     break;
                 }
                 value = out.value(f, &next)?;
                 if value.is_finite() && value <= (ARMIJO * step).mul_add(slope, out.value) {
+                    progress = true;
                     break;
                 }
                 step *= REDUCTION;
             }
-            let mut progress = !unchanged(&next, &x);
-            if value <= c.abstol
-                || (value - out.value).abs() <= c.reltol * (out.value.abs() + c.reltol)
+            if progress
+                && (value <= c.abstol
+                    || (value - out.value).abs() <= c.reltol * (out.value.abs() + c.reltol))
             {
                 x.copy_from_slice(&next);
                 out.value = value;
@@ -169,7 +175,7 @@ pub fn cg_with_report<F: Objective>(
     report(f, Progress::CgStep(false, 0, out.fncount, out.value, &x));
     loop {
         direction.fill(0.0);
-        let mut step = 1.0;
+        let mut step: f64 = 1.0;
         for k in 0..n.max(1) {
             out.grcount = out.grcount.map(|count| count.saturating_add(1));
             if out.grcount.unwrap_or(0) > c.maxit {
@@ -186,7 +192,7 @@ pub fn cg_with_report<F: Objective>(
                 CgFormula::PolakRibiere => (dot(&g, &difference), dot(&old_g, &old_g)),
                 CgFormula::BealeSorenson => (dot(&g, &difference), dot(&direction, &difference)),
             };
-            if numerator <= threshold || out.value <= c.abstol {
+            if !norm.is_finite() || numerator <= threshold || out.value <= c.abstol {
                 out.par = x;
                 report(f, Progress::Finish(out.fncount));
                 return Ok(out);
@@ -202,21 +208,26 @@ pub fn cg_with_report<F: Objective>(
             old_g.copy_from_slice(&g);
             out.par.copy_from_slice(&x);
             let slope = dot(&g, &direction);
-            if slope >= 0.0 {
+            if !slope.is_finite() || slope >= 0.0 {
                 break;
             }
-            let accepted = loop {
+            let mut accepted = false;
+            for _ in 0..MAX_BACKTRACKS {
+                if step == 0.0 || !step.is_finite() {
+                    break;
+                }
                 move_to(&mut next, &x, &direction, step);
                 if unchanged(&next, &x) {
-                    break false;
+                    break;
                 }
                 let value = out.value(f, &next)?;
                 if value.is_finite() && value <= (ARMIJO * step).mul_add(slope, out.value) {
                     out.value = value;
-                    break true;
+                    accepted = true;
+                    break;
                 }
                 step *= REDUCTION;
-            };
+            }
             if !accepted {
                 if k == 0 {
                     return Ok(out);

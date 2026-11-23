@@ -267,14 +267,16 @@ fn evaluate(ctx: &mut Ctx, call: &Call, args: &Args, op: Operation) -> EvalResul
             ));
         }
         lengths[i] = s.xlength(input)?;
-        *value = s.coerce(input, SexpType::Real)?.0;
+        vector_limit(ctx, call, lengths[i], size_of::<f64>())?;
+        *value = ctx.session_mut().coerce(input, SexpType::Real)?.0;
         ctx.protect(*value);
     }
     let scale = if args.len() == 3 {
         let s = ctx.session_mut();
         let input = args.get(2);
         lengths[2] = s.xlength(input)?;
-        let value = s.coerce(input, SexpType::Lgl)?.0;
+        vector_limit(ctx, call, lengths[2], size_of::<RLogical>())?;
+        let value = ctx.session_mut().coerce(input, SexpType::Lgl)?.0;
         ctx.protect(value);
         Some(value)
     } else {

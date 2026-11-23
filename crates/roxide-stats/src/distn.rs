@@ -50,6 +50,13 @@ fn columns<const N: usize>(
     Ok(columns)
 }
 
+#[derive(Clone, Copy)]
+enum KernelWarnings {
+    Default,
+    BinomialSize,
+    TukeyQuantile,
+}
+
 fn density<const N: usize>(
     ctx: &mut Ctx,
     call: &Call,
@@ -57,26 +64,32 @@ fn density<const N: usize>(
     kernel: impl Fn([f64; N], bool, &mut Flags) -> f64,
 ) -> EvalResult {
     let log = logical(ctx, call, args.get(N))? != Some(false);
-    vectorize(ctx, call, args, |row, flags| kernel(row, log, flags))
+    vectorize(ctx, call, args, KernelWarnings::Default, |row, flags| {
+        kernel(row, log, flags)
+    })
 }
 
 fn tail<const N: usize>(
     ctx: &mut Ctx,
     call: &Call,
     args: &Args,
+    warnings: KernelWarnings,
     kernel: impl Fn([f64; N], Tail, &mut Flags) -> f64,
 ) -> EvalResult {
     let tail = Tail {
         lower: logical(ctx, call, args.get(N))? != Some(false),
         log: logical(ctx, call, args.get(N + 1))? != Some(false),
     };
-    vectorize(ctx, call, args, |row, flags| kernel(row, tail, flags))
+    vectorize(ctx, call, args, warnings, |row, flags| {
+        kernel(row, tail, flags)
+    })
 }
 
 fn vectorize<const N: usize>(
     ctx: &mut Ctx,
     call: &Call,
     args: &Args,
+    warnings: KernelWarnings,
     kernel: impl Fn([f64; N], &mut Flags) -> f64,
 ) -> EvalResult {
     let inputs = &args.values()[..N];
@@ -112,7 +125,18 @@ fn vectorize<const N: usize>(
             kernel(row, &mut flags)
         };
         if flags.has(Flags::NONINT_X) {
-            ctx.warn_now(call.err_call(), format!("non-integer x = {:.6}", row[0]))?;
+            let (parameter, value) = if matches!(warnings, KernelWarnings::BinomialSize) {
+                ("n", row[1])
+            } else {
+                ("x", row[0])
+            };
+            ctx.warn_now(
+                call.err_call(),
+                format!("non-integer {parameter} = {value:.6}"),
+            )?;
+        }
+        if flags.has(Flags::NO_CONVERGENCE) && matches!(warnings, KernelWarnings::TukeyQuantile) {
+            ctx.warn_now(call.err_call(), "convergence failed in 'qtukey'")?;
         }
         invalid |= flags.has(Flags::NAN_PRODUCED);
         out.push(value);

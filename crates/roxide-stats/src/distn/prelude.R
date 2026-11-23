@@ -28,28 +28,28 @@ qweibull <- function(p, shape, scale = 1, lower.tail = TRUE, log.p = FALSE) .Int
 rweibull <- function(n, shape, scale = 1) .Internal(C_rweibull(n, shape, scale))
 dgamma <- function(x, shape, rate = 1, scale = 1/rate, log = FALSE) {
     if (!missing(rate) && !missing(scale)) {
-        if (rate * scale != 1) stop("specify 'rate' or 'scale' but not both")
+        if (abs(rate * scale - 1) > 1e-15) stop("specify 'rate' or 'scale' but not both")
         warning("specify 'rate' or 'scale' but not both")
     }
     .Internal(C_dgamma(x, shape, scale, log))
 }
 pgamma <- function(q, shape, rate = 1, scale = 1/rate, lower.tail = TRUE, log.p = FALSE) {
     if (!missing(rate) && !missing(scale)) {
-        if (rate * scale != 1) stop("specify 'rate' or 'scale' but not both")
+        if (abs(rate * scale - 1) > 1e-15) stop("specify 'rate' or 'scale' but not both")
         warning("specify 'rate' or 'scale' but not both")
     }
     .Internal(C_pgamma(q, shape, scale, lower.tail, log.p))
 }
 qgamma <- function(p, shape, rate = 1, scale = 1/rate, lower.tail = TRUE, log.p = FALSE) {
     if (!missing(rate) && !missing(scale)) {
-        if (rate * scale != 1) stop("specify 'rate' or 'scale' but not both")
+        if (abs(rate * scale - 1) > 1e-15) stop("specify 'rate' or 'scale' but not both")
         warning("specify 'rate' or 'scale' but not both")
     }
     .Internal(C_qgamma(p, shape, scale, lower.tail, log.p))
 }
 rgamma <- function(n, shape, rate = 1, scale = 1/rate) {
     if (!missing(rate) && !missing(scale)) {
-        if (rate * scale != 1) stop("specify 'rate' or 'scale' but not both")
+        if (abs(rate * scale - 1) > 1e-15) stop("specify 'rate' or 'scale' but not both")
         warning("specify 'rate' or 'scale' but not both")
     }
     .Internal(C_rgamma(n, shape, scale))
@@ -57,7 +57,10 @@ rgamma <- function(n, shape, rate = 1, scale = 1/rate) {
 dbeta <- function(x, shape1, shape2, ncp = 0, log = FALSE) if (missing(ncp)) .Internal(C_dbeta(x, shape1, shape2, log)) else .Internal(C_dnbeta(x, shape1, shape2, ncp, log))
 pbeta <- function(q, shape1, shape2, ncp = 0, lower.tail = TRUE, log.p = FALSE) if (missing(ncp)) .Internal(C_pbeta(q, shape1, shape2, lower.tail, log.p)) else .Internal(C_pnbeta(q, shape1, shape2, ncp, lower.tail, log.p))
 qbeta <- function(p, shape1, shape2, ncp = 0, lower.tail = TRUE, log.p = FALSE) if (missing(ncp)) .Internal(C_qbeta(p, shape1, shape2, lower.tail, log.p)) else .Internal(C_qnbeta(p, shape1, shape2, ncp, lower.tail, log.p))
-rbeta <- function(n, shape1, shape2, ncp = 0) if (missing(ncp)) .Internal(C_rbeta(n, shape1, shape2)) else .Internal(C_rnbeta(n, shape1, shape2, ncp))
+rbeta <- function(n, shape1, shape2, ncp = 0) if (missing(ncp)) .Internal(C_rbeta(n, shape1, shape2)) else {
+    x <- rchisq(n, 2 * shape1, ncp)
+    x / (x + rchisq(n, 2 * shape2))
+}
 dchisq <- function(x, df, ncp = 0, log = FALSE) if (missing(ncp)) .Internal(C_dchisq(x, df, log)) else .Internal(C_dnchisq(x, df, ncp, log))
 pchisq <- function(q, df, ncp = 0, lower.tail = TRUE, log.p = FALSE) if (missing(ncp)) .Internal(C_pchisq(q, df, lower.tail, log.p)) else .Internal(C_pnchisq(q, df, ncp, lower.tail, log.p))
 qchisq <- function(p, df, ncp = 0, lower.tail = TRUE, log.p = FALSE) if (missing(ncp)) .Internal(C_qchisq(p, df, lower.tail, log.p)) else .Internal(C_qnchisq(p, df, ncp, lower.tail, log.p))
@@ -65,11 +68,11 @@ rchisq <- function(n, df, ncp = 0) if (missing(ncp)) .Internal(C_rchisq(n, df)) 
 dt <- function(x, df, ncp, log = FALSE) if (missing(ncp)) .Internal(C_dt(x, df, log)) else .Internal(C_dnt(x, df, ncp, log))
 pt <- function(q, df, ncp, lower.tail = TRUE, log.p = FALSE) if (missing(ncp)) .Internal(C_pt(q, df, lower.tail, log.p)) else .Internal(C_pnt(q, df, ncp, lower.tail, log.p))
 qt <- function(p, df, ncp, lower.tail = TRUE, log.p = FALSE) if (missing(ncp)) .Internal(C_qt(p, df, lower.tail, log.p)) else .Internal(C_qnt(p, df, ncp, lower.tail, log.p))
-rt <- function(n, df, ncp) if (missing(ncp)) .Internal(C_rt(n, df)) else .Internal(C_rnt(n, df, ncp))
+rt <- function(n, df, ncp) if (missing(ncp)) .Internal(C_rt(n, df)) else rnorm(n, ncp) / sqrt(rchisq(n, df) / df)
 df <- function(x, df1, df2, ncp, log = FALSE) if (missing(ncp)) .Internal(C_df(x, df1, df2, log)) else .Internal(C_dnf(x, df1, df2, ncp, log))
 pf <- function(q, df1, df2, ncp, lower.tail = TRUE, log.p = FALSE) if (missing(ncp)) .Internal(C_pf(q, df1, df2, lower.tail, log.p)) else .Internal(C_pnf(q, df1, df2, ncp, lower.tail, log.p))
 qf <- function(p, df1, df2, ncp, lower.tail = TRUE, log.p = FALSE) if (missing(ncp)) .Internal(C_qf(p, df1, df2, lower.tail, log.p)) else .Internal(C_qnf(p, df1, df2, ncp, lower.tail, log.p))
-rf <- function(n, df1, df2, ncp) if (missing(ncp)) .Internal(C_rf(n, df1, df2)) else .Internal(C_rnf(n, df1, df2, ncp))
+rf <- function(n, df1, df2, ncp) if (missing(ncp)) .Internal(C_rf(n, df1, df2)) else (rchisq(n, df1, ncp) / df1) / (rchisq(n, df2) / df2)
 ptukey <- function(q, nmeans, df, nranges = 1, lower.tail = TRUE, log.p = FALSE) .Internal(C_ptukey(q, nmeans, df, nranges, lower.tail, log.p))
 qtukey <- function(p, nmeans, df, nranges = 1, lower.tail = TRUE, log.p = FALSE) .Internal(C_qtukey(p, nmeans, df, nranges, lower.tail, log.p))
 dbinom <- function(x, size, prob, log = FALSE) .Internal(C_dbinom(x, size, prob, log))

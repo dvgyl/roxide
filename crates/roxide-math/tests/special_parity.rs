@@ -109,3 +109,55 @@ fn bessel_recurrences_hold_across_seed_and_transition_regions() {
     }
     assert_eq!(flags.bits(), 0);
 }
+
+#[test]
+fn large_bessel_orders_and_special_boundaries() {
+    let mut flags = Flags::default();
+    // GNU R 4.6.2 values at, below, and above the turning point.
+    let cases = [
+        (
+            19_000.0,
+            7.445_178_985_728_955e-97,
+            -6.842_593_182_251_971e91,
+        ),
+        (
+            20_000.0,
+            0.015_921_497_394_404_703,
+            -0.029_508_459_775_872_645,
+        ),
+        (
+            20_001.0,
+            0.016_478_667_467_120_338,
+            -0.028_541_890_673_706_563,
+        ),
+        (
+            20_002.0,
+            0.017_035_800_409_243_174,
+            -0.027_575_386_023_084_007,
+        ),
+        (
+            21_000.0,
+            -0.005_943_177_445_086_373,
+            -0.008_009_389_467_197_892,
+        ),
+    ];
+    for (x, j, y) in cases {
+        near(bessel_j(x, 20_001.0, &mut flags), j, 2e-10);
+        near(bessel_y(x, 20_001.0, &mut flags), y, 2e-10);
+    }
+    near(
+        bessel_k(1e7, 20_001.0, true, &mut flags),
+        192_670.334_610_426_45,
+        2e-13,
+    );
+    assert_eq!(flags.bits(), 0);
+    assert_eq!(choose(3.0 + 1e-10, 4.0, &mut flags), 0.0);
+    near(
+        psigamma(1025.0, 100, &mut flags),
+        -8.291_503_113_543_444e-146,
+        2e-13,
+    );
+    assert_eq!(psigamma(1030.0, 100, &mut flags), 0.0);
+    assert_eq!(psigamma(2000.0, 100, &mut flags), 0.0);
+    near(psigamma(1e154, 1, &mut flags), 1e-154, 2e-13);
+}

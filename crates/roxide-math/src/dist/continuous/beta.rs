@@ -1,11 +1,11 @@
 //! Beta density and incomplete beta ratios.
 
-use crate::dist::normal::{pnorm, standard_quantile};
+use crate::dist::normal::{mills_ratio, pnorm, standard_quantile};
 use crate::rng::Rng;
-use crate::special::aux::{lgamma1p, log1pexp, log1pmx, stirlerr};
+use crate::special::aux::{lgamma1p, log1pmx, stirlerr};
 use crate::special::{lbeta, lgamma};
 
-use super::gamma::{pgamma, rgamma};
+use super::gamma::pgamma;
 use super::*;
 
 const INF: f64 = f64::INFINITY;
@@ -120,6 +120,28 @@ fn beta_tail(mut x: f64, mut y: f64, mut a: f64, mut b: f64, flags: &mut Flags) 
     if a == 1.0 {
         return (b * coordinate_log(y, x), false);
     }
+    // A beta variate near the smaller shape has a gamma limit. The
+    // expansion error is of order (shape + argument)^2 / large_shape.
+    let (shape, large_shape, coordinate, direct) = if a <= b {
+        (a, b, x, true)
+    } else {
+        (b, a, y, false)
+    };
+    let scaled = large_shape * coordinate;
+    if large_shape >= 2.0 / TOL
+        && scaled.is_normal()
+        && shape + scaled <= (0.25 * TOL * large_shape).sqrt()
+    {
+        let gamma_lower = scaled <= shape;
+        let tail = Tail {
+            lower: gamma_lower,
+            log: true,
+        };
+        return (
+            pgamma(scaled, shape, 1.0, tail, flags),
+            gamma_lower == direct,
+        );
+    }
     if a.min(b) <= 1.0 {
         if x > 0.5 {
             (x, y, a, b) = (y, x, b, a);
@@ -231,7 +253,12 @@ fn bpser(x: f64, y: f64, a: f64, b: f64, flags: &mut Flags) -> f64 {
         }
     }
     let log_abeta = if a.max(b) <= 0.5 {
-        lgamma1p(a) + lgamma1p(b) - lgamma1p(a + b) + (a / b).ln_1p()
+        let log_ratio = if a <= b {
+            (a / b).ln_1p()
+        } else {
+            a.ln() - b.ln() + (b / a).ln_1p()
+        };
+        lgamma1p(a) + lgamma1p(b) - lgamma1p(a + b) + log_ratio
     } else {
         a.ln() + lbeta(a, b, flags)
     };
@@ -365,7 +392,7 @@ fn basym(a: f64, b: f64, lambda: f64) -> f64 {
     inverse[0] = 1.0;
     reciprocal[0] = 1.0;
     moment[0] = 1.0;
-    let mills = (-deviance - LOG_SQRT_2PI - base).exp() * variance.sqrt();
+    let mills = mills_ratio(z, base) * variance.sqrt();
     let mut edge = mills;
     let mut sum = 1.0;
     let mut prior = 1.0;
@@ -493,28 +520,79 @@ pub(super) fn beta_quantile_odds(lp: f64, lq: f64, a: f64, b: f64, flags: &mut F
 }
 
 /// Draw from a beta distribution with the specified shapes.
-pub fn rbeta(rng: &mut Rng, a: f64, b: f64, flags: &mut Flags) -> f64 {
-    if a.is_nan() || b.is_nan() || a < 0.0 || b < 0.0 {
+pub fn rbeta(rng: &mut Rng, shape1: f64, shape2: f64, flags: &mut Flags) -> f64 {
+    if shape1.is_nan() || shape2.is_nan() || shape1 < 0.0 || shape2 < 0.0 {
         return invalid(flags);
     }
-    if let Some(at) = atom(a, b) {
+    if let Some(at) = atom(shape1, shape2) {
         return at;
     }
-    if a == 0.0 && b == 0.0 {
+    if shape1 == 0.0 && shape2 == 0.0 {
         return if rng.unif_rand() < 0.5 { 0.0 } else { 1.0 };
     }
-    let mut draw = |shape: f64| {
-        if shape < 1.0 {
-            rgamma(rng, shape + 1.0, 1.0, flags).ln() + rng.unif_rand().ln() / shape
-        } else {
-            rgamma(rng, shape, 1.0, flags).ln()
+    let a = shape1.min(shape2);
+    let b = shape1.max(shape2);
+    let sum = a + b;
+    // Cheng (1978), BB and BC. Keep the draw order and floating-point operations.
+    if a > 1.0 {
+        let beta = ((sum - 2.0) / (2.0 * a).mul_add(b, -sum)).sqrt();
+        let gamma = a + beta.recip();
+        for _ in 0..100_000 {
+            let u1 = rng.unif_rand();
+            let u2 = rng.unif_rand();
+            let v = beta * (u1 / (1.0 - u1)).ln();
+            let w = beta_weight(a, v);
+            let z = (u1 * u1) * u2;
+            let r = gamma.mul_add(v, -1.3862944);
+            let s = (a + r) - w;
+            let accept = if s + 2.609438 >= 5.0 * z {
+                true
+            } else {
+                let t = z.ln();
+                s >= t
+                    || sum.mul_add((sum / (b + w)).ln(), r).partial_cmp(&t)
+                        != Some(std::cmp::Ordering::Less)
+            };
+            if accept {
+                return if shape1 == a { w } else { b } / (b + w);
+            }
         }
-    };
-    let x = draw(a);
-    let y = draw(b);
-    if x == f64::NEG_INFINITY && y == f64::NEG_INFINITY {
-        let (p, _) = logistic_coordinates(a.ln() - b.ln());
-        return if rng.unif_rand() < p { 1.0 } else { 0.0 };
+    } else {
+        let beta = a.recip();
+        let delta = (1.0 + b) - a;
+        let k1 = delta * 0.0416667_f64.mul_add(a, 0.0138889) / b.mul_add(beta, -0.777778);
+        let k2 = (0.5 + 0.25 / delta).mul_add(a, 0.25);
+        for _ in 0..100_000 {
+            let u1 = rng.unif_rand();
+            let u2 = rng.unif_rand();
+            let z = if u1 < 0.5 {
+                let y = u1 * u2;
+                let z = u1 * y;
+                if (0.25 * u2 + z) - y >= k1 {
+                    continue;
+                }
+                z
+            } else {
+                let z = (u1 * u1) * u2;
+                if z > 0.25 && z >= k2 {
+                    continue;
+                }
+                z
+            };
+            let v = beta * (u1 / (1.0 - u1)).ln();
+            let w = beta_weight(b, v);
+            if (u1 >= 0.5 && z <= 0.25)
+                || sum.mul_add((sum / (a + w)).ln() + v, -1.3862944) >= z.ln()
+            {
+                return if shape1 == a { a } else { w } / (a + w);
+            }
+        }
     }
-    (-log1pexp(y - x)).exp()
+    flags.set(Flags::NO_CONVERGENCE);
+    f64::NAN
+}
+
+fn beta_weight(shape: f64, v: f64) -> f64 {
+    let w = shape * v.exp();
+    if w.is_finite() { w } else { f64::MAX }
 }

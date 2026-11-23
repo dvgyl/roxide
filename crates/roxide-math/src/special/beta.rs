@@ -86,6 +86,10 @@ fn binomial(mut n: f64, k: f64, log: bool, flags: &mut Flags) -> f64 {
         flags.set(Flags::NONINT_X);
     }
     let mut k = rounded;
+    let rounded_n = n.round_ties_even();
+    if (n - rounded_n).abs() <= 1e-9 * rounded_n.abs().max(1.0) {
+        n = rounded_n;
+    }
     let zero = if log { f64::NEG_INFINITY } else { 0.0 };
     if k < 0.0 || n >= 0.0 && n.is_finite() && n.fract() == 0.0 && k > n {
         return zero;

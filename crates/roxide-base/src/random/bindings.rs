@@ -196,15 +196,33 @@ fn set_seed(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     let seed = if seed == SEXP_NIL {
         time_seed(ctx)
     } else {
-        let (value, warn) = ctx.session_mut().coerce(seed, SexpType::Int)?;
+        let ty = ctx.session().type_of(seed)?;
+        if !matches!(
+            ty,
+            SexpType::Lgl
+                | SexpType::Int
+                | SexpType::Real
+                | SexpType::Cplx
+                | SexpType::Str
+                | SexpType::Raw
+        ) {
+            return Err(ctx.stop(call.err_call(), "supplied seed is not a valid integer"));
+        }
+        let first = if ctx.session().xlength(seed)? > 1 {
+            crate::ops::common::element(ctx.session_mut(), seed, 0)?
+        } else {
+            seed
+        };
+        ctx.protect(first);
+        let (value, warn) = ctx.session_mut().coerce(first, SexpType::Int)?;
         let words = ctx.session().int(value)?;
-        let seed = if words.len() == 1 {
+        let seed = if !words.is_empty() {
             words.get(0)
         } else {
             NA_INTEGER
         };
         if warn.na_introduced {
-            let message = if ctx.session().type_of(args.values()[0])? == SexpType::Real {
+            let message = if ty == SexpType::Real {
                 "NAs introduced by coercion to integer range"
             } else {
                 "NAs introduced by coercion"
@@ -267,6 +285,9 @@ fn rng_kind(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
 }
 
 fn scalar_real(ctx: &mut Ctx, value: SexpId) -> EvalResult<f64> {
+    if ctx.session().xlength(value)? != 1 {
+        return Ok(f64::NAN);
+    }
     let (value, _) = ctx.session_mut().coerce(value, SexpType::Real)?;
     let values = ctx.session().real(value)?;
     Ok(if values.len() == 1 {
@@ -277,6 +298,9 @@ fn scalar_real(ctx: &mut Ctx, value: SexpId) -> EvalResult<f64> {
 }
 
 fn logical(ctx: &mut Ctx, value: SexpId) -> EvalResult<Option<bool>> {
+    if ctx.session().xlength(value)? != 1 {
+        return Ok(None);
+    }
     let (value, _) = ctx.session_mut().coerce(value, SexpType::Lgl)?;
     let flags = ctx.session().lgl(value)?;
     Ok(match (flags.len() == 1).then(|| flags.get(0)) {
@@ -294,6 +318,10 @@ fn weights(
     size: usize,
     replace: bool,
 ) -> EvalResult<Vec<f64>> {
+    let len = ctx.session().xlength(prob)?;
+    if len as u64 != n {
+        return Err(ctx.stop(call.err_call(), "incorrect number of probabilities"));
+    }
     let (prob, warning) = ctx.session_mut().coerce(prob, SexpType::Real)?;
     let weights = ctx.session().real(prob)?;
     let mut weights = if weights.len() as u64 == n {
@@ -384,7 +412,14 @@ fn sample_int(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     } else {
         0
     };
-    if size > limit / 8 || workspace > (limit / 16) as u64 {
+    let output_bytes = size.saturating_mul(8);
+    let workspace_bytes = if hash {
+        // Allow for buckets, control bytes, and power-of-two rounding.
+        size.saturating_mul(24)
+    } else {
+        (workspace as usize).saturating_mul(if weighted { 32 } else { 8 })
+    };
+    if output_bytes.saturating_add(workspace_bytes) > limit {
         return Err(ctx.stop(
             call.err_call(),
             "sampling allocation exceeds the vector size limit",
@@ -401,6 +436,9 @@ fn sample_int(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
         (true, None) => rng.sample_with_replacement(n, size),
         (false, None) => rng.sample_without_replacement(n, size, hash),
     })?;
+    if indices.len() != size {
+        return Err(ctx.stop(call.err_call(), "sampling did not converge"));
+    }
     if population > f64::from(i32::MAX) {
         let indices: Vec<_> = indices.into_iter().map(|i| i as f64).collect();
         Ok(ctx.session_mut().alloc_real_from(&indices)?)

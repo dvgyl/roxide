@@ -50,9 +50,12 @@ fn i_hankel(x: f64, nu: f64) -> f64 {
     sum / ((2.0 * PI).sqrt() * x.sqrt())
 }
 
-pub(super) fn k_positive(x: f64, nu: f64, shift: f64, flags: &mut Flags) -> f64 {
+pub(super) fn k_positive(x: f64, nu: f64, shift: f64, _flags: &mut Flags) -> f64 {
     if x >= 24.0 + nu * nu {
         return k_seed(x, nu) * shift.exp();
+    }
+    if nu > MAX_RECURRENCE as f64 {
+        return k_debye(x, nu, shift);
     }
     let count = nu as usize;
     let frac = nu.fract();
@@ -66,7 +69,7 @@ pub(super) fn k_positive(x: f64, nu: f64, shift: f64, flags: &mut Flags) -> f64 
     }
     // DLMF 10.29.1. Keep a separate binary exponent during upward recurrence.
     let mut exponent = 0;
-    for n in 1..count.min(MAX_RECURRENCE) {
+    for n in 1..count {
         let scale = 2.0 * (frac + n as f64) / x;
         if value > 1e150 / scale.max(1.0) {
             previous *= 2.0_f64.powi(-512);
@@ -77,10 +80,6 @@ pub(super) fn k_positive(x: f64, nu: f64, shift: f64, flags: &mut Flags) -> f64 
         if value.is_infinite() || f64::from(exponent) > 1024.0 - shift / std::f64::consts::LN_2 {
             return f64::INFINITY;
         }
-    }
-    if count > MAX_RECURRENCE {
-        flags.set(Flags::PRECISION);
-        return f64::INFINITY;
     }
     if exponent == 0 && shift > -708.0 {
         return value * shift.exp();
@@ -115,4 +114,22 @@ fn k_seed(x: f64, nu: f64) -> f64 {
         let order = nu * t;
         0.5 * ((exponent + order).exp() + (exponent - order).exp())
     })
+}
+
+// DLMF 10.41.4. Compute the scaled exponent without subtracting x.
+fn k_debye(x: f64, nu: f64, shift: f64) -> f64 {
+    let hypotenuse = x.hypot(nu);
+    let t = nu / hypotenuse;
+    let square = t * t;
+    let u1 = t * (3.0 - 5.0 * square) / 24.0;
+    let u2 = square * (81.0 + square * (-462.0 + 385.0 * square)) / 1152.0;
+    let ratio = nu / x;
+    let hyperbolic = if ratio.is_finite() {
+        ratio.asinh()
+    } else {
+        nu.ln() - x.ln() + std::f64::consts::LN_2
+    };
+    let exponent = nu * (hyperbolic - t / (1.0 + x / hypotenuse)) + shift;
+    let log_prefactor = 0.5 * ((0.5 * PI).ln() - hypotenuse.ln());
+    (exponent + log_prefactor + (-u1 / nu + (u2 / nu) / nu).ln_1p()).exp()
 }

@@ -4,13 +4,14 @@ use crate::dist::normal::{dnorm, pnorm, qnorm};
 use crate::rng::Rng;
 use crate::special::aux::{bd0, stirlerr};
 
-use super::beta::{beta_factor, rbeta};
+use super::beta::beta_factor;
 use super::gamma::{dgamma, pgamma, rgamma};
-use super::quadrature::{log_chisq_scale, log_integral};
+use super::quadrature::{centered_integral, log_chisq_scale, log_integral};
 use super::ratios::{f_coordinates, rchisq};
 use super::*;
 
 const INF: f64 = f64::INFINITY;
+const MAX_QUANTILE_COMPONENTS: usize = 500_000;
 
 fn poisson_log_mass(k: f64, mean: f64) -> f64 {
     if k == 0.0 {
@@ -24,7 +25,13 @@ fn poisson_mixture(
     mean: f64,
     mut component: impl FnMut(f64, &mut Flags) -> f64,
     flags: &mut Flags,
+    budget: &mut usize,
 ) -> f64 {
+    if *budget == 0 {
+        flags.set(Flags::NO_CONVERGENCE);
+        return f64::NAN;
+    }
+    *budget -= 1;
     if mean == 0.0 {
         return component(0.0, flags);
     }
@@ -52,6 +59,11 @@ fn poisson_mixture(
             } else {
                 (mean / next).ln()
             };
+            if *budget == 0 {
+                flags.set(Flags::NO_CONVERGENCE);
+                return f64::NAN;
+            }
+            *budget -= 1;
             let term = log_weight + component(next, flags);
             // Component terms decrease at least geometrically beyond this point.
             let ratio = (term - previous).exp();
@@ -68,53 +80,6 @@ fn poisson_mixture(
         }
     }
     sum
-}
-
-fn rpoisson(rng: &mut Rng, mean: f64, flags: &mut Flags) -> f64 {
-    if mean == 0.0 {
-        return 0.0;
-    }
-    if mean < 30.0 {
-        let mut count = 0.0;
-        let mut sum = rng.exp_rand();
-        for _ in 0..100_000 {
-            if sum > mean {
-                return count;
-            }
-            count += 1.0;
-            sum += rng.exp_rand();
-        }
-    } else if mean < 4_503_599_627_370_496.0 {
-        // Use two geometric tails with a common center. The ratio of the
-        // Poisson mass to this proposal peaks at the adjacent integers
-        // around mean*exp(±rate).
-        let mode = mean.floor();
-        let rate = mean.sqrt().recip();
-        let envelope = |k: f64| poisson_log_mass(k, mean) + rate * (k - mode).abs();
-        let left = (mean * (-rate).exp()).floor();
-        let right = (mean * rate.exp()).floor();
-        let bound = envelope(mode).max(envelope(left)).max(envelope(right)) + 1e-12;
-        for _ in 0..100_000 {
-            let magnitude = (rng.exp_rand() / rate).floor();
-            let negative = rng.unif_rand() < 0.5;
-            if negative && magnitude == 0.0 {
-                continue;
-            }
-            let k = if negative {
-                mode - magnitude
-            } else {
-                mode + magnitude
-            };
-            if k >= 0.0 && rng.unif_rand().ln() <= envelope(k) - bound {
-                return k;
-            }
-        }
-    } else {
-        flags.set(Flags::PRECISION);
-        return mean.sqrt().mul_add(rng.norm_rand(), mean).round();
-    }
-    flags.set(Flags::NO_CONVERGENCE);
-    f64::NAN
 }
 
 fn positive_quantile(
@@ -170,10 +135,12 @@ pub fn dnchisq(x: f64, df: f64, ncp: f64, log: bool, flags: &mut Flags) -> f64 {
         }
         return zero(log);
     }
+    let mut budget = usize::MAX;
     let value = poisson_mixture(
         0.5 * ncp,
         |k, flags| dgamma(x, 0.5 * df + k, 2.0, true, flags),
         flags,
+        &mut budget,
     );
     on_scale(value, log)
 }
@@ -204,6 +171,18 @@ fn poisson_small(
 
 /// Evaluate a noncentral chi-square tail probability.
 pub fn pnchisq(x: f64, df: f64, ncp: f64, tail: Tail, flags: &mut Flags) -> f64 {
+    let mut budget = usize::MAX;
+    pnchisq_budget(x, df, ncp, tail, flags, &mut budget)
+}
+
+fn pnchisq_budget(
+    x: f64,
+    df: f64,
+    ncp: f64,
+    tail: Tail,
+    flags: &mut Flags,
+    budget: &mut usize,
+) -> f64 {
     if x.is_nan() || df.is_nan() || ncp.is_nan() {
         return x + df + ncp;
     }
@@ -226,9 +205,9 @@ pub fn pnchisq(x: f64, df: f64, ncp: f64, tail: Tail, flags: &mut Flags) -> f64 
     let value = if ncp < 80.0 {
         poisson_small(mean, component, flags)
     } else {
-        poisson_mixture(mean, component, flags)
+        poisson_mixture(mean, component, flags, budget)
     };
-    on_scale(value.min(0.0), tail.log)
+    on_scale(if value > 0.0 { 0.0 } else { value }, tail.log)
 }
 
 /// Evaluate a noncentral chi-square quantile.
@@ -254,45 +233,82 @@ pub fn qnchisq(p: f64, df: f64, ncp: f64, tail: Tail, flags: &mut Flags) -> f64 
     }
     let lower = lp <= lq;
     let log_tail = Tail { lower, log: true };
-    positive_quantile(lp.min(lq), lower, (df + ncp).min(f64::MAX), |x| {
+    let mut budget = MAX_QUANTILE_COMPONENTS;
+    let value = positive_quantile(lp.min(lq), lower, (df + ncp).min(f64::MAX), |x| {
         (
-            pnchisq(x, df, ncp, log_tail, flags),
+            pnchisq_budget(x, df, ncp, log_tail, flags, &mut budget),
             if ncp < 80.0 && x.is_finite() && x > 0.0 {
                 poisson_small(
                     0.5 * ncp,
                     |k, flags| dgamma(x, 0.5 * df + k, 2.0, true, flags),
                     flags,
                 )
+            } else if x.is_finite() && x > 0.0 {
+                poisson_mixture(
+                    0.5 * ncp,
+                    |k, flags| dgamma(x, 0.5 * df + k, 2.0, true, flags),
+                    flags,
+                    &mut budget,
+                )
             } else {
                 dnchisq(x, df, ncp, true, flags)
             },
         )
-    })
+    });
+    if budget == 0 { invalid(flags) } else { value }
 }
 
 /// Draw from a noncentral chi-square distribution.
 pub fn rnchisq(rng: &mut Rng, df: f64, ncp: f64, flags: &mut Flags) -> f64 {
-    if df < 0.0 || ncp < 0.0 || !df.is_finite() || !ncp.is_finite() {
+    if df < 0.0 || df.is_nan() || ncp < 0.0 || !ncp.is_finite() {
         return invalid(flags);
     }
-    let k = rpoisson(rng, 0.5 * ncp, flags);
-    rgamma(rng, k, 2.0, flags) + rchisq(rng, df, flags)
+    if ncp == 0.0 {
+        return rgamma(rng, 0.5 * df, 2.0, flags);
+    }
+    let k = crate::dist::discrete::rpois(rng, 0.5 * ncp, flags);
+    let mut value = if k > 0.0 {
+        rgamma(rng, k, 2.0, flags)
+    } else {
+        k
+    };
+    if df > 0.0 {
+        value += rgamma(rng, 0.5 * df, 2.0, flags);
+    }
+    value
 }
 
 fn beta_parameters(a: f64, b: f64, ncp: f64) -> bool {
     a > 0.0 && b > 0.0 && ncp >= 0.0 && a.is_finite() && b.is_finite() && ncp.is_finite()
 }
 
-fn n_beta_density(x: f64, y: f64, a: f64, b: f64, ncp: f64, flags: &mut Flags) -> f64 {
+fn n_beta_density(
+    x: f64,
+    y: f64,
+    a: f64,
+    b: f64,
+    ncp: f64,
+    flags: &mut Flags,
+    budget: &mut usize,
+) -> f64 {
     poisson_mixture(
         0.5 * ncp,
         |k, flags| beta_factor(x, y, a + k, b, flags),
         flags,
+        budget,
     )
 }
 
 // The next beta CDF bounds every component that follows it in the series.
-fn truncated_beta_lower(x: f64, y: f64, a: f64, b: f64, mean: f64, flags: &mut Flags) -> f64 {
+fn truncated_beta_lower(
+    x: f64,
+    y: f64,
+    a: f64,
+    b: f64,
+    mean: f64,
+    flags: &mut Flags,
+    budget: &mut usize,
+) -> f64 {
     let start = (mean - 7.0 * mean.sqrt()).floor().max(0.0);
     let mut weight = poisson_log_mass(start, mean).exp();
     let mut remainder = 1.0 - weight;
@@ -301,6 +317,11 @@ fn truncated_beta_lower(x: f64, y: f64, a: f64, b: f64, mean: f64, flags: &mut F
     let mut decrease = (beta_factor(x, y, shape, b, flags) - shape.ln()).exp();
     let mut sum = weight * value;
     for i in 1..=100_000 {
+        if *budget == 0 {
+            flags.set(Flags::NO_CONVERGENCE);
+            return f64::NAN;
+        }
+        *budget -= 1;
         let j = f64::from(i);
         let next = (value - decrease).max(0.0);
         if next * remainder <= 1e-9 {
@@ -315,9 +336,17 @@ fn truncated_beta_lower(x: f64, y: f64, a: f64, b: f64, mean: f64, flags: &mut F
     sum.min(1.0)
 }
 
-fn n_beta_tail(x: f64, y: f64, a: f64, b: f64, ncp: f64, tail: Tail, flags: &mut Flags) -> f64 {
+fn n_beta_tail(
+    (x, y): (f64, f64),
+    a: f64,
+    b: f64,
+    ncp: f64,
+    tail: Tail,
+    flags: &mut Flags,
+    budget: &mut usize,
+) -> f64 {
     if ncp < 20_000.0 {
-        let lower = truncated_beta_lower(x, y, a, b, 0.5 * ncp, flags);
+        let lower = truncated_beta_lower(x, y, a, b, 0.5 * ncp, flags, budget);
         if lower > 0.0 {
             if !tail.lower && lower > 1.0 - 1e-10 {
                 flags.set(Flags::PRECISION);
@@ -335,8 +364,9 @@ fn n_beta_tail(x: f64, y: f64, a: f64, b: f64, ncp: f64, tail: Tail, flags: &mut
         0.5 * ncp,
         |k, flags| super::pbeta_raw(x, y, a + k, b, log_tail, flags),
         flags,
+        budget,
     );
-    on_scale(lp.min(0.0), tail.log)
+    on_scale(if lp > 0.0 { 0.0 } else { lp }, tail.log)
 }
 
 /// Evaluate a noncentral beta density.
@@ -361,8 +391,9 @@ pub fn dnbeta(x: f64, a: f64, b: f64, ncp: f64, log: bool, flags: &mut Flags) ->
         return super::dbeta(x, a, b, log, flags);
     }
     let y = complement(x);
+    let mut budget = usize::MAX;
     on_scale(
-        n_beta_density(x, y, a, b, ncp, flags) - x.ln() - y.ln(),
+        n_beta_density(x, y, a, b, ncp, flags, &mut budget) - x.ln() - y.ln(),
         log,
     )
 }
@@ -381,7 +412,8 @@ pub fn pnbeta(x: f64, a: f64, b: f64, ncp: f64, tail: Tail, flags: &mut Flags) -
     if !beta_parameters(a, b, ncp) {
         return invalid(flags);
     }
-    n_beta_tail(x, complement(x), a, b, ncp, tail, flags)
+    let mut budget = usize::MAX;
+    n_beta_tail((x, complement(x)), a, b, ncp, tail, flags, &mut budget)
 }
 
 fn n_beta_odds(lp: f64, lq: f64, a: f64, b: f64, ncp: f64, flags: &mut Flags) -> f64 {
@@ -390,7 +422,8 @@ fn n_beta_odds(lp: f64, lq: f64, a: f64, b: f64, ncp: f64, flags: &mut Flags) ->
     let target = lp.min(lq);
     let use_mixture = !lower && target < -23.0;
     let seed = super::beta::beta_quantile_odds(lp, lq, a + 0.5 * ncp, b, flags);
-    invert(
+    let mut budget = MAX_QUANTILE_COMPONENTS;
+    let value = invert(
         -746.0,
         746.0,
         seed.clamp(-745.0, 745.0),
@@ -403,14 +436,16 @@ fn n_beta_odds(lp: f64, lq: f64, a: f64, b: f64, ncp: f64, flags: &mut Flags) ->
                     0.5 * ncp,
                     |k, flags| super::pbeta_raw(x, y, a + k, b, log_tail, flags),
                     flags,
+                    &mut budget,
                 )
             } else {
-                n_beta_tail(x, y, a, b, ncp, log_tail, flags)
+                n_beta_tail((x, y), a, b, ncp, log_tail, flags, &mut budget)
             };
-            let slope = (n_beta_density(x, y, a, b, ncp, flags) - lp).exp();
+            let slope = (n_beta_density(x, y, a, b, ncp, flags, &mut budget) - lp).exp();
             (lp, if lower { slope } else { -slope })
         },
-    )
+    );
+    if budget == 0 { invalid(flags) } else { value }
 }
 
 /// Evaluate a noncentral beta quantile.
@@ -433,8 +468,8 @@ pub fn rnbeta(rng: &mut Rng, a: f64, b: f64, ncp: f64, flags: &mut Flags) -> f64
     if a < 0.0 || b < 0.0 || ncp < 0.0 || a.is_nan() || b.is_nan() || !ncp.is_finite() {
         return invalid(flags);
     }
-    let k = rpoisson(rng, 0.5 * ncp, flags);
-    rbeta(rng, a + k, b, flags)
+    let x = rnchisq(rng, 2.0 * a, ncp, flags);
+    x / (x + rchisq(rng, 2.0 * b, flags))
 }
 
 fn f_parameters(df1: f64, df2: f64, ncp: f64) -> bool {
@@ -445,6 +480,12 @@ fn f_parameters(df1: f64, df2: f64, ncp: f64) -> bool {
 pub fn dnf(x: f64, df1: f64, df2: f64, ncp: f64, log: bool, flags: &mut Flags) -> f64 {
     if x.is_nan() || df1.is_nan() || df2.is_nan() || ncp.is_nan() {
         return x + df1 + df2 + ncp;
+    }
+    if df1 == INF && df2 > 0.0 && ncp >= 0.0 && ncp.is_finite() {
+        if x == 0.0 {
+            return invalid(flags);
+        }
+        return super::df(x, df1, df2, log, flags);
     }
     if !f_parameters(df1, df2, ncp) || x == INF {
         return invalid(flags);
@@ -459,8 +500,9 @@ pub fn dnf(x: f64, df1: f64, df2: f64, ncp: f64, log: bool, flags: &mut Flags) -
         return on_scale(dnchisq(x * df1, df1, ncp, true, flags) + df1.ln(), log);
     }
     let (z, y) = f_coordinates(x, df1, df2);
+    let mut budget = usize::MAX;
     on_scale(
-        n_beta_density(z, y, 0.5 * df1, 0.5 * df2, ncp, flags) - x.ln(),
+        n_beta_density(z, y, 0.5 * df1, 0.5 * df2, ncp, flags, &mut budget) - x.ln(),
         log,
     )
 }
@@ -470,17 +512,21 @@ pub fn pnf(x: f64, df1: f64, df2: f64, ncp: f64, tail: Tail, flags: &mut Flags) 
     if x.is_nan() || df1.is_nan() || df2.is_nan() || ncp.is_nan() {
         return x + df1 + df2 + ncp;
     }
-    if !f_parameters(df1, df2, ncp) {
+    if df1 <= 0.0 || df2 <= 0.0 || ncp < 0.0 || !ncp.is_finite() {
         return invalid(flags);
     }
     if x <= 0.0 || x == INF {
         return step(x > 0.0, tail);
     }
+    if df1 == INF {
+        return invalid(flags);
+    }
     if df2.is_infinite() {
         return pnchisq(x * df1, df1, ncp, tail, flags);
     }
     let (z, y) = f_coordinates(x, df1, df2);
-    n_beta_tail(z, y, 0.5 * df1, 0.5 * df2, ncp, tail, flags)
+    let mut budget = usize::MAX;
+    n_beta_tail((z, y), 0.5 * df1, 0.5 * df2, ncp, tail, flags, &mut budget)
 }
 
 /// Evaluate a noncentral F quantile.
@@ -488,17 +534,20 @@ pub fn qnf(p: f64, df1: f64, df2: f64, ncp: f64, tail: Tail, flags: &mut Flags) 
     if p.is_nan() || df1.is_nan() || df2.is_nan() || ncp.is_nan() {
         return p + df1 + df2 + ncp;
     }
-    if !f_parameters(df1, df2, ncp) || !probability_valid(p, tail) {
+    if df1 <= 0.0 || df2 <= 0.0 || ncp < 0.0 || !ncp.is_finite() || !probability_valid(p, tail) {
         return invalid(flags);
     }
     if let Some(x) = endpoints(p, tail, 0.0, INF) {
         return x;
     }
-    if df2.is_infinite() {
+    if df1 == INF {
+        return invalid(flags);
+    }
+    if df2 > 1e8 {
         return qnchisq(p, df1, ncp, tail, flags) / df1;
     }
     let (lp, lq) = probability_logs(p, tail);
-    (n_beta_odds(lp, lq, 0.5 * df1, 0.5 * df2, ncp, flags) + (df2 / df1).ln()).exp()
+    (n_beta_odds(lp, lq, 0.5 * df1, 0.5 * df2, ncp, flags) + (df2.ln() - df1.ln())).exp()
 }
 
 /// Draw from a noncentral F distribution.
@@ -564,7 +613,7 @@ fn t_series(x: f64, df: f64, ncp: f64, flags: &mut Flags) -> Option<f64> {
     Some(cdf)
 }
 
-fn t_mixture(x: f64, df: f64, ncp: f64, density: bool, lower: bool) -> f64 {
+fn t_mixture(x: f64, df: f64, ncp: f64, lower: bool) -> f64 {
     let root_df = df.sqrt();
     let log_center = (root_df.max(ncp.abs()).max(1.0).ln() - x.abs().ln()).min(0.0);
     let shift = root_df * log_center;
@@ -576,20 +625,59 @@ fn t_mixture(x: f64, df: f64, ncp: f64, density: bool, lower: bool) -> f64 {
         } else {
             (x.abs().ln() + h).exp().copysign(x) - ncp
         };
-        let normal = if density {
-            dnorm(z, 0.0, 1.0, true, &mut Flags::default()) + h
-        } else {
-            pnorm(
-                z,
-                0.0,
-                1.0,
-                Tail { lower, log: true },
-                &mut Flags::default(),
-            )
-        };
+        let normal = pnorm(
+            z,
+            0.0,
+            1.0,
+            Tail { lower, log: true },
+            &mut Flags::default(),
+        );
         log_chisq_scale(w, df) + normal
     };
     log_integral(shift, 0.0, range, f)
+}
+
+// Locate the mode in log(s), where df * s^2 has a chi-square distribution.
+fn t_density(x: f64, df: f64, ncp: f64) -> f64 {
+    let root_df = df.sqrt();
+    let h = root_df.hypot(x);
+    let r = x / h;
+    let b = r * ncp;
+    let root = (0.5 * b).hypot((df + 1.0).sqrt());
+    let m = if b >= 0.0 {
+        root + 0.5 * b
+    } else {
+        (df + 1.0) / (root - 0.5 * b)
+    };
+    let offset = (m - h) / h;
+    let center = if offset.abs() < 0.5 {
+        offset.ln_1p()
+    } else {
+        m.ln() - h.ln()
+    };
+    let z = if b > 0.0 {
+        r * ((df + 1.0) / m) - ((root_df / h) * ncp) * (root_df / h)
+    } else {
+        r.mul_add(m, -ncp)
+    };
+    let width = (df + 1.0).sqrt().hypot(m).recip();
+    let peak = log_chisq_scale(center * root_df, df)
+        + center
+        + dnorm(z, 0.0, 1.0, true, &mut Flags::default());
+    let log_relative = |u: f64| {
+        let v = u * width;
+        let e = v.exp_m1();
+        let remainder = if v.abs() < 0.25 {
+            let series = (2..=19)
+                .rev()
+                .fold(0.0, |sum, k| (v * sum + 1.0) / f64::from(k));
+            v * v * series
+        } else {
+            e - v
+        };
+        -(df + 1.0) * remainder - 0.5 * (m * e).powi(2)
+    };
+    peak + (root_df * width).ln() + centered_integral(log_relative)
 }
 
 /// Evaluate the noncentral Student's t density.
@@ -597,8 +685,11 @@ pub fn dnt(x: f64, df: f64, ncp: f64, log: bool, flags: &mut Flags) -> f64 {
     if x.is_nan() || df.is_nan() || ncp.is_nan() {
         return x + df + ncp;
     }
-    if df <= 0.0 || !ncp.is_finite() {
+    if df <= 0.0 {
         return invalid(flags);
+    }
+    if ncp.is_infinite() {
+        return zero(log);
     }
     if df.is_infinite() {
         return dnorm(x, ncp, 1.0, log, flags);
@@ -619,7 +710,7 @@ pub fn dnt(x: f64, df: f64, ncp: f64, log: bool, flags: &mut Flags) -> f64 {
             }
         }
     }
-    on_scale(t_mixture(x, df, ncp, true, true), log)
+    on_scale(t_density(x, df, ncp), log)
 }
 
 /// Evaluate a noncentral Student's t tail probability.
@@ -627,17 +718,17 @@ pub fn pnt(x: f64, df: f64, ncp: f64, tail: Tail, flags: &mut Flags) -> f64 {
     if x.is_nan() || df.is_nan() || ncp.is_nan() {
         return x + df + ncp;
     }
-    if df <= 0.0 || !ncp.is_finite() {
+    if df <= 0.0 {
         return invalid(flags);
+    }
+    if x.is_infinite() || ncp.is_infinite() {
+        return step(x == INF || (x != -INF && ncp == -INF), tail);
     }
     if df.is_infinite() || x == 0.0 {
         return pnorm(x, ncp, 1.0, tail, flags);
     }
     if ncp == 0.0 {
         return super::pt(x, df, tail, flags);
-    }
-    if x.is_infinite() {
-        return step(x > 0.0, tail);
     }
     if let Some(cdf) = t_series(x, df, ncp, flags) {
         let lower = x >= 0.0;
@@ -657,7 +748,7 @@ pub fn pnt(x: f64, df: f64, ncp: f64, tail: Tail, flags: &mut Flags) -> f64 {
     } else {
         tail.lower || x < 0.0
     };
-    from_log(t_mixture(x, df, ncp, false, lower).min(0.0), lower, tail)
+    from_log(t_mixture(x, df, ncp, lower).min(0.0), lower, tail)
 }
 
 /// Evaluate a noncentral Student's t quantile.
@@ -692,10 +783,7 @@ pub fn qnt(p: f64, df: f64, ncp: f64, tail: Tail, flags: &mut Flags) -> f64 {
         |z| {
             let x = convert(z);
             let (lp, ld) = if target < -26.0 {
-                (
-                    t_mixture(x, df, ncp, false, lower),
-                    t_mixture(x, df, ncp, true, true),
-                )
+                (t_mixture(x, df, ncp, lower), t_density(x, df, ncp))
             } else {
                 (
                     pnt(x, df, ncp, log_tail, flags),

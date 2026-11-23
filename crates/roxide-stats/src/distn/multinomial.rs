@@ -88,6 +88,12 @@ pub(super) fn random(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult 
     if !prob.iter().any(|p| *p > 0.0) {
         return Err(ctx.stop(call.err_call(), "no positive probabilities"));
     }
+    if count != 0.0 && prob.iter().sum::<f64>().is_infinite() {
+        return Err(ctx.stop(
+            call.err_call(),
+            "rbinom: probability sum should be 1, but is 0",
+        ));
+    }
     let count = count as usize;
     let len = prob.len().saturating_mul(count);
     limit::<i32>(ctx, call, len)?;

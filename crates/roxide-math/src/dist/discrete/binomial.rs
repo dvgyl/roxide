@@ -41,6 +41,13 @@ pub fn dbinom(x: f64, size: f64, prob: f64, log: bool, flags: &mut Flags) -> f64
     if x.is_nan() || size.is_nan() || prob.is_nan() {
         return x + size + prob;
     }
+    if size == INF && (0.0..=1.0).contains(&prob) {
+        return if observation(x, true, flags) == Some(0.0) && prob == 0.0 {
+            on_scale(0.0, log)
+        } else {
+            zero(log)
+        };
+    }
     if !valid(size, prob) {
         return invalid(flags);
     }
@@ -57,6 +64,9 @@ pub fn pbinom(q: f64, size: f64, prob: f64, tail: Tail, flags: &mut Flags) -> f6
         return q + size + prob;
     }
     if !valid(size, prob) {
+        if size.is_finite() && size >= 0.0 && !integral(size) {
+            flags.set(Flags::NONINT_X);
+        }
         return invalid(flags);
     }
     let size = size.round_ties_even();
@@ -123,13 +133,16 @@ pub fn rbinom(rng: &mut Rng, size: f64, prob: f64, flags: &mut Flags) -> f64 {
     } else {
         btpe(rng, size, p)
     };
+    if x.is_nan() {
+        flags.set(Flags::NO_CONVERGENCE);
+    }
     if prob > 0.5 { size - x } else { x }
 }
 
 fn invert(rng: &mut Rng, n: f64, p: f64) -> f64 {
     let q = 1.0 - p;
     let initial = (n * (-p).ln_1p()).exp();
-    loop {
+    for _ in 0..100_000 {
         let mut u = rng.unif_rand();
         let mut mass = initial;
         for j in 0..=(n as u32).min(111) {
@@ -140,6 +153,7 @@ fn invert(rng: &mut Rng, n: f64, p: f64) -> f64 {
             mass *= ((n - f64::from(j)) / f64::from(j + 1)) * (p / q);
         }
     }
+    f64::NAN
 }
 
 fn btpe(rng: &mut Rng, n: f64, p: f64) -> f64 {
@@ -160,7 +174,7 @@ fn btpe(rng: &mut Rng, n: f64, p: f64) -> f64 {
     let left_tail = parallelogram + height / rate_left;
     let area = left_tail + height / rate_right;
     let peak = binomial_log(mode, n, p, q);
-    loop {
+    for _ in 0..100_000 {
         let u = area * rng.unif_rand();
         let v = rng.unif_rand();
         if u <= width {
@@ -187,4 +201,5 @@ fn btpe(rng: &mut Rng, n: f64, p: f64) -> f64 {
             return x;
         }
     }
+    f64::NAN
 }

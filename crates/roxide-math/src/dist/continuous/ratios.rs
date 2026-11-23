@@ -37,7 +37,9 @@ pub fn rchisq(rng: &mut Rng, df: f64, flags: &mut Flags) -> f64 {
 }
 
 fn t_normalization(df: f64, flags: &mut Flags) -> f64 {
-    if df >= 1e8 {
+    if df < 2.0_f64.powi(-54) {
+        0.5 * df.ln() - std::f64::consts::LN_2
+    } else if df >= 1e8 {
         let r = df.recip();
         -LOG_SQRT_2PI - 0.25 * r + (r * r * r) / 24.0
     } else {
@@ -64,7 +66,7 @@ pub fn dt(x: f64, df: f64, log: bool, flags: &mut Flags) -> f64 {
     }
     let ratio = (x / df.sqrt()).powi(2);
     let power = if ratio < f64::MIN_POSITIVE {
-        0.5 * x * x * (1.0 + df.recip())
+        0.5 * ratio * (1.0 + df)
     } else if ratio.is_infinite() {
         (0.5 * df + 0.5) * (2.0 * x.abs().ln() - df.ln())
     } else {
@@ -286,7 +288,7 @@ pub fn qf(p: f64, df1: f64, df2: f64, tail: Tail, flags: &mut Flags) -> f64 {
     }
     let (lp, lq) = probability_logs(p, tail);
     let odds = beta_quantile_odds(lp, lq, 0.5 * df1, 0.5 * df2, flags);
-    (odds + (df2 / df1).ln()).exp()
+    (odds + (df2.ln() - df1.ln())).exp()
 }
 
 /// Draw from an F distribution.

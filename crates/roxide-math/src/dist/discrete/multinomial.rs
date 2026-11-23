@@ -57,7 +57,7 @@ pub fn dmultinom(x: &[f64], prob: &[f64], log: bool, flags: &mut Flags) -> f64 {
 ///
 /// Return [`MathError::Dim`] for invalid size, weights, or output length.
 pub fn rmultinom(rng: &mut Rng, size: i32, prob: &[f64], out: &mut [i32]) -> Result<(), MathError> {
-    if size < 0 || prob.len() != out.len() {
+    if size < 0 || prob.len() != out.len() || !prob.iter().sum::<f64>().is_finite() {
         return Err(MathError::Dim);
     }
     let scale = weight_scale(prob).ok_or(MathError::Dim)?;

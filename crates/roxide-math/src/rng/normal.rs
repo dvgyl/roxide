@@ -2,6 +2,8 @@ use super::{NormalKind, Rng};
 use crate::core::Tail;
 use crate::dist::normal::standard_quantile;
 
+const MAX_ATTEMPTS: usize = 100_000;
+
 impl Rng {
     /// Draw a standard normal variate with the selected normal algorithm.
     pub fn norm_rand(&mut self) -> f64 {
@@ -73,7 +75,7 @@ fn kinderman_ramage(rng: &mut Rng, legacy: bool) -> f64 {
         return A * (slope.mul_add(selector, rng.unif_rand()) - 1.0);
     }
     if selector >= 0.973310954173898 {
-        loop {
+        for _ in 0..MAX_ATTEMPTS {
             let b = rng.unif_rand();
             let c = rng.unif_rand();
             let square = A * A - 2.0 * c.ln();
@@ -85,6 +87,7 @@ fn kinderman_ramage(rng: &mut Rng, legacy: bool) -> f64 {
                 };
             }
         }
+        return f64::NAN;
     }
 
     let (slope, intercept, limit, area): (f64, f64, f64, f64) = if selector >= 0.958720824790463 {
@@ -105,7 +108,7 @@ fn kinderman_ramage(rng: &mut Rng, legacy: bool) -> f64 {
         )
     };
     let innermost = selector < 0.911312780288703;
-    loop {
+    for _ in 0..MAX_ATTEMPTS {
         let b = rng.unif_rand();
         let c = rng.unif_rand();
         let t = slope.mul_add(b.min(c), intercept);
@@ -120,6 +123,7 @@ fn kinderman_ramage(rng: &mut Rng, legacy: bool) -> f64 {
             return if b < c { t } else { -t };
         }
     }
+    f64::NAN
 }
 
 // Algorithm FL (Ahrens and Dieter, 1973). These tables use seven significant digits.
@@ -220,13 +224,15 @@ fn ahrens_dieter(rng: &mut Rng) -> f64 {
 
 fn fl_strip(rng: &mut Rng, i: usize, mut v: f64) -> f64 {
     let base = BOUNDS[i];
-    loop {
+    let mut budget = MAX_ATTEMPTS;
+    while budget != 0 {
         if v > THRESHOLDS[i] {
             return base + (v - THRESHOLDS[i]) * HEIGHTS[i];
         }
         let w = rng.unif_rand() * (BOUNDS[i + 1] - base);
         let mut z = w * (base + 0.5 * w);
-        loop {
+        while budget != 0 {
+            budget -= 1;
             if v > z {
                 return base + w;
             }
@@ -239,6 +245,7 @@ fn fl_strip(rng: &mut Rng, i: usize, mut v: f64) -> f64 {
             z = x;
         }
     }
+    f64::NAN
 }
 
 fn fl_tail(rng: &mut Rng, mut v: f64) -> f64 {
@@ -252,7 +259,7 @@ fn fl_tail(rng: &mut Rng, mut v: f64) -> f64 {
     let width = WIDTHS[strip];
     let mut w = (2.0 * v - 1.0) * width;
     let mut z = w * (base + 0.5 * w);
-    loop {
+    for _ in 0..MAX_ATTEMPTS {
         let v = rng.unif_rand();
         if v > z {
             return base + w;
@@ -265,4 +272,5 @@ fn fl_tail(rng: &mut Rng, mut v: f64) -> f64 {
             z = w * (base + 0.5 * w);
         }
     }
+    f64::NAN
 }

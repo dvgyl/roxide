@@ -40,3 +40,27 @@ if (!identical(y, c(1, 1, NA_real_)))
     )
     .expect("Check the R bindings");
 }
+
+#[test]
+fn special_coercion_checks_compact_vector_size() {
+    let limits = roxide_host::Limits {
+        max_vector_bytes: 128,
+        ..roxide_host::Limits::default()
+    };
+    let mut ctx = Ctx::new(
+        Box::new(roxide_host::NativeHost::with_limits(limits)),
+        GcPolicy::Torture,
+    )
+    .unwrap();
+    roxide_base::register_all(&mut ctx).unwrap();
+    ctx.run_script(
+        "Special limits",
+        r#"
+message <- tryCatch(gamma(seq_len(100000000)), error = function(e) conditionMessage(e))
+stopifnot(identical(message, "vector size limit exceeded"))
+"#,
+        GLOBAL_ENV,
+        false,
+    )
+    .unwrap();
+}

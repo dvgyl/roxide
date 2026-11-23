@@ -2,18 +2,24 @@ use roxide_eval::{Args, Call, Ctx, EvalResult, PrimDef};
 use roxide_math::dist::{continuous, discrete, normal};
 
 use super::support::internal;
-use super::{RandomOutput, density, random, tail};
+use super::{KernelWarnings, RandomOutput, density, random, tail};
 
 macro_rules! vector {
     ($kind:ident, $entry:ident, $kernel:path, [$($arg:ident),+]) => {{
         fn apply(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
-            $kind(ctx, call, args, |[$($arg),+], option, flags| {
+            vector!(@apply $kind ctx, call, args, |[$($arg),+], option, flags| {
                 $kernel($($arg),+, option, flags)
             })
         }
         let option_count = vector!(@options $kind);
         internal(stringify!($entry), [$(stringify!($arg)),+].len() + option_count, apply)
     }};
+    (@apply density $ctx:ident, $call:ident, $args:ident, $kernel:expr) => {
+        density($ctx, $call, $args, $kernel)
+    };
+    (@apply tail $ctx:ident, $call:ident, $args:ident, $kernel:expr) => {
+        tail($ctx, $call, $args, KernelWarnings::Default, $kernel)
+    };
     (@options density) => { 1 };
     (@options tail) => { 2 };
 }
@@ -69,7 +75,6 @@ pub(super) const TABLE: &[PrimDef] = &[
     vector!(tail, C_qbeta, continuous::qbeta, [a, b, c]),
     vector!(tail, C_qnbeta, continuous::qnbeta, [a, b, c, d]),
     random!(C_rbeta, continuous::rbeta, [a, b], RandomOutput::Real),
-    random!(C_rnbeta, continuous::rnbeta, [a, b, c], RandomOutput::Real),
     vector!(density, C_dchisq, continuous::dchisq, [a, b]),
     vector!(density, C_dnchisq, continuous::dnchisq, [a, b, c]),
     vector!(tail, C_pchisq, continuous::pchisq, [a, b]),
@@ -85,7 +90,6 @@ pub(super) const TABLE: &[PrimDef] = &[
     vector!(tail, C_qt, continuous::qt, [a, b]),
     vector!(tail, C_qnt, continuous::qnt, [a, b, c]),
     random!(C_rt, continuous::rt, [a], RandomOutput::Real),
-    random!(C_rnt, continuous::rnt, [a, b], RandomOutput::Real),
     vector!(density, C_df, continuous::df, [a, b, c]),
     vector!(density, C_dnf, continuous::dnf, [a, b, c, d]),
     vector!(tail, C_pf, continuous::pf, [a, b, c]),
@@ -93,11 +97,10 @@ pub(super) const TABLE: &[PrimDef] = &[
     vector!(tail, C_qf, continuous::qf, [a, b, c]),
     vector!(tail, C_qnf, continuous::qnf, [a, b, c, d]),
     random!(C_rf, continuous::rf, [a, b], RandomOutput::Real),
-    random!(C_rnf, continuous::rnf, [a, b, c], RandomOutput::Real),
     vector!(tail, C_ptukey, continuous::ptukey, [a, b, c, d]),
-    vector!(tail, C_qtukey, continuous::qtukey, [a, b, c, d]),
+    internal("C_qtukey", 6, qtukey),
     vector!(density, C_dbinom, discrete::dbinom, [a, b, c]),
-    vector!(tail, C_pbinom, discrete::pbinom, [a, b, c]),
+    internal("C_pbinom", 5, pbinom),
     vector!(tail, C_qbinom, discrete::qbinom, [a, b, c]),
     random!(C_rbinom, discrete::rbinom, [a, b], RandomOutput::Integer),
     vector!(density, C_dpois, discrete::dpois, [a, b]),
@@ -136,3 +139,23 @@ pub(super) const TABLE: &[PrimDef] = &[
     internal("C_dmultinom", 4, super::multinomial::density),
     internal("C_rmultinom", 3, super::multinomial::random),
 ];
+
+fn pbinom(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    tail(
+        ctx,
+        call,
+        args,
+        KernelWarnings::BinomialSize,
+        |[q, n, p], options, flags| discrete::pbinom(q, n, p, options, flags),
+    )
+}
+
+fn qtukey(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    tail(
+        ctx,
+        call,
+        args,
+        KernelWarnings::TukeyQuantile,
+        |[p, n, df, ranges], options, flags| continuous::qtukey(p, n, df, ranges, options, flags),
+    )
+}

@@ -87,7 +87,11 @@ impl UniformState {
                 State::WichmannHill(values)
             }
             UniformKind::MarsagliaMulticarry => {
-                State::Marsaglia(take::<2>(words)?.map(|x| x.max(1)))
+                let state = take::<2>(words)?.map(|x| x.max(1));
+                if state == [36969 * 65536 - 1, 18000 * 65536 - 1] {
+                    return Ok(Self::seeded(fallback, kind));
+                }
+                State::Marsaglia(state)
             }
             UniformKind::SuperDuper => {
                 let [a, b] = take::<2>(words)?;
