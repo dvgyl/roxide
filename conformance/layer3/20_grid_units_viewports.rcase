@@ -1,0 +1,107 @@
+=== case: grid_unit_codes_and_algebra ===
+#@ tags: layer3,grid
+#@ compare: exact
+library(grid)
+u <- unit(1:3, "cm")
+v <- unit(2:4, c("cm", "millimetres"))
+dput(class(u))
+dput(attr(u, "unit"))
+dput(unitType(unit(1, c("npc", "pt", "in", "mylines", "mychar", "mystrwidth", "mystrheight"))))
+dput(unitType(u + v, recurse = TRUE))
+dput(as.character(u + v))
+dput(as.character(u - v))
+dput(as.character(2 * sum(v)))
+dput(as.character(min(u)))
+dput(as.character(unit.pmin(u, v)))
+dput(as.character(unit.pmax(u, v)))
+v[2] <- unit(7, "in")
+dput(as.character(v[2:3]))
+dput(as.character(absolute.size(unit(1:4, c("npc", "native", "snpc", "cm")))))
+dput(as.character(unit.c(u[1], v[2])))
+options(warn = -1)
+dput(as.character(unit.rep(v, times = 2)))
+dput(unit.length(v))
+dput(format(unit(1.234567, "cm"), digits = 3))
+
+=== case: grid_viewport_geometry_and_inheritance ===
+#@ tags: layer3,grid
+#@ compare: exact
+library(grid)
+pdf(tempfile(), width = 8, height = 4, pointsize = 16)
+grid.newpage()
+dput(current.viewport()$xscale)
+dput(current.viewport()$yscale)
+dput(get.gpar("fontsize")$fontsize)
+pushViewport(viewport(name = "outer", width = .5, height = .5, angle = 30,
+    gp = gpar(cex = 2, alpha = .5, lwd = 2, lex = 3)))
+pushViewport(viewport(name = "inner", x = .2, y = .4, width = .5, height = .5,
+    xscale = c(0, 10), yscale = c(10, 4), angle = 10,
+    gp = gpar(cex = 1.5, alpha = .5, fontsize = 18, lwd = 5, lex = 2)))
+dput(round(as.vector(current.transform()), 6))
+dput(current.rotation())
+dput(current.parent()$name)
+dput(as.character(current.vpPath()))
+dput(vapply(get.gpar(c("cex", "alpha", "fontsize", "lwd", "lex")), function(x) x, 0.0))
+dput(convertX(unit(5, "native"), "npc", valueOnly = TRUE))
+dput(convertHeight(unit(3, "native"), "npc", valueOnly = TRUE))
+dput(round(convertWidth(unit(1, "char") + unit(1, "cm"), "in", valueOnly = TRUE), 6))
+dput(as.character(upViewport(0)))
+dput(seekViewport(vpPath("outer", "inner")))
+popViewport()
+dput(as.character(current.vpPath()))
+dput(current.vpTree()$children$outer$name)
+dput(round(convertWidth(unit(1, c("in", "cm", "mm", "pt", "picas",
+    "bigpts", "dida", "cicero", "scaledpts")), "in", TRUE), 10))
+pushViewport(viewport(name = "zero", width = 0, xscale = c(10, 20)))
+dput(convertX(unit(14, "native"), "npc", TRUE))
+dput(convertWidth(unit(4, "native"), "npc", TRUE))
+dput(convertX(unit(0, "in"), "native", TRUE))
+popViewport(0)
+invisible(dev.off())
+
+=== case: grid_layout_fixed_relative_and_respected_tracks ===
+#@ tags: layer3,grid
+#@ compare: exact
+library(grid)
+pdf(tempfile(), width = 8, height = 4)
+grid.newpage()
+box <- function(row, col) {
+    pushViewport(viewport(name = "cell", layout.pos.row = row, layout.pos.col = col))
+    on.exit(popViewport())
+    round(c(current.transform()[3, 1:2],
+        convertWidth(unit(1, "npc"), "in", TRUE),
+        convertHeight(unit(1, "npc"), "in", TRUE)), 6)
+}
+w <- unit.c(unit(1, "in") + unit(1, "null"), unit(1:2, "null"))
+h <- unit(1:2, "null")
+pushViewport(viewport(name = "independent", layout = grid.layout(2, 3, w, h)))
+dput(box(1:2, 2:3))
+dput(box(1, 1))
+popViewport()
+pushViewport(viewport(name = "respected", layout = grid.layout(2, 3, w, h, respect = TRUE)))
+dput(box(1, 2))
+popViewport()
+marks <- matrix(c(0, 0, 1, 0, 0, 0), nrow = 2)
+pushViewport(viewport(name = "matrix", layout = grid.layout(2, 3, w, h, respect = marks)))
+dput(box(1, 2))
+dput(box(2, 3))
+popViewport()
+pushViewport(viewport(name = "overfull", layout = grid.layout(2, 2,
+    unit(c(10, 1), c("in", "null")), unit(1:2, "null"), respect = TRUE)))
+dput(box(1, 2))
+invisible(dev.off())
+
+=== case: grid_helvetica_string_metrics ===
+#@ tags: layer3,grid
+#@ compare: exact
+library(grid)
+pdf(tempfile(), width = 7, height = 7)
+grid.newpage()
+s <- c("A", "g", "AV", "a\nb", "")
+dput(unitType(stringWidth(s)))
+dput(round(convertWidth(stringWidth(s), "bigpts", TRUE), 6))
+dput(round(convertHeight(stringHeight(s), "bigpts", TRUE), 6))
+dput(round(convertHeight(stringAscent(s), "bigpts", TRUE), 6))
+dput(round(convertHeight(stringDescent(s), "bigpts", TRUE), 6))
+grid.clip(width = unit(2.54, "cm"), height = unit(5, "lines"))
+invisible(dev.off())
