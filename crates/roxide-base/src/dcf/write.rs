@@ -7,12 +7,12 @@ use crate::scan::{base_call, r_strings};
 
 pub(super) fn write_dcf(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     let append = flag(ctx, call, args.get(2))?;
-    let _use_bytes = flag(ctx, call, args.get(3))?;
+    let use_bytes = flag(ctx, call, args.get(3))?;
     let bound = ctx.host().limits().max_vector_bytes;
     let indent = number(ctx, call, args.get(4), bound)?;
     let width = number(ctx, call, args.get(5), bound)?;
     let keep = keys(ctx, args.get(6))?;
-    let data = Table::new(ctx, call, args.get(0))?;
+    let data = Table::new(ctx, call, args.get(0), use_bytes)?;
     if data
         .rows
         .saturating_mul(data.names.len())
@@ -32,7 +32,7 @@ pub(super) fn write_dcf(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResu
                 return Err(ctx.stop(call.err_call(), "missing value where TRUE/FALSE needed"));
             };
             let preserve = keep.iter().flatten().any(|key| key == name.as_bytes());
-            let values = data.cell(ctx, call, row, col)?;
+            let values = data.cell(ctx, call, row, col, use_bytes)?;
             for value in values.iter().flatten() {
                 if first && !output.text.is_empty() {
                     output.push(ctx, call, "\n")?;
@@ -58,11 +58,12 @@ enum Column {
 }
 
 impl Column {
-    fn new(ctx: &mut Ctx, call: &Call, x: SexpId) -> EvalResult<Self> {
+    fn new(ctx: &mut Ctx, call: &Call, x: SexpId, use_bytes: bool) -> EvalResult<Self> {
+        guard_shape(ctx, call, ctx.session().xlength(x)?, 1)?;
         if ctx.session().type_of(x)? == SexpType::Vec {
             return Ok(Self::List(ctx.session().list_slice(x)?.to_vec()));
         }
-        Ok(Self::Atomic(strings(ctx, call, x)?))
+        Ok(Self::Atomic(strings(ctx, call, x, use_bytes)?))
     }
 
     fn len(&self) -> usize {
@@ -72,11 +73,17 @@ impl Column {
         }
     }
 
-    fn cell(&self, ctx: &mut Ctx, call: &Call, index: usize) -> EvalResult<Vec<Option<String>>> {
+    fn cell(
+        &self,
+        ctx: &mut Ctx,
+        call: &Call,
+        index: usize,
+        use_bytes: bool,
+    ) -> EvalResult<Vec<Option<String>>> {
         match self {
             Self::Atomic(values) => Ok(values.get(index).cloned().into_iter().collect()),
             Self::List(values) => match values.get(index) {
-                Some(&value) => strings(ctx, call, value),
+                Some(&value) => strings(ctx, call, value, use_bytes),
                 None => Ok(Vec::new()),
             },
         }
@@ -84,11 +91,15 @@ impl Column {
 }
 
 impl Table {
-    fn new(ctx: &mut Ctx, call: &Call, x: SexpId) -> EvalResult<Self> {
+    fn new(ctx: &mut Ctx, call: &Call, x: SexpId, use_bytes: bool) -> EvalResult<Self> {
         let s = ctx.session_mut();
         let dim = attr(s, x, "dim")?;
         if dim != SEXP_NIL && s.xlength(dim)? == 2 {
-            let rows = s.int(dim)?.get(0).max(0) as usize;
+            let dims = s.int(dim)?;
+            let rows = dims.get(0).max(0) as usize;
+            let width = dims.get(1).max(0) as usize;
+            guard_shape(ctx, call, rows, width)?;
+            let s = ctx.session_mut();
             let dimnames = attr(s, x, "dimnames")?;
             let names = if dimnames == SEXP_NIL {
                 SEXP_NIL
@@ -101,34 +112,40 @@ impl Table {
             return Ok(Self {
                 rows,
                 names: r_strings(ctx, names)?,
-                columns: vec![Column::new(ctx, call, x)?],
+                columns: vec![Column::new(ctx, call, x, use_bytes)?],
                 matrix: true,
             });
         }
         let names = attr(s, x, "names")?;
         let row_names = s.attr_row_names(x)?;
-        let rows = s.xlength(row_names)?;
+        let mut rows = s.xlength(row_names)?;
         let list = s.type_of(x)? == SexpType::Vec;
         if names == SEXP_NIL && s.xlength(x)? != 0 {
             return Err(ctx.stop(call.err_call(), "missing value where TRUE/FALSE needed"));
         }
+        let width = s.xlength(x)?;
+        if rows == 0 {
+            rows = if list {
+                s.list_slice(x)?.iter().try_fold(0, |rows, &value| {
+                    Ok::<_, roxide_value::ValueError>(rows.max(s.xlength(value)?))
+                })?
+            } else {
+                usize::from(width != 0)
+            };
+        }
+        guard_shape(ctx, call, rows, width)?;
         let names = r_strings(ctx, names)?;
         let columns = if list {
             let values = ctx.session().list_slice(x)?.to_vec();
             values
                 .into_iter()
-                .map(|x| Column::new(ctx, call, x))
+                .map(|x| Column::new(ctx, call, x, use_bytes))
                 .collect::<EvalResult<Vec<_>>>()?
         } else {
-            strings(ctx, call, x)?
+            strings(ctx, call, x, use_bytes)?
                 .into_iter()
                 .map(|x| Column::Atomic(vec![x]))
                 .collect()
-        };
-        let rows = if rows == 0 {
-            columns.iter().map(Column::len).max().unwrap_or(0)
-        } else {
-            rows
         };
         if columns.iter().any(|column| {
             column.len() == 0 && rows != 0
@@ -150,21 +167,70 @@ impl Table {
         call: &Call,
         row: usize,
         col: usize,
+        use_bytes: bool,
     ) -> EvalResult<Vec<Option<String>>> {
         if self.matrix {
-            self.columns[0].cell(ctx, call, col * self.rows + row)
+            self.columns[0].cell(ctx, call, col * self.rows + row, use_bytes)
         } else {
             let column = &self.columns[col];
-            column.cell(ctx, call, row % column.len().max(1))
+            column.cell(ctx, call, row % column.len().max(1), use_bytes)
         }
     }
 }
 
-fn strings(ctx: &mut Ctx, call: &Call, value: SexpId) -> EvalResult<Vec<Option<String>>> {
+fn guard_shape(ctx: &mut Ctx, call: &Call, rows: usize, width: usize) -> EvalResult<()> {
+    let bound = ctx.host().limits().max_vector_bytes;
+    if rows.max(width).max(rows.saturating_mul(width)) > bound / size_of::<Option<String>>() {
+        return Err(ctx.stop(call.err_call(), "vector size limit exceeded"));
+    }
+    Ok(())
+}
+
+fn strings(
+    ctx: &mut Ctx,
+    call: &Call,
+    value: SexpId,
+    use_bytes: bool,
+) -> EvalResult<Vec<Option<String>>> {
     ctx.scoped(|ctx| {
         let chars = base_call(ctx, call, "as.character", &[value])?;
         ctx.protect(chars);
-        r_strings(ctx, chars)
+        let mut values = r_strings(ctx, chars)?;
+        if !ctx.host().locale().utf8 {
+            let s = ctx.session();
+            for (value, &id) in values.iter_mut().zip(s.str_slice(chars)?) {
+                let Some(text) = value else { continue };
+                match s.char_encoding(id)? {
+                    Encoding::Latin1 => {
+                        *text = s
+                            .char_bytes(id)?
+                            .iter()
+                            .map(|&byte| {
+                                if byte.is_ascii() {
+                                    char::from(byte).to_string()
+                                } else {
+                                    format!("<{byte:02x}>")
+                                }
+                            })
+                            .collect();
+                    }
+                    Encoding::Utf8 if !use_bytes => {
+                        *text = text
+                            .chars()
+                            .map(|ch| {
+                                if ch.is_ascii() {
+                                    ch.to_string()
+                                } else {
+                                    format!("<U+{:04X}>", ch as u32)
+                                }
+                            })
+                            .collect();
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(values)
     })
 }
 
@@ -323,6 +389,7 @@ fn write_output(
         &[payload, con, separator, TRUE_SCALAR],
     );
     if path && append {
+        ctx.protect_eval_result(&result);
         let closed = base_call(ctx, call, "close", &[con]);
         result.and(closed)
     } else {

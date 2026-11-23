@@ -70,14 +70,13 @@ pub(super) fn median(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult 
     }
     values.sort_unstable_by(f64::total_cmp);
     let (low, high) = middle(&values);
-    if values.is_empty() || values.len() % 2 == 1 {
-        return match ty {
-            SexpType::Int => Ok(ctx.session_mut().scalar_int(if low.is_nan() {
-                NA_INTEGER
-            } else {
-                low as i32
-            })?),
-            SexpType::Lgl => Ok(ctx.session_mut().scalar_lgl(if low.is_nan() {
+    let result = if values.is_empty() || values.len() % 2 == 1 {
+        match ty {
+            SexpType::Int => {
+                ctx.session_mut()
+                    .scalar_int(if low.is_nan() { NA_INTEGER } else { low as i32 })?
+            }
+            SexpType::Lgl => ctx.session_mut().scalar_lgl(if low.is_nan() {
                 RLogical::NA
             } else {
                 if low != 0.0 {
@@ -85,11 +84,30 @@ pub(super) fn median(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult 
                 } else {
                     RLogical::FALSE
                 }
-            })?),
-            _ => Ok(ctx.session_mut().scalar_real(low)?),
-        };
+            })?,
+            _ => ctx.session_mut().scalar_real(low)?,
+        }
+    } else {
+        ctx.session_mut().scalar_real(average(&[low, high]))?
+    };
+    copy_class(ctx, x, result)?;
+    Ok(result)
+}
+
+fn copy_class(ctx: &mut Ctx, from: SexpId, to: SexpId) -> EvalResult<()> {
+    if !has_class(ctx, from, "Date")?
+        && !has_class(ctx, from, "POSIXct")?
+        && !has_class(ctx, from, "difftime")?
+    {
+        return Ok(());
     }
-    Ok(ctx.session_mut().scalar_real(average(&[low, high]))?)
+    for name in ["class", "tzone", "units"] {
+        let value = attr(ctx, from, name)?;
+        if value != SEXP_NIL {
+            set_attr(ctx, to, name, value)?;
+        }
+    }
+    Ok(())
 }
 
 fn middle(x: &[f64]) -> (f64, f64) {
@@ -274,6 +292,16 @@ pub(super) fn quantile(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResul
                 return Err(ctx.stop(call.err_call(), error));
             }
             values.sort_unstable_by(f64::total_cmp);
+            if has_class(ctx, x, "Date")?
+                && (kind == 7
+                    || values.is_empty()
+                    || probs.iter().filter(|p| !p.is_nan()).any(|&p| {
+                        let (lo, hi, weight) = quantile_position(p, values.len(), kind, fuzz);
+                        weight > 0.0 && weight < 1.0 && values[lo] != values[hi]
+                    }))
+            {
+                return Err(ctx.stop(call.err_call(), "* not defined for \"Date\" objects"));
+            }
             let out: Vec<_> = probs
                 .iter()
                 .map(|&p| {
@@ -300,7 +328,9 @@ pub(super) fn quantile(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResul
                 }
                 result
             } else {
-                ctx.session_mut().alloc_real_from(&out)?
+                let result = ctx.session_mut().alloc_real_from(&out)?;
+                copy_class(ctx, x, result)?;
+                result
             }
         };
         if names && !probs.is_empty() {
@@ -325,6 +355,9 @@ pub(super) fn mad(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     let mut deviations = numbers(ctx, call, args.get(0))?;
     let low = boolean(ctx, call, args.get(1))?;
     let high = boolean(ctx, call, args.get(2))?;
+    if low && high && deviations.len().is_multiple_of(2) {
+        return Err(ctx.stop(call.err_call(), "'low' and 'high' cannot be both TRUE"));
+    }
     if deviations.iter().any(|x| x.is_nan()) {
         deviations.clear();
     }
@@ -342,6 +375,9 @@ pub(super) fn mad(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
 
 pub(super) fn fivenum(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     let na_rm = boolean(ctx, call, args.get(1))?;
+    if args.get(0) != SEXP_NIL && !numeric(ctx, args.get(0))? {
+        return Err(ctx.stop(call.err_call(), "non-numeric argument to binary operator"));
+    }
     let mut x = numbers(ctx, call, args.get(0))?;
     if na_rm {
         x.retain(|v| !v.is_nan());

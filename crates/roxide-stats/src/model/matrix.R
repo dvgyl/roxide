@@ -116,7 +116,19 @@ contrasts <- function(x, contrasts = TRUE, sparse = FALSE) {
 }
 C <- function(object, contr, how.many, ...) {
     if (!is.factor(object)) object <- ordered(object)
-    if (missing(contr)) contr <- getOption("contrasts")[(if (inherits(object, "ordered")) 2L else 1L)]
+    if (missing(contr)) {
+        contr <- getOption("contrasts")[(if (inherits(object, "ordered")) 2L else 1L)]
+    } else {
+        expr <- substitute(contr)
+        aliases <- c("treatment", "sum", "helmert", "poly", "SAS")
+        if (typeof(expr) == "symbol") {
+            name <- as.character(expr)
+            if (any(name == aliases)) contr <- paste0("contr.", name)
+        }
+    }
+    if (!missing(how.many) && is.character(contr)) {
+        contr <- get(contr, mode = "function")
+    }
     if (is.function(contr)) {
         input <- if (identical(contr, contr.poly)) length(levels(object)) else levels(object)
         contr <- contr(input, ...)

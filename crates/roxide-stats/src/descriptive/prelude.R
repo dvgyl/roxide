@@ -20,7 +20,6 @@ IQR <- function(x, na.rm = FALSE, type = 7) {
     q[2L] - q[1L]
 }
 mad <- function(x, center = median(x), constant = 1.4826, na.rm = FALSE, low = FALSE, high = FALSE) {
-    if (low && high) stop("'low' and 'high' cannot be both TRUE")
     if (na.rm) x <- x[!is.na(x)]
     constant * .Internal(C_mad(abs(x - center), low, high))
 }

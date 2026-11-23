@@ -450,7 +450,7 @@ pub(super) fn cov2cor(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult
         return Err(ctx.stop(call.err_call(), "'V' is not a square numeric matrix"));
     }
     limit::<f64>(ctx, call, n)?;
-    let scale: Vec<_> = (0..n).map(|i| out[i * n + i].sqrt().recip()).collect();
+    let scale: Vec<_> = (0..n).map(|i| out[i * n + i].recip().sqrt()).collect();
     if scale.iter().any(|x| !x.is_finite()) {
         ctx.warn_now(
             call.err_call(),

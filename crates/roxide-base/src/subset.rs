@@ -101,5 +101,11 @@ pub const MODULE: Module = Module {
         primitive!("Filter", apply::filter),
         primitive!("do.call", apply::do_call),
     ],
-    prelude: "",
+    prelude: r#"
+`[.AsIs` <- function(x, ...) {
+    y <- NextMethod("[")
+    class(y) <- c("AsIs", attr(y, "class", exact = TRUE))
+    y
+}
+"#,
 };

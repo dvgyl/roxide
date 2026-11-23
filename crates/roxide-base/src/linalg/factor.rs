@@ -156,6 +156,12 @@ pub(super) fn solve(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     };
     let inverse = flag(ctx, *inverse, false)?;
     let s = ctx.session();
+    if !matches!(
+        s.type_of(*a)?,
+        SexpType::Lgl | SexpType::Int | SexpType::Real | SexpType::Cplx
+    ) {
+        return Err(error(ctx, call, "'a' must be a numeric matrix"));
+    }
     let (n, cols) = dimensions(s, *a).unwrap_or((s.xlength(*a)?, 1));
     if n == 0 {
         return Err(error(ctx, call, "'a' is 0-diml"));
@@ -290,7 +296,7 @@ fn complex_norm(a: &[Cplx], n: usize, one: bool) -> f64 {
 }
 
 pub(super) fn rcond(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
-    let [x, kind] = args.values() else {
+    let [x, kind, triangular, uplo] = args.values() else {
         return Err(error(ctx, call, "invalid rcond arguments"));
     };
     if *kind != SEXP_NIL && ctx.session().xlength(*kind)? != 1 {
@@ -308,6 +314,18 @@ pub(super) fn rcond(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     if rows.min(cols) == 0 {
         return Ok(ctx.session_mut().scalar_real(f64::INFINITY)?);
     }
+    let triangle = if flag(ctx, *triangular, false)? && rows == cols {
+        if ctx.session().xlength(*uplo)? != 1 {
+            return Err(error(ctx, call, "EXPR must be a length 1 vector"));
+        }
+        match string(ctx.session(), *uplo).as_deref() {
+            Some("U") => Some(true),
+            Some("L") => Some(false),
+            _ => return Err(error(ctx, call, "'uplo' must be \"U\" or \"L\"")),
+        }
+    } else {
+        None
+    };
     if ctx.session().type_of(*x)? == SexpType::Cplx {
         if rows != cols {
             return Err(error(
@@ -316,10 +334,11 @@ pub(super) fn rcond(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
                 "rectangular complex condition estimates are not supported",
             ));
         }
-        let a = complex(ctx, call, *x)?;
+        let mut a = complex(ctx, call, *x)?;
         if a.len() != rows * cols {
             return Err(error(ctx, call, "invalid matrix dimensions"));
         }
+        retain_triangle(&mut a, rows, triangle);
         let norm = complex_norm(&a, rows, one);
         if !norm.is_finite() {
             return Err(error(
@@ -357,6 +376,7 @@ pub(super) fn rcond(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
         a.values = qr.r_mat(false).map_err(|e| math_error(ctx, call, e))?;
         a.rows = n;
     }
+    retain_triangle(&mut a.values, n, triangle);
     let norm = norm(a.view(), one);
     if !norm.is_finite() {
         return Err(error(
@@ -367,6 +387,19 @@ pub(super) fn rcond(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     }
     let lu = lu(ctx, call, a.values, n)?;
     Ok(ctx.session_mut().scalar_real(lu.rcond(norm, one))?)
+}
+
+fn retain_triangle<T: Default>(data: &mut [T], n: usize, upper: Option<bool>) {
+    if let Some(upper) = upper {
+        for (j, column) in data.chunks_exact_mut(n).enumerate() {
+            let unused = if upper {
+                &mut column[j + 1..]
+            } else {
+                &mut column[..j]
+            };
+            unused.fill_with(T::default);
+        }
+    }
 }
 
 pub(super) fn determinant(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {

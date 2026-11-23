@@ -152,3 +152,40 @@ fn replacement_and_language_values() {
     "#,
     );
 }
+
+#[test]
+fn factor_comparisons_and_base_helpers() {
+    let mut ctx = roxide_eval::Ctx::new(
+        Box::new(roxide_host::PureHost::new()),
+        roxide_gc::GcPolicy::Torture,
+    )
+    .expect("Create the R session");
+    roxide_base::register_all(&mut ctx).expect("Register base");
+    ctx.run_script(
+        "Factor comparisons and helpers",
+        r#"
+f <- factor(c("a", "c", NA))
+stopifnot(identical(f != "c", c(TRUE,FALSE,NA)),
+          identical("a" == f, c(TRUE,FALSE,NA)),
+          identical(f == factor(c("a", "c", NA), levels = c("c", "a")), c(TRUE,TRUE,NA)))
+err <- tryCatch(f == factor(c("a","b","c")), error = conditionMessage)
+stopifnot(identical(err, "level sets of factors are different"))
+warn <- tryCatch(f < "c", warning = conditionMessage)
+stopifnot(identical(warn, paste0("‘", "<", "’ not meaningful for factors")))
+x <- structure(1:3, class = "AsIs")
+stopifnot(inherits(x[2L], "AsIs"))
+y <- 1:3; x <- 4:6
+stopifnot(identical(colnames(cbind(y, x)), c("y", "x")),
+          identical(colnames(cbind(y = y, x = x)), c("y", "x")))
+a <- matrix(1:4, 2); colnames(a) <- c("y","x")
+stopifnot(identical(colnames(a), c("y","x")), identical(as.vector(a), 1:4),
+          identical(as.vector(f), c("a", "c", NA_character_)),
+          identical(signif(c(123.456, 0.012345), 3), c(123, 0.0123)),
+          identical(all.vars(quote(y ~ f(x) + x + z)), c("y","x","z")),
+          identical(environmentName(baseenv()), "base"))
+"#,
+        roxide_value::GLOBAL_ENV,
+        false,
+    )
+    .expect("Check factor comparisons and helpers");
+}

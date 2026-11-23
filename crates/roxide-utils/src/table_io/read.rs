@@ -77,7 +77,9 @@ pub(super) fn read_table(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalRes
         args.get(6),
         args.get(11),
     )?;
-    let nrows = limit(ctx, args.get(14))?;
+    let rows = ctx.session_mut().coerce(args.get(14), SexpType::Real)?.0;
+    let rows = ctx.session().real(rows)?.iter().next().unwrap_or(f64::NAN);
+    let nrows = rows.max(0.0) as usize;
     let skip = limit(ctx, args.get(15))?;
     let encoding = string(ctx, call, args.get(23), "encoding")?;
     let skip_nul = flag(ctx, args.get(25))?.unwrap_or(false);
@@ -104,11 +106,14 @@ pub(super) fn read_table(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalRes
     )?;
     let mut header = flag(ctx, args.get(1))?.unwrap_or(false);
     let auto_header = flag(ctx, args.get(2))?.unwrap_or(false);
-    let lookahead = if nrows == 0 {
+    let lookahead = if rows < 0.0 {
         5
     } else {
         5.min(nrows.saturating_add(usize::from(header)))
     };
+    if lookahead == 0 {
+        return Err(ctx.stop(call.err_call(), "invalid 'nlines' argument"));
+    }
     let start = preview.start_preview();
     let first = preview.record(ctx, call, usize::MAX, |_| (true, true))?;
     let has_input = first.is_some();
@@ -228,7 +233,7 @@ pub(super) fn read_table(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalRes
                 }
             };
             ctx.protect(value);
-            columns.push((names[i].clone(), value));
+            columns.push((i, value));
         }
         let explicit = flag(ctx, args.get(7))?.unwrap_or(false);
         let row_names = if explicit {
@@ -250,8 +255,12 @@ pub(super) fn read_table(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalRes
         } else {
             n
         };
-        let rows = row_names_value(ctx, call, row_names, &mut columns, n, explicit)?;
+        let rows = row_names_value(ctx, call, row_names, &mut columns, &names, n, explicit)?;
         ctx.protect(rows);
+        let columns = columns
+            .into_iter()
+            .map(|(i, value)| (names[i].clone(), value))
+            .collect::<Vec<_>>();
         frame(ctx, &columns, rows)
     })
 }
@@ -298,11 +307,26 @@ fn column_classes(
         ));
     }
     let names = attr(ctx.session_mut(), value, "names")?;
+    let bound = ctx.host().limits().max_vector_bytes;
+    let slots = columns.len().saturating_mul(size_of::<Option<String>>());
+    if slots > bound {
+        return Err(ctx.stop(call.err_call(), "vector size limit exceeded"));
+    }
     let classes = r_strings(ctx, value)?;
     if classes.is_empty() {
         return Ok(vec![None; columns.len()]);
     }
     if names == SEXP_NIL {
+        let bytes = classes
+            .iter()
+            .cycle()
+            .take(columns.len())
+            .fold(slots, |used, class| {
+                used.saturating_add(class.as_ref().map_or(0, String::len))
+            });
+        if bytes > bound {
+            return Err(ctx.stop(call.err_call(), "vector size limit exceeded"));
+        }
         return Ok(classes.into_iter().cycle().take(columns.len()).collect());
     }
     let names = r_strings(ctx, names)?;
@@ -383,7 +407,8 @@ fn row_names_value(
     ctx: &mut Ctx,
     call: &Call,
     value: SexpId,
-    columns: &mut Vec<(Option<String>, SexpId)>,
+    columns: &mut Vec<(usize, SexpId)>,
+    names: &[Option<String>],
     n: usize,
     explicit: bool,
 ) -> EvalResult {
@@ -403,11 +428,11 @@ fn row_names_value(
             let i = match ty {
                 SexpType::Str => {
                     let name = r_strings(ctx, value)?.into_iter().next().flatten();
-                    columns.iter().position(|(c, _)| *c == name)
+                    names.iter().position(|c| *c == name)
                 }
                 SexpType::Int | SexpType::Real => {
                     let value = limit(ctx, value)?;
-                    value.checked_sub(1).filter(|&i| i < columns.len())
+                    value.checked_sub(1).filter(|&i| i < names.len())
                 }
                 _ => return Err(ctx.stop(call.err_call(), "invalid 'row.names' specification")),
             };
@@ -417,7 +442,10 @@ fn row_names_value(
                     "attempt to select less than one element in get1index",
                 )
             })?;
-            rows = columns.remove(i).1;
+            let Some(position) = columns.iter().position(|(column, _)| *column == i) else {
+                return Err(ctx.stop(call.err_call(), "invalid 'row.names' length"));
+            };
+            rows = columns.remove(position).1;
         } else if ty != SexpType::Str {
             return Err(ctx.stop(call.err_call(), "invalid 'row.names' specification"));
         }

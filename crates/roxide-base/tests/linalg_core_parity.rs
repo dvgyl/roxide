@@ -64,3 +64,29 @@ check(qr.Q(qr(1:500), complete=TRUE))
     )
     .expect("check matrix allocation limits");
 }
+
+#[test]
+fn linear_algebra_uses_the_selected_triangle_and_rhs_dispatch() {
+    let mut ctx = roxide_eval::Ctx::new(
+        Box::new(roxide_host::PureHost::new()),
+        roxide_gc::GcPolicy::Torture,
+    )
+    .expect("Create the R session");
+    roxide_base::register_all(&mut ctx).expect("Register base");
+    ctx.run_script(
+        "Matrix dispatch and triangles",
+        r#"
+a <- matrix(c(1,2,3,4,5,6,7,8,10), 3L)
+stopifnot(abs(rcond(a, triangular = TRUE) - 0.04) < 1e-12,
+          abs(rcond(a, "O", TRUE, "L") - 0.062266500622665) < 1e-12)
+err <- tryCatch(solve(matrix("2")), error = conditionMessage)
+stopifnot(identical(err, "'a' must be a numeric matrix"), identical(solve(matrix(2), "4"), 2))
+matrixOps.audit <- function(x, y) .Generic
+f <- structure(diag(2), class = "audit")
+stopifnot(identical(diag(2) %*% f, "%*%"), identical(crossprod(diag(2), f), "crossprod"))
+"#,
+        roxide_value::GLOBAL_ENV,
+        false,
+    )
+    .expect("Check triangle selection and matrix dispatch");
+}

@@ -41,7 +41,7 @@ pub const MODULE: Module = Module {
         internal("chol", 3, factor::chol),
         internal("chol2inv", 2, factor::chol2inv),
         internal("solve", 4, factor::solve),
-        internal("rcond", 2, factor::rcond),
+        internal("rcond", 4, factor::rcond),
         internal("determinant", 2, factor::determinant),
         internal("backsolve", 5, factor::backsolve),
         internal("spectral_svd", 4, spectral::svd),
@@ -91,7 +91,8 @@ det <- function(x, ...) {
     d <- determinant(x, logarithm = TRUE, ...)
     d$sign * exp(as.double(d$modulus))
 }
-rcond <- function(x, norm = "O", ...) .Internal(rcond(x, norm))
+rcond <- function(x, norm = "O", triangular = FALSE, uplo = "U", ...)
+    .Internal(rcond(x, norm, triangular, uplo))
 backsolve <- function(r, x, k = ncol(r), upper.tri = TRUE, transpose = FALSE)
     .Internal(backsolve(r, x, if (missing(k)) if (is.matrix(r)) ncol(r) else 1L else k, upper.tri, transpose))
 forwardsolve <- function(l, x, k = ncol(l), upper.tri = FALSE, transpose = FALSE)

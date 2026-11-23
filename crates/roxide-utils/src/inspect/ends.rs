@@ -5,6 +5,7 @@ use roxide_gc::SexpId;
 use roxide_value::{BASE_ENV, FALSE_SCALAR, SEXP_MISSING, SEXP_NIL, SexpType, ValueApi};
 
 use super::{attr, flag, set, strings};
+use roxide_value::deparse::deparse_bounded;
 
 pub(super) fn ends(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     let x = args.get(0);
@@ -33,7 +34,11 @@ pub(super) fn ends(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
             .collect()
     } else {
         validate(ctx, call, &n, None)?;
-        let len = ctx.session().xlength(x)?;
+        let caller = ctx.closure_caller(call.env);
+        let length = ctx.call_function("length", &[(None, x)], caller)?;
+        let len = ctx.session_mut().coerce(length, SexpType::Real)?.0;
+        let len = ctx.session().real(len)?.iter().next().unwrap_or(0.0);
+        let len = len as usize;
         let sub = indices(ctx, call, selection(len, n[0], tail))?;
         return subset(ctx, call, x, &[sub], false);
     };
@@ -224,7 +229,18 @@ fn function(ctx: &mut Ctx, call: &Call, x: SexpId, n: &[f64], tail: bool) -> Eva
     let lines = if let Some(name) = ctx.primitive_name(x) {
         vec![format!(".Primitive(\"{name}\")")]
     } else {
-        ctx.deparse_lines(x, Default::default())?
+        let byte_limit = ctx.host().limits().max_vector_bytes.min(1024 * 1024);
+        let line_limit = if !tail && n[0] >= 0.0 {
+            n[0] as usize
+        } else {
+            usize::MAX
+        };
+        let (lines, used_budget) =
+            deparse_bounded(ctx.session(), x, Default::default(), line_limit, byte_limit)?;
+        if used_budget && (tail || n[0] < 0.0) {
+            return Err(ctx.stop(call.err_call(), "function deparse exceeds the size limit"));
+        }
+        lines
     };
     let range = selection(lines.len(), n[0], tail);
     let rows = range.len() as i32;

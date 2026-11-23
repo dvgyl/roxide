@@ -242,14 +242,22 @@ impl<'a> Fields<'a> {
             let mut after_sep = std::mem::take(&mut self.pending_empty);
             let mut unclosed_quote = false;
             while fields.len() < limit {
-                if self.dialect.separator.is_none() {
+                let (quoted, strip) = mode(fields.len());
+                let numeric_blank = self.dialect.skip_blank
+                    && !quoted
+                    && !after_sep
+                    && fields.is_empty()
+                    && self
+                        .remaining()
+                        .split_once('\n')
+                        .is_some_and(|(line, _)| line.chars().all(horizontal));
+                if self.dialect.separator.is_none() || numeric_blank {
                     self.trim_horizontal();
                 }
                 self.discard_comment();
                 if !after_sep && matches!(self.peek(), Some('\n') | None) {
                     break;
                 }
-                let (quoted, strip) = mode(fields.len());
                 let (value, unclosed) = self.field(ctx, call, quoted, strip)?;
                 unclosed_quote |= unclosed;
                 field_bytes = field_bytes.saturating_add(value.len() + size_of::<String>());

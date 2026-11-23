@@ -105,6 +105,7 @@ pub const MODULE: Module = Module {
         group!("ceiling", summary::ceiling, Exact(1), Math),
         group!("trunc", summary::trunc, Exact(1), Math),
         group!("round", summary::round, Range(1, 2), Math),
+        group!("signif", summary::signif, Range(1, 2), Math),
         group!("sign", summary::sign, Exact(1), Math),
         group!("sqrt", summary::sqrt, Exact(1), Math),
         group!("exp", summary::exp, Exact(1), Math),
@@ -152,6 +153,30 @@ pub const MODULE: Module = Module {
         primitive!("as.character", types::as_character),
         primitive!("as.raw", types::as_raw),
         primitive!("as.list", types::as_list),
+        primitive!(
+            "as.vector",
+            types::as_vector,
+            Eval,
+            Range(1, 2),
+            Dispatch::Internal("as.vector"),
+            On
+        ),
+        primitive!(
+            "all.vars",
+            types::all_vars,
+            Eval,
+            Range(1, 4),
+            Dispatch::None,
+            On
+        ),
+        primitive!(
+            "environmentName",
+            types::environment_name,
+            Eval,
+            Exact(1),
+            Dispatch::None,
+            On
+        ),
         primitive!("attributes", attributes::attributes),
         primitive!("attributes<-", attributes::set_attributes),
         primitive!("attr", attributes::attr),
@@ -175,5 +200,45 @@ pub const MODULE: Module = Module {
         primitive!("inherits", attributes::inherits),
         primitive!("c", types::combine),
     ],
-    prelude: "",
+    prelude: r#"
+`colnames<-` <- function(x, value) {
+    if (is.data.frame(x)) {
+        names(x) <- value
+    } else {
+        if (length(dim(x)) < 2L) stop("attempt to set 'colnames' on an object with less than two dimensions")
+        dn <- dimnames(x)
+        if (is.null(dn)) dn <- rep(list(NULL), length(dim(x)))
+        dn[2L] <- list(value)
+        dimnames(x) <- dn
+    }
+    x
+}
+Ops.factor <- function(e1, e2) {
+    if (.Generic != "==" && .Generic != "!=") {
+        warning(paste0("‘", .Generic, "’ not meaningful for factors"))
+        len <- length(e1)
+        if (!missing(e2)) len <- max(len, length(e2))
+        return(rep(NA, len))
+    }
+    f1 <- is.factor(e1)
+    f2 <- is.factor(e2)
+    if (f1 && f2 && !identical(sort(levels(e1)), sort(levels(e2))))
+        stop("level sets of factors are different")
+    convert <- function(x) {
+        y <- as.character(x)
+        if (!is.null(dim(x))) {
+            dim(y) <- dim(x)
+            dimnames(y) <- dimnames(x)
+        } else names(y) <- names(x)
+        y
+    }
+    if (f1) e1 <- convert(e1)
+    if (f2) e2 <- convert(e2)
+    if (.Generic == "==") e1 == e2 else e1 != e2
+}
+as.vector.factor <- function(x, mode = "any") {
+    if (mode == "any" || mode == "character") as.character(x)
+    else as.vector(unclass(x), mode)
+}
+"#,
 };

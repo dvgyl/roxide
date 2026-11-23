@@ -137,6 +137,40 @@ fn group_name(group: GroupGeneric) -> &'static str {
 }
 
 impl Ctx {
+    /// Return the calling environment of the current closure frame.
+    pub fn closure_caller(&self, env: SexpId) -> SexpId {
+        self.frame(env).map_or(env, |frame| frame.caller)
+    }
+
+    /// Find an explicit S3 method for an object without invoking its default method.
+    pub fn explicit_s3_method(
+        &mut self,
+        generic: &str,
+        x: SexpId,
+        caller: SexpId,
+        definition: SexpId,
+    ) -> EvalResult<Option<SexpId>> {
+        for class in self.classes(x, false)? {
+            if let Some(fun) =
+                self.lookup_method(&format!("{generic}.{class}"), caller, definition)?
+            {
+                return Ok(Some(fun));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Return the namespace name for a registered package environment.
+    pub fn namespace_name(&self, env: SexpId) -> Option<&'static str> {
+        if env == BASE_NAMESPACE {
+            return Some("base");
+        }
+        self.packages
+            .iter()
+            .find(|pkg| pkg.namespace == env)
+            .map(|pkg| pkg.name)
+    }
+
     pub(crate) fn classes(&mut self, value: SexpId, implicit: bool) -> EvalResult<Vec<String>> {
         let class_tag = self.session.intern("class")?;
         let explicit = self.session.attr(value, class_tag);
@@ -179,7 +213,8 @@ impl Ctx {
     ) -> EvalResult<Option<SexpId>> {
         let sym = self.session.intern(name)?;
         while env != SEXP_NIL && env != end {
-            if let Some(binding) = self.session.env_get(env, sym)
+            if !self.packages.iter().any(|pkg| pkg.attached == Some(env))
+                && let Some(binding) = self.session.env_get(env, sym)
                 && binding.value != SEXP_MISSING
                 && binding.value != SEXP_UNBOUND
             {
@@ -212,20 +247,20 @@ impl Ctx {
                 return Ok(Some(fun.value));
             }
         }
-        let tag = self.session.intern(name)?;
-        for i in 0..self.packages.len() {
-            let env = self.packages[i].namespace;
-            if let Some(binding) = self.session.env_get(env, tag)
-                && binding.value != SEXP_MISSING
-                && binding.value != SEXP_UNBOUND
-            {
-                let value = self.read_binding(binding, env)?;
-                if matches!(
-                    self.session.type_of(value)?,
-                    SexpType::Clo | SexpType::Builtin | SexpType::Special
-                ) {
-                    return Ok(Some(value));
-                }
+        if definition != BASE_NAMESPACE && definition != BASE_ENV {
+            return self.optional_fun(name, definition, self.session.env_enclos(definition)?);
+        }
+        // These methods belong to base generics and are registered by other packages.
+        let package = match name {
+            "print.formula" | "print.htest" | "print.integrate" | "[.terms" => Some("stats"),
+            "format.object_size" | "print.object_size" | "print.sessionInfo" => Some("utils"),
+            "print.Rd" => Some("tools"),
+            _ => None,
+        };
+        if let Some(pkg) = self.packages.iter().find(|pkg| Some(pkg.name) == package) {
+            let ns = pkg.namespace;
+            if let Some(fun) = self.optional_fun(name, ns, self.session.env_enclos(ns)?)? {
+                return Ok(Some(fun));
             }
         }
         self.optional_fun(name, BASE_ENV, SEXP_NIL)
@@ -321,7 +356,7 @@ impl Ctx {
             return Ok(None);
         }
         let na_rm = self.session.intern("na.rm")?;
-        let ops = group == Some(GroupGeneric::Ops);
+        let ops = matches!(group, Some(GroupGeneric::Ops | GroupGeneric::MatrixOps));
         let candidates: Vec<_> = args
             .iter()
             .enumerate()
@@ -399,7 +434,11 @@ impl Ctx {
         let mut pairs = Vec::with_capacity(args.len() + 1);
         for (i, (tag, value)) in args.iter().enumerate() {
             let expr = promised.map_or(Ok(value), |args| self.promise_expr(args.get(i)))?;
-            let tag = if ops { None } else { tag };
+            let tag = if group == Some(GroupGeneric::Ops) {
+                None
+            } else {
+                tag
+            };
             pairs.push((tag, self.value_promise(expr, value)?));
         }
         if group == Some(GroupGeneric::Summary) && !pairs.iter().any(|(tag, _)| *tag == Some(na_rm))
@@ -491,9 +530,16 @@ impl Ctx {
         let tag = self.session.intern("class")?;
         let mut class = SEXP_NIL;
         for value in values.by_ref() {
-            if self.session.is_object(value)? && self.session.xlength(value)? == result_len {
-                class = self.session.attr(value, tag);
-                break;
+            if self.session.is_object(value)? {
+                let date_offset = matches!(def.name, "+" | "-")
+                    && self
+                        .classes(value, false)?
+                        .iter()
+                        .any(|class| class == "Date");
+                if date_offset || self.session.xlength(value)? == result_len {
+                    class = self.session.attr(value, tag);
+                    break;
+                }
             }
         }
         if class != SEXP_NIL {

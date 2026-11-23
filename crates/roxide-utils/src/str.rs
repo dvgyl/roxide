@@ -57,11 +57,7 @@ fn display(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
         path: HashSet::new(),
     };
     display.value(args.get(0), "", 0, false)?;
-    display
-        .ctx
-        .host()
-        .write_out(display.text.as_bytes())
-        .map_err(|err| display.ctx.stop(call.err_call(), err.to_string()))?;
+    display.flush()?;
     Ok(SEXP_NIL)
 }
 
@@ -153,6 +149,40 @@ struct Display<'a> {
 }
 
 impl Display<'_> {
+    fn flush(&mut self) -> EvalResult<()> {
+        self.ctx
+            .host()
+            .write_out(self.text.as_bytes())
+            .map_err(|err| self.ctx.stop(self.call.err_call(), err.to_string()))?;
+        self.bound = self.bound.saturating_sub(self.text.len());
+        self.text.clear();
+        Ok(())
+    }
+
+    fn child(&mut self, x: SexpId, prefix: &str, depth: usize, column: bool) -> EvalResult<()> {
+        let caller = self.ctx.closure_caller(self.call.env);
+        let definition = self.ctx.session().env_enclos(self.call.env)?;
+        if depth < self.max_depth
+            && !self.path.contains(&x)
+            && let Some(fun) = self.ctx.explicit_s3_method("str", x, caller, definition)?
+        {
+            let symbol = self.ctx.session_mut().intern("str.default")?;
+            if self.ctx.get_local(symbol, definition)? != Some(fun) {
+                if prefix.len() > self.bound.saturating_sub(self.text.len()) {
+                    return Err(self
+                        .ctx
+                        .stop(self.call.err_call(), "vector size limit exceeded"));
+                }
+                self.text.push_str(prefix);
+                self.flush()?;
+                self.ctx
+                    .apply(fun, &[(None, x)], self.call.err_call(), caller)?;
+                return Ok(());
+            }
+        }
+        self.value(x, prefix, depth, column)
+    }
+
     fn line(&mut self, prefix: &str, content: &str) -> EvalResult<()> {
         let size = prefix.len().saturating_add(content.len()).saturating_add(1);
         if size > self.bound.saturating_sub(self.text.len()) {
@@ -375,7 +405,7 @@ impl Display<'_> {
                 "$ "
             };
             let line = format!("{indent}{component}{name:width$}:");
-            self.value(child, &line, depth + 1, frame && depth == 0)?;
+            self.child(child, &line, depth + 1, frame && depth == 0)?;
         }
         if count < n {
             self.line(&indent, " [list output truncated]")?;
@@ -418,12 +448,12 @@ impl Display<'_> {
             };
             return Ok(format!("function ({arguments})  "));
         }
-        let lines = self.ctx.deparse_lines(x, Default::default())?;
-        let count = lines
-            .iter()
-            .position(|line| line.trim_end().ends_with(')'))
-            .map_or(1, |i| i + 1);
-        let formals = lines[..count.min(lines.len())].join("\n");
+        let lines = roxide_value::deparse::deparse_formals(
+            self.ctx.session(),
+            x,
+            self.bound.min(1024 * 1024),
+        )?;
+        let formals = lines.join("\n");
         Ok(format!("{}  ", formals.trim_end()))
     }
 

@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use roxide_base::scan::r_strings;
 use roxide_eval::{Args, Call, Ctx, EvalResult};
@@ -17,6 +17,8 @@ pub(super) fn size(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
         ctx,
         call,
         path: HashSet::new(),
+        sizes: HashMap::new(),
+        cycles: 0,
         depth,
     };
     let bytes = count.value(args.get(0))?;
@@ -32,11 +34,17 @@ struct Counter<'a> {
     call: &'a Call,
     path: HashSet<SexpId>,
     depth: usize,
+    sizes: HashMap<SexpId, usize>,
+    cycles: usize,
 }
 
 impl Counter<'_> {
     fn value(&mut self, value: SexpId) -> EvalResult<usize> {
-        if value == SEXP_NIL || self.path.contains(&value) {
+        if self.path.contains(&value) {
+            self.cycles += 1;
+            return Ok(0);
+        }
+        if value == SEXP_NIL {
             return Ok(0);
         }
         if self.path.len() >= self.depth {
@@ -44,10 +52,18 @@ impl Counter<'_> {
                 .ctx
                 .stop(self.call.err_call(), "object size recursion limit exceeded"));
         }
+        if let Some(&bytes) = self.sizes.get(&value) {
+            return Ok(bytes);
+        }
+        let cycles = self.cycles;
         self.path.insert(value);
         let result = self.count(value);
         self.path.remove(&value);
-        result
+        let bytes = result?;
+        if cycles == self.cycles {
+            self.sizes.insert(value, bytes);
+        }
+        Ok(bytes)
     }
 
     fn count(&mut self, x: SexpId) -> EvalResult<usize> {

@@ -196,7 +196,11 @@ fn bind(ctx: &mut Ctx, call: &Call, args: &Args, rows: bool) -> EvalResult {
     let mut ty = SexpType::Nil;
     let mut blocks = Vec::new();
     let mut fixed = None;
-    for (n, x) in args.iter() {
+    let level = args
+        .named(s, "deparse.level")
+        .map_or(Ok(1.0), |x| number(s, x))?;
+    let exprs = s.pairlist_iter(call.expr).skip(1).collect::<Vec<_>>();
+    for (arg_index, (n, x)) in args.iter().enumerate() {
         if tag(s, n) == Some("deparse.level") || x == SEXP_NIL {
             continue;
         }
@@ -218,10 +222,21 @@ fn bind(ctx: &mut Ctx, call: &Call, args: &Args, rows: bool) -> EvalResult {
             fixed = Some(inner);
         }
         let size = s.xlength(x)?;
-        let name = tag(s, n)
-            .map(str::to_owned)
-            .map(|v| ch(s, &v))
-            .transpose()?;
+        let name = if let Some(name) = tag(s, n) {
+            Some(name.to_owned())
+        } else if level > 0.0 && dim.is_none() {
+            let expr = exprs.get(arg_index).map_or(SEXP_NIL, |(_, expr)| *expr);
+            if let Ok(name) = s.sym_name_of(expr) {
+                Some(name.to_owned())
+            } else if level >= 2.0 && expr != SEXP_NIL {
+                Some(roxide_value::deparse(s, expr, Default::default())?.join(" "))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let name = name.map(|name| ch(s, &name)).transpose()?;
         blocks.push(Block { x, dim, name, size });
     }
     if ty == SexpType::Nil {

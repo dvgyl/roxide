@@ -68,7 +68,17 @@ impl Document {
                 .strip_prefix(b"\r\n")
                 .or_else(|| rest.get(1..))
                 .unwrap_or_default();
-            let line = line.split(|&b| b == 0).next().unwrap_or_default();
+            let filtered;
+            let line = if all && line.contains(&0) {
+                filtered = line
+                    .iter()
+                    .copied()
+                    .filter(|&byte| byte != 0)
+                    .collect::<Vec<_>>();
+                &filtered
+            } else {
+                line.split(|&b| b == 0).next().unwrap_or_default()
+            };
             if line.starts_with(b"#") {
                 continue;
             }
@@ -193,6 +203,25 @@ impl Document {
             return Err(ctx.stop(call.err_call(), "vector size limit exceeded"));
         }
 
+        if all {
+            let mut sizes = HashMap::new();
+            for row in &self.records {
+                for (&column, values) in row {
+                    if self.repeated.contains(&column) {
+                        *sizes.entry(column).or_insert(0usize) += values.len().saturating_sub(1);
+                    }
+                }
+            }
+            let cells = selected
+                .iter()
+                .flatten()
+                .fold(rows.saturating_mul(width), |used, column| {
+                    used.saturating_add(sizes.get(column).copied().unwrap_or(0))
+                });
+            if cells > bound / size_of::<roxide_gc::SexpId>() {
+                return Err(ctx.stop(call.err_call(), "vector size limit exceeded"));
+            }
+        }
         let names = ctx.session_mut().alloc_str_from(&names)?;
         ctx.protect(names);
         if !all {

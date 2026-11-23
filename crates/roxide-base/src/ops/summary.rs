@@ -371,6 +371,7 @@ enum Math {
     Ceiling,
     Trunc,
     Round,
+    Signif,
     Sign,
     Sqrt,
     Exp,
@@ -388,11 +389,15 @@ macro_rules! math {
     )*};
 }
 
-math!(abs:Abs, floor:Floor, ceiling:Ceiling, trunc:Trunc, round:Round, sign:Sign,
+math!(abs:Abs, floor:Floor, ceiling:Ceiling, trunc:Trunc, round:Round, signif:Signif, sign:Sign,
     sqrt:Sqrt, exp:Exp, log:Log, sin:Sin, cos:Cos, tan:Tan);
 
 fn math_op(ctx: &mut Ctx, call: &Call, args: &Args, op: Math) -> EvalResult {
-    let parameter = if op == Math::Round { "digits" } else { "base" };
+    let parameter = if matches!(op, Math::Round | Math::Signif) {
+        "digits"
+    } else {
+        "base"
+    };
     let [x, extra] = formals(ctx.session(), args, ["x", parameter]);
     let s = ctx.session_mut();
     let ty = s.type_of(x)?;
@@ -421,13 +426,14 @@ fn math_op(ctx: &mut Ctx, call: &Call, args: &Args, op: Math) -> EvalResult {
                     | Math::Cos
                     | Math::Tan
                     | Math::Round
+                    | Math::Signif
             ) =>
         {
             let extra = if extra == SEXP_MISSING {
-                if op == Math::Round {
-                    0.0
-                } else {
-                    std::f64::consts::E
+                match op {
+                    Math::Round => 0.0,
+                    Math::Signif => 6.0,
+                    _ => std::f64::consts::E,
                 }
             } else {
                 number(s, extra)?
@@ -441,10 +447,10 @@ fn math_op(ctx: &mut Ctx, call: &Call, args: &Args, op: Math) -> EvalResult {
         }
         SexpType::Lgl | SexpType::Int | SexpType::Real => {
             let extra = if extra == SEXP_MISSING {
-                if op == Math::Round {
-                    0.0
-                } else {
-                    std::f64::consts::E
+                match op {
+                    Math::Round => 0.0,
+                    Math::Signif => 6.0,
+                    _ => std::f64::consts::E,
                 }
             } else {
                 number(s, extra)?
@@ -463,6 +469,7 @@ fn math_op(ctx: &mut Ctx, call: &Call, args: &Args, op: Math) -> EvalResult {
                         Math::Ceiling => v.ceil(),
                         Math::Trunc => v.trunc(),
                         Math::Round => round_value(v, extra),
+                        Math::Signif => significant(v, extra),
                         Math::Sign => {
                             if v == 0.0 {
                                 0.0
@@ -503,6 +510,21 @@ fn math_op(ctx: &mut Ctx, call: &Call, args: &Args, op: Math) -> EvalResult {
         ctx.warn_now(call.err_call(), "NaNs produced")?;
     }
     Ok(out)
+}
+
+fn significant(x: f64, digits: f64) -> f64 {
+    if digits.is_nan() {
+        return nan_propagate(x, digits);
+    }
+    if x == 0.0 || !x.is_finite() || digits > 22.0 {
+        return x;
+    }
+    let places = digits.round().max(1.0) - 1.0 - x.abs().log10().floor();
+    if places > 308.0 {
+        round_value(x * 1e308, places - 308.0) / 1e308
+    } else {
+        round_value(x, places)
+    }
 }
 
 fn round_value(x: f64, digits: f64) -> f64 {
@@ -572,6 +594,10 @@ fn complex_math(z: RComplex, op: Math, extra: f64) -> RComplex {
                 (2.0 * y).sinh() / ((2.0 * x).cos() + (2.0 * y).cosh())
             },
         ),
+        Math::Signif => {
+            let places = extra.round().max(1.0) - 1.0 - x.abs().max(y.abs()).log10().floor();
+            (round_value(x, places), round_value(y, places))
+        }
         _ => (round_value(x, extra), round_value(y, extra)),
     };
     RComplex { re, im }

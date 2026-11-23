@@ -57,6 +57,9 @@ fn weighted_mean(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
         return Err(ctx.stop(call.err_call(), "'x' and 'w' must have the same length"));
     }
     if !super::distn::support::numeric(ctx, args.get(0))? && args.get(0) != SEXP_NIL {
+        if !unweighted {
+            return Err(ctx.stop(call.err_call(), "non-numeric argument to binary operator"));
+        }
         ctx.warn_now(
             call.err_call(),
             "argument is not numeric or logical: returning NA",
@@ -81,7 +84,7 @@ fn weighted_mean(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
             if na_rm && x.is_nan() {
                 continue;
             }
-            missing |= is_na_real(w) || (w != 0.0 && is_na_real(x));
+            missing |= w.is_nan() || (w != 0.0 && is_na_real(x));
             denominator += w;
             if w != 0.0 {
                 numerator += x * w;

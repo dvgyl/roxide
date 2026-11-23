@@ -549,3 +549,127 @@ fn join_name(prefix: &str, suffix: &str) -> String {
     }
     format!("{prefix}.{suffix}")
 }
+
+pub(super) fn as_vector(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    let [x, mode] = formals(ctx.session(), args, ["x", "mode"]);
+    let named = if mode == SEXP_MISSING {
+        "any".to_owned()
+    } else {
+        string(ctx.session(), mode).ok_or_else(|| error(ctx, call, "invalid 'mode' argument"))?
+    };
+    let ty = match named.as_str() {
+        "any" => ctx.session().type_of(x)?,
+        "logical" => Lgl,
+        "integer" => Int,
+        "numeric" | "double" => Real,
+        "complex" => Cplx,
+        "character" => Str,
+        "raw" => Raw,
+        "list" => Vec,
+        "expression" => Expr,
+        "pairlist" => {
+            let items = convert(ctx, call, x, Vec)?;
+            let s = ctx.session_mut();
+            let ids = chars(s, get(s, items, "names")).to_vec();
+            let mut out = SEXP_NIL;
+            for (i, value) in s.list_slice(items)?.to_vec().into_iter().enumerate().rev() {
+                let tag = if let Some(&id) = ids.get(i).filter(|&&id| id != CharId::BLANK) {
+                    let name = text(s, id);
+                    s.intern(&name)?.as_sexp()
+                } else {
+                    SEXP_NIL
+                };
+                out = s.cons(value, out, tag)?;
+            }
+            return Ok(out);
+        }
+        "name" | "symbol" => {
+            if ctx.session().type_of(x)? == Sym {
+                return Ok(x);
+            }
+            let value = convert(ctx, call, x, Str)?;
+            let name = string(ctx.session(), value)
+                .filter(|name| !name.is_empty())
+                .ok_or_else(|| error(ctx, call, "invalid argument of type 'symbol'"))?;
+            return Ok(ctx.session_mut().intern(&name)?.as_sexp());
+        }
+        _ => return Err(error(ctx, call, "invalid 'mode' argument")),
+    };
+    if named == "any" && !matches!(ty, Lgl | Int | Real | Cplx | Str | Raw | Vec) {
+        if matches!(ty, Nil | Lang | List | Expr) {
+            return Ok(x);
+        }
+        return Err(error(
+            ctx,
+            call,
+            format!(
+                "cannot coerce type '{}' to vector of type 'any'",
+                ty.type_name(false)
+            ),
+        ));
+    }
+    convert(ctx, call, x, ty)
+}
+
+pub(super) fn all_vars(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    use std::collections::HashSet;
+
+    let [expr, max, unique, functions] = formals(
+        ctx.session(),
+        args,
+        ["expr", "max.names", "unique", "functions"],
+    );
+    let unique = flag(ctx, unique, true)?;
+    let functions = flag(ctx, functions, false)?;
+    let max = if max == SEXP_MISSING {
+        usize::MAX
+    } else {
+        let max = number(ctx.session_mut(), max)?;
+        if max < 0.0 { usize::MAX } else { max as usize }
+    };
+    let bound = ctx.host().limits().max_vector_bytes;
+    let s = ctx.session_mut();
+    let mut names = std::vec::Vec::new();
+    let mut seen = HashSet::new();
+    let mut pending = vec![expr];
+    while let Some(value) = pending.pop() {
+        if names.len() == max {
+            break;
+        }
+        match s.type_of(value)? {
+            Sym if value != SEXP_MISSING && (!unique || seen.insert(value)) => {
+                let name = s.sym_name_of(value)?.to_owned();
+                names.push(ch(s, &name)?);
+            }
+            Lang | List | Dot => {
+                let (head, tail, _) = s.cons_parts(value)?;
+                let start = pending.len();
+                pending.extend(s.pairlist_iter(tail).map(|(_, value)| value));
+                pending[start..].reverse();
+                if functions || s.type_of(value)? != Lang {
+                    pending.push(head);
+                }
+            }
+            Expr => pending.extend(s.list_slice(value)?.iter().rev()),
+            _ => {}
+        }
+        if names.len().saturating_add(pending.len()) > bound / size_of::<SexpId>() {
+            return Err(error(ctx, call, "vector size limit exceeded"));
+        }
+    }
+    Ok(s.alloc_str_from(&names)?)
+}
+
+pub(super) fn environment_name(ctx: &mut Ctx, _: &Call, args: &mut Args) -> EvalResult {
+    use roxide_value::{BASE_ENV, EMPTY_ENV, GLOBAL_ENV};
+    let x = args.get(0);
+    let name = match x {
+        BASE_ENV => "base".to_owned(),
+        EMPTY_ENV => "R_EmptyEnv".to_owned(),
+        GLOBAL_ENV => "R_GlobalEnv".to_owned(),
+        _ => ctx.namespace_name(x).map(str::to_owned).unwrap_or_else(|| {
+            string(ctx.session(), get(ctx.session(), x, "name")).unwrap_or_default()
+        }),
+    };
+    Ok(ctx.session_mut().scalar_str(&name)?)
+}

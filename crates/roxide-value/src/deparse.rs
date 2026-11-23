@@ -1,7 +1,7 @@
 //! Deparse R objects as R source.
 
 use roxide_gc::SexpId;
-use roxide_syntax::ops::Prec;
+use roxide_syntax::ops::{Prec, prec};
 
 use crate::api::{ValueApi, ValueError, VecView};
 use crate::format::encode_string;
@@ -55,6 +55,65 @@ pub fn dput(session: &RSession, x: SexpId, opts: DeparseOpts) -> Result<Vec<Stri
     render(session, x, opts, true)
 }
 
+/// Deparse up to `max_lines` lines and `max_bytes` bytes.
+///
+/// The second result is true if the byte budget ran out.
+pub fn deparse_bounded(
+    session: &RSession,
+    x: SexpId,
+    opts: DeparseOpts,
+    max_lines: usize,
+    max_bytes: usize,
+) -> Result<(Vec<String>, bool), ValueError> {
+    let mut out = Deparser {
+        session,
+        opts,
+        dput: false,
+        lines: Vec::new(),
+        line: String::new(),
+        budget: Some((max_lines, max_bytes)),
+    };
+    out.value(x, 0, 0, Prec(0))?;
+    if out.lines.len() < max_lines && max_bytes != 0 {
+        out.lines.push(out.line);
+    }
+    Ok((out.lines, out.budget.is_some_and(|(_, bytes)| bytes == 0)))
+}
+
+/// Deparse the formal argument list of a closure within a byte limit.
+pub fn deparse_formals(
+    session: &RSession,
+    x: SexpId,
+    max_bytes: usize,
+) -> Result<Vec<String>, ValueError> {
+    let (formals, _, _) = session.closure_parts(x)?;
+    let mut out = Deparser {
+        session,
+        opts: DeparseOpts::default(),
+        dput: false,
+        lines: Vec::new(),
+        line: String::new(),
+        budget: Some((usize::MAX, max_bytes)),
+    };
+    out.push("function (");
+    for (i, (tag, value)) in session.pairlist_iter(formals).enumerate() {
+        if out.exhausted() {
+            break;
+        }
+        out.separator(i, 4);
+        if let Some(tag) = tag {
+            out.push(&symbol(session.sym_name(tag)?));
+            if value != SEXP_MISSING {
+                out.push(" = ");
+            }
+        }
+        out.value(value, 1, 0, Prec(0))?;
+    }
+    out.push(")");
+    out.lines.push(out.line);
+    Ok(out.lines)
+}
+
 fn render(
     session: &RSession,
     x: SexpId,
@@ -67,6 +126,7 @@ fn render(
         dput,
         lines: Vec::new(),
         line: String::new(),
+        budget: None,
     };
     out.value(x, 0, 0, Prec(0))?;
     out.lines.push(out.line);
@@ -83,16 +143,100 @@ struct Deparser<'a> {
     dput: bool,
     lines: Vec<String>,
     line: String,
+    budget: Option<(usize, usize)>,
 }
 
 impl Deparser<'_> {
+    fn exhausted(&self) -> bool {
+        self.budget
+            .is_some_and(|(lines, bytes)| self.lines.len() >= lines || bytes == 0)
+    }
+
     fn push(&mut self, text: &str) {
-        self.line.push_str(text);
+        if self.exhausted() {
+            return;
+        }
+        if let Some((_, bytes)) = &mut self.budget {
+            let mut end = text.len().min(*bytes);
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            self.line.push_str(&text[..end]);
+            *bytes = if end == text.len() { *bytes - end } else { 0 };
+        } else {
+            self.line.push_str(text);
+        }
     }
 
     fn newline(&mut self, indent: usize) {
+        if self.exhausted() {
+            return;
+        }
         self.lines.push(std::mem::take(&mut self.line));
-        self.line.push_str(&" ".repeat(indent));
+        if let Some((_, bytes)) = &mut self.budget {
+            *bytes = bytes.saturating_sub(1);
+        }
+        self.push(&" ".repeat(indent));
+    }
+
+    fn bounded_block(
+        &mut self,
+        tail: SexpId,
+        depth: usize,
+        indent: usize,
+    ) -> Result<(), ValueError> {
+        self.push("{");
+        for (_, expr) in self.session.pairlist_iter(tail) {
+            if self.exhausted() {
+                break;
+            }
+            self.newline(indent + 4);
+            self.value(expr, depth + 1, indent + 4, Prec(0))?;
+        }
+        self.newline(indent);
+        self.push("}");
+        Ok(())
+    }
+
+    fn bounded_call(&mut self, x: SexpId, depth: usize, indent: usize) -> Result<(), ValueError> {
+        let (head, tail, _) = self.session.cons_parts(x)?;
+        if self.session.sym_name_of(head) == Ok("{") {
+            return self.bounded_block(tail, depth, indent);
+        }
+        if self.session.pairlist_iter(tail).take(4).count() < 4 {
+            return self.call(x, depth, indent);
+        }
+        let subscripts = self
+            .session
+            .sym_name_of(head)
+            .ok()
+            .filter(|op| matches!(*op, "[" | "[["));
+        let mut args = self.session.pairlist_iter(tail);
+        let close = if let Some(op) = subscripts
+            && let Some((_, target)) = args.next()
+        {
+            self.value(target, depth + 1, indent, prec::EXTRACT)?;
+            self.push(op);
+            if op == "[" { "]" } else { "]]" }
+        } else {
+            self.value(head, depth + 1, indent, prec::EXTRACT)?;
+            self.push("(");
+            self.wrap(indent + 4);
+            ")"
+        };
+        for (i, (tag, value)) in args.enumerate() {
+            if self.exhausted() {
+                break;
+            }
+            self.separator(i, indent + 4);
+            if let Some(tag) = tag {
+                self.push(&symbol(self.session.sym_name(tag)?));
+                self.push(" = ");
+            }
+            self.value(value, depth + 1, indent, Prec(0))?;
+        }
+        self.push(close);
+        Ok(())
     }
 
     fn wrap(&mut self, indent: usize) {
@@ -115,6 +259,9 @@ impl Deparser<'_> {
         indent: usize,
         min: Prec,
     ) -> Result<(), ValueError> {
+        if self.exhausted() {
+            return Ok(());
+        }
         if depth >= MAX_DEPARSE_DEPTH {
             return Err(ValueError::InvalidAttribute(
                 "deparse depth limit exceeded".into(),
@@ -200,6 +347,9 @@ impl Deparser<'_> {
                         self.wrap(indent + 4);
                     }
                     for (i, &item) in items.iter().enumerate() {
+                        if self.exhausted() {
+                            break;
+                        }
                         self.separator(i, indent + 4);
                         self.vector_name(names, i)?;
                         self.value(item, depth + 1, indent, Prec(0))?;
@@ -211,6 +361,7 @@ impl Deparser<'_> {
                     self.arguments(self.session.pairlist_iter(x), depth, indent)?;
                     self.push(")");
                 }
+                SexpType::Lang if self.budget.is_some() => self.bounded_call(x, depth, indent)?,
                 SexpType::Lang => self.call(x, depth, indent)?,
                 SexpType::Clo => {
                     let (formals, body, _) = self.session.closure_parts(x)?;

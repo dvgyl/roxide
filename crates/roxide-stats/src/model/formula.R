@@ -42,6 +42,29 @@ terms.default <- function(x, ...) {
     t
 }
 terms.terms <- function(x, ...) x
+labels <- function(object, ...) UseMethod("labels")
+labels.default <- function(object, ...) {
+    if (!is.null(dim(object))) return(dimnames(object))
+    if (!is.null(names(object))) return(names(object))
+    as.character(seq_along(object))
+}
+labels.terms <- function(object, ...) attr(object, "term.labels")
+`[.terms` <- function(termobj, i) {
+    labels <- labels.terms(termobj)
+    selected <- seq_along(labels)[i]
+    if (any(is.na(selected))) stop("invalid model formula in ExtractVars")
+    if (!length(selected)) warning("no non-missing arguments to max; returning -Inf")
+    if (identical(selected, seq_along(labels))) return(termobj)
+    factors <- attr(termobj, "factors")
+    attr(termobj, "factors") <- factors[, selected, drop = FALSE]
+    attr(termobj, "term.labels") <- labels[selected]
+    attr(termobj, "order") <- attr(termobj, "order")[selected]
+    drop.terms(termobj, keep.response = TRUE)
+}
+is.empty.model <- function(x) {
+    t <- terms(x)
+    !length(labels.terms(t)) && attr(t, "intercept") == 0L
+}
 terms.formula <- function(x, specials = NULL, abb = NULL, data = NULL,
                           neg.out = TRUE, keep.order = FALSE, simplify = FALSE,
                           ..., allowDotAsName = FALSE) {

@@ -140,14 +140,13 @@ impl Table {
         match ctx.session().type_of(value)? {
             SexpType::Vec => {
                 let s = ctx.session_mut();
-                let values = s.list_slice(value)?.to_vec();
-                let width = values.len();
+                let width = s.xlength(value)?;
                 let labels = attr(s, value, "names")?;
                 let row_labels = s.attr_row_names(value)?;
                 let mut rows = s.xlength(row_labels)?;
                 if !is_frame {
-                    for &value in &values {
-                        rows = rows.max(s.xlength(value)?);
+                    for &column in s.list_slice(value)? {
+                        rows = rows.max(s.xlength(column)?);
                     }
                 }
                 guard_shape(ctx, call, rows, width)?;
@@ -162,8 +161,13 @@ impl Table {
                     r_strings(ctx, labels)?
                 };
                 let mut columns = Vec::with_capacity(width);
-                for value in values {
+                let mut budget = ctx.host().limits().max_vector_bytes;
+                for i in 0..width {
+                    let value = ctx.session().list_get(value, i)?;
                     let column = Column::new(ctx, call, value, decimal)?;
+                    budget = budget
+                        .checked_sub(column.bytes())
+                        .ok_or_else(|| ctx.stop(call.err_call(), "vector size limit exceeded"))?;
                     if (is_frame && rows != column.values.len())
                         || (rows != 0
                             && (column.values.is_empty() || rows % column.values.len() != 0))
@@ -233,12 +237,22 @@ struct Column {
 }
 
 impl Column {
+    fn bytes(&self) -> usize {
+        self.values.iter().flatten().fold(
+            self.values
+                .len()
+                .saturating_mul(size_of::<Option<String>>()),
+            |used, value| used.saturating_add(value.len()),
+        )
+    }
+
     fn new(ctx: &mut Ctx, call: &Call, value: SexpId, decimal: char) -> EvalResult<Self> {
         let factor = has_class(ctx, value, "factor")?;
         let ty = ctx.session().type_of(value)?;
         let text = factor || ty == SexpType::Str;
         let class = attr(ctx.session_mut(), value, "class")?;
         let formatted = class != SEXP_NIL && (factor || !has_class(ctx, value, "AsIs")?);
+        guard_shape(ctx, call, ctx.session().xlength(value)?, 1)?;
         let scipen = ctx.opts().scipen;
         let s = ctx.session();
         let mut values = match ty {
@@ -268,7 +282,11 @@ impl Column {
                 *value = value.replace('.', &decimal.to_string());
             }
         }
-        Ok(Self { values, text })
+        let column = Self { values, text };
+        if column.bytes() > ctx.host().limits().max_vector_bytes {
+            return Err(ctx.stop(call.err_call(), "vector size limit exceeded"));
+        }
+        Ok(column)
     }
 }
 
@@ -500,6 +518,7 @@ fn commit_output(
             ],
         );
         if open {
+            ctx.protect_eval_result(&result);
             let closed = base_call(ctx, call, "close", &[con]);
             result.and(closed)
         } else {

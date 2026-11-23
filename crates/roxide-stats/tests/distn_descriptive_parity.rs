@@ -228,3 +228,35 @@ stopifnot(identical(message, "rbinom: probability sum should be 1, but is 0"))
 "#,
     );
 }
+
+#[test]
+fn descriptive_order_statistics_preserve_date_class() {
+    let mut ctx = roxide_eval::Ctx::new(
+        Box::new(roxide_host::PureHost::new()),
+        roxide_gc::GcPolicy::Torture,
+    )
+    .expect("Create the R session");
+    roxide_base::register_all(&mut ctx).expect("Register base");
+    roxide_stats::register(&mut ctx).expect("Register stats");
+    ctx.run_script(
+        "Classed order statistics",
+        r#"
+x <- as.Date("2020-01-01") + 0:3
+stopifnot(inherits(median(x), "Date"), as.double(median(x)) == 18263.5)
+err <- tryCatch(quantile(x, 0.5), error = conditionMessage)
+stopifnot(identical(err, '* not defined for "Date" objects'))
+stopifnot(inherits(quantile(x, .5, type = 1), "Date"))
+stopifnot(mad(1:3, low = TRUE, high = TRUE) == 1.4826)
+err <- tryCatch(mad(1:4, low = TRUE, high = TRUE), error = conditionMessage)
+stopifnot(identical(err, "'low' and 'high' cannot be both TRUE"))
+err <- tryCatch(fivenum(c("a", "b")), error = conditionMessage)
+stopifnot(identical(err, "non-numeric argument to binary operator"))
+err <- tryCatch(weighted.mean(c("1", "2"), 1:2), error = conditionMessage)
+stopifnot(identical(err, "non-numeric argument to binary operator"),
+          identical(weighted.mean(1:2, c(1, NaN)), NA_real_))
+"#,
+        roxide_value::GLOBAL_ENV,
+        false,
+    )
+    .expect("Check descriptive order statistics");
+}

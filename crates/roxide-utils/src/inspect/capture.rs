@@ -8,9 +8,17 @@ use super::{flag, strings};
 pub(super) fn capture(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     let file = args.get(0);
     let append = flag(ctx, call, args.get(1))?;
-    let kinds = r_strings(ctx, args.get(2))?;
+    let kind = args.get(2);
+    if kind != SEXP_NIL && ctx.session().type_of(kind)? != SexpType::Str {
+        return Err(ctx.stop(call.err_call(), "'arg' must be NULL or a character vector"));
+    }
+    let kinds = r_strings(ctx, kind)?;
     let messages = match kinds.as_slice() {
+        [] if kind == SEXP_NIL => false,
         [Some(out), Some(msg)] if out == "output" && msg == "message" => false,
+        kinds if kinds.len() != 1 => {
+            return Err(ctx.stop(call.err_call(), "'arg' must be of length 1"));
+        }
         [Some(kind)] if !kind.is_empty() && "output".starts_with(kind) => false,
         [Some(kind)] if !kind.is_empty() && "message".starts_with(kind) => true,
         _ => {
@@ -25,13 +33,50 @@ pub(super) fn capture(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult
         return Err(ctx.stop(call.err_call(), "cannot split the message connection"));
     }
 
-    let owned = ctx.session().type_of(file)? == SexpType::Str;
+    let ty = ctx.session().type_of(file)?;
+    let mut owned = ty == SexpType::Str;
     let dest = if owned {
         let mode = ctx
             .session_mut()
             .scalar_str(if append { "at" } else { "wt" })?;
         base_call(ctx, call, "file", &[file, mode])?
+    } else if file == SEXP_NIL {
+        file
     } else {
+        let s = ctx.session_mut();
+        let class = s.intern("class")?;
+        let class = s.attr(file, class);
+        if ty != SexpType::Int
+            || !s.str_slice(class).is_ok_and(|classes| {
+                classes
+                    .iter()
+                    .any(|&id| s.char_bytes(id).ok() == Some(b"connection"))
+            })
+        {
+            return Err(ctx.stop(
+                call.err_call(),
+                "'file' must be NULL, a character string or a connection",
+            ));
+        }
+        let open = base_call(ctx, call, "isOpen", &[file])?;
+        if flag(ctx, call, open)? {
+            let write = ctx.session_mut().scalar_str("write")?;
+            let writable = base_call(ctx, call, "isOpen", &[file, write])?;
+            if !flag(ctx, call, writable)? {
+                let reason = if ctx.session().int(file)?.iter().next() == Some(0) {
+                    "cannot switch output to stdin"
+                } else {
+                    "cannot write to this connection"
+                };
+                return Err(ctx.stop(call.err_call(), reason));
+            }
+        } else {
+            let mode = ctx
+                .session_mut()
+                .scalar_str(if append { "at" } else { "wt" })?;
+            base_call(ctx, call, "open", &[file, mode])?;
+            owned = true;
+        }
         file
     };
     ctx.protect(dest);

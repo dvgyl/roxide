@@ -114,25 +114,8 @@ fn union(left: &[usize], right: &[usize]) -> Term {
     result
 }
 
-fn merge(left: &mut Vec<Term>, right: Vec<Term>) {
-    let mut seen: HashSet<_> = left.iter().cloned().collect();
-    left.extend(right.into_iter().filter(|term| seen.insert(term.clone())));
-}
-
-fn code(term: &Term, variable: usize, preceding: &[Term]) -> i32 {
-    if term.binary_search(&variable).is_err() {
-        return 0;
-    }
-    if term.len() == 1
-        || preceding.iter().any(|prior| {
-            term.iter()
-                .all(|&other| other == variable || prior.binary_search(&other).is_ok())
-        })
-    {
-        1
-    } else {
-        2
-    }
+fn append_terms(output: &mut Vec<Term>, seen: &mut HashSet<Term>, terms: Vec<Term>) {
+    output.extend(terms.into_iter().filter(|term| seen.insert(term.clone())));
 }
 
 struct Algebra<'a> {
@@ -208,6 +191,40 @@ impl Algebra<'_> {
         Ok(())
     }
 
+    fn binary(&self, expr: SexpId, op: &str) -> Option<(SexpId, SexpId)> {
+        let s = self.ctx.session();
+        if operator(s, expr) == op
+            && let [left, right] = args(s, expr).as_slice()
+        {
+            return Some((*left, *right));
+        }
+        None
+    }
+
+    fn chain(&mut self, expr: SexpId, op: &str, add: bool, depth: usize) -> EvalResult<Vec<Term>> {
+        let mut pending = vec![expr];
+        let mut output = Vec::new();
+        let mut seen = HashSet::new();
+        while let Some(node) = pending.pop() {
+            if let Some((left, right)) = self.binary(node, op) {
+                self.spend(1)?;
+                pending.extend([right, left]);
+            } else {
+                let terms = self.walk(node, add, depth + 1)?;
+                self.spend(terms.len())?;
+                append_terms(&mut output, &mut seen, terms);
+            }
+        }
+        Ok(output)
+    }
+
+    fn merge(&mut self, left: &mut Vec<Term>, right: Vec<Term>) -> EvalResult<()> {
+        self.spend(left.len().saturating_add(right.len()))?;
+        let mut seen = left.iter().cloned().collect();
+        append_terms(left, &mut seen, right);
+        Ok(())
+    }
+
     fn walk(&mut self, expr: SexpId, add: bool, depth: usize) -> EvalResult<Vec<Term>> {
         self.spend(1)?;
         if depth >= 128 {
@@ -248,15 +265,16 @@ impl Algebra<'_> {
                     let terms = self.walk(*inner, if op == "-" { !add } else { add }, depth + 1)?;
                     return Ok(if op == "-" { Vec::new() } else { terms });
                 }
+                [_, _] if op == "+" => return self.chain(expr, &op, add, depth),
+                [_, _] if matches!(op.as_str(), "*" | ":") => {
+                    return self.products(expr, &op, add, depth);
+                }
                 [lhs, rhs] => {
                     let mut left = self.walk(*lhs, add, depth + 1)?;
                     if op == "^" {
-                        let Some(degree) = number(self.ctx.session(), *rhs).filter(|n| {
-                            n.is_finite()
-                                && *n > 0.0
-                                && n.fract() == 0.0
-                                && self.ctx.session().type_of(*rhs).ok() == Some(SexpType::Real)
-                        }) else {
+                        let Some(degree) = number(self.ctx.session(), *rhs)
+                            .filter(|n| n.is_finite() && *n > 0.0 && n.fract() == 0.0)
+                        else {
                             return Err(self.error("invalid power in formula"));
                         };
                         let mut result = Vec::new();
@@ -266,26 +284,15 @@ impl Algebra<'_> {
                     }
                     let right = self.walk(*rhs, if op == "-" { !add } else { add }, depth + 1)?;
                     return match op.as_str() {
-                        "+" => {
-                            merge(&mut left, right);
-                            Ok(left)
-                        }
                         "-" => {
                             let removed: HashSet<_> = right.into_iter().collect();
                             left.retain(|term| !removed.contains(term));
                             Ok(left)
                         }
-                        "*" => {
-                            let interactions = self.cross(&left, &right)?;
-                            merge(&mut left, right);
-                            merge(&mut left, interactions);
-                            Ok(left)
-                        }
-                        ":" => self.cross(&left, &right),
                         "/" => {
                             if !left.is_empty() {
                                 let nested = self.cross(&[all_variables(&left)], &right)?;
-                                merge(&mut left, nested);
+                                self.merge(&mut left, nested)?;
                             }
                             Ok(left)
                         }
@@ -297,6 +304,37 @@ impl Algebra<'_> {
             }
         }
         Ok(vec![vec![self.variable(expr)?]])
+    }
+
+    fn products(
+        &mut self,
+        expr: SexpId,
+        op: &str,
+        add: bool,
+        depth: usize,
+    ) -> EvalResult<Vec<Term>> {
+        let mut pending = vec![(expr, false)];
+        let mut values: Vec<Vec<Term>> = Vec::new();
+        while let Some((node, combine)) = pending.pop() {
+            if combine {
+                let right = values.pop().unwrap_or_default();
+                let mut left = values.pop().unwrap_or_default();
+                let cross = self.cross(&left, &right)?;
+                if op == "*" {
+                    self.merge(&mut left, right)?;
+                    self.merge(&mut left, cross)?;
+                    values.push(left);
+                } else {
+                    values.push(cross);
+                }
+            } else if let Some((left, right)) = self.binary(node, op) {
+                self.spend(1)?;
+                pending.extend([(node, true), (right, false), (left, false)]);
+            } else {
+                values.push(self.walk(node, add, depth + 1)?);
+            }
+        }
+        Ok(values.pop().unwrap_or_default())
     }
 
     fn expanded(&mut self, expr: SexpId, nested: bool, depth: usize) -> EvalResult {
@@ -319,6 +357,9 @@ impl Algebra<'_> {
             return Ok(expr);
         }
         let op = op.to_owned();
+        if matches!(op.as_str(), "+" | "*" | ":") && self.binary(expr, &op).is_some() {
+            return self.expand_chain(expr, &op, nested, depth);
+        }
         let (head, _, _) = s.cons_parts(expr)?;
         let children = args(s, expr)
             .into_iter()
@@ -330,6 +371,27 @@ impl Algebra<'_> {
             head,
             children.into_iter().map(|x| (SEXP_NIL, x)),
         )
+    }
+    fn expand_chain(&mut self, expr: SexpId, op: &str, nested: bool, depth: usize) -> EvalResult {
+        let mut pending = vec![(expr, nested, false)];
+        let mut values = Vec::new();
+        while let Some((node, nested, combine)) = pending.pop() {
+            if combine {
+                let right = values.pop().unwrap_or(SEXP_NIL);
+                let left = values.pop().unwrap_or(SEXP_NIL);
+                values.push(lang(self.ctx.session_mut(), op, &[left, right])?);
+            } else if let Some((left, right)) = self.binary(node, op) {
+                self.spend(1)?;
+                pending.extend([
+                    (node, nested, true),
+                    (right, true, false),
+                    (left, op != "+", false),
+                ]);
+            } else {
+                values.push(self.expanded(node, nested, depth + 1)?);
+            }
+        }
+        Ok(values.pop().unwrap_or(expr))
     }
 }
 
@@ -360,20 +422,24 @@ fn all_variables(terms: &[Term]) -> Term {
     variables
 }
 
-fn symbols(s: &RSession, expr: SexpId, out: &mut Vec<SexpId>, depth: usize) {
-    if depth >= 128 {
-        return;
-    }
-    match s.type_of(expr).ok() {
-        Some(SexpType::Sym) if !out.contains(&expr) => {
-            out.push(expr);
+fn symbols(s: &RSession, expr: SexpId, out: &mut Vec<SexpId>) {
+    let mut seen = HashSet::new();
+    let mut pending = vec![(expr, 0)];
+    while let Some((expr, depth)) = pending.pop() {
+        if depth >= 128 || !seen.insert(expr) {
+            continue;
         }
-        Some(SexpType::Lang) => {
-            for (_, child) in s.pairlist_iter(expr).skip(1) {
-                symbols(s, child, out, depth + 1);
+        match s.type_of(expr).ok() {
+            Some(SexpType::Sym) => out.push(expr),
+            Some(SexpType::Lang) => {
+                let op = operator(s, expr);
+                let children = args(s, expr);
+                let depth =
+                    depth + usize::from(!matches!(op, "+" | "*" | ":") || children.len() != 2);
+                pending.extend(children.into_iter().rev().map(|x| (x, depth)));
             }
+            _ => {}
         }
-        _ => {}
     }
 }
 
@@ -419,7 +485,7 @@ pub(super) fn terms(ctx: &mut Ctx, site: &Call, args: &mut Args) -> EvalResult {
     let (lhs, rhs) = parts(ctx, site, args.get(0))?;
     let env = attr(ctx, args.get(0), ".Environment")?;
     let mut response_names = Vec::new();
-    symbols(ctx.session(), lhs, &mut response_names, 0);
+    symbols(ctx.session(), lhs, &mut response_names);
     let dot = if args.get(1) == SEXP_NIL {
         None
     } else {
@@ -470,14 +536,19 @@ pub(super) fn terms(ctx: &mut Ctx, site: &Call, args: &mut Args) -> EvalResult {
     } else {
         algebra.expanded(rhs, false, 0)?
     };
+    let size = terms.len().saturating_mul(algebra.variables.len());
+    // Include dense factors in the work limit while allowing moderately wide additive models.
+    algebra.spend(size.div_ceil(32))?;
     let Algebra {
         ctx,
         variables,
         labels,
         offsets,
         intercept,
+        budget,
         ..
     } = algebra;
+    let mut remaining = budget;
     let result = build_formula(ctx.session_mut(), lhs, rhs)?;
     let vars = lang(ctx.session_mut(), "list", &variables)?;
     set_attr(ctx, result, "variables", vars)?;
@@ -495,11 +566,45 @@ pub(super) fn terms(ctx: &mut Ctx, site: &Call, args: &mut Args) -> EvalResult {
         })
         .collect::<Vec<_>>();
     let col_names = strings(ctx.session_mut(), term_labels.iter().map(String::as_str))?;
-    let size = terms.len().saturating_mul(variables.len());
     limit::<i32>(ctx, site, size)?;
     let mut factors = Vec::with_capacity(size);
+    let mut preceding: HashSet<&[usize]> = HashSet::new();
+    let mut margins = HashSet::new();
+    let mut margin = Vec::new();
+    let mut longest = 0;
     for (index, term) in terms.iter().enumerate() {
-        factors.extend((0..variables.len()).map(|var| code(term, var, &terms[..index])));
+        let start = factors.len();
+        factors.resize(start + variables.len(), 0);
+        for (i, &var) in term.iter().enumerate() {
+            margin.clear();
+            margin.extend_from_slice(&term[..i]);
+            margin.extend_from_slice(&term[i + 1..]);
+            let mut earlier = margin.is_empty()
+                || preceding.contains(margin.as_slice())
+                || margins.contains(margin.as_slice());
+            if !earlier && longest > term.len() {
+                for prior in &terms[..index] {
+                    remaining = remaining.checked_sub(1).ok_or_else(|| {
+                        ctx.stop(site.err_call(), "formula expansion exceeds size limit")
+                    })?;
+                    if prior.len() > term.len()
+                        && margin.iter().all(|v| prior.binary_search(v).is_ok())
+                    {
+                        earlier = true;
+                        break;
+                    }
+                }
+            }
+            factors[start + var] = if earlier { 1 } else { 2 };
+        }
+        for i in 0..term.len() {
+            margin.clear();
+            margin.extend_from_slice(&term[..i]);
+            margin.extend_from_slice(&term[i + 1..]);
+            margins.insert(margin.clone());
+        }
+        preceding.insert(term.as_slice());
+        longest = longest.max(term.len());
     }
     let factors = ctx.session_mut().alloc_int_from(&factors)?;
     if !terms.is_empty() {
@@ -753,7 +858,7 @@ pub(super) fn labels(ctx: &mut Ctx, _: &Call, args: &mut Args) -> EvalResult {
 
 pub(super) fn all_symbols(ctx: &mut Ctx, _: &Call, args: &mut Args) -> EvalResult {
     let mut output = Vec::new();
-    symbols(ctx.session(), args.get(0), &mut output, 0);
+    symbols(ctx.session(), args.get(0), &mut output);
     let names = output
         .iter()
         .map(|&sym| Ok(ctx.session().sym_name_of(sym)?.to_owned()))
