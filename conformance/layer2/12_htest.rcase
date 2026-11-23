@@ -1,0 +1,204 @@
+=== case: htest_t_intervals ===
+#@ tags: layer2,htest
+#@ compare: rel=2e-6
+x <- c(1,4,6,9,12)
+y <- c(2,3,7,8,10)
+for (v in list(t.test(x, mu=3), t.test(x,y), t.test(x,y,var.equal=TRUE,alternative="greater"),
+               t.test(x,y,paired=TRUE,alternative="less"))) {
+    cat(v$statistic, v$parameter, v$p.value, v$estimate, v$stderr, "\n")
+    cat(v$conf.int, attr(v$conf.int,"conf.level"), v$null.value, "\n")
+}
+
+=== case: htest_t_metadata ===
+#@ tags: layer2,htest
+#@ compare: exact
+x <- 1:8
+y <- 2:9
+v <- t.test(x,y,var.equal=TRUE,alternative="l")
+cat(class(v), names(v), "\n")
+dput(v$method)
+dput(v$alternative)
+dput(v$data.name)
+dput(names(v$estimate))
+dput(v$null.value)
+
+=== case: htest_signed_rank_with_zero_and_ties ===
+#@ tags: layer2,htest
+#@ compare: rel=1e-8
+x <- c(0,1,1,2)
+for (exact in c(TRUE,FALSE)) {
+    v <- wilcox.test(x,exact=exact)
+    cat(v$statistic,v$p.value,"\n")
+    cat(v$method,v$data.name,"\n")
+}
+ci <- wilcox.test(x,exact=TRUE,conf.int=TRUE)$conf.int
+cat(ci,attr(ci,"conf.level"),"\n")
+
+=== case: htest_rank_sum_confidence_interval ===
+#@ tags: layer2,htest
+#@ compare: rel=2e-5
+x <- c(1,4,6,9,12)
+y <- c(2,3,7,8,10)
+for (exact in c(TRUE,FALSE)) {
+    v <- wilcox.test(x,y,exact=exact,conf.int=TRUE)
+    cat(v$statistic, v$p.value, v$conf.int, v$estimate, attr(v$conf.int,"conf.level"), "\n")
+    cat(names(v), "\n")
+}
+
+=== case: htest_chisq_observed_and_expected ===
+#@ tags: layer2,htest
+#@ compare: rel=2e-6
+for (v in list(chisq.test(c(12,8,10)),withCallingHandlers(chisq.test(matrix(c(8,2,1,5),2)), warning=function(w) invokeRestart("muffleWarning")))) {
+    cat(v$method, "\n")
+    cat(v$statistic, v$parameter, v$p.value, "\n")
+    cat(v$observed,v$expected,v$residuals,v$stdres,"\n")
+}
+
+=== case: htest_chisq_warning ===
+#@ tags: layer2,htest
+#@ compare: exact
+invisible(tryCatch(chisq.test(c(1,2,3)),warning=function(w) cat(conditionMessage(w),"\n")))
+invisible(tryCatch(chisq.test(-1:2),error=function(e) cat(conditionMessage(e),"\n")))
+
+=== case: htest_fixed_margin_simulation ===
+#@ tags: layer2,htest
+#@ compare: rel=2e-6
+x <- matrix(c(8,2,1,5),2)
+y <- matrix(c(3,1,2,2,4,1),2)
+set.seed(42)
+a <- chisq.test(x,simulate.p.value=TRUE,B=2000)
+cat(a$p.value,.Random.seed[2],runif(1),"\n")
+set.seed(42)
+a <- fisher.test(y,simulate.p.value=TRUE,B=2000)
+cat(a$p.value,.Random.seed[2],runif(1),"\n")
+set.seed(42)
+a <- chisq.test(c(12,8,10),p=c(.2,.3,.5),simulate.p.value=TRUE,B=13)
+cat(a$p.value,.Random.seed[2],runif(1),"\n")
+
+=== case: htest_fisher_odds_and_alternatives ===
+#@ tags: layer2,htest
+#@ compare: rel=2e-6
+x <- matrix(c(8,2,1,5),2)
+for (a in c("two.sided","less","greater")) {
+    v <- fisher.test(x,alternative=a)
+    cat(v$p.value,v$estimate,v$conf.int,attr(v$conf.int,"conf.level"),"\n")
+    cat(names(v),v$method,v$data.name,"\n")
+}
+cat(fisher.test(matrix(c(3,1,2,2,4,1),2))$p.value,"\n")
+
+=== case: htest_ks_reference_distributions ===
+#@ tags: layer2,htest
+#@ compare: rel=2e-6
+x <- c(1,4,6,9,12)
+y <- c(2,3,7,8,10)
+for (a in c("two.sided","less","greater")) {
+    for (v in list(ks.test(x,"punif",0,15,alternative=a),ks.test(x,y,alternative=a),
+                   ks.test(x,y,alternative=a,exact=FALSE))) {
+        cat(v$statistic,v$p.value,v$exact,"\n")
+        cat(class(v),names(v$statistic),v$alternative,v$method,v$data.name,"\n")
+    }
+}
+
+=== case: htest_ks_ties ===
+#@ tags: layer2,htest
+#@ compare: rel=2e-6
+x <- c(1,1,2)
+y <- c(1,3,4)
+v <- ks.test(x,y,exact=TRUE)
+cat(v$p.value,v$exact,"\n")
+invisible(tryCatch(ks.test(x,"punif",0,5),warning=function(w) cat(conditionMessage(w),"\n")))
+invisible(tryCatch(ks.test(x,y,exact=FALSE),warning=function(w) cat(conditionMessage(w),"\n")))
+
+=== case: htest_shapiro_small_and_large_samples ===
+#@ tags: layer2,htest
+#@ compare: rel=2e-6
+for (x in list(c(1,4,8),c(1,4,6,9,12,NA),sqrt(1:24))) {
+    v <- shapiro.test(x)
+    cat(v$statistic,v$p.value,v$method,v$data.name,"\n")
+}
+for (x in list(c(1,NA,3),rep(1,5)))
+    invisible(tryCatch(shapiro.test(x),error=function(e) cat(conditionMessage(e),"\n")))
+
+=== case: htest_binomial_and_proportions ===
+#@ tags: layer2,htest
+#@ compare: rel=2e-6
+for (a in c("two.sided","less","greater")) {
+    for (v in list(binom.test(7,10,alternative=a),prop.test(7,10,alternative=a),
+                   prop.test(c(7,3),c(10,10),alternative=a))) {
+        cat(v$statistic,v$parameter,v$p.value,v$estimate,v$conf.int,"\n")
+        cat(names(v),v$method,v$data.name,"\n")
+    }
+}
+
+=== case: htest_correlation_and_variance ===
+#@ tags: layer2,htest
+#@ compare: rel=2e-6
+x <- c(1,4,6,9,12)
+y <- c(2,3,7,8,10)
+for (m in c("pearson","kendall","spearman")) {
+    v <- cor.test(x,y,method=m)
+    cat(round(v$statistic,12),v$parameter,v$p.value,v$estimate,v$conf.int,"\n")
+    cat(v$method,v$data.name,"\n")
+}
+for (a in c("two.sided","less","greater")) {
+    v <- var.test(x,y,alternative=a)
+    cat(v$statistic,v$parameter,v$p.value,v$estimate,v$conf.int,v$null.value,"\n")
+}
+
+=== case: htest_formula_interfaces ===
+#@ tags: layer2,htest
+#@ compare: rel=2e-6
+x <- c(1,4,6,9,12)
+y <- c(2,3,7,8,10)
+dat <- data.frame(z=c(x,y),g=factor(rep(c("a","b"),each=5L)))
+for (v in list(t.test(x~1), t.test(Pair(x,y)~1), t.test(formula=z~g,data=dat), wilcox.test(z~g,dat),
+               var.test(z~g,dat),cor.test(~x+y),ks.test(z~g,dat,alternative="greater"))) {
+    cat(v$statistic,v$p.value,v$data.name,"\n")
+    cat(names(v$estimate),names(v$null.value),v$alternative,"\n")
+}
+
+=== case: htest_p_adjust_all_methods ===
+#@ tags: layer2,htest
+#@ compare: rel=2e-6
+p <- c(a=.01,b=NA,c=.04,d=.033,e=.25,f=.041)
+cat(p.adjust.methods,"\n")
+for (m in p.adjust.methods) {
+    a <- p.adjust(p,m,n=10)
+    cat(a,names(a),"\n")
+}
+
+=== case: htest_print_format ===
+#@ tags: layer2,htest
+#@ compare: exact
+x <- c(1,4,6,9,12)
+v <- t.test(x)
+invisible(print(v))
+invisible(print(ks.test(x,"punif",0,15)))
+invisible(print(fisher.test(matrix(c(3,1,2,2,4,1),2))))
+
+=== case: htest_ks_monte_carlo_random_stream ===
+#@ tags: layer2,htest
+#@ compare: rel=2e-6
+set.seed(39)
+v <- ks.test(c(1,1,2,4),c(2,5,7),exact=FALSE,simulate.p.value=TRUE,B=71)
+cat(v$p.value,v$exact,.Random.seed[2L],runif(1),"\n")
+cat(v$method,"\n")
+
+=== case: htest_result_schema ===
+#@ tags: layer2,htest
+#@ compare: exact
+x <- c(1,4,6,9,12)
+y <- c(2,3,7,8,10)
+tab <- matrix(c(8,2,1,5),2)
+for (v in list(t.test(x,y), wilcox.test(x,y,conf.int=TRUE),
+               chisq.test(c(12,8,10)), fisher.test(tab,conf.int=FALSE),
+               ks.test(x,y), shapiro.test(x), prop.test(7,10), binom.test(7L,10L),
+               cor.test(x,y), var.test(x,y))) {
+    cat(class(v),"\n")
+    cat(names(v),"\n")
+    cat(paste(names(v$statistic),collapse="|"),typeof(v$statistic),
+        paste(names(v$parameter),collapse="|"),typeof(v$parameter),"\n")
+    cat(paste(names(v$estimate),collapse="|"),paste(names(v$null.value),collapse="|"),
+        typeof(attr(v$conf.int,"conf.level")),"\n")
+    cat(v$method,v$data.name,"\n")
+}
