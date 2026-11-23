@@ -19,6 +19,8 @@ Every external Rust crate, C library, published algorithm, or specification adop
 | Adobe Core-14 Helvetica AFM Font Metrics | Adobe AFM Specification 4.1 (Core-14 Helvetica metric tables) | Permissive Adobe AFM Notice | Clean-room text advance widths (`strwidth`, legend geometry, PDF/SVG metrics) in `roxide-graphics` | ADR-0015 |
 | Hershey Simplex Vector Font | Allen Vincent Hershey / US NBS / NTIS (1967) | `Public Domain` | Clean-room stroke glyphs for headless PNG rasterizer in `roxide-graphics` | ADR-0015 |
 | PDF 1.4, SVG 1.1, PNG (ISO/IEC 15948), POSIX.1-1988 `ustar` Specifications | Adobe PDF 1.4; W3C SVG 1.1; W3C PNG; IEEE Std 1003.1 | Public Specifications | Clean-room file writers (`roxide-graphics`) and pure-Rust tar archive reader (`roxide-pkg`) | ADR-0014, ADR-0015 |
+| `colorspace` HCL palette parameters & trajectory equations | Zeileis et al. (2020) *JSS* 96(1) / CRAN `colorspace` 2.1-4 | `BSD-3-Clause` | Analytical HCL palette trajectories (`hcl.colors`, `hcl.pals`) in `roxide-graphics::grdevices` | ADR-0016 |
+| X11 `rgb.txt` named color catalog & public qualitative palettes (Okabe-Ito, ColorBrewer, Tableau) | X.Org `rgb.txt` (MIT/X11); Okabe & Ito (2002); Brewer (Apache-2.0); Tableau | Permissive / Public | `colors()` 657-entry catalog and `palette.colors()` / `palette.pals()` in `roxide-graphics::grdevices` | ADR-0016 |
 
 ## Forbidden Sources (Strict Clean-Room Wall)
 

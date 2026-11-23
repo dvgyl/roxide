@@ -202,5 +202,16 @@ All major architectural contracts and deviations from `docs/ARCHITECTURE.md` are
   - Implement PDF 1.4 (`FlateDecode` via `flate2`), SVG 1.1 (`<pageSet>`/`<page>` for `onefile = TRUE`), and PNG (clean-room scanline coverage rasterizer + PNG encoder using existing `flate2` zlib & CRC32) with **zero new Cargo dependencies**.
   - Use Adobe Core-14 Helvetica AFM advance widths (permissive Adobe notice) for text metrics and public-domain Hershey Simplex vector strokes for PNG glyph rendering. Numerical and geometry outputs (`par`, `usr`, `hist`, `boxplot`, `barplot`, `legend(plot=FALSE)`, `grid` units/viewports) target exact GNU R 4.6.2 parity; rendered files are verified structurally.
 
+---
+
+## ADR-0016: Analytical HCL Palettes from BSD-3-Clause `colorspace` Parameters
+
+- **Status:** Accepted
+- **Context:** `grDevices::hcl.colors()` and `grDevices::hcl.pals()` provide 115 perceptual HCL palettes (9 qualitative, 70 sequential, 18 diverging, 18 flexible diverging). Sampling fixed color tables would bloat the repository with binary blobs and lose accuracy at arbitrary lengths `n`.
+- **Decision:**
+  - Adopt the published analytical HCL trajectory equations (linear/power hue, luminance, and piecewise-triangular chroma trajectories) and the 115-row compact plain-text parameter table (`hcl_palettes.tsv`, ~5 KB) from the permissively licensed upstream `colorspace` project (`BSD-3-Clause`, Zeileis et al. 2020 *JSS* 96(1), never consulting GNU R GPL source files).
+  - Evaluate every color analytically on demand through `roxide-graphics::grdevices::colors::hcl_rgb`, supporting exact arbitrary `n`, `fixup`, `alpha`, and `rev` semantics with zero binary lookup tables.
+  - Record BSD-3-Clause attribution in `THIRD_PARTY_NOTICES.md`, `docs/PRIOR_ART.md`, and `third_party/licences/colorspace-BSD-3-Clause.txt`.
+
 
 
