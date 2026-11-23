@@ -547,3 +547,132 @@ pub(super) fn unclass(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult
     }
     replace_attr(ctx, call, x, "class", SEXP_NIL)
 }
+
+pub(super) fn set_length(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    let [x, value] = formals(ctx.session(), args, ["x", "value"]);
+    let (len_sexp, _) = ctx.session_mut().coerce(value, Real)?;
+    if ctx.session().xlength(len_sexp)? != 1 {
+        return Err(error(ctx, call, "invalid value"));
+    }
+    let raw_len = ctx.session().real(len_sexp)?.get(0);
+    if raw_len.is_nan() {
+        return Err(error(ctx, call, "vector size cannot be NA"));
+    }
+    if raw_len < 0.0 || !raw_len.is_finite() {
+        return Err(error(ctx, call, "vector size cannot be negative"));
+    }
+    let new_len = raw_len.trunc() as usize;
+    if x == SEXP_NIL {
+        if new_len > 0 {
+            ctx.warn_now(call.err_call(), "length of NULL cannot be changed")?;
+        }
+        return Ok(SEXP_NIL);
+    }
+    let max_bytes = ctx.host().limits().max_vector_bytes;
+    let ty = ctx.session().type_of(x)?;
+    let elem_bytes = match ty {
+        Raw => 1,
+        Lgl | Int => 4,
+        Real | Str | Vec => 8,
+        Cplx => 16,
+        _ => 16,
+    };
+    if new_len > max_bytes / elem_bytes {
+        return Err(error(ctx, call, "vector size limit exceeded"));
+    }
+    ctx.scoped(|ctx| {
+        ctx.protect(x);
+        let old_names = get(ctx.session(), x, "names");
+        let old_len = ctx.session().xlength(x)?;
+        let out = match ty {
+            Lgl => {
+                let mut vals = vec![RLogical::NA; new_len];
+                let src = ctx.session().lgl(x)?;
+                for (i, slot) in vals.iter_mut().take(old_len.min(new_len)).enumerate() {
+                    *slot = src.get(i);
+                }
+                ctx.session_mut().alloc_lgl_from(&vals)?
+            }
+            Int => {
+                let mut vals = vec![NA_INTEGER; new_len];
+                let src = ctx.session().int(x)?;
+                for (i, slot) in vals.iter_mut().take(old_len.min(new_len)).enumerate() {
+                    *slot = src.get(i);
+                }
+                ctx.session_mut().alloc_int_from(&vals)?
+            }
+            Real => {
+                let mut vals = vec![roxide_value::NA_REAL; new_len];
+                let src = ctx.session().real(x)?;
+                for (i, slot) in vals.iter_mut().take(old_len.min(new_len)).enumerate() {
+                    *slot = src.get(i);
+                }
+                ctx.session_mut().alloc_real_from(&vals)?
+            }
+            Cplx => {
+                let mut vals = vec![roxide_value::RComplex::NA; new_len];
+                let src = ctx.session().cplx(x)?;
+                for (i, slot) in vals.iter_mut().take(old_len.min(new_len)).enumerate() {
+                    *slot = src.get(i);
+                }
+                ctx.session_mut().alloc_cplx_from(&vals)?
+            }
+            Str => {
+                let mut vals = vec![CharId::NA; new_len];
+                let src = ctx.session().str_slice(x)?;
+                let copy = old_len.min(new_len);
+                vals[..copy].copy_from_slice(&src[..copy]);
+                ctx.session_mut().alloc_str_from(&vals)?
+            }
+            Raw => {
+                let mut vals = vec![0u8; new_len];
+                let src = ctx.session().raw(x)?;
+                for (i, slot) in vals.iter_mut().take(old_len.min(new_len)).enumerate() {
+                    *slot = src.get(i);
+                }
+                ctx.session_mut().alloc_raw_from(&vals)?
+            }
+            Vec => {
+                let src = ctx.session().list_slice(x)?.to_vec();
+                let out = ctx.session_mut().alloc_list(new_len)?;
+                ctx.protect(out);
+                for (i, &item) in src.iter().take(new_len).enumerate() {
+                    ctx.session_mut().list_set(out, i, item)?;
+                }
+                out
+            }
+            List => {
+                let mut items: std::vec::Vec<_> = ctx.session().pairlist_iter(x).collect();
+                items.truncate(new_len);
+                while items.len() < new_len {
+                    items.push((None, SEXP_NIL));
+                }
+                let mut out = SEXP_NIL;
+                for (tag, val) in items.into_iter().rev() {
+                    let tag_sexp = tag.map_or(SEXP_NIL, |t| t.as_sexp());
+                    out = ctx.session_mut().cons(val, out, tag_sexp)?;
+                    ctx.protect(out);
+                }
+                out
+            }
+            _ => {
+                return Err(error(
+                    ctx,
+                    call,
+                    format!("invalid argument type '{}'", ty.type_name(false)),
+                ));
+            }
+        };
+        ctx.protect(out);
+        if old_names != SEXP_NIL && matches!(ty, Lgl | Int | Real | Cplx | Str | Raw | Vec) {
+            let src_names = ctx.session().str_slice(old_names)?.to_vec();
+            let mut new_names = vec![CharId::BLANK; new_len];
+            let copy = src_names.len().min(new_len);
+            new_names[..copy].copy_from_slice(&src_names[..copy]);
+            let names_sexp = ctx.session_mut().alloc_str_from(&new_names)?;
+            ctx.protect(names_sexp);
+            set(ctx.session_mut(), out, "names", names_sexp)?;
+        }
+        Ok(out)
+    })
+}

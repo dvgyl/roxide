@@ -77,7 +77,14 @@ pub const MODULE: Module = Module {
         primitive!("seq.int", sequence::seq),
         primitive!("seq_along", sequence::seq_along),
         primitive!("seq_len", sequence::seq_len),
-        primitive!("rep", sequence::rep),
+        primitive!(
+            "rep",
+            sequence::rep,
+            Eval,
+            Any,
+            Dispatch::Internal("rep"),
+            On
+        ),
         primitive!("rev", sequence::rev),
         primitive!("sort", sequence::sort),
         primitive!("order", sequence::order),

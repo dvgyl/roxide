@@ -60,3 +60,6 @@ opt-level = 2
 
 [profile.dev.package.roxide-value]
 opt-level = 2
+
+[profile.dev.package.roxide-eval]
+opt-level = 2

@@ -138,6 +138,7 @@ fn load_new(
         path: Some(path.clone()),
         builtin: false,
     };
+    let mut cached_meta = false;
     let result = (|| {
         if installed {
             // The byte stream can refer to the namespace that owns it.
@@ -152,6 +153,7 @@ fn load_new(
             && let Some(cache) = local(ctx, methods, ".rx_cacheMetaData")?
         {
             ctx.apply(cache, &[(None, ns)], SEXP_NIL, methods)?;
+            cached_meta = true;
         }
         let dynlibs = spec.dynlib_names(ctx)?;
         define(ctx, info, "dynlibs", dynlibs)?;
@@ -179,6 +181,9 @@ fn load_new(
         Ok(ns)
     })();
     if result.is_err() {
+        if cached_meta {
+            let _ = uncache_methods_metadata(ctx, ns);
+        }
         ctx.ns_unregister(name);
     }
     result
@@ -518,7 +523,22 @@ pub(crate) fn unload(ctx: &mut Ctx, name: &str) -> EvalResult<()> {
         let path = package_path(ctx, name);
         let path = path.as_deref().unwrap_or(Path::new("")).to_string_lossy();
         call_cleanup_hook(ctx, record.ns, ".onUnload", name, path.as_ref())?;
+        uncache_methods_metadata(ctx, record.ns)?;
         ctx.ns_unregister(name);
         Ok(())
     })
+}
+
+fn uncache_methods_metadata(ctx: &mut Ctx, ns: SexpId) -> EvalResult<()> {
+    if let Some(methods) = ctx.ns_lookup("methods")
+        && let Some(cache) = local(ctx, methods, ".rx_cacheMetaData")?
+    {
+        ctx.apply(
+            cache,
+            &[(None, ns), (None, roxide_value::FALSE_SCALAR)],
+            SEXP_NIL,
+            methods,
+        )?;
+    }
+    Ok(())
 }

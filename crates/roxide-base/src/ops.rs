@@ -233,6 +233,14 @@ pub const MODULE: Module = Module {
             Dispatch::None,
             On
         ),
+        primitive!(
+            "length<-",
+            attributes::set_length,
+            Eval,
+            Exact(2),
+            Dispatch::Internal("length<-"),
+            On
+        ),
         primitive!("attributes", attributes::attributes),
         primitive!("attributes<-", attributes::set_attributes),
         primitive!("attr", attributes::attr),
