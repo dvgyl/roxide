@@ -151,9 +151,13 @@ impl Ctx {
         definition: SexpId,
     ) -> EvalResult<Option<SexpId>> {
         for class in self.classes(x, false)? {
-            if let Some(fun) =
-                self.lookup_method(&format!("{generic}.{class}"), caller, definition)?
-            {
+            if let Some(fun) = self.lookup_method(
+                generic,
+                &format!("{generic}.{class}"),
+                caller,
+                definition,
+                false,
+            )? {
                 return Ok(Some(fun));
             }
         }
@@ -762,7 +766,9 @@ fn next_method(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
 fn choose_ops_method(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     for class in ctx.classes(args.get(0), true)? {
         let name = format!("chooseOpsMethod.{class}");
-        if let Some(fun) = ctx.lookup_method(&name, call.env, BASE_NAMESPACE)? {
+        if let Some(fun) =
+            ctx.lookup_method("chooseOpsMethod", &name, call.env, BASE_NAMESPACE, false)?
+        {
             let pairs = args.iter().collect::<Vec<_>>();
             return ctx.apply(fun, &pairs, call.expr, call.env);
         }
