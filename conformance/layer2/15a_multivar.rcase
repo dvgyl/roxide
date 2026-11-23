@@ -1,0 +1,189 @@
+=== case: multivar_dist_euclidean_and_attributes ===
+#@ tags: layer2,multivar
+#@ compare: exact
+x <- rbind(a=c(NA,2,0), b=c(3,5,0), c=c(NA,NA,NA))
+d <- dist(x, diag=TRUE, upper=TRUE)
+cat(sprintf("%.8f", as.double(d)), "\n")
+cat(names(attributes(d)), "\n")
+cat(attr(d, "Size"), attr(d, "Labels"), attr(d, "Diag"), attr(d, "Upper"), class(d), "\n")
+cat(as.character(attr(d, "call")), "\n")
+
+=== case: multivar_dist_maximum_and_manhattan ===
+#@ tags: layer2,multivar
+#@ compare: exact
+x <- rbind(c(NA,2,0), c(3,5,0), c(NA,NA,NA))
+for (method in c("maximum", "manhattan")) {
+    d <- dist(x, method)
+    cat(sprintf("%.8f", as.double(d)), "\n")
+}
+
+=== case: multivar_dist_canberra_and_binary ===
+#@ tags: layer2,multivar
+#@ compare: exact
+x <- rbind(a=c(NA,2,0), b=c(3,5,0), c=c(0,0,0), d=c(0,0,0))
+for (method in c("canberra", "binary")) {
+    d <- dist(x, method)
+    cat(sprintf("%.8f", as.double(d)), "\n")
+    cat(rownames(as.matrix(d)), "\n")
+}
+
+=== case: multivar_dist_minkowski_and_conversion ===
+#@ tags: layer2,multivar
+#@ compare: exact
+d <- dist(rbind(c(NA,2,0), c(3,5,0)), "minkowski", p=3)
+cat(attr(d, "p"), "\n")
+cat(sprintf("%.8f", as.double(d)), "\n")
+m <- matrix(1:9, 3, dimnames=list(c("a","b","c"), NULL))
+a <- as.dist(m, diag=TRUE)
+cat(typeof(a), class(a), names(attributes(a)), "\n")
+cat(a, "\n")
+cat(as.matrix(a), "\n")
+tryCatch(dist(m, "minkowski", p=0), error=function(e) cat(conditionMessage(e), "\n"))
+
+=== case: multivar_cluster_all_linkages ===
+#@ tags: layer2,multivar
+#@ compare: exact
+x <- rbind(a=c(0,0),b=c(1,1),c=c(4,2),d=c(9,4))
+for (method in c("complete","single","average","ward.D2","ward.D","mcquitty","median","centroid")) {
+    h <- hclust(dist(x), method)
+    cat(h$method, h$dist.method, class(h), h$merge, h$order, h$labels, "\n")
+    cat(sprintf("%.8f", h$height), "\n")
+}
+
+=== case: multivar_cluster_members_and_cuts ===
+#@ tags: layer2,multivar
+#@ compare: exact
+x <- rbind(a=c(0,0),b=c(1,1),c=c(4,2),d=c(9,4))
+h <- hclust(dist(x), "average", members=c(2,4,5,7))
+cat(names(h), "\n")
+cat(sprintf("%.8f", h$height), "\n")
+cat(cutree(h, k=1:4), colnames(cutree(h, k=1:4)), "\n")
+cat(cutree(h, h=c(0,1.5,5,20)), colnames(cutree(h, h=c(0,1.5,5,20))), "\n")
+cat(cutree(h, k=2, h=0), names(cutree(h, k=2)), "\n")
+
+=== case: multivar_cluster_ties_and_inversions ===
+#@ tags: layer2,multivar
+#@ compare: exact
+d <- as.dist(matrix(1, 4, 4))
+h <- hclust(d)
+cat(h$merge, h$order, "\n")
+h <- hclust(d, "centroid")
+cat(cutree(h, k=2), "\n")
+d <- structure(c(1,5,5,4,1,5,2,2,5,2,5,5,3,1,3), Size=6L)
+cat(hclust(d, "centroid")$merge, hclust(d, "median")$merge, "\n")
+tryCatch(cutree(h, h=1), error=function(e) cat(conditionMessage(e), "\n"))
+
+=== case: multivar_kmeans_explicit_centers ===
+#@ tags: layer2,multivar
+#@ compare: exact
+a <- rbind(a=c(0,0),b=c(0,2),c=c(10,0),d=c(10,2))
+dimnames(a) <- list(c("a","b","c","d"), c("u","v"))
+for (method in c("Hartigan-Wong", "Lloyd", "Forgy", "MacQueen")) {
+    f <- kmeans(a, a[c(1,3),], algorithm=method)
+    cat(names(f), class(f), "\n")
+    cat(f$cluster, f$centers, f$totss, f$withinss, f$tot.withinss, f$betweenss, f$size, f$iter, f$ifault, "\n")
+    cat(fitted(f, "classes"), fitted(f), rownames(fitted(f)), "\n")
+}
+
+=== case: multivar_kmeans_seeded_and_multiple_starts ===
+#@ tags: layer2,multivar
+#@ compare: exact
+a <- rbind(c(0,0),c(0,0),c(0,2),c(10,0),c(10,2))
+for (method in c("Hartigan-Wong", "Lloyd", "MacQueen")) {
+    for (starts in c(1L,3L)) {
+        set.seed(34)
+        f <- kmeans(a, 2L, nstart=starts, algorithm=method)
+        cat(f$cluster, f$centers, f$size, f$iter, f$ifault, .Random.seed[2L], "\n")
+    }
+}
+
+=== case: multivar_kmeans_diagnostics ===
+#@ tags: layer2,multivar
+#@ compare: exact
+x <- rbind(c(0,0),c(1,0),c(5,0),c(6,0))
+error <- function(e) cat(conditionMessage(e), "\n")
+tryCatch(kmeans(x, x[c(1,1),]), error=error)
+tryCatch(kmeans(x, rbind(c(0,0),c(50,0))), error=error)
+withCallingHandlers(kmeans(x, x[c(1,3),], iter.max=1L, algorithm="Lloyd"), warning=function(w) {
+    cat(conditionMessage(w), "\n")
+    invokeRestart("muffleWarning")
+}) -> fit
+cat(fit$iter, fit$ifault, "\n")
+
+=== case: multivar_prcomp_scale_summary_prediction ===
+#@ tags: layer2,multivar
+#@ compare: exact
+a <- rbind(a=c(0,0),b=c(0,2),c=c(10,0),d=c(10,3))
+dimnames(a) <- list(c("a","b","c","d"), c("u","v"))
+p <- prcomp(a, scale.=TRUE)
+cat(names(p), class(p), dim(p$rotation), "\n")
+cat(sprintf("%.8f", c(p$sdev, abs(p$rotation), p$center, p$scale)), "\n")
+cat(rownames(summary(p)$importance), "\n")
+cat(sprintf("%.8f", summary(p)$importance), "\n")
+cat(max(abs(predict(p, a[, 2:1]) - p$x)) < 1e-10, "\n")
+
+=== case: multivar_prcomp_rank_tolerance_and_formula ===
+#@ tags: layer2,multivar
+#@ compare: exact
+d <- data.frame(u=c(0,0,10,10),v=c(0,2,0,2))
+p <- prcomp(~u+v, d, rank.=1L)
+q <- prcomp(d, tol=.5, retx=FALSE)
+cat(names(p), colnames(p$x), rownames(p$x), names(q), "\n")
+cat(dim(summary(p)$importance), colnames(summary(p)$importance), "\n")
+cat(sprintf("%.8f", c(p$sdev, abs(p$x), q$sdev, abs(q$rotation))), "\n")
+d$v[3] <- NA_real_
+p <- prcomp(~u+v, d, subset=u>=0, na.action=na.exclude)
+cat(names(p), rownames(p$x), as.integer(p$na.action), is.na(p$x[3,1]), "\n")
+
+=== case: multivar_princomp_scores_and_covariance ===
+#@ tags: layer2,multivar
+#@ compare: exact
+d <- data.frame(u=c(0,0,10,10),v=c(0,2,0,2))
+p <- princomp(~u+v, d)
+q <- princomp(covmat=cov(d), cor=TRUE)
+cat(names(p), names(summary(p)), class(summary(p)), class(p$loadings), "\n")
+cat(sprintf("%.8f", c(p$sdev, abs(p$scores), p$scale, q$sdev, q$scale)), "\n")
+cat(max(abs(predict(p, d[, 2:1]) - p$scores)) < 1e-10, is.null(q$scores), "\n")
+
+=== case: multivar_cmdscale_eigen_and_centering ===
+#@ tags: layer2,multivar
+#@ compare: exact
+a <- rbind(a=c(0,0),b=c(0,2),c=c(10,0),d=c(10,2))
+f <- cmdscale(dist(a), eig=TRUE, x.ret=TRUE)
+cat(names(f), rownames(f$points), "\n")
+cat(sprintf("%.8f", c(abs(f$points), abs(f$eig), f$x, f$ac, f$GOF)), "\n")
+cat(is.matrix(cmdscale(dist(a))), "\n")
+
+=== case: multivar_cmdscale_cailliez ===
+#@ tags: layer2,multivar
+#@ compare: exact
+d <- as.dist(matrix(c(0,1,1,1,0,4,1,4,0),3))
+f <- withCallingHandlers(cmdscale(d, add=TRUE, eig=TRUE, x.ret=TRUE), warning=function(w) {
+    cat(conditionMessage(w), "\n")
+    invokeRestart("muffleWarning")
+})
+cat(dim(f$points), "\n")
+cat(sprintf("%.8f", c(abs(f$points), abs(f$eig), f$ac, f$GOF)), "\n")
+
+=== case: multivar_print_dist_and_hclust ===
+#@ tags: layer2,multivar
+#@ compare: exact
+x <- rbind(a=c(0,0), b=c(1,1), c=c(4,2))
+d <- dist(x)
+print(d, digits=5)
+print(d, diag=TRUE, upper=TRUE, digits=5)
+print(hclust(d))
+
+=== case: multivar_print_clustering_and_components ===
+#@ tags: layer2,multivar
+#@ compare: exact
+a <- rbind(a=c(0,0), b=c(0,2), c=c(10,0), d=c(10,2))
+dimnames(a) <- list(c("a","b","c","d"),c("u","v"))
+print(kmeans(a,a[c(1,3),]))
+p <- prcomp(a)
+p$rotation <- abs(p$rotation)
+print(p)
+print(summary(p))
+q <- princomp(a)
+print(q)
+print(summary(q))
