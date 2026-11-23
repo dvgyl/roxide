@@ -1,0 +1,94 @@
+=== case: s4_virtual_and_multiple_inheritance ===
+#@ tags: layer3,s4
+#@ compare: exact
+err <- function(expr) tryCatch(expr, error = function(e) conditionMessage(e))
+setClass("A", slots = c(x = "numeric", y = "character", z = "ANY", n = "NULL"))
+setClass("V", contains = "VIRTUAL", slots = c(t = "logical"))
+setClass("E")
+setClass("D", contains = c("A", "V"), slots = c(v = "integer"))
+dput(isVirtualClass("V"))
+dput(isVirtualClass("E"))
+dput(isVirtualClass("D"))
+dput(err(new("V")))
+dput(err(new("E")))
+d <- new("D", t = TRUE, x = 4)
+dput(slotNames(d))
+dput(d@t)
+dput(extends("D"))
+dput(extends("D", "A"))
+dput(extends("D", "A", fullInfo = TRUE)@distance)
+dput(names(extends("D", fullInfo = TRUE)))
+dput(inherits(d, "A"))
+dput(is(d))
+a <- as(d, "A")
+dput(attr(a, "class"))
+dput(slotNames(a))
+dput(a@x)
+dput(identical(as(d, "A", strict = FALSE), d))
+invisible(setAs("A", "character", function(from) as.character(from@x)))
+dput(as(d, "character"))
+as(d, "A") <- new("A", x = 10)
+dput(d@x)
+dput(d@t)
+
+=== case: s4_union_and_old_class ===
+#@ tags: layer3,s4
+#@ compare: exact
+err <- function(expr) tryCatch(expr, error = function(e) conditionMessage(e))
+setClassUnion("NumberOrText", c("numeric", "character"))
+setClass("U", slots = c(value = "NumberOrText"))
+dput(isVirtualClass("NumberOrText"))
+dput(err(new("NumberOrText")))
+dput(is(1L, "NumberOrText"))
+dput(is("s", "NumberOrText"))
+dput(is(TRUE, "NumberOrText"))
+dput(extends("integer", "NumberOrText"))
+dput(as(1L, "NumberOrText"))
+u <- new("U", value = 1L)
+u@value <- "s"
+dput(u@value)
+setOldClass(c("oldSub", "oldBase"))
+s <- structure(1, class = c("oldSub", "oldBase"))
+dput(is(s, "oldBase"))
+dput(isS4(s))
+dput(extends("oldSub"))
+dput(slotNames("oldSub"))
+dput(err(new("oldSub")))
+
+=== case: s4_conditional_inheritance_and_coercion ===
+#@ tags: layer3,s4
+#@ compare: exact
+setClass("Source", slots = c(x = "numeric"), prototype = list(x = 1))
+setClass("Target", slots = c(y = "numeric"))
+invisible(setIs("Source", "Target",
+                test = function(object) object@x > 0,
+                coerce = function(from) new("Target", y = from@x),
+                replace = function(from, value) {
+                    from@x <- value@y
+                    from
+                }))
+x <- new("Source")
+dput(is(x, "Target"))
+dput(is(new("Source", x = 0), "Target"))
+dput(extends("Source", "Target", maybe = FALSE))
+dput(extends("Source", "Target", maybe = NA))
+dput(as(x, "Target")@y)
+as(x, "Target") <- new("Target", y = 4)
+dput(x@x)
+
+=== case: s4_superclass_order_and_distances ===
+#@ tags: layer3,s4
+#@ compare: exact
+setClass("Root", slots = c(x = "integer"))
+setClass("Left", contains = "Root")
+setClass("Right", contains = "Root")
+setClass("Diamond", contains = c("Right", "Left"))
+dput(extends("Diamond"))
+dput(extends("Diamond", "Right", fullInfo = TRUE)@distance)
+dput(extends("Diamond", "Left", fullInfo = TRUE)@distance)
+dput(extends("Diamond", "Root", fullInfo = TRUE)@distance)
+dput(extends("integer"))
+dput(extends("matrix"))
+dput(extends("array"))
+dput(is(1L, "numeric"))
+dput(is(matrix(1), "numeric"))

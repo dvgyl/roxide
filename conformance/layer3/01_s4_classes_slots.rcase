@@ -1,0 +1,90 @@
+=== case: s4_class_definition_and_attribute_order ===
+#@ tags: layer3,s4
+#@ compare: exact
+gen <- setClass("A", slots = c(x = "numeric", y = "character", z = "ANY", n = "NULL"),
+                prototype = list(x = 2))
+a <- new("A")
+d <- getClass("A")
+dput(typeof(a))
+dput(isS4(a))
+dput(attr(a, "class"))
+dput(names(attributes(a)))
+dput(a@x)
+dput(a@y)
+dput(is.null(a@z))
+dput(is.null(a@n))
+dput(identical(attributes(a)[["z"]], as.name("\001NULL\001")))
+dput(identical(attributes(a)[["n"]], as.name("\001NULL\001")))
+dput(slotNames(a))
+dput(getSlots("A"))
+dput(identical(d, get(".__C__A", .GlobalEnv)))
+dput(identical(d, getClassDef("A")))
+dput(attr(d, "class"))
+dput(names(attributes(d)))
+dput(d@className)
+dput(is.function(gen))
+dput(attr(gen, "class"))
+dput(gen(x = 4)@x)
+
+=== case: s4_slot_assignment_and_validation ===
+#@ tags: layer3,s4
+#@ compare: exact
+err <- function(expr) tryCatch(expr, error = function(e) conditionMessage(e))
+setClass("A", slots = c(x = "numeric", z = "ANY", n = "NULL"))
+a <- new("A")
+dput(.hasSlot(a, "n"))
+dput(.hasSlot(a, "foo"))
+dput(err(a@foo))
+a@x <- 2L
+a@z <- NULL
+slot(a, "n") <- NULL
+dput(a@x)
+dput(a@z)
+dput(a@n)
+dput(err(a@x <- "s"))
+dput(err(a@foo <- 5))
+slot(a, "foo", check = FALSE) <- 5
+dput(a@foo)
+dput(.hasSlot(a, "foo"))
+dput(slotNames(a))
+yy <- structure(1, class = "yy")
+dput(err(yy@x <- 2))
+
+=== case: s4_vector_and_matrix_data ===
+#@ tags: layer3,s4
+#@ compare: exact
+setClass("Vec", contains = "numeric", slots = c(tag = "character"))
+v <- new("Vec", 1:3, tag = "a")
+dput(typeof(v))
+dput(isS4(v))
+dput(slotNames(v))
+dput(v@.Data)
+dput(as(v, "numeric"))
+dput(names(attributes(v)))
+dput(inherits(v, "numeric"))
+v@.Data <- 4:5
+dput(v@.Data)
+dput(v@tag)
+setClass("Mat", contains = "matrix", slots = c(tag = "character"))
+m <- matrix(1:4, 2, dimnames = list(c("a", "b"), c("x", "y")))
+obj <- new("Mat", m, tag = "a")
+dput(slotNames(obj))
+dput(names(attributes(obj)))
+dput(identical(slot(obj, ".Data"), m))
+dput(identical(as(obj, "matrix"), m))
+dput(identical(as(obj, "array"), m))
+m2 <- matrix(5:10, 3, dimnames = list(c("a", "b", "c"), c("p", "q")))
+slot(obj, ".Data") <- m2
+dput(identical(slot(obj, ".Data"), m2))
+dput(identical(as(obj, "matrix"), m2))
+
+=== case: s4_class_definition_environment ===
+#@ tags: layer3,s4
+#@ compare: exact
+e <- new.env()
+gen <- setClass("A", slots = c(i = "integer"), where = e)
+dput(getPackageName(e))
+dput(isClass("A", where = e))
+dput(identical(getClassDef("A", where = e, inherits = FALSE), e[[".__C__A"]]))
+dput(removeClass("A", where = e))
+dput(isClass("A", where = e))

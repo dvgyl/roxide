@@ -1,0 +1,42 @@
+=== case: s4_new_from_prototype_and_superclass ===
+#@ tags: layer3,s4
+#@ compare: exact
+err <- function(expr) tryCatch(expr, error = function(e) conditionMessage(e))
+setClass("A", representation(x = "numeric", y = "character"),
+         prototype = prototype(x = 2, y = "base"))
+setClass("B", representation("A", i = "integer"))
+a <- new("A")
+b <- new("B", new("A", x = 7), i = 8L)
+dput(a@x)
+dput(a@y)
+dput(b@i)
+dput(b@x)
+dput(b@y)
+dput(new("B", a, x = 9)@x)
+dput(initialize(a, x = 5)@x)
+dput(err(new("A", missingSlot = 4)))
+dput(err(new("A", 4)))
+dput(err(new("A", x = "s")))
+dput(err(new("Undefined")))
+
+=== case: s4_validity_and_nested_slots ===
+#@ tags: layer3,s4
+#@ compare: exact
+err <- function(expr) tryCatch(expr, error = function(e) conditionMessage(e))
+setClass("J", slots = c(j = "numeric"), prototype = list(j = 1))
+check <- function(object) if (object@j > 0) TRUE else "j must be positive"
+invisible(setValidity("J", check))
+dput(is.function(getValidity(getClass("J"))))
+dput(err(new("J", j = 0)))
+j <- new("J")
+j@j <- 0
+dput(j@j)
+dput(validObject(j, test = TRUE))
+dput(err(validObject(j)))
+setClass("Outer", slots = c(inner = "J"))
+out <- new("Outer", inner = j)
+dput(validObject(out, test = TRUE))
+dput(validObject(out, test = TRUE, complete = TRUE))
+invisible(setValidity("J", NULL))
+dput(getValidity(getClass("J")))
+dput(validObject(j))
