@@ -1,0 +1,238 @@
+=== case: gamma_and_lgamma_finite ===
+#@ tags: special,gamma
+#@ compare: rel=1e-13
+x <- c(-170.5, -50.5, -12.75, -3.625, -2.5, -1.25, -0.5, -0.01, 1e-150,
+       0.01, 0.25, 0.5, 0.99, 1, 1.01, 1.5, 1.99, 2, 2.01, 3.75, 8, 24, 50, 100, 171.5)
+cat(sprintf("%.17g", gamma(x)), "\n")
+cat(sprintf("%.17g", lgamma(x)), "\n")
+
+=== case: gamma_poles_and_nonfinite_values ===
+#@ tags: special,gamma
+#@ compare: exact
+options(warn = -1)
+x <- c(-Inf, -3, -2, -1, -0, 0, 1, 2, 3, 4, 172, Inf, NaN, NA_real_)
+cat(sprintf("%.17g", gamma(x)), "\n")
+cat(sprintf("%.17g", lgamma(x[c(1:8, 12:14)])), "\n")
+withCallingHandlers(invisible(gamma(c(-2, -1, 0))), warning = function(w) {
+    cat(conditionMessage(w), "\n")
+    invokeRestart("muffleWarning")
+})
+
+=== case: gamma_near_negative_pole_warning ===
+#@ tags: special,gamma
+#@ compare: rel=1e-13
+withCallingHandlers(cat(sprintf("%.17g", gamma(-20 + 1e-9)), "\n"), warning = function(w) {
+    cat(conditionMessage(w), "\n")
+    invokeRestart("muffleWarning")
+})
+withCallingHandlers(cat(sprintf("%.17g", lgamma(-20 + 1e-9)), "\n"), warning = function(w) {
+    cat(conditionMessage(w), "\n")
+    invokeRestart("muffleWarning")
+})
+
+=== case: factorial_and_lfactorial_finite ===
+#@ tags: special,gamma
+#@ compare: rel=1e-13
+x <- c(-25.25, -3.5, -2.25, -0.5, 0.5, 1.5, 11.5, 30, 100, 170)
+cat(sprintf("%.17g", factorial(x)), "\n")
+cat(sprintf("%.17g", lfactorial(x)), "\n")
+
+=== case: factorial_exact_values_and_poles ===
+#@ tags: special,gamma
+#@ compare: exact
+options(warn = -1)
+cat(sprintf("%.17g", factorial(c(0:12, Inf, NaN, NA_real_))), "\n")
+cat(sprintf("%.17g", factorial(c(-Inf, -3, -2, -1))), "\n")
+cat(sprintf("%.17g", lfactorial(c(-Inf, -3, -2, -1, 0, 1, Inf, NaN, NA_real_))), "\n")
+
+=== case: pi_trigonometry_exact_values ===
+#@ tags: special,trigpi
+#@ compare: exact
+options(warn = -1)
+x <- c(-Inf, -9007199254740992, -3, -2.5, -2, -1.5, -1, -0.5, -0, 0,
+       0.5, 1, 1.5, 2, 2.5, 3, 2^52 - 0.5, 9007199254740992, Inf, NaN, NA_real_)
+for (f in list(sinpi, cospi, tanpi)) {
+    y <- f(x)
+    cat(sprintf("%.17g", y), "\n")
+    cat(sprintf("%.17g", 1 / y), "\n")
+}
+cat(sprintf("%.17g", tanpi(c(-1.25, -0.75, -0.25, 0.25, 0.75, 1.25))), "\n")
+
+=== case: pi_trigonometry_reduced_arguments ===
+#@ tags: special,trigpi
+#@ compare: rel=1e-13
+x <- c(-602.9875, -11.125, -1.255, -0.49975, -0.375, -1e-15, 1e-15, 0.125, 0.375, 1.265, 6000.125)
+cat(sprintf("%.17g", sinpi(x)), "\n")
+cat(sprintf("%.17g", cospi(x)), "\n")
+cat(sprintf("%.17g", tanpi(x)), "\n")
+
+=== case: polygamma_finite_values ===
+#@ tags: special,psi
+#@ compare: rel=1e-13
+x <- c(-50.75, -8.25, -3.875, -2.5, -1.25, -0.5, -0.125, 0.05, 0.5, 1, 1.5, 2, 4, 15, 50, 1000)
+cat(sprintf("%.17g", digamma(x)), "\n")
+cat(sprintf("%.17g", trigamma(x)), "\n")
+for (d in 0:5)
+    cat(sprintf("%.17g", psigamma(x, d)), "\n")
+for (d in c(6, 17, 25, 50, 100))
+    cat(sprintf("%.17g", psigamma(c(0.5, 1, 1.5, 2, 5, 20, 200), d)), "\n")
+
+=== case: polygamma_poles_defaults_and_derivative_rounding ===
+#@ tags: special,psi
+#@ compare: exact
+options(warn = -1)
+x <- c(-Inf, -6, -1, -0, 0, Inf, NaN, NA_real_)
+cat(sprintf("%.17g", digamma(x)), "\n")
+cat(sprintf("%.17g", trigamma(x)), "\n")
+cat(sprintf("%.17g", psigamma(x)), "\n")
+cat(sprintf("%.17g", psigamma(x, c(0, 1, 2, 3, 4, 5, 6, 7))), "\n")
+cat(sprintf("%.17g", psigamma(c(1, -0.5, Inf), c(-1, 6, -1))), "\n")
+print(identical(psigamma(2, deriv = c(-0.5, 0.5, 1.5, 2.5)), psigamma(2, c(0, 0, 2, 2))))
+withCallingHandlers(cat(psigamma(1, 101), "\n"), warning = function(w) {
+    cat(conditionMessage(w), "\n")
+    invokeRestart("muffleWarning")
+})
+
+=== case: beta_and_lbeta_finite_values ===
+#@ tags: special,beta
+#@ compare: rel=1e-13
+a <- c(0.05, 0.5, 0.5, 1, 2, 2.5, 7, 8, 20, 100, 100, 500)
+b <- c(0.125, 0.5, 0.75, 1e150, 2, 15, 5, 15, 250, 100, 1e30, 500)
+cat(sprintf("%.17g", beta(a, b)), "\n")
+cat(sprintf("%.17g", lbeta(b, a)), "\n")
+cat(sprintf("%.17g", lbeta(c(1e200, 1e308), c(1e200, 1e308))), "\n")
+
+=== case: beta_poles_and_missing_values ===
+#@ tags: special,beta
+#@ compare: exact
+options(warn = -1)
+a <- c(-Inf, -1, 0, 0, 1, 1, Inf, Inf, NaN, NA_real_)
+b <- c(0, 2, 0, Inf, 1, Inf, 0, Inf, NA_real_, NaN)
+cat(sprintf("%.17g", beta(a, b)), "\n")
+cat(sprintf("%.17g", lbeta(a, b)), "\n")
+cat(sprintf("%.17g", beta(TRUE, FALSE)), "\n")
+
+=== case: binomial_exact_values_and_rounding_warnings ===
+#@ tags: special,choose
+#@ compare: exact
+options(warn = -1)
+cat(sprintf("%.17g", choose(10, 0:11)), "\n")
+cat(sprintf("%.17g", choose(-4, 0:6)), "\n")
+cat(sprintf("%.17g", choose(c(-1.5, 1.25, 2.5, 4.5), c(2, 2, 3, 2))), "\n")
+cat(sprintf("%.17g", choose(c(Inf, Inf, -Inf, 5, NaN, NA_real_), c(0, 3, 3, Inf, NA_real_, NaN))), "\n")
+withCallingHandlers(cat(sprintf("%.17g", choose(7, c(-0.5, 0.5, 1.5, 2.5, 3 + 1e-8, 3 + 1e-10))), "\n"), warning = function(w) {
+    cat(conditionMessage(w), "\n")
+    invokeRestart("muffleWarning")
+})
+
+=== case: binomial_finite_values_and_symmetry ===
+#@ tags: special,choose
+#@ compare: rel=1e-13
+n <- c(-250, -3.55, -0.35, 0.75, 18.5, 70, 100, 300, 300, 500, 1000)
+k <- c(100, 85, 80, 90, 75, 30, 50, 65, 235, 250, 100)
+cat(sprintf("%.17g", choose(n, k)), "\n")
+cat(sprintf("%.17g", lchoose(n, k)), "\n")
+print(identical(choose(300, 65), choose(300, 235)))
+
+=== case: special_vector_attributes_and_named_arguments ===
+#@ tags: special,attributes
+#@ compare: exact
+x <- structure(c(1, 2, 3, 4), dim = c(2L, 2L), dimnames = list(c("a", "b"), c("c", "d")))
+dput(attributes(gamma(x)))
+dput(attributes(beta(b = c(1, 2), a = x)))
+dput(attributes(beta(1, x)))
+dput(attributes(beta(c(2, 2, 2, 2), x)))
+dput(attributes(choose(structure(numeric(), tag = "empty"), 1)))
+dput(beta(1, structure(numeric(), tag = "empty")))
+dput(attributes(besselI(nu = 0, x = x, expon.scaled = c(TRUE, FALSE))))
+dput(attributes(besselK(nu = 0, x = x, expon.scaled = rep(TRUE, 8))))
+dput(attributes(psigamma(1, deriv = structure(c(1, 2), names = c("a", "b")))))
+
+=== case: bessel_i_argument_and_order_grid ===
+#@ tags: special,bessel
+#@ compare: rel=1e-13
+options(warn = -1)
+x <- c(0, 1e-6, 0.5, 2, 10, 50, 500)
+nu <- c(-2.5, -1.375, -1, -0.5, 0, 0.25, 0.5, 1, 2.5, 10, 50)
+for (n in nu)
+    cat(sprintf("%.17g", besselI(x, n)), "\n")
+
+=== case: bessel_i_scaled_grid ===
+#@ tags: special,bessel
+#@ compare: rel=1e-13
+options(warn = -1)
+x <- c(0, 1e-6, 0.5, 2, 10, 50, 500)
+for (n in c(-2.5, -1, -0.25, 0, 0.5, 1, 2.5, 10, 50))
+    cat(sprintf("%.17g", besselI(x, n, expon.scaled = TRUE)), "\n")
+cat(sprintf("%.17g", besselI(c(0.5, 2, 50, 500), 0, expon.scaled = c(TRUE, FALSE))), "\n")
+
+=== case: bessel_j_argument_and_order_grid ===
+#@ tags: special,bessel
+#@ compare: rel=1e-13
+options(warn = -1)
+x <- c(0, 1e-6, 0.5, 2, 10, 50, 500)
+nu <- c(-2.5, -1.375, -1, -0.5, 0, 0.25, 0.5, 1, 2.5, 10, 50)
+for (n in nu)
+    cat(sprintf("%.17g", besselJ(x, n)), "\n")
+
+=== case: bessel_j_across_the_recurrence_transition ===
+#@ tags: special,bessel
+#@ compare: rel=1e-13
+x <- c(6, 10, 10, 10, 24, 50, 50, 100, 100, 150, 500)
+nu <- c(8.5, 9.5, 10.5, 20, 25, 49.5, 100, 98, 101, 200, 510)
+cat(sprintf("%.17g", besselJ(x, nu)), "\n")
+
+=== case: bessel_k_argument_and_order_grid ===
+#@ tags: special,bessel
+#@ compare: rel=1e-13
+options(warn = -1)
+x <- c(0, 1e-6, 0.5, 2, 10, 50, 500)
+nu <- c(-2.5, -1.375, -1, -0.5, 0, 0.25, 0.5, 1, 2.5, 10, 50)
+for (n in nu)
+    cat(sprintf("%.17g", besselK(x, n)), "\n")
+
+=== case: bessel_k_scaled_grid ===
+#@ tags: special,bessel
+#@ compare: rel=1e-13
+options(warn = -1)
+x <- c(0, 1e-6, 0.5, 2, 10, 50, 500)
+for (n in c(-2.5, -1, -0.25, 0, 0.5, 1, 2.5, 10, 50))
+    cat(sprintf("%.17g", besselK(x, n, expon.scaled = TRUE)), "\n")
+cat(sprintf("%.17g", besselK(c(0.5, 2, 50, 500), 0, expon.scaled = c(TRUE, FALSE))), "\n")
+
+=== case: bessel_y_argument_and_order_grid ===
+#@ tags: special,bessel
+#@ compare: rel=1e-13
+options(warn = -1)
+x <- c(0, 1e-6, 0.5, 2, 10, 50, 500)
+nu <- c(-2.5, -1.375, -1, -0.5, 0, 0.25, 0.5, 1, 2.5, 10, 50)
+for (n in nu)
+    cat(sprintf("%.17g", besselY(x, n)), "\n")
+
+=== case: bessel_endpoints_and_missing_values ===
+#@ tags: special,bessel
+#@ compare: exact
+options(warn = -1)
+x <- c(-1, 0, Inf, NaN, NA_real_)
+for (n in c(-2.5, -1, 0, 0.5, 10, Inf, NA_real_, NaN)) {
+    cat(sprintf("%.17g", besselI(x, n)), "\n")
+    cat(sprintf("%.17g", besselJ(x, n)), "\n")
+    cat(sprintf("%.17g", besselK(x, n)), "\n")
+    cat(sprintf("%.17g", besselY(x, n)), "\n")
+}
+cat(sprintf("%.17g", besselI(c(1, 1, Inf, NaN), 0, c(NA, NaN, TRUE, TRUE))), "\n")
+cat(sprintf("%.17g", besselK(c(1, 1, Inf, NaN), 0, c(NA, NaN, TRUE, TRUE))), "\n")
+
+=== case: bessel_domain_and_precision_warnings ===
+#@ tags: special,bessel
+#@ compare: exact
+for (f in list(besselI, besselJ, besselK, besselY))
+    withCallingHandlers(cat(f(-1, 0), "\n"), warning = function(w) {
+        cat(conditionMessage(w), "\n")
+        invokeRestart("muffleWarning")
+    })
+for (f in list(besselI, besselJ, besselY))
+    withCallingHandlers(cat(f(1e-6, 50), "\n"), warning = function(w) {
+        cat(conditionMessage(w), "\n")
+        invokeRestart("muffleWarning")
+    })
