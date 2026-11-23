@@ -90,6 +90,20 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
+    const STACK_BYTES: usize = 32 * 1024 * 1024;
+    let run = std::thread::Builder::new()
+        .stack_size(STACK_BYTES)
+        .spawn(move || interpret(opts, STACK_BYTES));
+    match run {
+        Ok(thread) => thread.join().unwrap_or(ExitCode::FAILURE),
+        Err(err) => {
+            let _ = writeln!(io::stderr().lock(), "Error: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn interpret(opts: CliOpts, stack_bytes: usize) -> ExitCode {
     let policy = if env::var_os("ROXIDE_GC_TORTURE").is_some() {
         GcPolicy::Torture
     } else {
@@ -103,6 +117,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    ctx.set_stack_budget(stack_bytes - 2 * 1024 * 1024);
     if let Err(err) = roxide_base::register_all(&mut ctx) {
         let _ = writeln!(io::stderr().lock(), "Error: {err}");
         return ExitCode::FAILURE;
@@ -152,6 +167,10 @@ fn handle_unwind(unwind: Unwind) -> ExitCode {
         Unwind::Quit { status, .. } => ExitCode::from(status.clamp(0, 255) as u8),
         Unwind::TopLevel => {
             let _ = writeln!(io::stderr().lock(), "Execution halted");
+            ExitCode::FAILURE
+        }
+        Unwind::Value(err) => {
+            let _ = writeln!(io::stderr().lock(), "Error: {err}\nExecution halted");
             ExitCode::FAILURE
         }
         Unwind::Internal(err) => {

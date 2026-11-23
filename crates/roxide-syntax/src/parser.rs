@@ -4,7 +4,7 @@ use std::{collections::HashSet, fmt};
 
 use roxide_diag::{LineDirective, Span, SrcFileId};
 
-use crate::ast::{Arg, ArgName, Ast, Const, Node, NodeId};
+use crate::ast::{Arg, ArgName, Ast, Const, Node, NodeId, StrEncoding};
 use crate::lexer::{Lexer, TokKind, Token};
 use crate::literal::{decode_escaped, decode_string, parse_r_double, parse_r_int, symbol_name};
 use crate::ops::{self, Assoc, Prec};
@@ -90,6 +90,8 @@ impl ExprContext {
 /// R 4.6.2 Pratt parser producing an [`Ast`].
 pub struct Parser<'s> {
     src: &'s str,
+    error_call: Option<NodeId>,
+    expression_start: usize,
     tokens: Vec<Token>,
     cursor: usize,
     ast: Ast,
@@ -130,6 +132,8 @@ impl<'s> Parser<'s> {
         let line_directives = collect_line_directives(src, &tokens);
         Self {
             src,
+            error_call: None,
+            expression_start: 0,
             tokens,
             cursor: 0,
             ast: Ast::new(),
@@ -209,12 +213,23 @@ impl<'s> Parser<'s> {
         }
     }
 
+    /// Return the call associated with the most recent parse error, if present.
+    #[must_use]
+    pub fn error_call(&self) -> Option<NodeId> {
+        self.error_call
+    }
+
     /// Parse the next single top-level expression.
     pub fn parse_next(&mut self) -> ParseStep {
         self.skip_newlines_and_comments();
         if self.is_eof() {
             return self.end_of_input(false);
         }
+        self.error_call = None;
+        self.expression_start = self
+            .cursor
+            .checked_sub(1)
+            .map_or(0, |i| self.tokens[i].span.hi as usize);
         self.placeholders.clear();
         match self.parse_expr(Prec(0), ExprContext::TOP_LEVEL) {
             Ok(expr) => {
@@ -1169,9 +1184,22 @@ impl<'s> Parser<'s> {
                 return Err(self.invalid_placeholder(placeholder));
             };
             if arg.name.is_none() {
+                let prefix = &self.src[self.expression_start..rhs_span.lo as usize];
+                let line = 1 + prefix.bytes().filter(|&byte| byte == b'\n').count();
+                let column = prefix.rsplit('\n').next().map_or(1, |line| line.len() + 1);
+                let literal = Const::Str {
+                    bytes: Box::from(b"_".as_slice()),
+                    enc: StrEncoding::Native,
+                };
+                let span = arg.span;
+                arg.value = Some(self.ast.push_node(Node::Const(literal), span));
+                let args = self.ast.push_args(arguments);
+                self.error_call = Some(self.ast.push_node(Node::Call { func, args }, rhs_span));
                 return Err(ParseError {
-                    message: String::from("pipe placeholder may only be used as a named argument"),
-                    span: arg.span,
+                    message: format!(
+                        "pipe placeholder can only be used as a named argument (<input>:{line}:{column})"
+                    ),
+                    span,
                 });
             }
             arg.value = Some(lhs);

@@ -427,7 +427,7 @@ fn class_names(s: &RSession, x: SexpId) -> Result<std::vec::Vec<String>, roxide_
         match ty {
             Real => "numeric",
             Clo | Builtin | Special => "function",
-            Lang => "call",
+            Lang => s.call_class(x)?,
             Sym => "name",
             _ => ty.type_name(s.is_s4(x)?),
         }

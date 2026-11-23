@@ -14,6 +14,13 @@ pub(crate) const MODULE: Module = Module {
         primitive!("rm", remove, Unevaluated, Arity::Any, Off),
         primitive!("remove", remove, Unevaluated, Arity::Any, Off),
         primitive!("ls", ls, Eval, Arity::Any, On),
+        primitive!(
+            "makeActiveBinding",
+            make_active_binding,
+            Eval,
+            Arity::Exact(3),
+            Off
+        ),
         primitive!("new.env", new_env, Eval, Arity::Range(0, 3), On),
         primitive!("emptyenv", constant_env, Eval, Arity::Exact(0), On),
         primitive!("baseenv", constant_env, Eval, Arity::Exact(0), On),
@@ -107,6 +114,46 @@ impl Ctx {
         }
         Ok(None)
     }
+}
+
+fn make_active_binding(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    let matched = ctx.match_names(args, &["sym", "fun", "env"], call.err_call())?;
+    let sym = ctx.matched_arg(args, &matched, 0).unwrap_or(SEXP_NIL);
+    let sym = if ctx.session.type_of(sym)? == SexpType::Sym {
+        ctx.sym_from_sexp(sym)?
+    } else {
+        let name = ctx.string(sym, call.err_call())?;
+        ctx.session.intern(&name)?
+    };
+    let fun = ctx.matched_arg(args, &matched, 1).unwrap_or(SEXP_NIL);
+    if !matches!(
+        ctx.session.type_of(fun)?,
+        SexpType::Clo | SexpType::Builtin | SexpType::Special
+    ) {
+        return Err(ctx.stop(call.err_call(), "invalid function"));
+    }
+    let env = ctx.require_env(
+        ctx.matched_arg(args, &matched, 2).unwrap_or(SEXP_NIL),
+        call.err_call(),
+    )?;
+    if ctx
+        .session
+        .env_get(env, sym)
+        .is_some_and(|binding| !binding.active)
+    {
+        return Err(ctx.stop(call.err_call(), "symbol already has a regular binding"));
+    }
+    ctx.session.env_define_binding(
+        env,
+        sym,
+        roxide_value::Binding {
+            value: fun,
+            active: true,
+            locked: false,
+            missing: 0,
+        },
+    )?;
+    Ok(SEXP_NIL)
 }
 
 fn scalar_flag(

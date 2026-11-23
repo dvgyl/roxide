@@ -129,16 +129,22 @@ pub struct Ctx {
     pub(crate) utils: SexpId,
     pub(crate) next_frame_id: u64,
     pub(crate) expr_depth: usize,
+    pub(crate) overflow_headroom: usize,
+    pub(crate) stack_origin: Option<usize>,
+    pub(crate) stack_budget: usize,
+    pub(crate) calls: Vec<(SexpId, SexpId)>,
+    pub(crate) replacement_call: Option<SexpId>,
     pub(crate) eval_env: SexpId,
     pub(crate) visible: bool,
     pub(crate) pending_warnings: Vec<(Option<Vec<String>>, String)>,
     pub(crate) extensions: HashMap<TypeId, ExtEntry>,
-    pub(crate) s4_hooks: Option<Box<dyn S4Hooks>>,
+    pub(crate) s4_hooks: Option<&'static dyn S4Hooks>,
     pub(crate) interactive: bool,
 }
 
 struct CtxRoots<'a> {
     frames: &'a [Frame],
+    calls: &'a [(SexpId, SexpId)],
     loops: &'a [(FrameId, SexpId)],
     eval_env: SexpId,
     conditions: &'a crate::conditions::Conditions,
@@ -149,6 +155,10 @@ struct CtxRoots<'a> {
 
 impl RootSet for CtxRoots<'_> {
     fn trace_roots(&self, tracer: &mut Tracer<'_>) {
+        for &(call, env) in self.calls {
+            tracer.edge(call);
+            tracer.edge(env);
+        }
         for frame in self.frames {
             tracer.edge(frame.call);
             tracer.edge(frame.cloenv);
@@ -199,6 +209,11 @@ impl Ctx {
             utils,
             next_frame_id: 1,
             expr_depth: 0,
+            overflow_headroom: 0,
+            stack_origin: None,
+            stack_budget: 512 * 1024,
+            calls: Vec::new(),
+            replacement_call: None,
             eval_env: GLOBAL_ENV,
             visible: true,
             pending_warnings: Vec::new(),
@@ -227,12 +242,14 @@ impl Ctx {
     /// Register a [`Module`]'s primitives and `.Internal` entries in `BASE_ENV`.
     pub fn register_module(&mut self, module: &Module) -> Result<(), InternalError> {
         for prim in module.prims {
-            let id = PrimId(self.prims.len() as u16);
+            let id = PrimId(u16::try_from(self.prims.len()).map_err(|_| InternalError {
+                message: String::from("primitive table is full"),
+            })?);
             self.prims.push(prim);
             match prim.kind {
                 PrimKind::Primitive => {
                     let sym = self.session.intern(prim.name)?;
-                    let special = matches!(prim.args, ArgEval::Unevaluated);
+                    let special = matches!(prim.args, ArgEval::Unevaluated | ArgEval::EvalDollar);
                     let pval = self.session.alloc_prim(id, special)?;
                     self.session.env_define(BASE_ENV, sym, pval)?;
                 }
@@ -331,8 +348,20 @@ impl Ctx {
         self.interactive = interactive;
     }
 
-    /// Install Milestone 3 S4 dispatch hooks.
-    pub fn set_s4_hooks(&mut self, hooks: Box<dyn S4Hooks>) {
+    /// Return whether this replacement call can update its target in place.
+    pub fn can_overwrite(&self, call: &crate::Call) -> bool {
+        self.replacement_call == Some(call.expr)
+    }
+
+    /// Set the evaluator stack budget in bytes.
+    ///
+    /// The caller must leave space outside this budget for entry frames and unwinding.
+    pub fn set_stack_budget(&mut self, bytes: usize) {
+        self.stack_budget = bytes;
+    }
+
+    /// Install the stateless S4 dispatch hook.
+    pub fn set_s4_hooks(&mut self, hooks: &'static dyn S4Hooks) {
         self.s4_hooks = Some(hooks);
     }
 
@@ -371,6 +400,7 @@ impl Ctx {
         if self.session.heap.wants_collection() {
             let roots = CtxRoots {
                 frames: &self.frames,
+                calls: &self.calls,
                 loops: &self.loops,
                 eval_env: self.eval_env,
                 conditions: &self.conditions,
@@ -430,10 +460,15 @@ impl Ctx {
                     return Err(self.stop(SEXP_NIL, "unexpected end of input"));
                 }
                 ParseStep::Error(err) => {
-                    return Err(self.stop(SEXP_NIL, err.message));
+                    let call = parser.error_call().map_or(Ok(SEXP_NIL), |node| {
+                        lower(parser.ast(), node, &mut self.session, KeepSource::No)
+                    });
+                    let call = self.condition_result(SEXP_NIL, call.map_err(Into::into))?;
+                    return Err(self.stop(call, err.message));
                 }
                 ParseStep::Expr(node) => {
-                    let expr = lower(parser.ast(), node, &mut self.session, KeepSource::No)?;
+                    let expr = lower(parser.ast(), node, &mut self.session, KeepSource::No);
+                    let expr = self.condition_result(SEXP_NIL, expr.map_err(Into::into))?;
                     let val = self.scoped(|ctx| {
                         ctx.protect(expr);
                         ctx.visible = true;

@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use roxide_gc::{GcPolicy, GcStats, Heap, RootSet, SexpId};
 
 use crate::alt::AltRegistry;
-use crate::api::ValueError;
+use crate::api::{ValueApi, ValueError};
 use crate::na::RLogical;
 use crate::object::{Body, CharId, Encoding, EnvData, RChar, RObject, RVec, Sym};
 
@@ -225,6 +225,102 @@ impl RSession {
             });
         };
         Ok(rc.encoding())
+    }
+
+    /// Return the implicit class of a language object.
+    pub fn call_class(&self, call: SexpId) -> Result<&'static str, ValueError> {
+        let (head, _, _) = self.cons_parts(call)?;
+        Ok(match self.sym_name_of(head) {
+            Ok("if") => "if",
+            Ok("for") => "for",
+            Ok("while") => "while",
+            Ok("{") => "{",
+            Ok("(") => "(",
+            Ok("<-") => "<-",
+            Ok("=") => "=",
+            _ => "call",
+        })
+    }
+
+    /// Release references from a call frame that has no references outside its own bindings.
+    pub fn release_call_frame(&mut self, env: SexpId, actuals: &[SexpId], retained: &[SexpId]) {
+        let Ok(object) = self.heap.get(env) else {
+            return;
+        };
+        let Body::Env(frame) = &object.body else {
+            return;
+        };
+        let mut defaults = 0;
+        for (_, binding) in &frame.entries {
+            if self.heap.refcnt(binding.value) == 1
+                && !retained.contains(&binding.value)
+                && self
+                    .promise_parts(binding.value)
+                    .is_ok_and(|parts| parts.1 == env)
+            {
+                defaults += 1;
+            }
+        }
+        let refs = self.heap.refcnt(env);
+        if refs == roxide_gc::REFCNT_MAX || usize::from(refs) != defaults || retained.contains(&env)
+        {
+            return;
+        }
+        let Ok(object) = self.heap.get_mut(env) else {
+            return;
+        };
+        let Body::Env(frame) = &mut object.body else {
+            return;
+        };
+        let enclos = std::mem::replace(&mut frame.enclos, SEXP_NIL);
+        let entries = std::mem::take(&mut frame.entries);
+        frame.index.clear();
+        self.heap.dec_ref(enclos);
+        let mut candidates = actuals.to_vec();
+        for (_, binding) in entries {
+            self.heap.dec_ref(binding.value);
+            let mut value = binding.value;
+            while !self.heap.maybe_referenced(value) && !retained.contains(&value) {
+                let Ok(object) = self.heap.get_mut(value) else {
+                    break;
+                };
+                let Body::Dots(cell) = &mut object.body else {
+                    break;
+                };
+                let (car, cdr, tag) = (cell.car, cell.cdr, cell.tag);
+                cell.car = SEXP_NIL;
+                cell.cdr = SEXP_NIL;
+                cell.tag = SEXP_NIL;
+                for edge in [car, cdr, tag] {
+                    self.heap.dec_ref(edge);
+                }
+                candidates.push(car);
+                value = cdr;
+            }
+            candidates.push(value);
+        }
+        for value in candidates {
+            self.release_promise(value, retained);
+        }
+    }
+
+    fn release_promise(&mut self, promise: SexpId, retained: &[SexpId]) {
+        if self.heap.maybe_referenced(promise) || retained.contains(&promise) {
+            return;
+        }
+        let Ok(object) = self.heap.get_mut(promise) else {
+            return;
+        };
+        let Body::Promise {
+            expr, env, value, ..
+        } = &mut object.body
+        else {
+            return;
+        };
+        let edges = [expr, env, value].map(|edge| std::mem::replace(edge, SEXP_NIL));
+        for edge in edges {
+            self.heap.dec_ref(edge);
+        }
     }
 
     /// Run a complete two-phase GC cycle: mark, purge unmarked weak `CHARSXP` entries, then sweep.

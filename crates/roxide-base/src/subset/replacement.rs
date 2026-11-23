@@ -115,7 +115,7 @@ pub(super) fn replace_one(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalRe
             return Err(error(ctx, call, "wrong args for environment subassignment"));
         };
         let sym = ctx.session_mut().intern(&key)?;
-        ctx.session_mut().env_define(x, sym, value)?;
+        ctx.assign(sym, value, x)?;
         return Ok(x);
     }
     if subs.len() == 2 && has_class(ctx.session(), x, "data.frame") {
@@ -177,17 +177,16 @@ pub(super) fn replace_one(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalRe
 }
 
 pub(super) fn replace_dollar(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
-    let x = ctx.eval(args.get(0), call.env)?;
-    ctx.protect(x);
+    let x = args.get(0);
     let x = ctx.session_mut().unshare(x)?;
     ctx.protect(x);
     let key = dollar_name(ctx, call, args.get(1))?;
-    let value = ctx.eval(args.get(2), call.env)?;
+    let value = args.get(2);
     let s = ctx.session_mut();
     let ty = s.type_of(x)?;
     if ty == SexpType::Env {
         let sym = s.intern(&key)?;
-        s.env_define(x, sym, value)?;
+        ctx.assign(sym, value, x)?;
         return Ok(x);
     }
     let x = if atomic(ty) {
@@ -447,6 +446,7 @@ fn assign(
         return Err(error(ctx, call, "subscript out of bounds"));
     }
     vector_limit(ctx, call, end, size_of::<SexpId>() * 2)?;
+    let can_overwrite = ctx.can_overwrite(call);
     let s = ctx.session_mut();
     let target_ty = if rank(tx) >= rank(tv) { tx } else { tv };
     let ty = if atomic(target_ty) || target_ty == SexpType::Expr {
@@ -454,6 +454,15 @@ fn assign(
     } else {
         SexpType::Vec
     };
+    if can_overwrite
+        && end == n
+        && ty == tx
+        && value != SEXP_NIL
+        && value != x
+        && let Some(out) = overwrite(s, x, value, ty, &ix, value_len, one)?
+    {
+        return Ok(out);
+    }
     let labels = names(s, x);
     let named = attr(s, x, "names") != SEXP_NIL || !added.is_empty();
     let mut labels = if named { labels.to_vec() } else { vec![] };
@@ -500,6 +509,44 @@ fn assign(
     Ok(out)
 }
 
+fn overwrite(
+    s: &mut roxide_value::RSession,
+    target: SexpId,
+    value: SexpId,
+    ty: SexpType,
+    indices: &[Index],
+    value_len: usize,
+    one: bool,
+) -> Result<Option<SexpId>, roxide_value::ValueError> {
+    let target = s.unshare(target)?;
+    macro_rules! overwrite_atomic {
+        ($read:ident, $write:ident) => {{
+            let (value, _) = s.coerce(value, ty)?;
+            let values = s.$read(value)?.to_vec();
+            let dst = s.$write(target)?;
+            for (i, index) in indices.iter().enumerate() {
+                if let Some(pos) = index.pos {
+                    dst[pos] = values[i % value_len];
+                }
+            }
+        }};
+    }
+    match ty {
+        SexpType::Lgl => overwrite_atomic!(lgl, lgl_mut),
+        SexpType::Int => overwrite_atomic!(int, int_mut),
+        SexpType::Real => overwrite_atomic!(real, real_mut),
+        SexpType::Vec | SexpType::Expr if one => {
+            for index in indices {
+                if let Some(pos) = index.pos {
+                    s.list_set(target, pos, value)?;
+                }
+            }
+        }
+        _ => return Ok(None),
+    }
+    Ok(Some(target))
+}
+
 fn factor_codes(ctx: &mut Ctx, call: &Call, x: SexpId, value: SexpId) -> EvalResult {
     let s = ctx.session_mut();
     let v = if has_class(s, value, "factor") {
@@ -529,4 +576,33 @@ fn factor_codes(ctx: &mut Ctx, call: &Call, x: SexpId, value: SexpId) -> EvalRes
         ctx.warn_now(call.err_call(), "invalid factor level, NA generated")?;
     }
     Ok(ctx.session_mut().alloc_int_from(&values)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use roxide_eval::{Ctx, EvalResult, Unwind};
+    use roxide_gc::GcPolicy;
+    use roxide_host::PureHost;
+    use roxide_value::{GLOBAL_ENV, ValueApi};
+
+    #[test]
+    fn repeated_replacement_updates_an_unshared_vector_in_place() -> EvalResult<()> {
+        for policy in [GcPolicy::default(), GcPolicy::Torture] {
+            let mut ctx = Ctx::new(Box::new(PureHost::new()), policy).map_err(Unwind::Internal)?;
+            crate::register_all(&mut ctx).map_err(Unwind::Internal)?;
+            ctx.run_script("<test>", "x <- integer(20L)", GLOBAL_ENV, false)?;
+            let name = ctx.session_mut().intern("x")?;
+            let Some(original) = ctx.get_var(name, GLOBAL_ENV)? else {
+                return Err(Unwind::TopLevel);
+            };
+            ctx.run_script("<test>", "for (i in 1:20) x[i] <- i", GLOBAL_ENV, false)?;
+            assert_eq!(ctx.get_var(name, GLOBAL_ENV)?, Some(original));
+            assert_eq!(ctx.session().heap.refcnt(original), 1);
+            assert_eq!(
+                ctx.session().int(original)?.to_vec(),
+                (1..=20).collect::<Vec<_>>()
+            );
+        }
+        Ok(())
+    }
 }

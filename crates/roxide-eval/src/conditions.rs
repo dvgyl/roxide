@@ -91,7 +91,6 @@ struct Restart {
 pub(crate) struct Conditions {
     handlers: Vec<Handler>,
     restarts: Vec<Restart>,
-    pub(crate) unhandled: Option<String>,
 }
 
 impl Conditions {
@@ -113,7 +112,16 @@ impl Ctx {
             "warning" => "simpleWarning",
             _ => "simpleMessage",
         };
-        let classes = self.strings([class, kind, "condition"])?;
+        self.make_condition(message, call, [class, kind, "condition"])
+    }
+
+    fn make_condition<'a>(
+        &mut self,
+        message: SexpId,
+        call: SexpId,
+        classes: impl IntoIterator<Item = &'a str>,
+    ) -> EvalResult {
+        let classes = self.strings(classes)?;
         let message_tag = self.session.intern("message")?;
         let call_tag = self.session.intern("call")?;
         let cond = self.list(&Args::from_pairs(vec![
@@ -184,25 +192,57 @@ impl Ctx {
             self.deparse_lines(call, DeparseOpts::default()).ok()
         };
         let formatted = diag_format::error(call_lines.as_deref(), text);
-        if self.expr_depth == 0 && self.frames.is_empty() {
+        let _ = self.host.write_err(formatted.as_bytes());
+        if !self.interactive && call != SEXP_NIL {
+            self.print_call_trace(call);
+        }
+        if !self.pending_warnings.is_empty() {
+            let _ = self.host.write_err(b"In addition: ");
             self.flush_warnings();
-            let _ = self.host.write_err(formatted.as_bytes());
-        } else {
-            self.conditions.unhandled = Some(formatted);
         }
         Err(Unwind::TopLevel)
     }
 
-    pub(crate) fn finish_error<T>(&mut self, result: EvalResult<T>) -> EvalResult<T> {
-        if self.expr_depth == 0
-            && self.frames.is_empty()
-            && let Some(message) = self.conditions.unhandled.take()
-            && matches!(result, Err(Unwind::TopLevel))
-        {
-            let _ = self.host.write_err(message.as_bytes());
-            self.flush_warnings();
+    fn print_call_trace(&mut self, error_call: SexpId) {
+        let mut names = self.calls.iter().filter_map(|&(call, _)| {
+            let (head, _, _) = self.session.cons_parts(call).ok()?;
+            let name = self.session.sym_name_of(head).unwrap_or("<Anonymous>");
+            Some((call, name))
+        });
+        let Some((first, name)) = names.next() else {
+            return;
+        };
+        let mut names = names.peekable();
+        if first == error_call && names.peek().is_none() {
+            return;
         }
-        result
+        let mut trace = format!("Calls: {name}");
+        for (_, name) in names {
+            trace.push_str(" -> ");
+            trace.push_str(name);
+        }
+        trace.push('\n');
+        let _ = self.host.write_err(trace.as_bytes());
+    }
+
+    pub(crate) fn stack_overflow_condition(&mut self) -> Unwind {
+        const MESSAGE: &str =
+            "evaluation nested too deeply: infinite recursion / options(expressions=)?";
+        let result = self.scoped(|ctx| {
+            let msg = ctx.session.scalar_str(MESSAGE)?;
+            let condition = ctx.make_condition(
+                msg,
+                SEXP_NIL,
+                [
+                    "expressionStackOverflowError",
+                    "stackOverflowError",
+                    "error",
+                    "condition",
+                ],
+            )?;
+            ctx.raise_condition(condition, SEXP_NIL, MESSAGE)
+        });
+        result.err().unwrap_or(Unwind::TopLevel)
     }
 
     pub(crate) fn emit_condition(
@@ -360,6 +400,52 @@ impl Ctx {
         Ok(value)
     }
 
+    fn eval_try_expr(
+        &mut self,
+        args: &Args,
+        matched: &crate::closure::Matches,
+        call: &Call,
+    ) -> EvalResult {
+        let list_call = self.named_call(
+            "tryCatchList",
+            &["expr", "classes", "parentenv", "handlers"],
+        )?;
+        self.with_call(list_call, call.env, |ctx| {
+            if matched.dots.is_empty() {
+                return ctx.eval_arg(args, matched, 0, call, SEXP_MISSING);
+            }
+            let one_call =
+                ctx.named_call("tryCatchOne", &["expr", "names", "parentenv", "handlers"])?;
+            let ret = ctx.named_call("return", &["expr"])?;
+            let invoke = ctx.session.intern("doTryCatch")?.as_sexp();
+            let names = ["name", "parentenv", "handler"].map(|name| ctx.session.intern(name));
+            let [name, env, handler] = names;
+            let invoke = ctx.make_call(
+                invoke,
+                &Args::from_pairs(vec![
+                    (None, ret),
+                    (None, name?.as_sexp()),
+                    (None, env?.as_sexp()),
+                    (None, handler?.as_sexp()),
+                ]),
+            )?;
+            ctx.with_call(one_call, call.env, |ctx| {
+                ctx.with_call(invoke, call.env, |ctx| {
+                    ctx.eval_arg(args, matched, 0, call, SEXP_MISSING)
+                })
+            })
+        })
+    }
+
+    fn named_call(&mut self, name: &str, args: &[&str]) -> EvalResult {
+        let head = self.session.intern(name)?.as_sexp();
+        let args = args
+            .iter()
+            .map(|name| self.session.intern(name).map(|sym| (None, sym.as_sexp())))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.make_call(head, &Args::from_pairs(args))
+    }
+
     fn concat_message(&mut self, args: &Args, skip: &[&str]) -> EvalResult<String> {
         let mut text = String::new();
         for (tag, value) in args.iter() {
@@ -462,7 +548,10 @@ fn notify(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
             None => true,
         };
         let err_call = if show {
-            ctx.frame(call.env).map_or(SEXP_NIL, |frame| frame.call)
+            ctx.calls
+                .iter()
+                .rfind(|&&(_, env)| env == call.env)
+                .map_or(SEXP_NIL, |&(expr, _)| expr)
         } else {
             SEXP_NIL
         };
@@ -531,7 +620,7 @@ fn with_handlers(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     } else {
         &["expr", "..."]
     };
-    let args = &ctx.promise_args(args, call.env, call.err_call())?;
+    let args = &ctx.expand_dots(args, call.env, call.err_call())?;
     for &value in args.values() {
         ctx.protect(value);
     }
@@ -568,7 +657,11 @@ fn with_handlers(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
             });
         }
         ctx.conditions.handlers.extend(handlers.into_iter().rev());
-        ctx.eval_arg(args, &matched, 0, call, SEXP_MISSING)
+        if exiting {
+            ctx.eval_try_expr(args, &matched, call)
+        } else {
+            ctx.eval_arg(args, &matched, 0, call, SEXP_MISSING)
+        }
     })();
     if let Err(Unwind::Transfer {
         target,

@@ -90,6 +90,24 @@ impl Ctx {
         Ok(promise)
     }
 
+    pub(crate) fn expand_dots(
+        &mut self,
+        args: &Args,
+        env: SexpId,
+        call: SexpId,
+    ) -> EvalResult<Args> {
+        let mut result = Vec::new();
+        for (tag, expr) in args.iter() {
+            if self.session.sym_name_of(expr).ok() == Some("...") {
+                let dots = self.dots(env, call)?;
+                result.extend(self.session.pairlist_iter(dots));
+            } else {
+                result.push((tag, expr));
+            }
+        }
+        Ok(Args::from_pairs(result))
+    }
+
     pub(crate) fn promise_args(
         &mut self,
         args: &Args,
@@ -269,6 +287,7 @@ impl Ctx {
             let formals = Args::from_pairs(ctx.session.pairlist_iter(formals).collect());
             let matched = ctx.match_args(&formals, &actuals, call, true)?;
             let env = ctx.session.alloc_env(enclos)?;
+            ctx.protect(env);
             for (i, (tag, default)) in formals.iter().enumerate() {
                 let Some(tag) = tag else { continue };
                 let supplied = matched.slots[i].map_or(SEXP_MISSING, |i| actuals.get(i));
@@ -316,7 +335,17 @@ impl Ctx {
                 actuals,
                 dispatch,
             };
-            ctx.run_frame(frame, |ctx| ctx.eval(body, env))
+            let actuals = frame.actuals.values().to_vec();
+            for &value in &actuals {
+                ctx.session.heap.inc_ref(value);
+            }
+            let result = ctx.run_frame(frame, |ctx| ctx.eval(body, env));
+            for &value in &actuals {
+                ctx.session.heap.dec_ref(value);
+            }
+            ctx.session
+                .release_call_frame(env, &actuals, &result_roots(&result));
+            result
         })
     }
 
@@ -327,8 +356,11 @@ impl Ctx {
     ) -> EvalResult {
         let (id, env) = (frame.id, frame.cloenv);
         self.frames.push(frame);
-        let result = run(self);
-        let result = self.finish_closure(env, result);
+        let call = self.frames.last().map_or(SEXP_NIL, |frame| frame.call);
+        let result = self.with_call(call, env, |ctx| {
+            let result = run(ctx);
+            ctx.finish_closure(env, result)
+        });
         self.frames.pop();
         match result {
             Err(Unwind::Transfer {
@@ -382,5 +414,24 @@ impl Ctx {
             }
             _ => {}
         }
+    }
+}
+
+fn result_roots(result: &EvalResult) -> Vec<SexpId> {
+    match result {
+        Ok(value)
+        | Err(Unwind::Transfer {
+            kind: Transfer::Return(value),
+            ..
+        })
+        | Err(Unwind::Transfer {
+            kind: Transfer::ExitingHandler { cond: value, .. },
+            ..
+        }) => vec![*value],
+        Err(Unwind::Transfer {
+            kind: Transfer::Restart { restart, args },
+            ..
+        }) => vec![*restart, *args],
+        _ => Vec::new(),
     }
 }

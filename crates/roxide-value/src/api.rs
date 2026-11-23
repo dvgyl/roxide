@@ -799,6 +799,9 @@ impl ValueApi for RSession {
     }
 
     fn env_define(&mut self, env: SexpId, sym: Sym, val: SexpId) -> Result<(), ValueError> {
+        if self.env_get(env, sym).is_some_and(|binding| binding.active) {
+            return Err(ValueError::LockedBinding(self.sym_name(sym)?.to_owned()));
+        }
         self.env_define_binding(
             env,
             sym,

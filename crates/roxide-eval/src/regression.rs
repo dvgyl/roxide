@@ -337,3 +337,94 @@ fn apply_passes_evaluated_language_to_a_closure_as_data() -> crate::EvalResult<(
     assert_eq!(result, v);
     Ok(())
 }
+
+#[test]
+fn value_errors_are_catchable() {
+    check(
+        r#"tryCatch(structure(1L, names = c("one", "two")), error = function(e) cat("caught\n"))"#,
+        "caught\n",
+        "",
+    );
+}
+
+#[test]
+fn active_bindings_read_call_and_write() {
+    check(
+        r#"
+saved <- 3L
+makeActiveBinding("active", function(value) {
+    if (missing(value)) return(function() saved)
+    saved <<- value
+}, .GlobalEnv)
+dput(active())
+active <- 4L
+dput(get("active", inherits = FALSE)())
+dput(active())
+"#,
+        "3L\n4L\n4L\n",
+        "",
+    );
+}
+
+#[test]
+fn non_escaping_promises_release_their_cached_values() -> crate::EvalResult<()> {
+    use roxide_value::GLOBAL_ENV;
+
+    for policy in [GcPolicy::default(), GcPolicy::Torture] {
+        let mut ctx = crate::Ctx::new(Box::new(roxide_host::PureHost::new()), policy)
+            .map_err(crate::Unwind::Internal)?;
+        ctx.run_script(
+            "<test>",
+            "x <- c(1L, 2L); f <- function(arg) arg; for (i in 1:12) f(x)",
+            GLOBAL_ENV,
+            false,
+        )?;
+        let x = ctx.session_mut().intern("x")?;
+        let Some(x) = ctx.get_var(x, GLOBAL_ENV)? else {
+            return Err(crate::Unwind::TopLevel);
+        };
+        assert_eq!(ctx.session().heap.refcnt(x), 1);
+        ctx.run_script(
+            "<test>",
+            "keep <- function(arg) { force(arg); function() arg }; escaped <- keep(x)",
+            GLOBAL_ENV,
+            false,
+        )?;
+        assert_eq!(ctx.call_function("escaped", &[], GLOBAL_ENV)?, x);
+    }
+    Ok(())
+}
+
+#[test]
+fn s4_dispatch_can_call_another_s4_generic() -> crate::EvalResult<()> {
+    use roxide_value::{GLOBAL_ENV, Sym, ValueApi};
+
+    struct Hooks;
+
+    impl crate::S4Hooks for Hooks {
+        fn dispatch(
+            &self,
+            ctx: &mut crate::Ctx,
+            generic: Sym,
+            call: &crate::Call,
+            args: &crate::Args,
+        ) -> crate::EvalResult<Option<roxide_gc::SexpId>> {
+            match ctx.session().sym_name(generic)? {
+                "+" => ctx
+                    .call_function("-", &[(None, args.get(0))], call.env)
+                    .map(Some),
+                "-" => Ok(Some(ctx.session_mut().scalar_int(42)?)),
+                _ => Ok(None),
+            }
+        }
+    }
+
+    let mut ctx = crate::Ctx::new(Box::new(roxide_host::PureHost::new()), GcPolicy::Torture)
+        .map_err(crate::Unwind::Internal)?;
+    ctx.set_s4_hooks(&Hooks);
+    let value = ctx.session_mut().scalar_int(1)?;
+    ctx.session_mut().set_s4_flag(value, true)?;
+    let result = ctx.call_function("+", &[(None, value)], GLOBAL_ENV)?;
+    assert_eq!(ctx.session().int(result)?.to_vec(), [42]);
+    Ok(())
+}

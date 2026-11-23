@@ -73,6 +73,8 @@ fn render(
     Ok(out.lines)
 }
 
+const MAX_DEPARSE_DEPTH: usize = 128;
+
 type Arg = (Option<Sym>, SexpId);
 
 struct Deparser<'a> {
@@ -113,7 +115,7 @@ impl Deparser<'_> {
         indent: usize,
         min: Prec,
     ) -> Result<(), ValueError> {
-        if depth >= 256 {
+        if depth >= MAX_DEPARSE_DEPTH {
             return Err(ValueError::InvalidAttribute(
                 "deparse depth limit exceeded".into(),
             ));

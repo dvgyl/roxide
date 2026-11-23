@@ -167,6 +167,10 @@ pub fn run_with_policy(src: &str, policy: GcPolicy) -> Outcome {
                 .write_err(format!("Error: {}\n", err.message).as_bytes());
             1
         }
+        Err(Unwind::Value(err)) => {
+            let _ = ctx.host.write_err(format!("Error: {err}\n").as_bytes());
+            1
+        }
         Err(Unwind::Transfer { .. }) => 1,
     };
     drop(ctx);

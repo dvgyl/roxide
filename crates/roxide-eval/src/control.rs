@@ -1,7 +1,8 @@
 use roxide_gc::SexpId;
 use roxide_value::{RLogical, SEXP_MISSING, SEXP_NIL, SexpType, ValueApi, ValueError};
 
-use crate::{Args, Arity, Call, Ctx, EvalResult, Module, Transfer, Unwind};
+use crate::eval::ArgInput;
+use crate::{ArgEval, Args, Arity, Call, Ctx, EvalResult, Module, Transfer, Unwind};
 
 pub(crate) const MODULE: Module = Module {
     prims: &[
@@ -63,46 +64,150 @@ pub(crate) fn assign(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult 
         return Ok(rhs);
     }
 
+    ctx.session.heap.inc_ref(rhs);
+    let result = assign_replacement(ctx, call, layers, sym, dest, rhs_expr, rhs);
+    ctx.session.heap.dec_ref(rhs);
+    result
+}
+
+fn assign_replacement(
+    ctx: &mut Ctx,
+    call: &Call,
+    mut layers: Vec<(SexpId, SexpId, Args)>,
+    sym: roxide_value::Sym,
+    dest: SexpId,
+    rhs_expr: SexpId,
+    rhs: SexpId,
+) -> EvalResult {
     let mut target = ctx.eval(sym.as_sexp(), dest)?;
+    if ctx.session.env_get(dest, sym).is_none() {
+        target = ctx.session.shallow_duplicate(target)?;
+    }
     let mut replacements = Vec::with_capacity(layers.len());
+    let mut shared_parent = false;
     while let Some((source, head, args)) = layers.pop() {
         ctx.protect(target);
-        let first = ctx.value_promise(args.get(0), target)?;
-        let actuals = Args::from_pairs(
-            std::iter::once((args.name(0), first))
-                .chain(args.iter().skip(1))
-                .collect(),
-        );
-        if !layers.is_empty() {
-            let expr = ctx.make_call(head, &actuals)?;
-            ctx.protect(expr);
-            let (f, tail, _) = ctx.session.cons_parts(expr)?;
-            let fun = if ctx.session.type_of(f)? == SexpType::Sym {
-                let sym = ctx.sym_from_sexp(f)?;
-                ctx.find_fun(sym, call.env)?
-            } else {
-                ctx.eval(f, call.env)?
-            };
-            target = ctx.invoke_raw(fun, tail, source, call.env)?;
+        if shared_parent {
+            target = ctx.session.shallow_duplicate(target)?;
+            ctx.protect(target);
         }
-        replacements.push((head, actuals));
+        if !layers.is_empty() {
+            let next = invoke_assignment(ctx, head, source, call.env, &args, target, None)?;
+            shared_parent |= ctx.session.heap.maybe_shared(target);
+            replacements.push((head, args, target));
+            target = next;
+        } else {
+            replacements.push((head, args, target));
+        }
     }
 
     let value_tag = ctx.session.intern("value")?;
     let mut value = rhs;
     let mut original = rhs_expr;
-    for (head, args) in replacements.into_iter().rev() {
+    let simple = replacements.len() == 1
+        && ctx
+            .session
+            .env_get(dest, sym)
+            .is_some_and(|binding| !binding.active && !binding.locked);
+    for (head, args, target) in replacements.into_iter().rev() {
         ctx.protect(value);
         let replacement = replacement_head(ctx, head, call.err_call())?;
-        let promised = ctx.value_promise(original, value)?;
-        let args = Args::from_pairs(args.iter().chain([(Some(value_tag), promised)]).collect());
-        let expr = ctx.make_call(replacement, &args)?;
-        value = ctx.eval(expr, call.env)?;
+        let raw = Args::from_pairs(args.iter().chain([(Some(value_tag), original)]).collect());
+        let expr = ctx.make_call(replacement, &raw)?;
+        ctx.protect(expr);
+        let previous = std::mem::replace(&mut ctx.replacement_call, simple.then_some(expr));
+        let result = invoke_assignment(ctx, replacement, expr, call.env, &raw, target, Some(value));
+        ctx.replacement_call = previous;
+        value = result?;
         original = expr;
-        ctx.protect(original);
     }
     ctx.assign(sym, value, dest)?;
     Ok(rhs)
+}
+
+fn invoke_assignment(
+    ctx: &mut Ctx,
+    head: SexpId,
+    expr: SexpId,
+    env: SexpId,
+    args: &Args,
+    target: SexpId,
+    replacement: Option<SexpId>,
+) -> EvalResult {
+    let fun = if ctx.session.type_of(head)? == SexpType::Sym {
+        let sym = ctx.sym_from_sexp(head)?;
+        ctx.find_fun_at(sym, env, expr)?
+    } else {
+        ctx.eval(head, env)?
+    };
+    ctx.protect(fun);
+    if let Ok((prim, _)) = ctx.session.prim_parts(fun) {
+        let policy = ctx.prims[usize::from(prim.0)].args;
+        if policy != ArgEval::Unevaluated {
+            let mut values = vec![(args.name(0), target)];
+            let end = args.len() - usize::from(replacement.is_some());
+            let middle = Args::from_pairs(args.iter().skip(1).take(end - 1).collect());
+            let middle = if policy == ArgEval::EvalDollar {
+                middle
+            } else {
+                ctx.expand_dots(&middle, env, expr)?
+            };
+            for &arg in middle.values() {
+                ctx.protect(arg);
+            }
+            ctx.session.heap.inc_ref(target);
+            let result = (|| {
+                for (tag, value) in middle.iter() {
+                    let value = if policy == ArgEval::EvalDollar {
+                        value
+                    } else if value == SEXP_MISSING {
+                        if policy != ArgEval::EvalKeepMissing {
+                            return Err(ctx.stop(expr, "argument is missing, with no default"));
+                        }
+                        value
+                    } else {
+                        ctx.eval(value, env)?
+                    };
+                    ctx.protect(value);
+                    values.push((tag, value));
+                }
+                Ok(())
+            })();
+            ctx.session.heap.dec_ref(target);
+            result?;
+            if let Some(value) = replacement {
+                values.push((args.name(end), value));
+            }
+            let call = Call {
+                expr,
+                env,
+                prim,
+                user_call: expr,
+            };
+            let source = Args::from_pairs(
+                args.iter()
+                    .take(1)
+                    .chain(middle.iter())
+                    .chain(args.iter().skip(end))
+                    .collect(),
+            );
+            return ctx.run_primitive(
+                call,
+                Args::from_pairs(values),
+                ArgInput::Values(Some(&source)),
+                true,
+            );
+        }
+    }
+    let mut raw: Vec<_> = args.iter().collect();
+    raw[0].1 = ctx.value_promise(raw[0].1, target)?;
+    if let Some(value) = replacement
+        && let Some((_, last)) = raw.last_mut()
+    {
+        *last = ctx.value_promise(*last, value)?;
+    }
+    let tail = ctx.pairlist(&Args::from_pairs(raw), false)?;
+    ctx.invoke_raw(fun, tail, expr, env)
 }
 
 fn replacement_head(ctx: &mut Ctx, head: SexpId, call: SexpId) -> EvalResult {

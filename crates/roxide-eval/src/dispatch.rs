@@ -3,6 +3,7 @@ use roxide_value::{
     BASE_ENV, BASE_NAMESPACE, SEXP_MISSING, SEXP_NIL, SEXP_UNBOUND, SexpType, ValueApi,
 };
 
+use crate::eval::ArgInput;
 use crate::{
     Args, Arity, Call, Ctx, Dispatch, EvalResult, GroupGeneric, Module, PrimDef, Transfer, Unwind,
 };
@@ -164,6 +165,7 @@ impl Ctx {
             SexpType::Int => classes.extend(["integer", "numeric"]),
             SexpType::Builtin | SexpType::Special | SexpType::Clo => classes.push("function"),
             SexpType::Sym => classes.push("name"),
+            SexpType::Lang => classes.push(self.session.call_class(value)?),
             ty => classes.push(ty.type_name(false)),
         }
         Ok(classes.into_iter().map(str::to_owned).collect())
@@ -181,10 +183,7 @@ impl Ctx {
                 && binding.value != SEXP_MISSING
                 && binding.value != SEXP_UNBOUND
             {
-                let mut value = binding.value;
-                if self.session.type_of(value)? == SexpType::Prom {
-                    value = self.force(value)?;
-                }
+                let value = self.read_binding(binding, env)?;
                 if matches!(
                     self.session.type_of(value)?,
                     SexpType::Clo | SexpType::Builtin | SexpType::Special
@@ -280,7 +279,7 @@ impl Ctx {
                     prim,
                 },
                 args,
-                false,
+                ArgInput::Expressions,
                 false,
             )
         }
@@ -313,6 +312,17 @@ impl Ctx {
             .filter(|(_, (tag, _))| group != Some(GroupGeneric::Summary) || *tag != Some(na_rm))
             .take(if ops { 2 } else { 1 })
             .collect();
+        if let Some(hooks) = self.s4_hooks {
+            for &(_, (_, value)) in &candidates {
+                if self.session.is_s4(value)? {
+                    let symbol = self.session.intern(generic)?;
+                    if let Some(result) = hooks.dispatch(self, symbol, &call, args)? {
+                        return Ok(Some(result));
+                    }
+                    break;
+                }
+            }
+        }
         let size = candidates.len();
         let mut methods = Vec::new();
         for &(i, (_, value)) in &candidates {
@@ -436,7 +446,18 @@ impl Ctx {
         ) || result == SEXP_NIL
             || matches!(
                 def.name,
-                "==" | "!=" | "<" | "<=" | ">" | ">=" | "&" | "|" | "!"
+                "==" | "!="
+                    | "<"
+                    | "<="
+                    | ">"
+                    | ">="
+                    | "&"
+                    | "|"
+                    | "!"
+                    | "cumsum"
+                    | "cumprod"
+                    | "cummin"
+                    | "cummax"
             )
         {
             return Ok(result);
@@ -626,7 +647,12 @@ fn next_method(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
             ctx.protect(value);
             values.push((tag, value));
         }
-        return ctx.run_primitive(primitive, Args::from_pairs(values), true, false);
+        return ctx.run_primitive(
+            primitive,
+            Args::from_pairs(values),
+            ArgInput::Values(None),
+            false,
+        );
     }
     let sym = ctx.session.intern(&method.generic)?;
     if let Some(binding) = ctx.session.env_get(BASE_ENV, sym)
@@ -636,7 +662,12 @@ fn next_method(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
         )
     {
         let (prim, _) = ctx.session.prim_parts(binding.value)?;
-        return ctx.run_primitive(Call { prim, ..*call }, forwarded, false, false);
+        return ctx.run_primitive(
+            Call { prim, ..*call },
+            forwarded,
+            ArgInput::Expressions,
+            false,
+        );
     }
     Err(ctx.stop(call.err_call(), "no method to invoke"))
 }

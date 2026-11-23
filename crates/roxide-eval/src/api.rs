@@ -78,13 +78,18 @@ pub enum Unwind {
         /// Whether `.Last()` should execute.
         run_last: bool,
     },
+    /// Value operation error awaiting translation at an evaluation boundary.
+    Value(ValueError),
     /// Engine invariant failure (e.g. stale `SEXP` or memory limit).
     Internal(InternalError),
 }
 
 impl From<ValueError> for Unwind {
     fn from(value: ValueError) -> Self {
-        Self::Internal(InternalError::from(value))
+        match value {
+            ValueError::Heap(_) | ValueError::Shared(_) => Self::Internal(value.into()),
+            _ => Self::Value(value),
+        }
     }
 }
 
@@ -107,6 +112,8 @@ pub enum ArgEval {
     Eval,
     /// Eagerly evaluate present arguments while preserving `SEXP_MISSING` slots (e.g. `[`).
     EvalKeepMissing,
+    /// Evaluate the object and replacement value, keeping the dollar field name as written.
+    EvalDollar,
     /// Pass unevaluated argument expressions (`SPECIALSXP`).
     Unevaluated,
 }
@@ -243,7 +250,7 @@ impl Default for OptionsCache {
 /// GC-traced per-module session state stored inside [`Ctx`] via `ctx.ext::<T>()` (ADR-0007).
 pub trait CtxExt: Any + Trace + 'static {}
 
-/// Pluggable S4 method dispatch hook implemented by `roxide-methods` in Milestone 3.
+/// Stateless S4 dispatch hook. Store session state in a traced [`CtxExt`].
 pub trait S4Hooks {
     /// Attempt S4 dispatch; return `Ok(Some(res))` if handled, `Ok(None)` to fall through.
     fn dispatch(

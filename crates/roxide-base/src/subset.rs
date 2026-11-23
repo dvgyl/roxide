@@ -34,7 +34,7 @@ pub const MODULE: Module = Module {
         primitive!(
             "$",
             index::dollar,
-            Unevaluated,
+            EvalDollar,
             Exact(2),
             Dispatch::Internal("$"),
             On
@@ -58,7 +58,7 @@ pub const MODULE: Module = Module {
         primitive!(
             "$<-",
             replacement::replace_dollar,
-            Unevaluated,
+            EvalDollar,
             Exact(3),
             Dispatch::Internal("$<-"),
             On

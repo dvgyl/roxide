@@ -11,6 +11,7 @@ use roxide_value::{
 use crate::closure::{Matches, dots_index};
 use crate::control::logical;
 use crate::ctx::Frame;
+use crate::eval::ArgInput;
 use crate::{Args, Arity, Call, Ctx, EvalResult, Module};
 
 pub(crate) const MODULE: Module = Module {
@@ -197,7 +198,16 @@ fn closure(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
         .alloc_closure(args.get(0), args.get(1), call.env)?)
 }
 
-fn quote(_: &mut Ctx, _: &Call, args: &mut Args) -> EvalResult {
+fn quote(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    if let Some(tag) = args.name(0) {
+        let name = ctx.session.sym_name(tag)?;
+        if name != "expr" {
+            return Err(ctx.stop(
+                call.err_call(),
+                format!("supplied argument name '{name}' does not match 'expr'"),
+            ));
+        }
+    }
     Ok(args.get(0))
 }
 
@@ -315,10 +325,19 @@ fn substitute(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
         SexpType::Nil => roxide_value::EMPTY_ENV,
         _ => return Err(ctx.stop(call.err_call(), "invalid environment specified")),
     };
-    substitute_expr(ctx, expr, frame)
+    substitute_expr(ctx, expr, frame, 0, call.err_call())
 }
 
-fn substitute_expr(ctx: &mut Ctx, expr: SexpId, frame: SexpId) -> EvalResult {
+fn substitute_expr(
+    ctx: &mut Ctx,
+    expr: SexpId,
+    frame: SexpId,
+    depth: usize,
+    call: SexpId,
+) -> EvalResult {
+    if depth >= 128 {
+        return Err(ctx.stop(call, "substitute depth limit exceeded"));
+    }
     match ctx.session.type_of(expr)? {
         SexpType::Prom => ctx.promise_expr(expr),
         SexpType::Sym if expr != SEXP_MISSING && frame != GLOBAL_ENV => {
@@ -344,7 +363,10 @@ fn substitute_expr(ctx: &mut Ctx, expr: SexpId, frame: SexpId) -> EvalResult {
         ty @ (SexpType::Lang | SexpType::List) => {
             let (head, tail, _) = ctx.session.cons_parts(expr)?;
             let (head, tail) = if ty == SexpType::Lang {
-                (Some(substitute_expr(ctx, head, frame)?), tail)
+                (
+                    Some(substitute_expr(ctx, head, frame, depth + 1, call)?),
+                    tail,
+                )
             } else {
                 (None, expr)
             };
@@ -360,7 +382,7 @@ fn substitute_expr(ctx: &mut Ctx, expr: SexpId, frame: SexpId) -> EvalResult {
                         pairs.push((tag, ctx.promise_expr(value)?));
                     }
                 } else {
-                    pairs.push((tag, substitute_expr(ctx, expr, frame)?));
+                    pairs.push((tag, substitute_expr(ctx, expr, frame, depth + 1, call)?));
                 }
             }
             let pairs = Args::from_pairs(pairs);
@@ -754,7 +776,7 @@ fn internal(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     ctx.run_primitive(
         call,
         Args::from_pairs(ctx.session.pairlist_iter(tail).collect()),
-        false,
+        ArgInput::Expressions,
         true,
     )
 }

@@ -9,17 +9,51 @@ use roxide_value::{
 use crate::api::{ArgEval, Arity, Call, EvalResult, InternalError, Unwind, Visibility};
 use crate::ctx::{Args, Ctx};
 
-const MAX_NATIVE_EVAL_DEPTH: usize = 192;
+const OVERFLOW_HEADROOM: usize = 500;
+const STACK_RECOVERY_BYTES: usize = 128 * 1024;
+
+pub(crate) enum ArgInput<'a> {
+    Expressions,
+    Values(Option<&'a Args>),
+}
 
 impl Ctx {
     /// Evaluate an R expression `expr` in environment `env`.
     pub fn eval(&mut self, expr: SexpId, env: SexpId) -> EvalResult {
-        let result = self.scoped(|ctx| {
-            ctx.protect(expr);
-            ctx.protect(env);
-            ctx.eval_protected(expr, env)
-        });
-        self.finish_error(result)
+        let marker = 0_u8;
+        let previous_stack = self.enter_evaluation(&marker)?;
+        let mark = self.session.heap.protect_mark();
+        self.protect(expr);
+        self.protect(env);
+        let result = self.eval_protected(expr, env);
+        let result = self.condition_result(SEXP_NIL, result);
+        self.session.heap.unprotect_to(mark);
+        self.stack_origin = previous_stack;
+        result
+    }
+
+    fn enter_evaluation(&mut self, marker: &u8) -> EvalResult<Option<usize>> {
+        // Keep a reserve for condition handlers and stack unwinding.
+        let address = std::ptr::from_ref(marker).addr();
+        let Some(origin) = self.stack_origin else {
+            self.stack_origin = Some(address);
+            return Ok(None);
+        };
+        let used = origin.abs_diff(address);
+        let limit = self
+            .stack_budget
+            .saturating_sub(if self.overflow_headroom == 0 {
+                STACK_RECOVERY_BYTES
+            } else {
+                0
+            });
+        if used < limit {
+            Ok(Some(origin))
+        } else if self.overflow_headroom == 0 {
+            Err(self.expression_overflow())
+        } else {
+            Err(Unwind::TopLevel)
+        }
     }
 
     fn eval_protected(&mut self, expr: SexpId, env: SexpId) -> EvalResult {
@@ -27,98 +61,88 @@ impl Ctx {
         if self.host.poll_interrupt() {
             return Err(self.stop(SEXP_NIL, "interrupted"));
         }
-        // Leave space for Rust frames used by primitives and error handlers.
-        if self.expr_depth
-            >= self
-                .opts
-                .expressions
-                .min(self.host.limits().max_expressions)
-                .min(MAX_NATIVE_EVAL_DEPTH)
-        {
-            return Err(self.stop(
-                SEXP_NIL,
-                "evaluation nested too deeply: infinite recursion / options(expressions=)?",
-            ));
-        }
-        self.expr_depth += 1;
-        let previous_env = std::mem::replace(&mut self.eval_env, env);
-        let result = self.eval_inner(expr, env);
-        self.eval_env = previous_env;
-        self.expr_depth -= 1;
-        result
-    }
-
-    fn eval_inner(&mut self, expr: SexpId, env: SexpId) -> EvalResult {
         let ty = self.session.type_of(expr)?;
-        match ty {
-            SexpType::Nil
-            | SexpType::Lgl
-            | SexpType::Int
-            | SexpType::Real
-            | SexpType::Cplx
-            | SexpType::Str
-            | SexpType::Raw
-            | SexpType::Vec
-            | SexpType::Clo
-            | SexpType::Builtin
-            | SexpType::Special
-            | SexpType::Env
-            | SexpType::ExtPtr
-            | SexpType::Obj => {
-                self.visible = true;
-                Ok(expr)
-            }
-            SexpType::Prom => self.force(expr),
-            SexpType::Sym => {
-                if expr == SEXP_MISSING {
-                    return Err(self.stop(SEXP_NIL, "argument is missing, with no default"));
-                }
-                let sym = self.sym_from_sexp(expr)?;
-                let name = self.session.sym_name(sym)?;
-                if name == "..." {
-                    return Err(self.stop(SEXP_NIL, "'...' used in an incorrect context"));
-                }
-                if let Some(index) = crate::closure::dots_index(name) {
-                    let value = self.dots_elt(env, index, SEXP_NIL)?;
-                    if value == SEXP_MISSING {
-                        let name = self.session.sym_name(sym)?.to_owned();
-                        return Err(self.stop(
-                            SEXP_NIL,
-                            format!("argument \"{name}\" is missing, with no default"),
-                        ));
-                    }
-                    let value = self.eval(value, env)?;
-                    self.visible = true;
-                    return Ok(value);
-                }
-                let Some(val) = self.get_var(sym, env)? else {
-                    let name = self.session.sym_name(sym)?.to_owned();
-                    return Err(self.stop(SEXP_NIL, format!("object '{name}' not found")));
-                };
-                if val == SEXP_MISSING {
-                    let name = self.session.sym_name(sym)?.to_owned();
-                    let call = self.frame(env).map_or(SEXP_NIL, |frame| frame.call);
-                    return Err(self.stop(
-                        call,
-                        format!("argument \"{name}\" is missing, with no default"),
-                    ));
-                }
-                self.visible = true;
-                Ok(val)
-            }
+        let counted = usize::from(matches!(ty, SexpType::Lang | SexpType::Prom));
+        let limit = self
+            .opts
+            .expressions
+            .min(self.host.limits().max_expressions)
+            .saturating_add(self.overflow_headroom);
+        if counted != 0 && self.expr_depth >= limit {
+            return Err(if self.overflow_headroom == 0 {
+                self.expression_overflow()
+            } else {
+                Unwind::TopLevel
+            });
+        }
+        self.expr_depth += counted;
+        let previous_env = std::mem::replace(&mut self.eval_env, env);
+        let result = match ty {
             SexpType::Lang => self.eval_call(expr, env),
+            SexpType::Prom => self.force_protected(expr),
+            SexpType::Sym => self.eval_symbol(expr, env),
             _ => {
                 self.visible = true;
                 Ok(expr)
             }
+        };
+        self.eval_env = previous_env;
+        self.expr_depth -= counted;
+        result
+    }
+
+    fn expression_overflow(&mut self) -> Unwind {
+        self.overflow_headroom = OVERFLOW_HEADROOM;
+        let error = self.stack_overflow_condition();
+        self.overflow_headroom = 0;
+        error
+    }
+
+    fn eval_symbol(&mut self, expr: SexpId, env: SexpId) -> EvalResult {
+        if expr == SEXP_MISSING {
+            return Err(self.stop(SEXP_NIL, "argument is missing, with no default"));
         }
+        let sym = self.sym_from_sexp(expr)?;
+        let name = self.session.sym_name(sym)?;
+        if name == "..." {
+            return Err(self.stop(SEXP_NIL, "'...' used in an incorrect context"));
+        }
+        if let Some(index) = crate::closure::dots_index(name) {
+            let value = self.dots_elt(env, index, SEXP_NIL)?;
+            if value == SEXP_MISSING {
+                let name = self.session.sym_name(sym)?.to_owned();
+                return Err(self.stop(
+                    SEXP_NIL,
+                    format!("argument \"{name}\" is missing, with no default"),
+                ));
+            }
+            let value = self.eval(value, env)?;
+            self.visible = true;
+            return Ok(value);
+        }
+        let Some(val) = self.get_var(sym, env)? else {
+            let name = self.session.sym_name(sym)?.to_owned();
+            let call = self.frame(env).map_or(SEXP_NIL, |frame| frame.call);
+            return Err(self.stop(call, format!("object '{name}' not found")));
+        };
+        if val == SEXP_MISSING {
+            let name = self.session.sym_name(sym)?.to_owned();
+            let call = self.frame(env).map_or(SEXP_NIL, |frame| frame.call);
+            return Err(self.stop(
+                call,
+                format!("argument \"{name}\" is missing, with no default"),
+            ));
+        }
+        self.visible = true;
+        Ok(val)
     }
 
     /// Force a lazy promise (`PROMSXP`) implementing ADR-0006's 4-state lifecycle.
     pub fn force(&mut self, promise: SexpId) -> EvalResult {
         self.scoped(|ctx| {
             ctx.protect(promise);
-            ctx.force_protected(promise)
+            let result = ctx.force_protected(promise);
+            ctx.condition_result(SEXP_NIL, result)
         })
     }
 
@@ -175,29 +199,51 @@ impl Ctx {
                     cur = self.session.env_enclos(cur)?;
                     continue;
                 }
-                if self.session.type_of(val)? == SexpType::Prom {
-                    return self.force(val).map(Some);
-                }
-                return Ok(Some(val));
+                return self.read_binding(binding, cur).map(Some);
             }
             cur = self.session.env_enclos(cur)?;
         }
         Ok(None)
     }
 
-    /// Look up a callable binding along the lexical chain (skipping non-function values like R).
-    pub fn find_fun(&mut self, sym: Sym, env: SexpId) -> EvalResult<SexpId> {
+    /// Read a binding in one environment, forcing a promise or calling an active getter.
+    pub fn get_local(&mut self, sym: Sym, env: SexpId) -> EvalResult<Option<SexpId>> {
+        self.session
+            .env_get(env, sym)
+            .map(|binding| self.read_binding(binding, env))
+            .transpose()
+    }
+
+    pub(crate) fn read_binding(
+        &mut self,
+        binding: roxide_value::Binding,
+        env: SexpId,
+    ) -> EvalResult {
+        if binding.active {
+            self.apply(binding.value, &[], SEXP_NIL, env)
+        } else if self.session.type_of(binding.value)? == SexpType::Prom {
+            self.eval(binding.value, env)
+        } else {
+            Ok(binding.value)
+        }
+    }
+
+    /// Look up a callable binding along the lexical chain.
+    pub fn find_fun(&mut self, sym: Sym, env: SexpId) -> EvalResult {
+        let result = self.find_fun_at(sym, env, SEXP_NIL);
+        self.condition_result(SEXP_NIL, result)
+    }
+
+    pub(crate) fn find_fun_at(&mut self, sym: Sym, env: SexpId, call: SexpId) -> EvalResult {
         let mut cur = env;
         while cur != SEXP_NIL {
             if let Some(binding) = self.session.env_get(cur, sym) {
-                let mut val = binding.value;
+                let val = binding.value;
                 if val == SEXP_UNBOUND {
                     cur = self.session.env_enclos(cur)?;
                     continue;
                 }
-                if self.session.type_of(val)? == SexpType::Prom {
-                    val = self.force(val)?;
-                }
+                let val = self.read_binding(binding, cur)?;
                 if val == SEXP_MISSING {
                     let name = self.session.sym_name(sym)?.to_owned();
                     let call = self.frame(env).map_or(SEXP_NIL, |frame| frame.call);
@@ -216,11 +262,19 @@ impl Ctx {
             cur = self.session.env_enclos(cur)?;
         }
         let name = self.session.sym_name(sym)?.to_owned();
-        Err(self.stop(SEXP_NIL, format!("could not find function \"{name}\"")))
+        Err(self.stop(call, format!("could not find function \"{name}\"")))
     }
 
     /// Assign `val` to `sym` in `env`.
     pub fn assign(&mut self, sym: Sym, val: SexpId, env: SexpId) -> EvalResult<()> {
+        if let Some(binding) = self.session.env_get(env, sym)
+            && binding.active
+            && !binding.locked
+        {
+            return self
+                .apply(binding.value, &[(None, val)], SEXP_NIL, env)
+                .map(|_| ());
+        }
         match self.session.env_define(env, sym, val) {
             Ok(()) => Ok(()),
             Err(error @ ValueError::LockedBinding(_)) => {
@@ -232,14 +286,15 @@ impl Ctx {
                 };
                 Err(self.stop(call, message))
             }
-            Err(error) => Err(error.into()),
+            Err(error) => self.condition_result(SEXP_NIL, Err(error.into())),
         }
     }
 
     /// Super-assign (`<<-`) `val` to `sym` in the first enclosing environment binding `sym`,
     /// or `.GlobalEnv` if unbound in all enclosing frames.
     pub fn assign_super(&mut self, sym: Sym, val: SexpId, env: SexpId) -> EvalResult<()> {
-        let dest = self.super_env(sym, env)?;
+        let dest = self.super_env(sym, env);
+        let dest = self.condition_result(SEXP_NIL, dest)?;
         self.assign(sym, val, dest)
     }
 
@@ -262,36 +317,56 @@ impl Ctx {
         call_expr: SexpId,
         env: SexpId,
     ) -> EvalResult {
-        let result = self.scoped(|ctx| {
-            ctx.protect(fun);
-            ctx.protect(call_expr);
-            ctx.protect(env);
-            for &(_, value) in args {
-                ctx.protect(value);
+        let marker = 0_u8;
+        let previous_stack = self.enter_evaluation(&marker)?;
+        let mark = self.session.heap.protect_mark();
+        let result = self.apply_protected(fun, args, call_expr, env);
+        let result = self.condition_result(call_expr, result);
+        self.session.heap.unprotect_to(mark);
+        self.stack_origin = previous_stack;
+        result
+    }
+
+    fn apply_protected(
+        &mut self,
+        fun: SexpId,
+        args: &[(Option<Sym>, SexpId)],
+        call_expr: SexpId,
+        env: SexpId,
+    ) -> EvalResult {
+        let ctx = self;
+        ctx.protect(fun);
+        ctx.protect(call_expr);
+        ctx.protect(env);
+        for &(_, value) in args {
+            ctx.protect(value);
+        }
+        ctx.safepoint();
+        match ctx.session.type_of(fun)? {
+            SexpType::Builtin | SexpType::Special => {
+                let (prim, _) = ctx.session.prim_parts(fun)?;
+                let call = Call {
+                    expr: call_expr,
+                    env,
+                    prim,
+                    user_call: call_expr,
+                };
+                ctx.run_primitive(
+                    call,
+                    Args::from_pairs(args.to_vec()),
+                    ArgInput::Values(None),
+                    true,
+                )
             }
-            ctx.safepoint();
-            match ctx.session.type_of(fun)? {
-                SexpType::Builtin | SexpType::Special => {
-                    let (prim, _) = ctx.session.prim_parts(fun)?;
-                    let call = Call {
-                        expr: call_expr,
-                        env,
-                        prim,
-                        user_call: call_expr,
-                    };
-                    ctx.run_primitive(call, Args::from_pairs(args.to_vec()), true, true)
-                }
-                SexpType::Clo => {
-                    let pairs = args
-                        .iter()
-                        .map(|&(tag, value)| Ok((tag, ctx.value_promise(value, value)?)))
-                        .collect::<EvalResult<Vec<_>>>()?;
-                    ctx.invoke_closure(fun, Args::from_pairs(pairs), call_expr, env, None)
-                }
-                _ => Err(ctx.stop(call_expr, msg::NOT_A_FUNCTION)),
+            SexpType::Clo => {
+                let pairs = args
+                    .iter()
+                    .map(|&(tag, value)| Ok((tag, ctx.value_promise(value, value)?)))
+                    .collect::<EvalResult<Vec<_>>>()?;
+                ctx.invoke_closure(fun, Args::from_pairs(pairs), call_expr, env, None)
             }
-        });
-        self.finish_error(result)
+            _ => Err(ctx.stop(call_expr, msg::NOT_A_FUNCTION)),
+        }
     }
 
     /// Look up function `name` in `env` and apply it to evaluated arguments.
@@ -307,8 +382,9 @@ impl Ctx {
                 ctx.protect(arg);
             }
             let sym = ctx.session.intern(name)?;
-            let fun = ctx.find_fun(sym, env)?;
             let call = ctx.make_call(sym.as_sexp(), &Args::from_pairs(args.to_vec()))?;
+            ctx.protect(call);
+            let fun = ctx.find_fun_at(sym, env, call)?;
             ctx.apply(fun, args, call, env)
         })
     }
@@ -317,7 +393,7 @@ impl Ctx {
         let (head, arg_list, _) = self.session.cons_parts(call_expr)?;
         let fun = if self.session.type_of(head)? == SexpType::Sym {
             let sym = self.sym_from_sexp(head)?;
-            self.find_fun(sym, env)?
+            self.find_fun_at(sym, env, call_expr)?
         } else {
             self.eval(head, env)?
         };
@@ -347,7 +423,7 @@ impl Ctx {
                     ctx.run_primitive(
                         call,
                         Args::from_pairs(ctx.session.pairlist_iter(arg_list).collect()),
-                        false,
+                        ArgInput::Expressions,
                         true,
                     )
                 }
@@ -364,8 +440,8 @@ impl Ctx {
     pub(crate) fn run_primitive(
         &mut self,
         call: Call,
-        mut args: Args,
-        evaluated: bool,
+        args: Args,
+        input: ArgInput<'_>,
         dispatch: bool,
     ) -> EvalResult {
         let Some(&def) = self.prims.get(usize::from(call.prim.0)) else {
@@ -373,62 +449,162 @@ impl Ctx {
                 message: "unknown primitive".into(),
             }));
         };
-        self.scoped(|ctx| {
-            for value in [call.expr, call.env, call.user_call] {
-                ctx.protect(value);
+        let mark = self.session.heap.protect_mark();
+        let trace = matches!(
+            def.name,
+            "print"
+                | "dput"
+                | "cat"
+                | "sprintf"
+                | "tryCatch"
+                | "withCallingHandlers"
+                | "withRestarts"
+        );
+        if trace {
+            self.calls.push((call.expr, call.env));
+        }
+        let result = self.run_primitive_body(def, call, args, input, dispatch);
+        let result = self.condition_result(call.err_call(), result);
+        if trace {
+            self.calls.pop();
+        }
+        self.session.heap.unprotect_to(mark);
+        result
+    }
+
+    fn run_primitive_body(
+        &mut self,
+        def: &crate::PrimDef,
+        call: Call,
+        mut args: Args,
+        input: ArgInput<'_>,
+        dispatch: bool,
+    ) -> EvalResult {
+        let ctx = self;
+        for value in [call.expr, call.env, call.user_call] {
+            ctx.protect(value);
+        }
+        for &value in args.values() {
+            ctx.protect(value);
+        }
+        let raw;
+        let source = match input {
+            ArgInput::Expressions if def.args != ArgEval::Unevaluated => {
+                raw = if def.args == ArgEval::EvalDollar {
+                    args
+                } else {
+                    ctx.expand_dots(&args, call.env, call.err_call())?
+                };
+                args = ctx.eval_primitive_args(&raw, call, def.args)?;
+                Some(&raw)
             }
-            for &value in args.values() {
-                ctx.protect(value);
+            ArgInput::Expressions => None,
+            ArgInput::Values(source) => source,
+        };
+        let valid = match def.arity {
+            Arity::Any => true,
+            Arity::Exact(count) => args.len() == count,
+            Arity::Range(lo, hi) => (lo..=hi).contains(&args.len()),
+        };
+        if !valid {
+            return Err(ctx.stop(
+                call.err_call(),
+                format!("incorrect number of arguments to '{}'", def.name),
+            ));
+        }
+        let retained: Vec<_> = if def.args == ArgEval::Unevaluated {
+            Vec::new()
+        } else {
+            args.values()
+                .iter()
+                .copied()
+                .skip(usize::from(ctx.can_overwrite(&call)))
+                .collect()
+        };
+        for &value in &retained {
+            ctx.session.heap.inc_ref(value);
+        }
+        let result = ctx.call_primitive(def, call, &mut args, source, dispatch);
+        for value in retained {
+            ctx.session.heap.dec_ref(value);
+        }
+        result
+    }
+
+    fn call_primitive(
+        &mut self,
+        def: &crate::PrimDef,
+        call: Call,
+        args: &mut Args,
+        raw: Option<&Args>,
+        dispatch: bool,
+    ) -> EvalResult {
+        self.visible = true;
+        if dispatch && let Some(result) = self.dispatch_primitive(def, call, args, raw)? {
+            return Ok(result);
+        }
+        let result = (def.fun)(self, &call, args)?;
+        let result = self.preserve_group_attributes(def, args, result)?;
+        self.visible = match def.visibility {
+            Visibility::On => true,
+            Visibility::Off => false,
+            Visibility::SetByFn => self.visible,
+        };
+        Ok(result)
+    }
+
+    fn eval_primitive_args(&mut self, raw: &Args, call: Call, policy: ArgEval) -> EvalResult<Args> {
+        for &arg in raw.values() {
+            self.protect(arg);
+        }
+        let mut values = Vec::with_capacity(raw.len());
+        let result = (|| {
+            for (i, (tag, arg)) in raw.iter().enumerate() {
+                let value = if policy == ArgEval::EvalDollar && i == 1 {
+                    arg
+                } else if arg == SEXP_MISSING {
+                    if policy != ArgEval::EvalKeepMissing {
+                        return Err(
+                            self.stop(call.err_call(), "argument is missing, with no default")
+                        );
+                    }
+                    arg
+                } else {
+                    self.eval(arg, call.env)?
+                };
+                self.protect(value);
+                self.session.heap.inc_ref(value);
+                values.push((tag, value));
             }
-            let mut promised = None;
-            if !evaluated && def.args != ArgEval::Unevaluated {
-                let raw = ctx.promise_args(&args, call.env, call.err_call())?;
-                let mut values = Vec::with_capacity(raw.len());
-                for &arg in raw.values() {
-                    ctx.protect(arg);
-                }
-                for (tag, arg) in raw.iter() {
-                    let value = if arg == SEXP_MISSING {
-                        if def.args == ArgEval::Eval {
-                            return Err(
-                                ctx.stop(call.err_call(), "argument is missing, with no default")
-                            );
-                        }
-                        arg
-                    } else {
-                        ctx.force(arg)?
-                    };
-                    ctx.protect(value);
-                    values.push((tag, value));
-                }
-                args = Args::from_pairs(values);
-                promised = Some(raw);
-            }
-            let valid = match def.arity {
-                Arity::Any => true,
-                Arity::Exact(count) => args.len() == count,
-                Arity::Range(lo, hi) => (lo..=hi).contains(&args.len()),
-            };
-            if !valid {
-                return Err(ctx.stop(
-                    call.err_call(),
-                    format!("incorrect number of arguments to '{}'", def.name),
-                ));
-            }
-            ctx.visible = true;
-            if dispatch
-                && let Some(result) = ctx.dispatch_primitive(def, call, &args, promised.as_ref())?
-            {
-                return Ok(result);
-            }
-            let result = (def.fun)(ctx, &call, &mut args)?;
-            let result = ctx.preserve_group_attributes(def, &args, result)?;
-            ctx.visible = match def.visibility {
-                Visibility::On => true,
-                Visibility::Off => false,
-                Visibility::SetByFn => ctx.visible,
-            };
-            Ok(result)
+            Ok(())
+        })();
+        for &(_, value) in &values {
+            self.session.heap.dec_ref(value);
+        }
+        result?;
+        Ok(Args::from_pairs(values))
+    }
+
+    pub(crate) fn with_call<T>(
+        &mut self,
+        call: SexpId,
+        env: SexpId,
+        run: impl FnOnce(&mut Self) -> EvalResult<T>,
+    ) -> EvalResult<T> {
+        self.calls.push((call, env));
+        let result = run(self);
+        self.calls.pop();
+        result
+    }
+
+    pub(crate) fn condition_result<T>(
+        &mut self,
+        call: SexpId,
+        result: EvalResult<T>,
+    ) -> EvalResult<T> {
+        result.map_err(|err| match err {
+            Unwind::Value(error) => self.stop(call, error.to_string()),
+            other => other,
         })
     }
 

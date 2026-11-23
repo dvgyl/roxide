@@ -679,21 +679,12 @@ pub(super) fn dollar_name(ctx: &mut Ctx, call: &Call, x: SexpId) -> EvalResult<S
 }
 
 fn env_lookup(ctx: &mut Ctx, env: SexpId, key: &str) -> EvalResult {
-    let s = ctx.session_mut();
-    let sym = s.intern(key)?;
-    let Some(binding) = s.env_get(env, sym) else {
-        return Ok(SEXP_NIL);
-    };
-    if s.type_of(binding.value)? == SexpType::Prom {
-        ctx.force(binding.value)
-    } else {
-        Ok(binding.value)
-    }
+    let sym = ctx.session_mut().intern(key)?;
+    Ok(ctx.get_local(sym, env)?.unwrap_or(SEXP_NIL))
 }
 
 pub(super) fn dollar(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
-    let x = ctx.eval(args.get(0), call.env)?;
-    ctx.protect(x);
+    let x = args.get(0);
     let key = dollar_name(ctx, call, args.get(1))?;
     let s = ctx.session();
     match s.type_of(x)? {
