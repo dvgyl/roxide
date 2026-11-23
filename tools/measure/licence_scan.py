@@ -12,8 +12,10 @@ Verifies:
 
 from __future__ import annotations
 
+import json
 import pathlib
 import re
+import subprocess
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -110,11 +112,38 @@ def check_cargo_licenses() -> list[str]:
     return errors
 
 
+def check_dependency_licenses() -> list[str]:
+    errors: list[str] = []
+    if not (ROOT / "Cargo.toml").exists():
+        return errors
+    try:
+        out = subprocess.check_output(
+            ["cargo", "metadata", "--format-version=1", "--locked"],
+            cwd=ROOT,
+            text=True,
+            stderr=subprocess.PIPE,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return errors
+    meta = json.loads(out)
+    for pkg in meta.get("packages", []):
+        lic = pkg.get("license") or ""
+        low = lic.lower()
+        if any(k in low for k in ("gpl", "agpl", "mpl")) and not any(
+            ok in low for ok in ("mit", "apache", "bsd", "zlib", "isc")
+        ):
+            errors.append(
+                f"Cargo dependency `{pkg['name']} {pkg['version']}` has disallowed copyleft licence: {lic}"
+            )
+    return errors
+
+
 def main() -> int:
     errors = []
     errors.extend(scan_files())
     errors.extend(check_pure_crates_forbid_unsafe())
     errors.extend(check_cargo_licenses())
+    errors.extend(check_dependency_licenses())
     if errors:
         print("LICENCE / CLEAN-ROOM SCAN FAILED:", file=sys.stderr)
         for err in errors:

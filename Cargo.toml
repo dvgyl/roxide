@@ -27,6 +27,14 @@ roxide-value = { path = "crates/roxide-value" }
 roxide-eval = { path = "crates/roxide-eval" }
 roxide-base = { path = "crates/roxide-base" }
 
+# Vetted permissive dependencies (ADR-0008, docs/PRIOR_ART.md)
+regex = "1.13"
+fancy-regex = "0.20"
+flate2 = { version = "1.1", default-features = false, features = ["miniz_oxide"] }
+bzip2 = "0.6"
+lzma-rust2 = { version = "0.25", default-features = false, features = ["std", "encoder", "xz"] }
+zstd = { version = "0.14", default-features = false, features = ["vendored"] }
+
 [workspace.lints.rust]
 missing_docs = "deny"
 rust_2018_idioms = { level = "warn", priority = -1 }

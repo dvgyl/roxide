@@ -95,3 +95,18 @@ All major architectural contracts and deviations from `docs/ARCHITECTURE.md` are
   - `RObject` internals stay `pub(crate)` inside `roxide-value`; workers access objects solely through `ValueApi`, `VecView<T>`, and `Ctx` methods.
   - Each standard library submodule exports a `pub const MODULE: Module` (`prims: &'static [PrimDef]`, `prelude: &'static str`) and uses `ctx.ext::<MyState>()` for per-module GC-traced session state without editing coordinator-owned `Ctx` or `roxide-value` structs.
   - `roxide-eval` owns S3 dispatch (`UseMethod`, `NextMethod`, group generics) and plugs S4 dispatch in via `S4Hooks` in Milestone 3.
+
+---
+
+## ADR-0008: Permissive Regex & Compression Dependencies for `roxide-base`
+
+- **Status:** Accepted
+- **Context:** Milestone 1 requires POSIX ERE / PCRE2-compatible regex matching (`grep`/`grepv`/`sub`/`gsub`/`regexpr`/`gregexpr`/`strsplit`) and gzip/bzip2/xz/zstd stream support (`gzfile`/`bzfile`/`xzfile`, `readRDS`/`saveRDS`, `load`/`save`, `extSoftVersion()[["zstd"]]`), while strictly avoiding any GPL/LGPL/AGPL dependencies and keeping `#![forbid(unsafe_code)]` in `roxide-base`.
+- **Decision:**
+  - Adopt `regex` (`MIT OR Apache-2.0`) and `fancy-regex` (`MIT`) for pure-Rust regex matching, lookaround (`perl = TRUE`), and backreferences (`\1`, `\2`).
+  - Adopt `flate2` with `default-features = false, features = ["miniz_oxide"]` (`MIT OR Apache-2.0` / `Zlib`) for pure-Rust gzip (`GzEncoder` / `MultiGzDecoder`).
+  - Adopt `bzip2` (`MIT OR Apache-2.0`, default pure-Rust `libbz2-rs-sys` under permissive `bzip2-1.0.6`) for bzip2 (`BzEncoder` / `MultiBzDecoder`).
+  - Adopt `lzma-rust2` (`Apache-2.0`, `default-features = false, features = ["std", "encoder", "xz"]`) for pure-Rust `.xz` streams — explicitly rejecting `xz2`/`lzma-sys` because its bundled XZ source archive contains GPL/LGPL components.
+  - Adopt `zstd` (`BSD-3-Clause`, `default-features = false, features = ["vendored"]`, `zstd-sys` `BSD-3-Clause AND BSD-2-Clause` bundling libzstd 1.5.7 under BSD terms) for Zstandard streams and exact GNU R 4.6.2 `extSoftVersion()[["zstd"]] == "1.5.7"` parity.
+  - Enforce zero copyleft dependencies in `Cargo.lock` and preserve `#![forbid(unsafe_code)]` across all `roxide-base` code.
+

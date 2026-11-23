@@ -13,5 +13,12 @@ roxide-syntax = { workspace = true }
 roxide-value = { workspace = true }
 roxide-eval = { workspace = true }
 
+regex = { workspace = true }
+fancy-regex = { workspace = true }
+flate2 = { workspace = true }
+bzip2 = { workspace = true }
+lzma-rust2 = { workspace = true }
+zstd = { workspace = true }
+
 [lints]
 workspace = true
