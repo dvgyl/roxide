@@ -40,3 +40,11 @@ dput(validObject(out, test = TRUE, complete = TRUE))
 invisible(setValidity("J", NULL))
 dput(getValidity(getClass("J")))
 dput(validObject(j))
+
+=== case: s4_named_data_is_coerced_before_validation ===
+#@ tags: layer3,s4
+setClass("RxNamedData", contains = "numeric", slots = c(label = "character"))
+obj <- new("RxNamedData", .Data = "2", label = "value")
+dput(typeof(obj@.Data))
+dput(obj@.Data)
+dput(obj@label)

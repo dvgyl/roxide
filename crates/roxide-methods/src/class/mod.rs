@@ -1,8 +1,8 @@
 //! S4 class definitions, construction, slots, validity, and coercion.
 
-mod definitions;
-mod objects;
-mod relations;
+pub(crate) mod definitions;
+pub(crate) mod objects;
+pub(crate) mod relations;
 
 use roxide_eval::{
     ArgEval, Arity, Call, Ctx, Dispatch, EvalResult, Module, PrimDef, PrimKind, Visibility,
@@ -49,7 +49,7 @@ pub const MODULE: Module = Module {
         prim!(".s4_validity_set", objects::set_validity, 3),
         prim!(".s4_valid", objects::valid, 4),
         prim!(".s4_union", relations::union, 3),
-        prim!(".s4_old", relations::old_class, 3),
+        prim!(".s4_old", relations::old_class, 4),
         prim!(".s4_set_is", relations::set_is, 6),
         prim!(".s4_is", relations::is, 3),
         prim!(".s4_extends", relations::extends, 5),

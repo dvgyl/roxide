@@ -76,3 +76,30 @@ fn data_storage_type_survives_s4_copy() -> Result<(), ValueError> {
     assert_eq!(session.attr(vector, tag_symbol), tag);
     Ok(())
 }
+
+#[test]
+fn coercion_resolves_class_again_after_test_removes_it() -> Result<(), String> {
+    use roxide_eval::Ctx;
+    use roxide_host::PureHost;
+
+    let mut ctx = Ctx::new(Box::new(PureHost::new()), GcPolicy::Torture)
+        .map_err(|error| format!("{error:?}"))?;
+    roxide_base::register_all(&mut ctx).map_err(|error| format!("{error:?}"))?;
+    roxide_methods::register(&mut ctx).map_err(|error| format!("{error:?}"))?;
+    ctx.run_global(
+        "<coercion test>",
+        r#"
+setClass("From", slots = c(x = "numeric"))
+setClass("To", slots = c(x = "numeric"))
+setIs("From", "To",
+      test = function(object) { removeClass("From"); TRUE },
+      coerce = function(from) new("To", x = from@x),
+      replace = function(from, value) from)
+obj <- new("From")
+message <- tryCatch(as(obj, "To"), error = conditionMessage)
+stopifnot(identical(message, "no method or default for coercing “From” to “To”"))
+"#,
+    )
+    .map_err(|error| format!("{error:?}"))?;
+    Ok(())
+}

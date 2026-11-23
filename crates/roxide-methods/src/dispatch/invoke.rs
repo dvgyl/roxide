@@ -5,8 +5,9 @@ use roxide_value::{
 };
 
 use super::metadata::{
-    Method, attr, by_definition, dispatch_tables, formal_pairs, generic_definition, lookup,
-    make_call, merge_tables, package_string, signature_object, texts,
+    Method, attr, by_definition, canonical_generic_name, dispatch_tables, formal_pairs,
+    generic_definition, lookup, make_call, merge_tables, methods, package_string, signature_object,
+    texts,
 };
 use super::resolver::{self, Class, Selection};
 use crate::registry::GenericInfo;
@@ -226,10 +227,10 @@ fn bind_method_dots(
     let extras = params
         .iter()
         .filter_map(|&(tag, _)| {
-            (tag != dots && !matched.iter().any(|&(key, _)| key == tag)).then_some(tag)
+            (tag == dots || !matched.iter().any(|&(key, _)| key == tag)).then_some(tag)
         })
         .collect::<Vec<_>>();
-    if extras.is_empty() {
+    if extras.iter().all(|&tag| tag == dots) {
         return Ok(matched.to_vec());
     }
     let mut out = matched
@@ -242,7 +243,6 @@ fn bind_method_dots(
 }
 
 pub(super) fn standard_generic(ctx: &mut Ctx, name: Sym, frame: FrameId) -> EvalResult<SexpId> {
-    crate::meta::clear_unloaded(ctx);
     let Some((call, _, fun, caller)) = ctx.frame_info(frame) else {
         return Err(ctx.stop(
             SEXP_NIL,
@@ -272,8 +272,26 @@ pub(super) fn standard_generic(ctx: &mut Ctx, name: Sym, frame: FrameId) -> Eval
         cache: true,
     };
     let Some(method) = resolver::select(ctx, &info, &target, opts, call)? else {
-        let desc = target_names(&target).join("\", \"");
-        return Err(ctx.stop(call, format!("unable to find an inherited method for function ‘{name}’ for signature ‘\"{desc}\"’")));
+        let definitions = methods(ctx, &info)?;
+        let desc = info
+            .signature
+            .iter()
+            .zip(&target)
+            .enumerate()
+            .filter(|(i, _)| {
+                definitions
+                    .iter()
+                    .any(|method| method.signature.get(*i).is_some_and(|class| class != "ANY"))
+            })
+            .map(|(_, (param, class))| format!("{param} = \"{}\"", class.name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(ctx.stop(
+            call,
+            format!(
+                "unable to find an inherited method for function ‘{name}’ for signature ‘{desc}’"
+            ),
+        ));
     };
     let invocation = Invocation {
         info,
@@ -444,7 +462,7 @@ pub(super) fn call_next_method(ctx: &mut Ctx, call: &Call, args: &mut Args) -> E
     let Some((mut invocation, frame)) = active_method(ctx)? else {
         return Err(ctx.stop(
             call.err_call(),
-            "'callNextMethod' is not defined in the current context",
+            "a call to callNextMethod() appears in a call to ‘callNextMethod’, but the call does not seem to come from either a generic function or another 'callNextMethod'",
         ));
     };
     let target = invocation
@@ -487,7 +505,7 @@ pub(super) fn call_next_method(ctx: &mut Ctx, call: &Call, args: &mut Args) -> E
         let args = explicit_args(ctx, call, args)?;
         match_args(ctx, &names, &args, call.err_call(), true)?
     };
-    match next {
+    let result = match next {
         Some(method)
             if ctx.session().type_of(method.fun)? == SexpType::Clo
                 && (invocation.primitive.is_none()
@@ -506,7 +524,9 @@ pub(super) fn call_next_method(ctx: &mut Ctx, call: &Call, args: &mut Args) -> E
             call.env,
         ),
         _ => Err(ctx.stop(call.err_call(), "no next method available")),
-    }
+    }?;
+    ctx.set_visible(true);
+    Ok(result)
 }
 
 pub(super) fn call_generic(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult<SexpId> {
@@ -516,15 +536,18 @@ pub(super) fn call_generic(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalR
             "no generic function found for ‘callGeneric’",
         ));
     };
-    let arguments = if args.is_empty() {
-        let matched = ctx.generic_frame_args(frame)?;
-        let mut arguments = flatten(ctx, &matched)?;
-        arguments.retain(|&(_, value)| value != SEXP_MISSING);
-        arguments
-    } else {
-        explicit_args(ctx, call, args)?
-    };
     let sym = ctx.session_mut().intern(&invocation.info.name)?;
+    if !args.is_empty() {
+        let Some((_, env, _, _)) = ctx.frame_info(frame) else {
+            return Err(ctx.stop(call.err_call(), "unknown method frame"));
+        };
+        let arguments = args.iter().collect::<Vec<_>>();
+        let expr = make_call(ctx, sym.as_sexp(), &arguments)?;
+        return ctx.eval(expr, env);
+    }
+    let matched = ctx.generic_frame_args(frame)?;
+    let mut arguments = flatten(ctx, &matched)?;
+    arguments.retain(|&(_, value)| value != SEXP_MISSING);
     let fun = if invocation.primitive.is_some() {
         ctx.find_fun(sym, BASE_ENV)?
     } else {
@@ -554,12 +577,7 @@ pub(super) fn dispatch_primitive(
     call: &Call,
     args: &Args,
 ) -> EvalResult<Option<SexpId>> {
-    crate::meta::clear_unloaded(ctx);
-    let mut name = ctx.session().sym_name(generic)?.to_owned();
-    // as.numeric and as.double share the same primitive.
-    if name == "as.double" {
-        name = "as.numeric".to_owned();
-    }
+    let name = canonical_generic_name(ctx.session().sym_name(generic)?).to_owned();
     let Some((params, _, package, _)) = primitive_formals(&name) else {
         return Ok(None);
     };
@@ -603,7 +621,7 @@ pub(super) fn dispatch_primitive(
     let opts = Selection {
         inherited: true,
         next: false,
-        cache: sources.len() == 1,
+        cache: true,
     };
     let Some(method) = resolver::select(ctx, &info, &target, opts, call.err_call())? else {
         return Ok(None);

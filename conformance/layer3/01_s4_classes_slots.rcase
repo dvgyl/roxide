@@ -88,3 +88,32 @@ dput(isClass("A", where = e))
 dput(identical(getClassDef("A", where = e, inherits = FALSE), e[[".__C__A"]]))
 dput(removeClass("A", where = e))
 dput(isClass("A", where = e))
+
+=== case: s4_inherited_slot_conflicts_and_refinement ===
+#@ tags: layer3,s4
+setClass("RxVirtual", slots = c(x = "numeric"), contains = "VIRTUAL")
+setClass("RxConcrete", contains = "RxVirtual")
+setClass("RxRefined", contains = "RxVirtual", slots = c(x = "integer"))
+setClass("RxOther", slots = c(x = "character"))
+dput(isVirtualClass("RxConcrete"))
+dput(new("RxConcrete")@x)
+dput(new("RxRefined")@x)
+dput(tryCatch(setClass("RxConflict", contains = c("RxVirtual", "RxOther")),
+              error = conditionMessage))
+
+=== case: s4_qualified_generators_and_locked_parent ===
+#@ tags: layer3,s4
+one <- new.env()
+two <- new.env()
+g1 <- setClass("RxDuplicate", slots = c(x = "numeric"), where = one, package = "rxOne")
+g2 <- setClass("RxDuplicate", slots = c(y = "character"), where = two, package = "rxTwo")
+dput(attr(class(g1()), "package"))
+dput(attr(class(g2()), "package"))
+
+locked <- new.env()
+setClass("RxLocked", slots = c(n = "numeric"), where = locked)
+lockEnvironment(locked, bindings = TRUE)
+setClass("RxUnlockedChild", contains = "RxLocked")
+dput(new("RxUnlockedChild", n = 1)@n)
+dput(getClass("RxLocked", where = locked)@subclasses$RxUnlockedChild@distance)
+dput(bindingIsLocked(".__C__RxLocked", locked))

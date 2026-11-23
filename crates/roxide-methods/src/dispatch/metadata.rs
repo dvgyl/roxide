@@ -1,8 +1,8 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
 
-use roxide_eval::{Args, Call, Ctx, EvalResult};
-use roxide_gc::SexpId;
+use roxide_eval::{Args, Call, Ctx, CtxExt, EvalResult};
+use roxide_gc::{SexpId, Trace, Tracer};
 use roxide_value::{
     BASE_ENV, CharId, EMPTY_ENV, Encoding, GLOBAL_ENV, RLogical, SEXP_MISSING, SEXP_NIL, SexpType,
     Sym, ValueApi,
@@ -260,6 +260,36 @@ pub(super) fn dispatch_tables(
     Ok(sources)
 }
 
+#[derive(Eq, Hash, PartialEq)]
+struct MergeKey {
+    table: SexpId,
+    sources: Vec<SexpId>,
+    include_primitive_default: bool,
+}
+
+#[derive(Default)]
+struct MergedTables {
+    epoch: u64,
+    tables: HashMap<MergeKey, SexpId>,
+}
+
+impl Trace for MergedTables {
+    fn trace(&self, tracer: &mut Tracer<'_>) {
+        for &table in self.tables.values() {
+            tracer.edge(table);
+        }
+    }
+}
+
+impl CtxExt for MergedTables {}
+
+pub(super) fn canonical_generic_name(name: &str) -> &str {
+    match name {
+        "as.double" => "as.numeric",
+        _ => name,
+    }
+}
+
 pub(super) fn merge_tables(
     ctx: &mut Ctx,
     mut info: GenericInfo,
@@ -270,6 +300,21 @@ pub(super) fn merge_tables(
         && (include_primitive_default || only.table == info.table)
     {
         return Ok(only.clone());
+    }
+    let epoch = ctx.ext::<MethodsExt>().epoch;
+    let key = MergeKey {
+        table: info.table,
+        sources: sources.iter().map(|source| source.table).collect(),
+        include_primitive_default,
+    };
+    let cache = ctx.ext::<MergedTables>();
+    if cache.epoch != epoch {
+        cache.epoch = epoch;
+        cache.tables.clear();
+    }
+    if let Some(&table) = cache.tables.get(&key) {
+        info.table = table;
+        return Ok(info);
     }
     // Earlier tables win when they define the same signature. Rank distinct signatures together.
     let mut entries = BTreeMap::new();
@@ -293,6 +338,9 @@ pub(super) fn merge_tables(
         bind(ctx, table, &method_key(&signature, width), fun)?;
     }
     info.table = table;
+    if ctx.ext::<MethodsExt>().epoch == epoch {
+        ctx.ext::<MergedTables>().tables.insert(key, table);
+    }
     Ok(info)
 }
 
@@ -454,6 +502,10 @@ fn create(ctx: &mut Ctx, spec: &GenericSpec<'_>, primitive: bool) -> EvalResult<
         fun,
         if members.is_some() {
             "groupGenericFunction"
+        } else if ctx.session().type_of(body)? == SexpType::Lang
+            && ctx.session().cons_parts(body)?.0 != standard.as_sexp()
+        {
+            "nonstandardGenericFunction"
         } else {
             "standardGeneric"
         },
@@ -791,9 +843,7 @@ fn activate(ctx: &mut Ctx, info: &GenericInfo) -> EvalResult<()> {
 
 pub(super) fn set_method(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     let mut name = text(ctx, args.get(0))?;
-    if name == "as.double" {
-        name = "as.numeric".to_owned();
-    }
+    name = canonical_generic_name(&name).to_owned();
     let where_ = args.get(3);
     let sig_arg = args.get(1);
     let definition = args.get(2);
@@ -879,10 +929,16 @@ pub(super) fn set_method(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalRes
 
 pub(super) fn remove_method(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     let name = text(ctx, args.get(0))?;
-    let Some(info) = local_tables(ctx, &name, "", args.get(2))?
-        .into_iter()
-        .next()
-    else {
+    let name = canonical_generic_name(&name);
+    let where_ = args.get(2);
+    let Some(info) = local_tables(ctx, name, "", where_)?.into_iter().next() else {
+        if lookup(ctx, name, "", where_)?.is_some() {
+            return warn_missing_method(ctx, call, name, args.get(1));
+        }
+        ctx.warn_now(
+            call.err_call(),
+            format!("no generic function ‘{name}’ found"),
+        )?;
         return logical(ctx, false);
     };
     let signature = normalize(ctx, &info, args.get(1))?;
@@ -892,8 +948,8 @@ pub(super) fn remove_method(ctx: &mut Ctx, call: &Call, args: &mut Args) -> Eval
         .map(|m| sig_width(&m.signature))
         .max()
         .unwrap_or(1);
-    if sig_width(&signature) > width {
-        return logical(ctx, false);
+    if !old.iter().any(|method| method.signature == signature) {
+        return warn_missing_method(ctx, call, name, args.get(1));
     }
     let key = method_key(&signature, width);
     if let Some(prior) = binding(ctx, info.table, &key)? {
@@ -930,6 +986,20 @@ pub(super) fn remove_method(ctx: &mut Ctx, call: &Call, args: &mut Args) -> Eval
     logical(ctx, removed)
 }
 
+fn warn_missing_method(ctx: &mut Ctx, call: &Call, name: &str, signature: SexpId) -> EvalResult {
+    let given = texts(ctx, signature)?;
+    let given = given
+        .iter()
+        .map(|class| roxide_value::encode_string(class.as_bytes()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    ctx.warn_now(
+        call.err_call(),
+        format!("no method found for function ‘{name}’ and signature {given}"),
+    )?;
+    logical(ctx, false)
+}
+
 pub(super) fn by_definition(
     ctx: &mut Ctx,
     fun: SexpId,
@@ -946,12 +1016,12 @@ pub(super) fn by_definition(
 
 pub(super) fn select_method(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     let name = text(ctx, args.get(0))?;
+    let name = canonical_generic_name(&name);
     let optional = flag(ctx, args.get(3));
-    let info = match by_definition(ctx, args.get(5), &name)? {
+    let info = match by_definition(ctx, args.get(5), name)? {
         Some(info) => Some(info),
-        None => lookup(ctx, &name, "", args.get(2))?,
+        None => lookup(ctx, name, "", args.get(2))?,
     };
-    crate::meta::clear_unloaded(ctx);
     if let Some(mut info) = info {
         let inherited = flag(ctx, args.get(4));
         if ctx.session().type_of(args.get(7))? == SexpType::Env {

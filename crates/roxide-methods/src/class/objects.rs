@@ -209,7 +209,7 @@ pub(super) fn slot_set(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResul
     Ok(copy)
 }
 
-pub(super) fn stamp_instance(ctx: &mut Ctx, prototype: SexpId, info: &ClassInfo) -> EvalResult {
+pub(crate) fn stamp_instance(ctx: &mut Ctx, prototype: SexpId, info: &ClassInfo) -> EvalResult {
     if prototype == SEXP_NIL {
         return Ok(SEXP_NIL);
     }
@@ -347,7 +347,9 @@ pub(super) fn initialize(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalRes
             if name == ".Data"
                 && let Some(data) = data_class(ctx, &info)?
             {
-                object = set_data(ctx, object, *value, &data)?;
+                let value = relations::convert(ctx, *value, &data, true, SEXP_NIL, env, call)?;
+                ctx.protect(value);
+                object = set_data(ctx, object, value, &data)?;
                 ctx.protect(object);
             } else {
                 write_slot(ctx, object, name, *value)?;

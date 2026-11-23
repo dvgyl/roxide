@@ -19,22 +19,18 @@ setClass("uninitializedField", slots = c(field = "character", className = "chara
 .ref_initialize_s4 <- initialize
 # Install the fields before the reference class initializer runs.
 initialize <- function(.Object, ...) {
-    if (isS4(.Object) && is(.Object, "envRefClass")) {
-        def <- getClass(class(.Object), where = topenv(parent.frame()))
-        meta <- .ref_meta(def)
-        if (!is.null(meta)) {
-            .ref_seed(.Object, meta)
-            init <- .ref_find_method(meta, "initialize")
-            if (is.null(init)) {
-                .Object$initFields(...)
-            } else {
-                .ref_bind_method(.Object, "initialize", init)(...)
-            }
-            return(.Object)
+    meta <- .ref_object_meta(.Object)
+    if (!is.null(meta)) {
+        init <- .ref_seed(.Object, meta)
+        if (is.null(init)) {
+            .ref_initialize_fields(.Object, list(...))
+        } else {
+            init(...)
         }
+        return(.Object)
     }
     .ref_initialize_s4(.Object, ...)
 }
 
-.ref_register_access(.ref_member, .ref_replace, .ref_generator_member)
+.ref_register_access(.ref_member, .ref_replace, .ref_generator_access)
 setMethod("show", "envRefClass", function(object) object$show(), where = .ref_namespace)

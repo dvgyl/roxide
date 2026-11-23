@@ -5,7 +5,7 @@ mod rank;
 
 use std::process::Command;
 
-use rank::{Ranked, distances};
+use rank::{Ranked, add_any_distance, distances};
 use roxide_eval::Ctx;
 use roxide_gc::GcPolicy;
 use roxide_host::PureHost;
@@ -36,7 +36,7 @@ const PROBES: &[Probe] = &[
         target: &["D", "D"],
         methods: &[&["D", "Root"], &["L", "D"]],
         chosen: 2,
-        note: false,
+        note: true,
     },
     Probe {
         target: &["D", "D"],
@@ -54,25 +54,25 @@ const PROBES: &[Probe] = &[
         target: &["D", "D"],
         methods: &[&["L", "R"], &["R", "L"]],
         chosen: 1,
-        note: true,
+        note: false,
     },
     Probe {
         target: &["E", "E"],
         methods: &[&["L", "R"], &["R", "L"]],
         chosen: 2,
-        note: true,
+        note: false,
     },
     Probe {
         target: &["D", "D"],
         methods: &[&["D", "ANY"], &["L", "D"]],
         chosen: 2,
-        note: false,
+        note: true,
     },
     Probe {
         target: &["D", "missing"],
         methods: &[&["D", "ANY"], &["ANY", "missing"]],
         chosen: 1,
-        note: false,
+        note: true,
     },
     Probe {
         target: &["E", "missing"],
@@ -90,13 +90,13 @@ const PROBES: &[Probe] = &[
         target: &["N6", "N6"],
         methods: &[&["N6", "N3"], &["N5", "N5"]],
         chosen: 2,
-        note: false,
+        note: true,
     },
     Probe {
         target: &["N6", "N6"],
         methods: &[&["N6", "N1"], &["N1", "N6"], &["N4", "N4"]],
         chosen: 3,
-        note: false,
+        note: true,
     },
     Probe {
         target: &["N6", "N6", "N6"],
@@ -120,13 +120,13 @@ const PROBES: &[Probe] = &[
         target: &["N6", "N6"],
         methods: &[&["ANY", "N6"], &["N3", "N3"]],
         chosen: 2,
-        note: false,
+        note: true,
     },
     Probe {
         target: &["N6", "N6"],
         methods: &[&["ANY", "N6"], &["N2", "N2"]],
         chosen: 1,
-        note: false,
+        note: true,
     },
 ];
 
@@ -211,11 +211,12 @@ probe <- function(i, target, signatures) {
 "#,
     );
     for (i, probe) in PROBES.iter().enumerate() {
-        let maps = probe
+        let mut maps = probe
             .target
             .iter()
             .map(|name| distances(name, class_info(name).superclasses))
             .collect::<Vec<_>>();
+        add_any_distance(&mut maps);
         let mut ranks = probe
             .methods
             .iter()
@@ -236,7 +237,7 @@ probe <- function(i, target, signatures) {
         assert_eq!(
             alternatives
                 .iter()
-                .any(|(other, _)| rank.total() == other.total() && rank.ambiguous_with(other)),
+                .any(|(other, _)| rank.ambiguous_with(other)),
             probe.note,
             "probe {}",
             i + 1
@@ -266,6 +267,35 @@ probe <- function(i, target, signatures) {
         assert_eq!(String::from_utf8(output.stdout)?, expected);
     }
     Ok(())
+}
+
+#[test]
+fn amended_ranking_uses_shared_any_distance_and_signature_order() {
+    let ranks = |target: &[&str], signatures: &[[&str; 2]]| {
+        let mut maps = target
+            .iter()
+            .map(|&name| distances(name, class_info(name).superclasses))
+            .collect::<Vec<_>>();
+        add_any_distance(&mut maps);
+        let mut candidates = signatures
+            .iter()
+            .enumerate()
+            .filter_map(|(i, sig)| {
+                let signature = sig.map(str::to_owned);
+                Ranked::score(&signature, &maps).map(|score| (score, i))
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by(|(a, _), (b, _)| a.order(b));
+        candidates.into_iter().map(|(_, i)| i).collect::<Vec<_>>()
+    };
+    assert_eq!(
+        ranks(&["N1", "N2"], &[["N0", "N0"], ["ANY", "N2"]]),
+        vec![0, 1]
+    );
+    assert_eq!(
+        ranks(&["N2", "N2"], &[["N1", "N1"], ["N0", "N2"]]),
+        vec![0, 1]
+    );
 }
 
 #[test]

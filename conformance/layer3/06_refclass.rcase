@@ -108,3 +108,16 @@ object <- Gen$new()
 cat(object$greeting(), "\n")
 invisible(Gen$methods(greeting = function(name = "reader") paste("Hi", name)))
 cat(object$greeting(), Gen$new()$greeting(), "\n")
+
+=== case: reference_class_method_context_and_cached_members ===
+#@ tags: layer3,s4,refclass
+Parent <- setRefClass("RxContextParent", fields = c(n = "numeric"))
+Child <- setRefClass("RxContextChild", contains = "RxContextParent",
+    methods = list(probe = function() c(getClass()@className[[1L]],
+        getClass("numeric")@className[[1L]], getRefClass()$className,
+        getRefClass("RxContextParent")$className)))
+a <- Child$new()
+dput(a$probe())
+invisible(Child$methods(readN = function() n))
+b <- Child$new(n = 7)
+dput(b$readN())

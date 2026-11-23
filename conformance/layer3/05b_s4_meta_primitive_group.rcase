@@ -201,3 +201,15 @@ dput(names(x))
 unloadNamespace(a)
 dput(isNamespaceLoaded("rxmetaa"))
 dput(is.null(getMethod("names", "RxExport", optional = TRUE)))
+
+=== case: s4_method_removal_and_s3part_warnings ===
+#@ tags: layer3,s4
+warning_text <- function(expr) withCallingHandlers(expr, warning = function(w) {
+    dput(conditionMessage(w))
+    invokeRestart("muffleWarning")
+})
+invisible(setGeneric("rxRemove", function(x) standardGeneric("rxRemove")))
+setMethod("rxRemove", "numeric", function(x) x)
+dput(warning_text(removeMethod("rxRemove", "character")))
+dput(warning_text(removeMethod("rxNoGeneric", "character")))
+dput(warning_text(S3Part(asS4(9L))))

@@ -9,6 +9,7 @@ use roxide_eval::{
 use roxide_gc::{SexpId, Trace, Tracer};
 use roxide_value::{GLOBAL_ENV, SEXP_NIL, SexpType, ValueApi};
 
+use crate::class::definitions::{cache_namespace_class, forget_namespace_classes};
 use crate::dispatch::metadata::{
     attr, canonical, environment_chain, flag, set_attr, set_class, strings, texts,
 };
@@ -83,6 +84,7 @@ fn forget(ctx: &mut Ctx, package: &str, env: SexpId) {
                 .then_some(binding.value)
         }));
     }
+    forget_namespace_classes(ctx, package);
     let registry = ctx.ext::<MethodsExt>();
     registry.classes.retain(|(_, owner), _| owner != package);
     registry
@@ -227,6 +229,9 @@ fn cache_metadata(ctx: &mut Ctx, _: &Call, args: &mut Args) -> EvalResult {
     }
     let tables = generic_tables(ctx, search)?;
     if let Some(package) = package {
+        for info in classes.iter().filter(|info| info.package == package) {
+            cache_namespace_class(ctx, info, search)?;
+        }
         let namespace = NamespaceMetadata {
             env,
             tables: tables.iter().map(|info| info.table).collect(),
@@ -475,6 +480,7 @@ fn s3_part(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     }
 
     let result = ctx.session_mut().shallow_duplicate(object)?;
+    ctx.protect(result);
     if let Some(info) = info {
         for (slot, _) in info.slots {
             if !matches!(slot.as_str(), ".Data" | ".S3Class") {
@@ -483,6 +489,13 @@ fn s3_part(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
         }
     }
     let strict = flag(ctx, args.get(1));
+    if s3 == SEXP_NIL && class == SEXP_NIL {
+        let ty = ctx.session().type_of(object)?;
+        let name = ty.type_name(false);
+        ctx.warn_now(call.err_call(), format!(
+            "Setting class(x) to \"{name}\" sets attribute to NULL; result will no longer be an S4 object"
+        ))?;
+    }
     if s3 == SEXP_NIL || strict {
         set_attr(ctx, result, "class", if strict { s3 } else { SEXP_NIL })?;
         set_attr(ctx, result, ".S3Class", SEXP_NIL)?;

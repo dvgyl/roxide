@@ -1,3 +1,18 @@
+signature <- function(...) {
+    entries <- list(...)
+    result <- character(length(entries))
+    for (i in seq_along(entries)) {
+        value <- entries[[i]]
+        if (!is.character(value) || length(value) != 1L) {
+            stop(sprintf("bad class specified for element %d (should be a single character string)", i),
+                 call. = FALSE)
+        }
+        result[[i]] <- value
+    }
+    names(result) <- names(entries)
+    result
+}
+
 setGeneric <- function(name, def = NULL, group = list(), valueClass = character(),
                        where = topenv(parent.frame()), package = NULL,
                        signature = NULL, useAsDefault = NULL,

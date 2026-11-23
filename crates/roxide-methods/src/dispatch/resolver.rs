@@ -5,13 +5,14 @@ use roxide_gc::{SexpId, Trace, Tracer};
 use roxide_value::{SEXP_MISSING, SexpType, ValueApi};
 
 use super::metadata::{Method, attr, methods, texts};
-use super::rank::{Ranked, distances};
+use super::rank::{Ranked, add_any_distance, distances};
 use crate::registry::{self, GenericInfo, MethodsExt};
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub(super) struct Class {
     pub(super) name: String,
     package: Option<String>,
+    s3_parents: Vec<String>,
 }
 
 impl Class {
@@ -19,6 +20,7 @@ impl Class {
         Self {
             name,
             package: None,
+            s3_parents: Vec::new(),
         }
     }
 
@@ -27,11 +29,13 @@ impl Class {
             return Ok(Self::unqualified("missing".to_owned()));
         }
         let class = attr(ctx, value, "class")?;
-        if let Some(name) = texts(ctx, class)?.into_iter().next() {
+        let mut classes = texts(ctx, class)?.into_iter();
+        if let Some(name) = classes.next() {
             let package = attr(ctx, class, "package")?;
             return Ok(Self {
                 name,
                 package: texts(ctx, package)?.into_iter().next(),
+                s3_parents: classes.collect(),
             });
         }
         let dim = attr(ctx, value, "dim")?;
@@ -43,6 +47,8 @@ impl Class {
             let tag = ctx.session().type_of(value)?;
             match tag {
                 SexpType::Real => "numeric",
+                SexpType::Sym => "name",
+                SexpType::Lang => "call",
                 SexpType::Clo | SexpType::Builtin | SexpType::Special => "function",
                 _ => tag.type_name(ctx.session().is_s4(value)?),
             }
@@ -54,7 +60,15 @@ impl Class {
         if self.name == "missing" || self.name == "ANY" {
             return Vec::new();
         }
-        let parents = registry::superclasses(ctx, &self.name, self.package.as_deref());
+        let mut parents = registry::superclasses(ctx, &self.name, self.package.as_deref());
+        for (i, class) in self.s3_parents.iter().enumerate() {
+            parents.push((class.clone(), i + 1, i));
+            parents.extend(
+                registry::superclasses(ctx, class, None)
+                    .into_iter()
+                    .map(|(name, distance, _)| (name, distance + i + 1, i)),
+            );
+        }
         if !parents.is_empty()
             || registry::class_info(ctx, &self.name, self.package.as_deref()).is_some()
         {
@@ -97,7 +111,7 @@ struct SelectionCache {
 struct CachedMethod {
     table: SexpId,
     defined: Vec<String>,
-    packages: Vec<Option<String>>,
+    classes: Vec<Class>,
 }
 
 impl Trace for SelectionCache {
@@ -140,11 +154,7 @@ pub(super) fn select(
             }
         } else if let Some(cached) = state.ordinary.get(&key)
             && cached.table == info.table
-            && cached
-                .packages
-                .iter()
-                .zip(target)
-                .all(|(package, class)| package == &class.package)
+            && cached.classes == target
         {
             let signature = cached.defined.clone();
             if let Some(&(cached_epoch, fun)) = ctx.ext::<MethodsExt>().method_cache.get(&key)
@@ -158,10 +168,11 @@ pub(super) fn select(
     if !opts.inherited {
         return Ok(all.into_iter().find(|method| method.signature == names));
     }
-    let distances = target
+    let mut distances = target
         .iter()
         .map(|cl| distances(&cl.name, cl.ancestors(ctx)))
         .collect::<Vec<_>>();
+    add_any_distance(&mut distances);
     let mut ranked = all
         .into_iter()
         .filter(|method| !opts.next || method.signature != names)
@@ -179,7 +190,6 @@ pub(super) fn select(
     ctx.protect(info.table);
     let alternatives = rest
         .iter()
-        .take_while(|(alt, _)| alt.total() == best.total())
         .filter(|(alt, _)| best.ambiguous_with(alt))
         .collect::<Vec<_>>();
     if !alternatives.is_empty() {
@@ -207,7 +217,7 @@ pub(super) fn select(
                 CachedMethod {
                     table: info.table,
                     defined: method.signature.clone(),
-                    packages: target.iter().map(|class| class.package.clone()).collect(),
+                    classes: target.to_vec(),
                 },
             );
             ctx.ext::<MethodsExt>()

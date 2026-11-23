@@ -11,7 +11,7 @@ use super::*;
 mod builtins;
 pub(super) use builtins::bootstrap;
 
-type Key = (String, String);
+pub(super) type Key = (String, String);
 
 #[derive(Clone)]
 pub(super) struct Edge {
@@ -43,6 +43,7 @@ pub(super) struct ClassState {
     pub(super) unions: HashMap<Key, Vec<Key>>,
     namespace: Option<SexpId>,
     edge_functions: HashMap<Key, (SexpId, SexpId)>,
+    locked_definitions: HashMap<SexpId, Key>,
 }
 
 impl Trace for ClassState {
@@ -55,6 +56,9 @@ impl Trace for ClassState {
             for conversion in record.edges.iter().filter_map(|edge| edge.methods.as_ref()) {
                 conversion.trace(tracer);
             }
+        }
+        for &def in self.locked_definitions.keys() {
+            tracer.edge(def);
         }
         for &(forward, replace) in self.edge_functions.values() {
             tracer.edge(forward);
@@ -76,7 +80,7 @@ pub(super) fn methods_env(ctx: &mut Ctx) -> SexpId {
     ctx.ext::<ClassState>().namespace.unwrap_or(GLOBAL_ENV)
 }
 
-fn package_name(ctx: &mut Ctx, env: SexpId) -> EvalResult<String> {
+pub(crate) fn package_name(ctx: &mut Ctx, env: SexpId) -> EvalResult<String> {
     let pkg = ctx.session_mut().intern(".packageName")?;
     if let Some(value) = ctx.get_local(pkg, env)? {
         return name(ctx, value, SEXP_NIL);
@@ -143,7 +147,7 @@ pub(super) fn cached(ctx: &mut Ctx, name: &str, package: Option<&str>) -> Option
         .cloned()
 }
 
-pub(super) fn lookup(
+pub(crate) fn lookup(
     ctx: &mut Ctx,
     class: &str,
     package: Option<&str>,
@@ -162,17 +166,26 @@ pub(super) fn lookup(
         let pkg = attr(ctx, value, "package")?;
         let pkg = name(ctx, pkg, SEXP_NIL)?;
         if package.is_none_or(|wanted| wanted == pkg) {
+            if let Some(info) = ctx
+                .ext::<ClassState>()
+                .locked_definitions
+                .get(&value)
+                .cloned()
+                && let Some(cached) = ctx.ext::<MethodsExt>().classes.get(&info)
+            {
+                return Ok(Some(cached.clone()));
+            }
             return definition_info(ctx, value).map(Some);
         }
     }
     Ok(if inherits {
-        cached(ctx, class, package).or_else(|| cached(ctx, class, None))
+        cached(ctx, class, package)
     } else {
         None
     })
 }
 
-fn definition_info(ctx: &mut Ctx, def: SexpId) -> EvalResult<ClassInfo> {
+pub(crate) fn definition_info(ctx: &mut Ctx, def: SexpId) -> EvalResult<ClassInfo> {
     let (name, package) = class_spec(ctx, def, SEXP_NIL)?;
     let package = package.unwrap_or_else(|| ".GlobalEnv".into());
     if let Some(info) = cached(ctx, &name, Some(&package))
@@ -219,7 +232,7 @@ pub(super) fn resolve(
     lookup(ctx, &name, package.as_deref(), env, true)
 }
 
-pub(super) fn object_info(ctx: &mut Ctx, object: SexpId) -> EvalResult<Option<ClassInfo>> {
+pub(crate) fn object_info(ctx: &mut Ctx, object: SexpId) -> EvalResult<Option<ClassInfo>> {
     let class = attr(ctx, object, "class")?;
     if class == SEXP_NIL {
         return Ok(None);
@@ -230,7 +243,78 @@ pub(super) fn object_info(ctx: &mut Ctx, object: SexpId) -> EvalResult<Option<Cl
     {
         return lookup(ctx, &name, Some(package), env, true);
     }
-    Ok(cached(ctx, &name, package.as_deref()).or_else(|| cached(ctx, &name, None)))
+    Ok(cached(ctx, &name, package.as_deref()))
+}
+
+pub(crate) fn cache_namespace_class(
+    ctx: &mut Ctx,
+    info: &ClassInfo,
+    env: SexpId,
+) -> EvalResult<()> {
+    let key = key(info);
+    if ctx.ext::<ClassState>().records.contains_key(&key) {
+        return Ok(());
+    }
+    let contains = attr(ctx, info.class_def, "contains")?;
+    let mut edges = Vec::new();
+    for (_, extension) in named_values(ctx, contains)? {
+        let distance = attr(ctx, extension, "distance")?;
+        let distance = match ctx.session().type_of(distance)? {
+            SexpType::Int => ctx.session().int(distance)?.iter().next().map(f64::from),
+            SexpType::Real => ctx.session().real(distance)?.iter().next(),
+            _ => None,
+        };
+        if distance != Some(1.0) {
+            continue;
+        }
+        let target = attr(ctx, extension, "superClass")?;
+        let (name, package) = class_spec(ctx, target, SEXP_NIL)?;
+        let simple = attr(ctx, extension, "simple")?;
+        let methods = if flag(ctx, simple)? {
+            None
+        } else {
+            Some(relations::Conversion {
+                forward: decode_slot(attr(ctx, extension, "coerce")?),
+                reverse: decode_slot(attr(ctx, extension, "replace")?),
+                test: decode_slot(attr(ctx, extension, "test")?),
+            })
+        };
+        edges.push(Edge {
+            target: (name, package.unwrap_or_else(|| info.package.clone())),
+            methods,
+        });
+    }
+    let data = data_class(ctx, info)?;
+    let state = ctx.ext::<ClassState>();
+    state.order.push(key.clone());
+    state.records.insert(
+        key,
+        Record {
+            where_: env,
+            edges,
+            data,
+        },
+    );
+    Ok(())
+}
+
+pub(crate) fn forget_namespace_classes(ctx: &mut Ctx, package: &str) {
+    let state = ctx.ext::<ClassState>();
+    state.records.retain(|(_, owner), _| owner != package);
+    state.order.retain(|(_, owner)| owner != package);
+    state
+        .locked_definitions
+        .retain(|_, (_, owner)| owner != package);
+    state
+        .edge_functions
+        .retain(|(_, owner), _| owner != package);
+    state.unions.retain(|(_, owner), _| owner != package);
+    state
+        .conversions
+        .retain(|((_, from), (_, to)), _| from != package && to != package);
+    for record in state.records.values_mut() {
+        record.edges.retain(|edge| edge.target.1 != package);
+    }
 }
 
 pub(super) fn data_class(ctx: &mut Ctx, info: &ClassInfo) -> EvalResult<Option<String>> {
@@ -393,7 +477,14 @@ impl Extensions {
         })
     }
 
-    fn get(&mut self, ctx: &mut Ctx, sub: &Key, parent: &Key, distance: usize) -> EvalResult {
+    fn get(
+        &mut self,
+        ctx: &mut Ctx,
+        sub: &Key,
+        parent: &Key,
+        distance: usize,
+        via: Option<&Key>,
+    ) -> EvalResult {
         let key = (sub.clone(), parent.clone(), distance);
         if let Some(&obj) = self.values.get(&key) {
             return Ok(obj);
@@ -415,6 +506,11 @@ impl Extensions {
         let simple = logical(ctx, methods.is_none())?;
         let data_part = logical(ctx, direct_data)?;
         let distance = ctx.session_mut().scalar_real(distance as f64)?;
+        let by = if let Some(via) = via {
+            ctx.session_mut().scalar_str(&via.0)?
+        } else {
+            self.by
+        };
         let methods = methods.unwrap_or_default();
         let (coerce, replace) = edge_functions(ctx, parent, superclass)?;
         let coerce = if methods.forward == SEXP_NIL {
@@ -440,7 +536,7 @@ impl Extensions {
             ("test", test),
             ("replace", replace),
             ("simple", simple),
-            ("by", self.by),
+            ("by", by),
             ("dataPart", data_part),
             ("distance", distance),
             ("class", self.class),
@@ -452,7 +548,7 @@ impl Extensions {
     }
 }
 
-type Chain = Vec<(Key, usize, usize)>;
+type Chain = Vec<(Key, usize, usize, Option<Key>)>;
 
 fn linearize(source: &Key, records: &HashMap<Key, Record>) -> Chain {
     let mut found = HashSet::from([source.clone()]);
@@ -464,20 +560,20 @@ fn linearize(source: &Key, records: &HashMap<Key, Record>) -> Chain {
                 .edges
                 .iter()
                 .enumerate()
-                .map(|(i, edge)| (&edge.target, 1, i)),
+                .map(|(i, edge)| (&edge.target, 1, i, None::<&Key>)),
         );
     }
-    while let Some((parent, distance, rank)) = pending.pop_front() {
+    while let Some((parent, distance, rank, via)) = pending.pop_front() {
         if !found.insert(parent.clone()) {
             continue;
         }
-        chain.push((parent.clone(), distance, rank));
+        chain.push((parent.clone(), distance, rank, via.cloned()));
         if let Some(record) = records.get(parent) {
             pending.extend(
                 record
                     .edges
                     .iter()
-                    .map(|edge| (&edge.target, distance + 1, rank)),
+                    .map(|edge| (&edge.target, distance + 1, rank, Some(parent))),
             );
         }
     }
@@ -485,6 +581,10 @@ fn linearize(source: &Key, records: &HashMap<Key, Record>) -> Chain {
 }
 
 pub(super) fn refresh(ctx: &mut Ctx) -> EvalResult<()> {
+    refresh_edges(ctx, None)
+}
+
+pub(super) fn refresh_edges(ctx: &mut Ctx, changed: Option<(&Key, &Key)>) -> EvalResult<()> {
     ctx.scoped(|ctx| {
         let state = ctx.ext::<ClassState>();
         let order = state.order.clone();
@@ -493,13 +593,13 @@ pub(super) fn refresh(ctx: &mut Ctx) -> EvalResult<()> {
             .iter()
             .map(|key| (key.clone(), linearize(key, &records)))
             .collect();
-        let mut subclasses: HashMap<Key, Vec<(Key, usize)>> = HashMap::new();
+        let mut subclasses: HashMap<Key, Vec<_>> = HashMap::new();
         for sub in &order {
-            for (parent, distance, _) in &chains[sub] {
+            for (parent, distance, _, via) in &chains[sub] {
                 subclasses
                     .entry(parent.clone())
                     .or_default()
-                    .push((sub.clone(), *distance));
+                    .push((sub.clone(), *distance, via));
             }
         }
         let mut extensions = Extensions::new(ctx)?;
@@ -510,33 +610,39 @@ pub(super) fn refresh(ctx: &mut Ctx) -> EvalResult<()> {
             let chain = &chains[key];
             let linear = chain
                 .iter()
-                .map(|((n, _), d, rank)| (n.clone(), *d, *rank))
+                .map(|((n, _), d, rank, _)| (n.clone(), *d, *rank))
                 .collect::<Vec<_>>();
             let parents = attr(ctx, info.class_def, "contains")?;
             let kids = attr(ctx, info.class_def, "subclasses")?;
             let descendants = subclasses.get(key).map_or(&[][..], Vec::as_slice);
             let same_parents = info.superclasses == linear
-                && matching_extensions(ctx, parents, chain.iter().map(|(p, d, _)| (p, *d)))?;
+                && matching_extensions(ctx, parents, chain.iter().map(|(p, d, _, _)| (p, *d)))?;
             let same_children =
-                matching_extensions(ctx, kids, descendants.iter().map(|(c, d)| (c, *d)))?;
-            if same_parents && same_children {
+                matching_extensions(ctx, kids, descendants.iter().map(|(c, d, _)| (c, *d)))?;
+            if same_parents
+                && same_children
+                && changed.is_none_or(|(from, to)| key != from && key != to)
+            {
                 continue;
             }
             let new_def = ctx.session_mut().shallow_duplicate(info.class_def)?;
             let contains = chain
                 .iter()
-                .map(|(parent, distance, _)| {
+                .map(|(parent, distance, _, via)| {
                     Ok((
                         parent.0.clone(),
-                        extensions.get(ctx, key, parent, *distance)?,
+                        extensions.get(ctx, key, parent, *distance, via.as_ref())?,
                     ))
                 })
                 .collect::<EvalResult<Vec<_>>>()?;
             let contains = make_list(ctx, &contains, !contains.is_empty())?;
             let children = descendants
                 .iter()
-                .map(|(child, distance)| {
-                    Ok((child.0.clone(), extensions.get(ctx, child, key, *distance)?))
+                .map(|(child, distance, via)| {
+                    Ok((
+                        child.0.clone(),
+                        extensions.get(ctx, child, key, *distance, via.as_ref())?,
+                    ))
                 })
                 .collect::<EvalResult<Vec<_>>>()?;
             let children = make_list(ctx, &children, !children.is_empty())?;
@@ -544,7 +650,20 @@ pub(super) fn refresh(ctx: &mut Ctx) -> EvalResult<()> {
             write_slot(ctx, new_def, "subclasses", children)?;
             info.class_def = new_def;
             info.superclasses = linear;
-            store(ctx, &info, records[key].where_)?;
+            let env = records[key].where_;
+            let symbol = ctx.session_mut().intern(&format!(".__C__{}", info.name))?;
+            if ctx.session().env_is_locked(env)?
+                || ctx.session().env_binding_is_locked(env, symbol)? == Some(true)
+            {
+                if let Some(binding) = ctx.session().env_get(env, symbol) {
+                    ctx.ext::<ClassState>()
+                        .locked_definitions
+                        .insert(binding.value, key.clone());
+                }
+                ctx.ext::<MethodsExt>().classes.insert(key.clone(), info);
+            } else {
+                store(ctx, &info, env)?;
+            }
         }
         ctx.ext::<MethodsExt>().bump_epoch();
         Ok(())
@@ -635,6 +754,7 @@ pub(super) fn remove(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult 
     ctx.ext::<MethodsExt>().classes.remove(&key);
     let state = ctx.ext::<ClassState>();
     state.records.remove(&key);
+    state.locked_definitions.retain(|_, owner| owner != &key);
     state.edge_functions.remove(&key);
     state.order.retain(|entry| entry != &key);
     state.unions.remove(&key);
@@ -778,13 +898,28 @@ pub(super) fn define(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult 
             }
             ancestors.push(info);
         }
-        let is_virtual = explicit_virtual || (slots.is_empty() && ancestors.iter().all(|p| p.is_virtual));
+        let is_virtual = explicit_virtual || (slots.is_empty() && ancestors.is_empty());
         let mut data = slots.iter().find(|(slot, _)| slot == ".Data").map(|(_, typ)| typ.clone());
         for parent in &ancestors {
+            ctx.protect(parent.class_def);
             if data.is_none() {
                 data = data_class(ctx, parent)?;
             }
-            slots.extend(parent.slots.iter().filter(|(name, _)| name != ".Data").cloned().collect::<Vec<_>>());
+            for (slot, inherited) in parent.slots.iter().filter(|(name, _)| name != ".Data") {
+                if let Some((_, declared)) = slots.iter().find(|(name, _)| name == slot) {
+                    if declared != inherited && inherited != "ANY"
+                        && !lookup(ctx, declared, None, env, true)?.is_some_and(|info| {
+                            info.superclasses.iter().any(|(name, _, _)| name == inherited)
+                        })
+                    {
+                        return Err(error(ctx, call, format!(
+                            "Definition of slot ‘{slot}’, in class “{class}”, as “{declared}” conflicts with definition, inherited from class “{}”, as “{inherited}”", parent.name
+                        )));
+                    }
+                } else {
+                    slots.push((slot.clone(), inherited.clone()));
+                }
+            }
         }
         if let Some(parent) = ancestors.iter().find(|p| matches!(p.name.as_str(), "environment" | "name"))
             && !slots.iter().any(|(name, _)| name == ".xData")
@@ -868,7 +1003,12 @@ pub(super) fn define(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult 
                 for parent in &ancestors {
                     let source = decode_slot(attr(ctx, parent.class_def, "prototype")?);
                     inherited = attr(ctx, source, slot)?;
-                    if inherited != SEXP_NIL { break; }
+                    if inherited != SEXP_NIL
+                        && relations::matches(ctx, decode_slot(inherited), typ, env)?
+                    {
+                        break;
+                    }
+                    inherited = SEXP_NIL;
                 }
                 if inherited == SEXP_NIL {
                     if lookup(ctx, typ, None, env, true)?.is_none() && typ != &class {
@@ -931,7 +1071,12 @@ pub(super) fn special_class(
     slots: Vec<(String, String)>,
     parents: Vec<Edge>,
     prototype: SexpId,
+    template: Option<&ClassInfo>,
 ) -> EvalResult<ClassInfo> {
+    let data = template
+        .map(|info| data_class(ctx, info))
+        .transpose()?
+        .flatten();
     let package = package_name(ctx, env)?;
     let def = Definition {
         info: ClassInfo {
@@ -939,13 +1084,13 @@ pub(super) fn special_class(
             package,
             slots,
             superclasses: Vec::new(),
-            is_virtual: true,
+            is_virtual: template.is_none_or(|info| info.is_virtual),
             class_def: SEXP_NIL,
         },
         record: Record {
             where_: env,
             edges: parents,
-            data: None,
+            data,
         },
         prototype,
         validity: SEXP_NIL,

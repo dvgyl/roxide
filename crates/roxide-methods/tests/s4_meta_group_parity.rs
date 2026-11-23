@@ -103,12 +103,21 @@ fn registering_and_uncaching_namespace_metadata_invalidates_the_epoch() -> Resul
     );
     assert_eq!(registry.generics[&method_key].signature, ["x"]);
     assert_eq!(registry.generics[&primitive_key].signature, ["x"]);
-    let before = registry.epoch;
+    ctx.session_mut()
+        .env_lock_all_bindings(ns)
+        .map_err(|error| format!("{error:?}"))?;
+    ctx.session_mut()
+        .env_set_locked(ns, true)
+        .map_err(|error| format!("{error:?}"))?;
+    let before = ctx.ext::<MethodsExt>().epoch;
     ctx.run_script(
         "s4_meta_combined.R",
         r#"
         stopifnot(identical(show(new("RxGlobal")), "global"))
         stopifnot(identical(show(new("RxCached")), "package"))
+        setClass("RxSubclass", contains = "RxCached")
+        stopifnot(identical(new("RxSubclass", data = 2)@data, 2))
+        stopifnot(identical(getClass("RxCached")@subclasses$RxSubclass@distance, 1))
         "#,
         GLOBAL_ENV,
         false,

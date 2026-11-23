@@ -10,7 +10,8 @@ setClass <- function(Class, representation = list(), prototype = NULL,
                      package = getPackageName(where), slots = list()) {
     definition <- .s4_define(Class, representation, prototype, contains, validity,
                              access, where, sealed, package, slots)
-    generator <- function(...) new(Class, ...)
+    className <- definition@className
+    generator <- function(...) new(className, ...)
     invisible(.s4_generator(generator, definition))
 }
 
@@ -65,7 +66,7 @@ setClassUnion <- function(name, members = character(), where = topenv(parent.fra
 
 setOldClass <- function(Classes, prototype = NULL, where = topenv(parent.frame()),
                         test = FALSE, S4Class) {
-    invisible(.s4_old(Classes, prototype, where))
+    invisible(.s4_old(Classes, prototype, where, if (missing(S4Class)) NULL else S4Class))
 }
 
 setIs <- function(class1, class2, test = NULL, coerce = NULL, replace = NULL,

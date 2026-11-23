@@ -92,3 +92,46 @@ dput(extends("matrix"))
 dput(extends("array"))
 dput(is(1L, "numeric"))
 dput(is(matrix(1), "numeric"))
+
+=== case: s4_setis_callback_can_remove_coercion ===
+#@ tags: layer3,s4
+setClass("RxFrom", slots = c(x = "numeric"))
+setClass("RxTo", slots = c(x = "numeric"))
+invisible(setIs("RxFrom", "RxTo",
+    test = function(object) {
+        removeClass("RxFrom")
+        TRUE
+    },
+    coerce = function(from) new("RxTo", x = from@x + 1),
+    replace = function(from, value) from))
+obj <- new("RxFrom", x = 2)
+dput(tryCatch(as(obj, "RxTo"), error = conditionMessage))
+
+=== case: s4_inherited_coercion_and_redefined_extension ===
+#@ tags: layer3,s4
+setClass("RxRoot", slots = c(x = "numeric"))
+setClass("RxParent", slots = c(x = "numeric"))
+setClass("RxLeaf", contains = "RxParent")
+invisible(setIs("RxParent", "RxRoot",
+    coerce = function(from) new("RxRoot", x = from@x + 1),
+    replace = function(from, value) from))
+dput(as(new("RxLeaf", x = 2), "RxRoot")@x)
+invisible(setIs("RxParent", "RxRoot",
+    coerce = function(from) new("RxRoot", x = from@x + 3),
+    replace = function(from, value) new("RxParent", x = value@x)))
+edge <- getClass("RxParent")@contains$RxRoot
+dput(edge@coerce(new("RxParent", x = 2))@x)
+obj <- new("RxParent")
+as(obj, "RxRoot") <- new("RxRoot", x = 5)
+dput(obj@x)
+
+=== case: s4_oldclass_uses_s4_layout_and_prototype ===
+#@ tags: layer3,s4
+setClass("RxOldLayout", contains = "numeric", slots = c(y = "integer"),
+         prototype = prototype(2, y = 1L))
+setOldClass("rxOldLayout", S4Class = "RxOldLayout")
+def <- getClass("rxOldLayout")
+dput(getSlots("rxOldLayout"))
+dput(isVirtualClass("rxOldLayout"))
+dput(as.numeric(def@prototype))
+dput(attributes(def@prototype))

@@ -50,3 +50,38 @@ setMethod("Math", "integer", function(x) 44L)
 dput(x[[2L]])
 dput(x$a)
 dput(abs(asS4(structure(2L, class = "integer"))))
+
+=== case: s4_callgeneric_preserves_explicit_syntax_and_dots ===
+#@ tags: layer3,s4
+invisible(setGeneric("rxAgain", function(x, ...) standardGeneric("rxAgain")))
+setMethod("rxAgain", "integer", function(x, ..., extra = 0) {
+    callGeneric(as.character(x), extra + 1, ...)
+})
+setMethod("rxAgain", "character", function(x, ...) {
+    dput(deparse(sys.call()))
+    dput(list(...))
+    x
+})
+dput(rxAgain(2L, keep = 7L, extra = 3L))
+dput(tryCatch(callNextMethod(), error = conditionMessage))
+setClass("RxVisibleParent", slots = c(x = "numeric"))
+setClass("RxVisibleChild", contains = "RxVisibleParent")
+invisible(setGeneric("rxVisible", function(x) standardGeneric("rxVisible")))
+setMethod("rxVisible", "RxVisibleParent", function(x) invisible(1))
+setMethod("rxVisible", "RxVisibleChild", function(x) callNextMethod())
+dput(withVisible(rxVisible(new("RxVisibleChild"))))
+
+=== case: s4_show_metadata_without_deparsing_method_tables ===
+#@ tags: layer3,s4
+setClass("RxDisplay", slots = c(x = "numeric"))
+show(getClass("RxDisplay"))
+invisible(setGeneric("rxDisplay", function(x) standardGeneric("rxDisplay")))
+setMethod("rxDisplay", "integer", function(x) 42L)
+show(getMethod("rxDisplay", "integer"))
+lines <- capture.output(show(getGeneric("rxDisplay")))
+dput(lines[c(1L, length(lines) - 1L, length(lines))])
+invisible(setGeneric("rxNonstandard", function(x) {
+    if (TRUE) standardGeneric("rxNonstandard")
+}))
+lines <- capture.output(show(getGeneric("rxNonstandard")))
+dput(lines[1L])
