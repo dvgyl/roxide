@@ -2,10 +2,15 @@
 
 use std::any::{Any, TypeId};
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use roxide_diag::{SourceMap, SrcFileId, format as diag_format};
 use roxide_gc::{GcPolicy, RootSet, SexpId, Tracer};
-use roxide_host::Host;
+use roxide_host::{
+    CommandSpec, CpuTimes, DirEntry, FileMeta, Host, HostError, HostErrorKind, HostFile,
+    HostResult, Limits, LocaleInfo, OpenMode, ProcessOutput, StdStream, SysInfo, WallTime,
+};
 use roxide_syntax::{ParseStep, Parser};
 use roxide_value::{
     BASE_ENV, DeparseOpts, GLOBAL_ENV, KeepSource, PrimId, RSession, SEXP_NIL, Sym, ValueApi,
@@ -125,7 +130,7 @@ pub(crate) struct RegisteredPackage {
 /// Core Roxide execution context owning the [`RSession`], [`Host`], frames, and primitive table.
 pub struct Ctx {
     pub(crate) session: RSession,
-    pub(crate) host: Box<dyn Host>,
+    pub(crate) host: HostStack,
     pub(crate) sources: SourceMap,
     pub(crate) opts: OptionsCache,
     pub(crate) prims: Vec<&'static PrimDef>,
@@ -152,6 +157,163 @@ pub struct Ctx {
     pub(crate) extensions: HashMap<TypeId, ExtEntry>,
     pub(crate) s4_hooks: Option<&'static dyn S4Hooks>,
     pub(crate) interactive: bool,
+}
+
+struct StreamCapture {
+    capture_out: bool,
+    capture_err: bool,
+    split: bool,
+    exceeded: bool,
+    bytes: Vec<u8>,
+}
+
+pub(crate) struct HostStack {
+    base: Box<dyn Host>,
+    captures: Vec<StreamCapture>,
+}
+
+impl HostStack {
+    pub(crate) fn write_out(&mut self, bytes: &[u8]) -> HostResult<()> {
+        self.write(StdStream::Stdout, bytes)
+    }
+
+    pub(crate) fn write_err(&mut self, bytes: &[u8]) -> HostResult<()> {
+        self.write(StdStream::Stderr, bytes)
+    }
+
+    pub(crate) fn limits(&self) -> &Limits {
+        self.base.limits()
+    }
+
+    pub(crate) fn poll_interrupt(&mut self) -> bool {
+        self.base.poll_interrupt()
+    }
+
+    fn write(&mut self, stream: StdStream, bytes: &[u8]) -> HostResult<()> {
+        let limit = self.base.limits().max_vector_bytes;
+        for capture in self.captures.iter_mut().rev() {
+            let selected = match stream {
+                StdStream::Stdout => capture.capture_out,
+                StdStream::Stderr => capture.capture_err,
+                StdStream::Stdin => false,
+            };
+            if !selected {
+                continue;
+            }
+            if capture.exceeded || bytes.len() > limit.saturating_sub(capture.bytes.len()) {
+                capture.exceeded = true;
+                return Err(HostError::new(
+                    HostErrorKind::Other,
+                    "output capture exceeds the vector size limit",
+                ));
+            }
+            capture.bytes.extend_from_slice(bytes);
+            if !capture.split {
+                return Ok(());
+            }
+        }
+        match stream {
+            StdStream::Stdout => self.base.write_out(bytes),
+            StdStream::Stderr => self.base.write_err(bytes),
+            StdStream::Stdin => Ok(()),
+        }
+    }
+}
+
+impl Host for HostStack {
+    fn write_out(&mut self, bytes: &[u8]) -> HostResult<()> {
+        self.write_out(bytes)
+    }
+    fn write_err(&mut self, bytes: &[u8]) -> HostResult<()> {
+        self.write_err(bytes)
+    }
+    fn flush(&mut self, stream: StdStream) -> HostResult<()> {
+        self.base.flush(stream)
+    }
+    fn read_line(&mut self, buf: &mut Vec<u8>) -> HostResult<usize> {
+        self.base.read_line(buf)
+    }
+    fn is_tty(&self, stream: StdStream) -> bool {
+        self.base.is_tty(stream)
+    }
+    fn open(&mut self, path: &Path, mode: OpenMode) -> HostResult<Box<dyn HostFile>> {
+        self.base.open(path, mode)
+    }
+    fn metadata(&self, path: &Path, follow: bool) -> HostResult<FileMeta> {
+        self.base.metadata(path, follow)
+    }
+    fn read_dir(&self, path: &Path) -> HostResult<Vec<DirEntry>> {
+        self.base.read_dir(path)
+    }
+    fn create_dir(&mut self, path: &Path, recursive: bool, mode: u32) -> HostResult<()> {
+        self.base.create_dir(path, recursive, mode)
+    }
+    fn remove(&mut self, path: &Path, recursive: bool) -> HostResult<()> {
+        self.base.remove(path, recursive)
+    }
+    fn rename(&mut self, from: &Path, to: &Path) -> HostResult<()> {
+        self.base.rename(from, to)
+    }
+    fn canonicalize(&self, path: &Path) -> HostResult<PathBuf> {
+        self.base.canonicalize(path)
+    }
+    fn cwd(&self) -> HostResult<PathBuf> {
+        self.base.cwd()
+    }
+    fn set_cwd(&mut self, path: &Path) -> HostResult<()> {
+        self.base.set_cwd(path)
+    }
+    fn session_temp_dir(&self) -> &Path {
+        self.base.session_temp_dir()
+    }
+    fn home_dir(&self) -> Option<PathBuf> {
+        self.base.home_dir()
+    }
+    fn env_var(&self, key: &str) -> Option<Vec<u8>> {
+        self.base.env_var(key)
+    }
+    fn set_env_var(&mut self, key: &str, value: Option<&[u8]>) -> HostResult<()> {
+        self.base.set_env_var(key, value)
+    }
+    fn env_vars(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
+        self.base.env_vars()
+    }
+    fn locale(&self) -> LocaleInfo {
+        self.base.locale()
+    }
+    fn tzif(&self, zone: &str) -> HostResult<Vec<u8>> {
+        self.base.tzif(zone)
+    }
+    fn now(&self) -> WallTime {
+        self.base.now()
+    }
+    fn monotonic(&self) -> Duration {
+        self.base.monotonic()
+    }
+    fn cpu_times(&self) -> CpuTimes {
+        self.base.cpu_times()
+    }
+    fn sleep(&mut self, duration: Duration) -> HostResult<()> {
+        self.base.sleep(duration)
+    }
+    fn pid(&self) -> u32 {
+        self.base.pid()
+    }
+    fn fill_entropy(&mut self, buf: &mut [u8]) {
+        self.base.fill_entropy(buf);
+    }
+    fn sys_info(&self) -> SysInfo {
+        self.base.sys_info()
+    }
+    fn spawn(&mut self, spec: &CommandSpec) -> HostResult<ProcessOutput> {
+        self.base.spawn(spec)
+    }
+    fn poll_interrupt(&mut self) -> bool {
+        self.base.poll_interrupt()
+    }
+    fn limits(&self) -> &Limits {
+        self.base.limits()
+    }
 }
 
 struct CtxRoots<'a> {
@@ -216,7 +378,10 @@ impl Ctx {
         };
         let mut ctx = Self {
             session,
-            host,
+            host: HostStack {
+                base: host,
+                captures: Vec::new(),
+            },
             sources: SourceMap::new(),
             opts,
             prims: Vec::new(),
@@ -388,7 +553,42 @@ impl Ctx {
     #[inline]
     #[must_use]
     pub fn host(&mut self) -> &mut dyn Host {
-        self.host.as_mut()
+        &mut self.host
+    }
+
+    /// Capture the selected host streams while running `f`.
+    ///
+    /// With `split`, copy each write to the previous stream destination as well.
+    /// The capture ends when `f` returns, including when it returns an R error.
+    pub fn capture_streams<R>(
+        &mut self,
+        capture_out: bool,
+        capture_err: bool,
+        split: bool,
+        f: impl FnOnce(&mut Self) -> EvalResult<R>,
+    ) -> EvalResult<(R, Vec<u8>)> {
+        self.host.captures.push(StreamCapture {
+            capture_out,
+            capture_err,
+            split,
+            exceeded: false,
+            bytes: Vec::new(),
+        });
+        let result = f(self);
+        let Some(capture) = self.host.captures.pop() else {
+            return Err(self.stop(SEXP_NIL, "missing output capture"));
+        };
+        if capture.exceeded {
+            return Err(self.stop(SEXP_NIL, "output capture exceeds the vector size limit"));
+        }
+        Ok((result?, capture.bytes))
+    }
+
+    /// Return the registered name of a primitive, if the value is a primitive.
+    #[must_use]
+    pub fn primitive_name(&self, value: SexpId) -> Option<&'static str> {
+        let (id, _) = self.session.prim_parts(value).ok()?;
+        self.prims.get(usize::from(id.0)).map(|def| def.name)
     }
 
     /// Borrow cached options.
@@ -471,6 +671,14 @@ impl Ctx {
     /// Protect a [`SexpId`] on the heap's protect stack.
     pub fn protect(&mut self, id: SexpId) {
         self.session.heap.protect(id);
+    }
+
+    /// Protect any R values in an evaluation result during subsequent evaluation.
+    ///
+    /// This also protects values carried by a non-local transfer, such as an
+    /// error condition. Use it before running cleanup that can collect garbage.
+    pub fn protect_eval_result(&mut self, result: &EvalResult) {
+        self.protect_result(result);
     }
 
     /// Execute `f` inside a protect-mark scope that restores the protect stack on every exit path.
@@ -579,7 +787,13 @@ impl Ctx {
                         let v = ctx.eval(expr, env)?;
                         if auto_print && ctx.visible {
                             ctx.protect(v);
-                            builtins::print_value(ctx, v, ctx.opts.digits)?;
+                            if ctx.session.is_object(v)? {
+                                let print = ctx.session.intern("print")?;
+                                let print = ctx.find_fun(print, BASE_ENV)?;
+                                ctx.apply(print, &[(None, v)], SEXP_NIL, env)?;
+                            } else {
+                                builtins::print_value(ctx, v, ctx.opts.digits)?;
+                            }
                         }
                         Ok(v)
                     })?;

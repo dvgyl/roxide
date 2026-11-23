@@ -565,7 +565,7 @@ impl BufRead for Console<'_> {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum Access {
+pub(crate) enum Access {
     Lines,
     Binary,
     Characters,
@@ -602,7 +602,7 @@ impl Access {
     }
 }
 
-pub(super) fn read<T>(
+pub(crate) fn read<T>(
     ctx: &mut Ctx,
     call: &Call,
     source: SexpId,

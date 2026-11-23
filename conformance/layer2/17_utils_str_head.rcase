@@ -1,0 +1,157 @@
+=== case: str_atomic_vectors ===
+#@ tags: utils,str
+#@ compare: exact
+show <- function(x, ...) cat(paste0("<", capture.output(utils::str(x, ...)), ">"), sep = "\n")
+show(c(3.141592653589793, NA, NaN, Inf, -0))
+show(c(1L, NA_integer_))
+show(c("hi", "é", "a\nb", NA))
+show(c(TRUE, FALSE, NA))
+show(c(1+2i, NA_complex_))
+show(as.raw(c(0,255)))
+show(1L)
+show(numeric())
+show(integer())
+show(character())
+show(logical())
+show(complex())
+show(raw())
+show(NULL)
+show(list())
+
+=== case: str_named_vectors_and_limits ===
+#@ tags: utils,str
+#@ compare: exact
+show <- function(x, ...) cat(paste0("<", capture.output(utils::str(x, ...)), ">"), sep = "\n")
+show(c(a=1,b=2))
+show(c(a=1,b=2), give.attr=FALSE)
+show(1:10, vec.len=2)
+show(strsplit("abcdefghij","")[[1]], vec.len=2)
+show(rep(TRUE,10), vec.len=2)
+show(structure(1:3,unit="kg"), give.head=FALSE)
+
+=== case: str_dimensions_and_classes ===
+#@ tags: utils,str
+#@ compare: exact
+show <- function(x, ...) cat(paste0("<", capture.output(str(x, ...)), ">"), sep = "\n")
+show(matrix(1:6,2))
+show(structure(1:2,dim=c(1L,2L,1L)))
+show(matrix(numeric(),0,3))
+show(matrix(1:6,2,dimnames=list(c("r","s"),c("a","b","c"))))
+show(factor(c("b",NA,"a","b"),levels=c("a","b","c")))
+show(ordered(c("b","a"),levels=c("a","b","c")))
+show(factor(character()))
+show(factor(strsplit("abcdefghijklmnopqrstuvwxyz","")[[1]]))
+show(as.Date(c("2020-01-02",NA)))
+show(as.Date(numeric(), origin="1970-01-01"))
+show(as.POSIXct(c("2020-01-02 03:04:05",NA),tz="UTC"))
+show(data.frame(aaa=1:2,b=c("x","y")))
+show(function(x,y=1) x+y)
+show(sum)
+show(baseenv())
+
+=== case: str_recursive_options_and_s3 ===
+#@ tags: utils,str
+#@ compare: exact
+show <- function(x, ...) cat(paste0("<", capture.output(str(x, ...)), ">"), sep = "\n")
+x <- list(a=1L,long=list(z=list(m=3L)),c=NULL)
+show(x)
+show(x,max.level=0)
+show(x,max.level=1)
+show(x,list.len=1)
+show(x,no.list=TRUE,comp.str="X",indent.str="!")
+show(structure(1:3,unit="kg"))
+show(structure(list(a=1),class="test_class"))
+str.visible <- function(object, ...) cat("custom", object[[1]], "\n")
+show(structure(list(3L),class="visible"))
+show(1.234567,digits.d=5L)
+show(1:10,strict.width="wrap",width=13L)
+show("abcdefghijklmnopqrstuvwxyz",nchar.max=20L)
+
+=== case: head_and_tail_vectors_arrays_and_frames ===
+#@ tags: utils,head,tail
+#@ compare: exact
+v <- c(a=1,b=2,c=3,d=4,e=5)
+stopifnot(identical(utils::head(v,2.9),v[1:2]),
+          identical(utils::tail(v,2.9),v[3:5]),
+          identical(utils::head(v,-1.1),v[1:3]),
+          identical(utils::tail(v,-1.1),v[2:5]),
+          identical(utils::head(v,Inf),v),
+          identical(utils::tail(v,-Inf),v[integer()]),
+          identical(utils::head(list(a=1,b=2),0),list(a=1,b=2)[integer()]))
+m <- matrix(1:12,3)
+stopifnot(identical(utils::head(m,c(2,2)),m[1:2,1:2,drop=FALSE]),
+          identical(utils::head(m,c(NA,2)),m[,1:2,drop=FALSE]),
+          identical(utils::head(m,-1),m[1:2,,drop=FALSE]))
+t <- utils::tail(m,c(2,2))
+stopifnot(identical(c(t),c(8L,9L,11L,12L)),
+          identical(dimnames(t),list(c("[2,]","[3,]"),c("[,3]","[,4]"))),
+          identical(utils::tail(m,c(-1,-1),keepnums=FALSE),m[2:3,2:4,drop=FALSE]))
+a <- structure(1:27,dim=c(3L,3L,3L))
+stopifnot(identical(utils::head(a,c(2,NA,1)),a[1:2,,1,drop=FALSE]),
+          identical(utils::tail(a,c(2,NA,-1),keepnums=FALSE),a[2:3,,2:3,drop=FALSE]),
+          identical(dimnames(utils::tail(a,c(2,2,2))),list(c("[2,]","[3,]"),c("[,2]","[,3]"),c("2","3"))),
+          identical(dim(utils::head(structure(1:4,dim=4L),2)),2L),
+          identical(dim(utils::tail(structure(1:4,dim=4L),2)),2L))
+d <- data.frame(a=1:3,b=4:6)
+stopifnot(identical(utils::head(d,c(1,1)),d[1,1,drop=FALSE]),
+          identical(utils::tail(d,c(2,1)),d[2:3,2,drop=FALSE]))
+tryCatch(utils::head(v,1:2),error=function(e) cat(conditionMessage(e),"\n"))
+head.sample <- function(x, ...) "user method"
+stopifnot(identical(utils::head(structure(1:3,class="sample")),"user method"))
+
+=== case: head_and_tail_functions ===
+#@ tags: utils,head,tail
+#@ compare: exact
+f <- function(x,y=1){a<-x+y;a^2}
+h <- utils::head(f,2)
+t <- utils::tail(f,2)
+stopifnot(identical(class(h),"noquote"),
+          identical(unclass(c(h)),c("function (x, y = 1) ","{")),
+          identical(unclass(c(t)),c("    a^2","}")),
+          identical(dimnames(h),list(c("1","2"),"")),
+          identical(dimnames(t),list(c("4","5"),"")),
+          identical(unclass(c(utils::head(sum))),'.Primitive("sum")'))
+
+=== case: capture_output_and_message ===
+#@ tags: utils,capture.output
+#@ compare: exact
+stopifnot(identical(capture.output(cat("a\nb\n")),c("a","b")),
+          identical(capture.output(print(1:3)),"[1] 1 2 3"),
+          identical(capture.output(message("hi"),type="message"),"hi"),
+          identical(capture.output({cat("a\nb"); 7},print(3)),c("a","b[1] 7","[1] 3")),
+          identical(capture.output(invisible(7)),character()),
+          identical(capture.output(),character()))
+capture.output(cat("both\n"),split=TRUE)
+con <- textConnection("captured","w")
+invisible(capture.output(cat("conn\n"),file=con))
+stopifnot(identical(textConnectionValue(con),"conn"))
+close(con)
+path <- tempfile()
+capture.output(cat("first\n"),file=path)
+capture.output(cat("second\n"),file=path,append=TRUE)
+stopifnot(identical(readLines(path),c("first","second")))
+capture.output(cat("one"),file=path)
+capture.output(cat("two"),file=path,append=TRUE)
+stopifnot(identical(readBin(path,"raw",n=6L),charToRaw("onetwo")))
+unlink(path)
+print.capture_test <- function(x, ...) cat("custom print\n")
+stopifnot(identical(capture.output(structure(1,class="capture_test")),"custom print"))
+tryCatch(capture.output({cat("hidden\n");stop("test")}),error=function(e) cat(conditionMessage(e),"\n"))
+cat("after error\n")
+
+=== case: object_size_and_session_info ===
+#@ tags: utils,object.size,sessionInfo
+#@ compare: exact
+for (x in list(NULL,1L,1:3,1,TRUE,1+2i,raw(1),"a",c("a","a"),list(1,1L),matrix(1:4,2))) {
+    n <- object.size(x)
+    stopifnot(identical(class(n),"object_size"),typeof(n)=="double")
+    cat(format(n),"\n",sep="")
+    print(n)
+}
+cat(format(object.size(integer(1000)), units="KiB"),"\n",sep="")
+s <- sessionInfo(package=c("utils","stats"))
+stopifnot(identical(class(s),"sessionInfo"),
+          identical(s$basePkgs,c("utils","stats")),
+          identical(s$R.version$version.string,"R version 4.6.2 (2026-10-29)"),
+          identical(s$RNGkind,RNGkind()),
+          any(names(s$loadedOnly)=="compiler"))

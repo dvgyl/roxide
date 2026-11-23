@@ -212,6 +212,22 @@ impl Ctx {
                 return Ok(Some(fun.value));
             }
         }
+        let tag = self.session.intern(name)?;
+        for i in 0..self.packages.len() {
+            let env = self.packages[i].namespace;
+            if let Some(binding) = self.session.env_get(env, tag)
+                && binding.value != SEXP_MISSING
+                && binding.value != SEXP_UNBOUND
+            {
+                let value = self.read_binding(binding, env)?;
+                if matches!(
+                    self.session.type_of(value)?,
+                    SexpType::Clo | SexpType::Builtin | SexpType::Special
+                ) {
+                    return Ok(Some(value));
+                }
+            }
+        }
         self.optional_fun(name, BASE_ENV, SEXP_NIL)
     }
 
