@@ -1,0 +1,158 @@
+=== case: tools_rd_sections ===
+#@ tags: tools,rd
+#@ compare: exact
+con <- textConnection(c("\\name{sample}", "\\alias{demo}", "\\title{A \\emph{title}}",
+                        "\\usage{sample(x)}", "\\value{a value}"))
+rd <- tools::parse_Rd(con, macros = FALSE)
+close(con)
+stopifnot(inherits(rd, "Rd"), is.null(attr(rd, "macros")))
+for (i in c(1, 3, 5, 7, 9)) cat(attr(rd[[i]], "Rd_tag"), attr(rd[[i]][[1]], "Rd_tag"), "\n")
+cat(as.integer(attr(rd[[1]], "srcref")), "\n")
+
+=== case: tools_rd_fragment_option ===
+#@ tags: tools,rd
+#@ compare: exact
+con <- textConnection("é\\link[pkg:target]{好} \\R")
+rd <- tools::parse_Rd(con, fragment = TRUE)
+close(con)
+stopifnot(is.environment(attr(rd, "macros")))
+cat(attr(rd[[2]], "Rd_tag"), "\n")
+opt <- attr(rd[[2]], "Rd_option")
+cat(opt, attr(opt, "Rd_tag"), "\n")
+cat(as.integer(attr(rd[[2]], "srcref")), "\n")
+cat(as.character(rd), sep = "|")
+
+=== case: tools_rd_comments_escapes ===
+#@ tags: tools,rd
+#@ compare: exact
+con <- textConnection(c("a\\%b\\{c\\}d\\\\z %comment", "\\code{x  +  1}"))
+rd <- tools::parse_Rd(con, fragment = TRUE)
+close(con)
+for (i in 1:3) cat(attr(rd[[i]], "Rd_tag"), sub("\n", "<newline>", rd[[i]], fixed = TRUE), "\n")
+cat(attr(rd[[4]][[1]], "Rd_tag"), rd[[4]][[1]], "\n")
+
+=== case: tools_rd_R_code_quotes_and_comments ===
+#@ tags: tools,rd
+#@ compare: exact
+con <- textConnection(c('\\code{r"(x"}y)"}', "\\code{1 # comment}"))
+rd <- tools::parse_Rd(con, fragment = TRUE, macros = FALSE)
+close(con)
+for (i in c(1, 3)) cat(attr(rd[[i]][[1]], "Rd_tag"), rd[[i]][[1]], "\n")
+
+=== case: tools_rd_macro_expansion ===
+#@ tags: tools,rd
+#@ compare: exact
+con <- textConnection(c("\\newcommand{\\hi}{Hi #1}", "\\hi{there} friend."))
+rd <- tools::parse_Rd(con, fragment = TRUE)
+close(con)
+cat(as.integer(rd[[1]]), attr(rd[[1]], "definition"), "\n")
+cat(attr(rd[[3]], "Rd_tag"), attr(rd[[3]], "macro"), rd[[3]], "\n")
+cat(as.character(rd), sep = "")
+
+=== case: tools_rd_conditional ===
+#@ tags: tools,rd
+#@ compare: exact
+con <- textConnection(c("#ifdef unix", "yes", "#endif", "#ifndef unix", "no", "#endif"))
+rd <- tools::parse_Rd(con, fragment = TRUE)
+close(con)
+cat(attr(rd, "dynamicFlag"), attr(rd[[1]], "dynamicFlag"), "\n")
+cat(as.character(rd), sep = "")
+
+=== case: tools_rd_to_text_page ===
+#@ tags: tools,rd
+#@ compare: exact
+con <- textConnection(c("\\name{sample}", "\\alias{sample}", "\\title{Sample \\emph{title}}",
+"% top comment", "\\description{", "  First   line % comment",
+"  next line. \\code{x  +  1}, \\emph{word}, \\verb{a   b}.",
+"  \\href{https://example.org}{link}; \\url{https://example.org/a}.",
+"  Inline \\eqn{x^2}{x squared}.", "  \\deqn{y^2}{y squared}", "}",
+"\\usage{sample(x, y = 1)}", "\\arguments{", "  \\item{x}{First \\code{arg}.}",
+"  \\item{y}{Second arg.}", "}", "\\value{A value.}", "\\section{Extra heading}{",
+"One paragraph.", "", "\\preformatted{", "  first   line", "    second", "}",
+"Last.", "}", "\\examples{", "x <- 1  # R comment", "sample(x)", "\\dontrun{sample(0)}", "}"))
+rd <- tools::parse_Rd(con)
+close(con)
+tools::Rd2txt(rd, options = list(underline_titles = FALSE))
+
+=== case: tools_rd_to_text_lists ===
+#@ tags: tools,rd
+#@ compare: exact
+con <- textConnection(c("Before", "\\itemize{\\item One \\item Two}", "After",
+  "\\enumerate{\\item first \\item second}", "\\describe{\\item{Key}{Value} \\item{Other}{More}}",
+  "\\tabular{lr}{a \\tab b \\cr cc \\tab dd}", "After table"))
+tools::Rd2txt(con, fragment = TRUE, options = list(itemBullet = "- "))
+close(con)
+
+=== case: tools_rd_to_text_column_one_comment ===
+#@ tags: tools,rd
+#@ compare: exact
+render <- function(blank) {
+    con <- textConnection(c("\\name{x}", "\\title{Title}", "\\description{First paragraph.",
+                            blank, "% comment", "Second paragraph.}"))
+    on.exit(close(con))
+    tools::Rd2txt(con, options = list(underline_titles = FALSE))
+}
+render("")
+render(NULL)
+
+=== case: tools_rd_to_text_connection ===
+#@ tags: tools,rd
+#@ compare: exact
+src <- textConnection("A \\bold{word} and a long sentence that needs to wrap.")
+dest <- textConnection("lines", "w")
+res <- withVisible(tools::Rd2txt(src, dest, fragment = TRUE, options = list(width = 22)))
+stopifnot(!res$visible, isOpen(src), isOpen(dest))
+cat(textConnectionValue(dest), sep = "\n")
+close(src)
+close(dest)
+
+=== case: tools_rd_render_options ===
+#@ tags: tools,rd
+#@ compare: exact
+old <- tools::Rd2txt_options(width = 27L, underline_titles = FALSE)
+now <- tools::Rd2txt_options()
+cat(old$width, old$underline_titles, now$width, now$underline_titles, "\n")
+con <- textConnection(c("\\name{x}", "\\title{T}", "\\description{A short sentence with enough text to wrap.}"))
+tools::Rd2txt(con)
+close(con)
+
+=== case: tools_license_canonical ===
+#@ tags: tools,license
+#@ compare: exact
+for (x in c("MIT", "Apache License (>= 2)", "GPL-2 | GPL-3", "BSD_3_clause",
+            "CC0", "Artistic-2.0", "Unlimited", "LGPL (>= 2.1)", "MPL-2.0")) {
+    a <- tools::analyze_license(x)
+    stopifnot(a$is_canonical, a$is_standardizable, a$is_verified, a$is_FOSS, !a$restricts_use)
+    expanded <- character()
+    for (part in a$expansions) expanded <- c(expanded, part)
+    cat(a$standardization, a$spdx, expanded, "\n")
+}
+
+=== case: tools_license_files ===
+#@ tags: tools,license
+#@ compare: exact
+a <- tools::analyze_license("MIT + file LICENSE | GPL-2 + file LICENCE")
+cat(names(a), "\n")
+cat(a$pointers, a$extensions$components, a$extensions$extensible, a$spdx, "\n")
+b <- tools::analyze_license("file LICENSE")
+cat(b$is_canonical, b$is_standardizable, b$is_verified, b$is_FOSS, b$restricts_use, b$spdx, "\n")
+
+=== case: tools_license_invalid_and_restricted ===
+#@ tags: tools,license
+#@ compare: exact
+for (x in c("", NA, "MIT OR Apache-2.0", "ISC", "MPL 2.0", "CC BY-NC 4.0", "GPL (>= 9)")) {
+    a <- tools::analyze_license(x)
+    cat(a$is_empty, a$is_canonical, paste(a$bad_components, collapse = "|"), a$is_standardizable, a$is_verified,
+        a$is_FOSS, a$restricts_use, a$spdx, "\n")
+}
+
+=== case: tools_file_extensions ===
+#@ tags: tools,path
+#@ compare: exact
+p <- c("a.txt", "a.tar.gz", ".profile", "a.tar.bz2", "a.tar.xz", "a.b-c",
+       "d.x/a", "a..b", "dir.x/", NA)
+cat(tools::file_ext(p), sep = "|")
+cat("\n")
+cat(tools::file_path_sans_ext(p), sep = "|")
+cat("\n")
+cat(tools::file_path_sans_ext(p, TRUE), sep = "|")
