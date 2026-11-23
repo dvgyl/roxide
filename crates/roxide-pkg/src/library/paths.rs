@@ -340,8 +340,13 @@ pub(super) fn system_file(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalRe
                 .map(|path| root.join(path.trim_start_matches('/')))
                 .collect();
         }
+        let virtual_builtin = parts.is_empty()
+            && (package == "base"
+                || ctx
+                    .ns_record(&package)
+                    .is_some_and(|rec| rec.builtin && rec.path.is_none()));
         for path in paths {
-            if ctx.host().metadata(&path, true).is_ok() {
+            if virtual_builtin || ctx.host().metadata(&path, true).is_ok() {
                 found.push(path);
             }
         }

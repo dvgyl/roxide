@@ -37,9 +37,11 @@ pub fn run_with_host(args: &[String], mut host: Box<dyn Host>, boot: Boot<'_>) -
         }
     };
     let result = boot(host).and_then(|mut ctx| {
-        ctx.register_module(&ARGUMENTS)?;
-        ctx.ext::<Arguments>().full = options.full.clone();
-        ctx.ext::<Arguments>().trailing = options.trailing.clone();
+        let sym = ctx.session_mut().intern("commandArgs")?;
+        if ctx.session().env_get(BASE_ENV, sym).is_none() {
+            ctx.register_module(&ARGUMENTS)?;
+        }
+        set_command_args(&mut ctx, options.full.clone(), options.trailing.clone());
         ctx.capture_streams(true, true, false, |ctx| Ok(execute(ctx, &options)))
             .map_err(|error| InternalError {
                 message: format!("{error:?}"),
@@ -276,7 +278,14 @@ impl Trace for Arguments {
 
 impl CtxExt for Arguments {}
 
-const ARGUMENTS: Module = Module {
+/// Store the full and trailing command-line arguments returned by `commandArgs()`.
+pub fn set_command_args(ctx: &mut Ctx, full: Vec<String>, trailing: Vec<String>) {
+    let args = ctx.ext::<Arguments>();
+    args.full = full;
+    args.trailing = trailing;
+}
+
+pub(crate) const ARGUMENTS: Module = Module {
     prims: &[internal("rox_batch_args", 1, command_args, Visibility::On)],
     prelude: "commandArgs <- function(trailingOnly = FALSE) .Internal(rox_batch_args(trailingOnly))",
 };

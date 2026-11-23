@@ -98,7 +98,13 @@ fn load_new(
     let path = valid_package(name)
         .then(|| find(ctx, name, paths))
         .flatten()
-        .ok_or_else(|| ctx.stop(call, format!("there is no package called ‘{name}’")))?;
+        .ok_or_else(|| {
+            ctx.stop_with_class(
+                call,
+                format!("there is no package called ‘{name}’"),
+                &["packageNotFoundError"],
+            )
+        })?;
     let description = Description::read(ctx, &path)?;
     if description.package != name {
         return Err(ctx.stop(call, format!("package ‘{name}’ has an invalid DESCRIPTION")));

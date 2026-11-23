@@ -5,7 +5,7 @@ use roxide_gc::SexpId;
 use roxide_host::Limits;
 use roxide_value::{
     BASE_ENV, BASE_NAMESPACE, CharId, EMPTY_ENV, Elem, Encoding, GLOBAL_ENV, PromiseState,
-    RSession, SEXP_MISSING, SEXP_NIL, SEXP_UNBOUND, SexpType, Sym, ValueApi, ValueError, VecView,
+    RSession, SEXP_MISSING, SEXP_NIL, SEXP_UNBOUND, SexpType, Sym, ValueApi, VecView,
 };
 
 use super::{
@@ -498,20 +498,6 @@ fn compact<T: Elem>(
     Some((name, [*len as f64, start, step]))
 }
 
-fn frame_locked(session: &mut RSession, env: SexpId) -> WireResult<bool> {
-    // The value API has no lock getter. An absent name tests the frame lock.
-    // Remove the temporary binding before any evaluation or garbage collection.
-    let mut name = session.intern("")?;
-    while session.env_get(env, name).is_some() {
-        let next = format!("{}.", session.sym_name(name)?);
-        name = session.intern(&next)?;
-    }
-    match session.env_define(env, name, SEXP_NIL) {
-        Ok(()) => {
-            session.env_remove(env, name)?;
-            Ok(false)
-        }
-        Err(ValueError::LockedBinding(_)) => Ok(true),
-        Err(err) => Err(err.into()),
-    }
+fn frame_locked(session: &RSession, env: SexpId) -> WireResult<bool> {
+    Ok(session.env_is_locked(env)?)
 }

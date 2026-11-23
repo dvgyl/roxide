@@ -28,11 +28,17 @@ struct CliOpts {
     show_version: bool,
     exprs: Vec<String>,
     file: Option<String>,
+    full_args: Vec<String>,
+    trailing_args: Vec<String>,
 }
 
 fn parse_cli() -> Result<CliOpts, String> {
-    let mut opts = CliOpts::default();
-    let mut args = env::args().skip(1);
+    let raw: Vec<String> = env::args().collect();
+    let mut opts = CliOpts {
+        full_args: raw.clone(),
+        ..CliOpts::default()
+    };
+    let mut args = raw.into_iter().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--version" | "-V" => {
@@ -63,7 +69,10 @@ fn parse_cli() -> Result<CliOpts, String> {
                     .ok_or_else(|| String::from("option '-f' requires an argument"))?;
                 opts.file = Some(path);
             }
-            "--args" | "--" => break,
+            "--args" | "--" => {
+                opts.trailing_args.extend(args);
+                break;
+            }
             s if s.starts_with("--file=") => {
                 opts.file = Some(s["--file=".len()..].to_owned());
             }
@@ -77,6 +86,10 @@ fn parse_cli() -> Result<CliOpts, String> {
             path => {
                 if opts.exprs.is_empty() && opts.file.is_none() {
                     opts.file = Some(path.to_owned());
+                    opts.trailing_args.extend(args);
+                } else {
+                    opts.trailing_args.push(path.to_owned());
+                    opts.trailing_args.extend(args);
                 }
                 break;
             }
@@ -162,13 +175,15 @@ fn interpret(opts: CliOpts, stack_bytes: usize) -> ExitCode {
     };
     ctx.session_mut().heap.set_policy(run_policy);
     ctx.set_stack_budget(stack_bytes - 2 * 1024 * 1024);
+    roxide_pkg::batch::set_command_args(&mut ctx, opts.full_args, opts.trailing_args);
 
     if !opts.exprs.is_empty() {
         for expr in &opts.exprs {
             if let Err(unwind) = ctx.run_global("<expr>", expr) {
-                return handle_unwind(unwind);
+                return handle_unwind(&mut ctx, unwind);
             }
         }
+        ctx.run_exit_finalizers();
         return ExitCode::SUCCESS;
     }
 
@@ -185,8 +200,11 @@ fn interpret(opts: CliOpts, stack_bytes: usize) -> ExitCode {
             }
         };
         return match ctx.run_global(&path_str, &src) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(unwind) => handle_unwind(unwind),
+            Ok(()) => {
+                ctx.run_exit_finalizers();
+                ExitCode::SUCCESS
+            }
+            Err(unwind) => handle_unwind(&mut ctx, unwind),
         };
     }
 
@@ -197,14 +215,24 @@ fn interpret(opts: CliOpts, stack_bytes: usize) -> ExitCode {
         return ExitCode::FAILURE;
     }
     match ctx.run_global("<stdin>", &src) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(unwind) => handle_unwind(unwind),
+        Ok(()) => {
+            ctx.run_exit_finalizers();
+            ExitCode::SUCCESS
+        }
+        Err(unwind) => handle_unwind(&mut ctx, unwind),
     }
 }
 
-fn handle_unwind(unwind: Unwind) -> ExitCode {
+fn handle_unwind(ctx: &mut Ctx, unwind: Unwind) -> ExitCode {
     match unwind {
-        Unwind::Quit { status, .. } => ExitCode::from(status.clamp(0, 255) as u8),
+        Unwind::Quit {
+            status, run_last, ..
+        } => {
+            if run_last {
+                ctx.run_exit_finalizers();
+            }
+            ExitCode::from(status.clamp(0, 255) as u8)
+        }
         Unwind::TopLevel => {
             let _ = writeln!(io::stderr().lock(), "Execution halted");
             ExitCode::FAILURE

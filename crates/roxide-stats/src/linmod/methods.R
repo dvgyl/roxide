@@ -113,7 +113,6 @@ nobs.default <- function(object, use.fallback = FALSE, ...) {
     result
 }
 
-summary <- function(object, ...) UseMethod("summary")
 summary.lm <- function(object, correlation = FALSE, symbolic.cor = FALSE, ...) {
     p <- object$rank
     r <- object[["residuals"]]

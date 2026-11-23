@@ -31,6 +31,7 @@ pub(super) fn add_any_distance(distances: &mut [Distances]) {
 pub(super) struct Ranked {
     ranks: Vec<Rank>,
     total: usize,
+    exact: bool,
 }
 
 impl Ranked {
@@ -43,12 +44,18 @@ impl Ranked {
         let total = ranks
             .iter()
             .fold(0_usize, |sum, &(distance, _)| sum.saturating_add(distance));
-        Some(Self { ranks, total })
+        let exact = ranks.iter().any(|&(distance, _)| distance == 0);
+        Some(Self {
+            ranks,
+            total,
+            exact,
+        })
     }
 
     pub(super) fn order(&self, other: &Self) -> std::cmp::Ordering {
         self.total
             .cmp(&other.total)
+            .then_with(|| other.exact.cmp(&self.exact))
             .then_with(|| {
                 self.ranks
                     .iter()
@@ -67,6 +74,6 @@ impl Ranked {
         self.ranks
             .iter()
             .zip(&other.ranks)
-            .any(|(chosen, alt)| chosen.0 > alt.0)
+            .any(|(chosen, alt)| alt < chosen)
     }
 }

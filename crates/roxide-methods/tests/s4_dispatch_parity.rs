@@ -54,13 +54,13 @@ const PROBES: &[Probe] = &[
         target: &["D", "D"],
         methods: &[&["L", "R"], &["R", "L"]],
         chosen: 1,
-        note: false,
+        note: true,
     },
     Probe {
         target: &["E", "E"],
         methods: &[&["L", "R"], &["R", "L"]],
         chosen: 2,
-        note: false,
+        note: true,
     },
     Probe {
         target: &["D", "D"],
@@ -126,6 +126,30 @@ const PROBES: &[Probe] = &[
         target: &["N6", "N6"],
         methods: &[&["ANY", "N6"], &["N2", "N2"]],
         chosen: 1,
+        note: true,
+    },
+    Probe {
+        target: &["N1", "N2"],
+        methods: &[&["N0", "N0"], &["ANY", "N2"]],
+        chosen: 2,
+        note: true,
+    },
+    Probe {
+        target: &["N2", "N2"],
+        methods: &[&["N1", "N1"], &["N0", "N2"]],
+        chosen: 2,
+        note: true,
+    },
+    Probe {
+        target: &["N2", "N2", "N2"],
+        methods: &[&["N2", "N1", "N1"], &["N0", "N2", "N2"]],
+        chosen: 1,
+        note: true,
+    },
+    Probe {
+        target: &["N2", "N2", "N2"],
+        methods: &[&["N1", "N1", "N1"], &["N0", "N1", "N2"]],
+        chosen: 2,
         note: true,
     },
 ];
@@ -204,9 +228,16 @@ probe <- function(i, target, signatures) {
         })
         setMethod(name, signatures[[j]], method, where = .GlobalEnv)
     }
-    selected <- suppressMessages(selectMethod(name, target))
+    notes <- FALSE
+    selected <- withCallingHandlers(
+        selectMethod(name, target),
+        message = function(m) {
+            notes <<- TRUE
+            invokeRestart("muffleMessage")
+        }
+    )
     values <- lapply(target[target != "missing"], new)
-    cat(i, do.call(selected, values), "\n")
+    cat(i, do.call(selected, values), notes, "\n")
 }
 "#,
     );
@@ -234,15 +265,16 @@ probe <- function(i, target, signatures) {
             return Err(format!("Probe {} found no method", i + 1).into());
         };
         assert_eq!(*winner, probe.chosen, "probe {}", i + 1);
-        assert_eq!(
-            alternatives
-                .iter()
-                .any(|(other, _)| rank.ambiguous_with(other)),
-            probe.note,
-            "probe {}",
-            i + 1
-        );
-        expected.push_str(&format!("{} {} \n", i + 1, winner));
+        let note = alternatives
+            .iter()
+            .any(|(other, _)| rank.ambiguous_with(other));
+        assert_eq!(note, probe.note, "probe {}", i + 1);
+        expected.push_str(&format!(
+            "{} {} {} \n",
+            i + 1,
+            winner,
+            if note { "TRUE" } else { "FALSE" }
+        ));
         let signatures = probe
             .methods
             .iter()
@@ -271,7 +303,7 @@ probe <- function(i, target, signatures) {
 
 #[test]
 fn amended_ranking_uses_shared_any_distance_and_signature_order() {
-    let ranks = |target: &[&str], signatures: &[[&str; 2]]| {
+    let ranks = |target: &[&str], signatures: &[&[&str]]| {
         let mut maps = target
             .iter()
             .map(|&name| distances(name, class_info(name).superclasses))
@@ -281,7 +313,7 @@ fn amended_ranking_uses_shared_any_distance_and_signature_order() {
             .iter()
             .enumerate()
             .filter_map(|(i, sig)| {
-                let signature = sig.map(str::to_owned);
+                let signature = sig.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
                 Ranked::score(&signature, &maps).map(|score| (score, i))
             })
             .collect::<Vec<_>>();
@@ -289,12 +321,26 @@ fn amended_ranking_uses_shared_any_distance_and_signature_order() {
         candidates.into_iter().map(|(_, i)| i).collect::<Vec<_>>()
     };
     assert_eq!(
-        ranks(&["N1", "N2"], &[["N0", "N0"], ["ANY", "N2"]]),
+        ranks(&["N1", "N2"], &[&["N0", "N0"], &["ANY", "N2"]]),
+        vec![1, 0]
+    );
+    assert_eq!(
+        ranks(&["N2", "N2"], &[&["N1", "N1"], &["N0", "N2"]]),
+        vec![1, 0]
+    );
+    assert_eq!(
+        ranks(
+            &["N2", "N2", "N2"],
+            &[&["N2", "N1", "N1"], &["N0", "N2", "N2"]]
+        ),
         vec![0, 1]
     );
     assert_eq!(
-        ranks(&["N2", "N2"], &[["N1", "N1"], ["N0", "N2"]]),
-        vec![0, 1]
+        ranks(
+            &["N2", "N2", "N2"],
+            &[&["N1", "N1", "N1"], &["N0", "N1", "N2"]]
+        ),
+        vec![1, 0]
     );
 }
 

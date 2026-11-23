@@ -21,6 +21,7 @@ pub fn register(ctx: &mut Ctx) -> Result<(), InternalError> {
     ctx.register_module(&library::MODULE)?;
     ctx.register_module(&s3reg::MODULE)?;
     ctx.register_module(&lazyload::MODULE)?;
+    ctx.register_module(&batch::ARGUMENTS)?;
     ctx.set_namespace_loader(&loader::LOADER);
     Ok(())
 }

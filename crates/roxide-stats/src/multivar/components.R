@@ -34,8 +34,6 @@
     list(matrix = x, center = center, scale = scale)
 }
 
-summary <- function(object, ...) UseMethod("summary")
-
 prcomp <- function(x, ...) UseMethod("prcomp")
 prcomp.default <- function(x, retx = TRUE, center = TRUE, scale. = FALSE,
                            tol = NULL, rank. = NULL, ...) {

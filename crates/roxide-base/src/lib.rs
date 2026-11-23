@@ -32,7 +32,6 @@ mod tier_a_strings;
 mod tier_a_subset;
 
 use roxide_eval::{Ctx, InternalError, Module};
-use roxide_value::{BASE_ENV, ValueApi};
 
 /// Ordered list of `roxide-base` submodules registered into `BASE_ENV`.
 pub const MODULES: &[&Module] = &[
@@ -57,16 +56,6 @@ pub const MODULES: &[&Module] = &[
 pub fn register_all(ctx: &mut Ctx) -> Result<(), InternalError> {
     for module in MODULES {
         ctx.register_module(module)?;
-    }
-    // Stats also registers a summary generic. Give it the base methods.
-    for class in ["default", "matrix", "factor"] {
-        let name = ctx.session_mut().intern(&format!("summary.{class}"))?;
-        if let Some(method) = ctx.session().env_get(BASE_ENV, name) {
-            ctx.ns_register_s3("stats", "summary", class, method.value)
-                .map_err(|err| InternalError {
-                    message: format!("could not register summary.{class}: {err:?}"),
-                })?;
-        }
     }
     Ok(())
 }
