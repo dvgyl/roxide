@@ -1,0 +1,112 @@
+=== case: normal_kinds_and_exponential ===
+#@ tags: layer2,rng
+#@ compare: exact
+for (kind in c("Ahrens-Dieter", "Box-Muller", "Inversion", "Kinderman-Ramage")) {
+    set.seed(42L, normal.kind = kind)
+    cat(sprintf("%a", rnorm(5L)), "\n")
+    cat(.Random.seed, "\n")
+}
+set.seed(42L)
+.Random.seed[1L] <- 10003L
+cat(sprintf("%a", rnorm(5L)), "\n")
+cat(.Random.seed, "\n")
+set.seed(42L, normal.kind = "Inversion")
+cat(sprintf("%a", rexp(12L)), "\n")
+cat(.Random.seed, "\n")
+
+=== case: gamma_rejection_and_rate_recycling ===
+#@ tags: layer2,rng
+#@ compare: exact
+for (shape in c(0.5, 1, 2.5)) {
+    set.seed(42L)
+    cat(sprintf("%a", rgamma(3L, shape)), "\n")
+    cat(.Random.seed, "\n")
+}
+set.seed(42L)
+cat(sprintf("%a", rgamma(6L, c(0.5, 2.5), scale = c(1, 2, 4))), "\n")
+cat(.Random.seed, "\n")
+
+=== case: binomial_and_poisson_switches ===
+#@ tags: layer2,rng
+#@ compare: exact
+for (size in c(59, 60, 2147483647)) {
+    set.seed(42L)
+    cat(rbinom(10L, size, 0.5), "\n")
+    cat(.Random.seed, "\n")
+}
+for (lambda in c(9.99, 10)) {
+    set.seed(42L)
+    cat(rpois(10L, lambda), "\n")
+    cat(.Random.seed, "\n")
+}
+
+=== case: mixture_and_rank_draws ===
+#@ tags: layer2,rng
+#@ compare: exact
+set.seed(42L)
+cat(rnbinom(8L, 2, 0.4), "\n")
+cat(rnbinom(8L, 2.25, mu = 18), "\n")
+cat(rgeom(8L, 0.3), "\n")
+cat(rwilcox(8L, 3, 4), "\n")
+cat(rsignrank(8L, 4), "\n")
+cat(.Random.seed, "\n")
+
+=== case: hypergeometric_generation_paths ===
+#@ tags: layer2,rng
+#@ compare: exact
+set.seed(42L)
+cat(rhyper(12L, 3, 12, 5), "\n")
+cat(rhyper(12L, 60, 50, 80), "\n")
+cat(rhyper(12L, 1.5e9, 1e9, 1), "\n")
+cat(rhyper(12L, 1.5e9, 1e9, 30), "\n")
+cat(.Random.seed, "\n")
+
+=== case: multinomial_matrix_and_state ===
+#@ tags: layer2,rng
+#@ compare: exact
+set.seed(42L)
+x <- rmultinom(5L, 10L, c(a = 2, b = 3, c = 5))
+cat(typeof(x), dim(x), dimnames(x)[[1L]], "\n")
+cat(x, "\n")
+cat(.Random.seed, "\n")
+
+=== case: count_zero_and_vector_length ===
+#@ tags: layer2,rng
+#@ compare: exact
+dput(runif(0L))
+dput(exists(".Random.seed", envir = .GlobalEnv, inherits = FALSE))
+set.seed(42L)
+cat(sprintf("%a", runif(1:3, min = c(0, 1))), "\n")
+seed <- .Random.seed
+dput(rbinom(0L, 16, 0.5))
+dput(identical(seed, .Random.seed))
+error <- function(e) cat(conditionMessage(e), "\n")
+tryCatch(runif(-0.5), error = error)
+tryCatch(runif(NA_integer_), error = error)
+
+=== case: random_invalid_and_large_counts ===
+#@ tags: layer2,rng
+#@ compare: exact
+set.seed(42L)
+show <- function(x) {
+    withCallingHandlers({
+        cat(typeof(x), sprintf("%.17g", x), "\n")
+    }, warning = function(w) {
+        cat(conditionMessage(w), "\n")
+        invokeRestart("muffleWarning")
+    })
+}
+show(rnorm(2L, NA))
+show(rnorm(2L, sd = -1))
+show(rnorm(2L, numeric(0)))
+show(rbinom(2L, -1, 0.5))
+show(rpois(2L, -1))
+show(rnbinom(2L, 0, mu = 1))
+show(rhyper(2L, -1, 2, 2))
+show(rwilcox(2L, -1, 2))
+show(rsignrank(2L, -1))
+show(rbinom(2L, c(-1, 3e9), 1))
+show(rbinom(1L, 2147483647, 1))
+show(rpois(2L, 3e9))
+show(rhyper(2L, 3e9, 0, 3e9))
+cat(.Random.seed, "\n")

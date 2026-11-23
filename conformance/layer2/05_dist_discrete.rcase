@@ -1,0 +1,72 @@
+=== case: discrete_masses_and_log_tails ===
+#@ tags: layer2,distribution
+#@ compare: rel=1e-13
+show <- function(x) cat(sprintf("%.17g", x), "\n")
+x <- c(0, 1, 2, 4, 6)
+show(dbinom(x, 8, 0.25))
+show(pbinom(x, 8, 0.25, lower.tail = FALSE, log.p = TRUE))
+show(dpois(x, 3))
+show(ppois(x, 3, lower.tail = FALSE, log.p = TRUE))
+show(dnbinom(x, 2, mu = 3))
+show(pnbinom(x, 2, 0.4, lower.tail = FALSE, log.p = TRUE))
+show(dgeom(x, 0.3))
+show(pgeom(x, 0.3, lower.tail = FALSE, log.p = TRUE))
+show(dhyper(x, 6, 9, 5))
+show(phyper(x, 6, 9, 5, lower.tail = FALSE, log.p = TRUE))
+show(dwilcox(x, 3, 4))
+show(pwilcox(x, 3, 4, lower.tail = FALSE, log.p = TRUE))
+show(dsignrank(x, 4))
+show(psignrank(x, 4, lower.tail = FALSE, log.p = TRUE))
+show(dmultinom(c(2, 3, 5), prob = c(5, 2, 3)))
+show(dmultinom(c(1.9, 0, 2), 4, c(3, 0, 4), log = TRUE))
+
+=== case: large_population_hypergeometric ===
+#@ tags: layer2,distribution
+#@ compare: rel=1e-13
+x <- c(-1, 0, 1, 2, 3, 4, 5, 6)
+cat(sprintf("%.17g", dhyper(x, 1.5e9, 1e9, 5)), "\n")
+cat(sprintf("%.17g", phyper(x, 1.5e9, 1e9, 5)), "\n")
+cat(qhyper(c(0, 0.1, 0.5, 0.75, 1), 1.5e9, 1e9, 5), "\n")
+
+=== case: discrete_quantile_jump_boundaries ===
+#@ tags: layer2,distribution
+#@ compare: exact
+delta <- 1 + c(-1e-12, 0, 1e-12)
+cat(qbinom(pbinom(2, 8, 0.25) * delta, 8, 0.25), "\n")
+cat(qpois(ppois(2, 3) * delta, 3), "\n")
+cat(qnbinom(pnbinom(2, 2, 0.4) * delta, 2, mu = 3), "\n")
+cat(qgeom(pgeom(2, 0.3) * delta, 0.3), "\n")
+cat(qhyper(phyper(2, 6, 9, 5) * delta, 6, 9, 5), "\n")
+cat(qwilcox(pwilcox(2, 3, 4) * delta, 3, 4), "\n")
+cat(qsignrank(psignrank(2, 4) * delta, 4), "\n")
+eps <- 2.220446049250313e-16
+cat(qbinom(0.5 * (1 + c(8, 9) * eps), 1, 0.5), "\n")
+cat(qhyper(0.5 * (1 + c(1001, 1002) * eps), 1, 1, 1), "\n")
+cat(qsignrank(0.5 + c(10, 11) * eps, 1), "\n")
+cat(qpois(-1000, 3, lower.tail = FALSE, log.p = TRUE), "\n")
+cat(qnbinom(-1000, 2, 0.4, lower.tail = FALSE, log.p = TRUE), "\n")
+cat(qgeom(-1000, 0.3, lower.tail = FALSE, log.p = TRUE), "\n")
+
+=== case: discrete_diagnostics ===
+#@ tags: layer2,distribution
+#@ compare: exact
+show <- function(x) withCallingHandlers(
+    cat(x, "\n"),
+    warning = function(w) {
+        cat(conditionMessage(w), "\n")
+        invokeRestart("muffleWarning")
+    })
+show(dpois(c(0.2, 0.3, NA, NaN, 2), c(1, 1, NaN, NA, -1)))
+show(dbinom(2.25, 8, 0.25))
+show(dnbinom(2.25, 2, mu = 3))
+show(dgeom(2.25, 0.3))
+show(dhyper(2.25, 6, 9, 5))
+show(dwilcox(2.25, 3, 4))
+show(dsignrank(2.25, 4))
+show(qhyper(-Inf, 6, 9, 5, log.p = TRUE))
+show(qwilcox(-Inf, 3, 4, log.p = TRUE))
+show(qsignrank(-Inf, 4, log.p = TRUE))
+error <- function(e) cat(conditionMessage(e), "\n")
+tryCatch(dnbinom(1, 2, prob = 0.4, mu = 3), error = error)
+tryCatch(dmultinom(c(1, 2), 4, c(1, 2)), error = error)
+tryCatch(dmultinom(c(1, 2), prob = c(0, 0)), error = error)

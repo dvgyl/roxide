@@ -1,0 +1,113 @@
+=== case: all_nine_quantile_types ===
+#@ tags: layer2,descriptive
+#@ compare: exact
+x <- c(1, 2, 3, 4, 10)
+p <- c(0, 0.25, 0.33, 0.5, 1/3, 0.999999, 1)
+for (type in 1:9) {
+    q <- quantile(x, p, type = type)
+    cat(names(q), "\n")
+    cat(sprintf("%.17g", q), "\n")
+}
+
+=== case: quantile_names_fuzz_and_missing ===
+#@ tags: layer2,descriptive
+#@ compare: exact
+p <- c(NA_real_, NaN, 0, 0.25, 1/3, 0.999999, 1)
+dput(names(quantile(1:5, p, digits = 4)))
+dput(names(quantile(1:5, p, digits = 7)))
+dput(names(quantile(1:5, p, digits = 9)))
+dput(names(quantile(1:5, c(1e-12, -2e-14, 1 + 2e-14))))
+cat(quantile(c(1, NA, 2), c(NA_real_, NaN, 0.5), na.rm = TRUE), "\n")
+for (t in 1:4)
+    cat(quantile(1:4, c(0.24999, 0.25, 0.25001, 0.62499, 0.625, 0.62501),
+                 type = t, fuzz = 1e-3, names = FALSE), "\n")
+tryCatch(quantile(c(1, NA)), error = function(e) cat(conditionMessage(e), "\n"))
+tryCatch(quantile(1:5, type = 9.5), error = function(e) cat(conditionMessage(e), "\n"))
+
+=== case: matrix_and_vector_covariance ===
+#@ tags: layer2,descriptive
+#@ compare: rel=1e-13
+show <- function(x) cat(sprintf("%.17g", x), "\n")
+x <- c(1, 5, 3, 8, 2, 3)
+y <- c(2, 1, 2, 6, 3, 4)
+a <- matrix(c(x, y), 6L, dimnames = list(NULL, c("x", "y")))
+for (method in c("pearson", "spearman", "kendall")) {
+    show(cov(x, y, method = method))
+    show(cor(a, method = method))
+    show(cov(a, y, method = method))
+    show(cor(x, a, method = method))
+}
+show(var(a))
+show(sd(a))
+show(cov2cor(var(a)))
+dput(dimnames(cov(a)))
+dput(dimnames(cor(x, a)))
+dput(dimnames(cor(a, y)))
+dput(dimnames(cor(data.frame(x = x, y = y), a)))
+
+=== case: missing_observation_modes ===
+#@ tags: layer2,descriptive
+#@ compare: rel=1e-13
+show <- function(x) cat(sprintf("%.17g", x), "\n")
+a <- matrix(c(1, 4, 2, 8, 3, 7, 1, 2, NA, 3, 9, 4, NA, 2, 3, 5, 8, 7), 6L)
+for (use in c("everything", "complete.obs", "na.or.complete", "pairwise.complete.obs")) {
+    show(cov(a, use = use))
+    show(var(a, use = use))
+    show(cor(a, use = use))
+    show(cor(a, use = use, method = "spearman"))
+    show(cor(a, use = use, method = "kendall"))
+}
+show(var(c(1, NA, 4), na.rm = TRUE))
+show(sd(c(1, NA, 4), na.rm = TRUE))
+show(cov(a[c(1, 2, 4), 1:2], use = "all.obs"))
+
+=== case: covariance_diagnostics_and_empty_inputs ===
+#@ tags: layer2,descriptive
+#@ compare: exact
+error <- function(e) cat(conditionMessage(e), "\n")
+one <- matrix(c(1, 1, 1, 2, 3, 4), 3L)
+withCallingHandlers(cat(cor(one), "\n"), warning = function(w) {
+    cat(conditionMessage(w), "\n")
+    invokeRestart("muffleWarning")
+})
+tryCatch(cor(one, 1:2), error = error)
+tryCatch(cor(matrix(NA_real_, 3L, 2L), use = "complete.obs"), error = error)
+tryCatch(cov(c(1, NA, 2), 1:3, use = "all.obs"), error = error)
+tryCatch(cov(1:3, 1:3, use = "pairwise.complete.obs", method = "kendall"), error = error)
+tryCatch(cov2cor(1), error = error)
+dput(var(numeric(0)))
+dput(sd(NULL))
+cat(cor(matrix(NA_real_, 3L, 2L), use = "na.or.complete"), "\n")
+
+=== case: median_spread_and_weighted_mean ===
+#@ tags: layer2,descriptive
+#@ compare: rel=1e-13
+show <- function(x) cat(sprintf("%.17g", x), "\n")
+x <- c(8, 4, 3, 1, 9, 2)
+dput(median(c(1L, NA_integer_, 5L, 3L), na.rm = TRUE))
+dput(median(c(1L, NA_integer_, 5L, 3L)))
+show(median(x))
+show(IQR(x))
+show(IQR(c(x, NA), na.rm = TRUE, type = 8))
+show(mad(x))
+show(mad(x, low = TRUE))
+show(mad(x, high = TRUE))
+show(mad(c(x, NA), na.rm = TRUE))
+show(fivenum(x))
+show(fivenum(c(x, NA), na.rm = FALSE))
+show(weighted.mean(x, 1:6))
+show(weighted.mean(x))
+show(weighted.mean(c(Inf, 7), c(0, 1)))
+show(weighted.mean(c(1, NA, 3), c(1, NA, 2), na.rm = TRUE))
+dput(names(setNames(nm = c("a", "b"))))
+
+=== case: descriptive_s3_dispatch ===
+#@ tags: layer2,descriptive
+#@ compare: exact
+median.example <- function(x, ...) 42L
+quantile.example <- function(x, ...) 43L
+weighted.mean.example <- function(x, w, ...) 44L
+x <- structure(1:5, class = "example")
+dput(median(x))
+dput(quantile(x))
+dput(weighted.mean(x, 1:5))
