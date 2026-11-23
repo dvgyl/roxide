@@ -1,0 +1,62 @@
+=== case: package_library_require_use ===
+#@ tags: layer3,package-loader
+#@ compare: exact
+pkg <- "rxattach"
+d <- file.path(tempdir(), pkg)
+dir.create(file.path(d, "Meta"), recursive = TRUE)
+dir.create(file.path(d, "R"))
+writeLines(c("Package: rxattach", "Version: 1.2-3", "Title: Attach probe"), file.path(d, "DESCRIPTION"))
+writeLines("export(a, b)", file.path(d, "NAMESPACE"))
+writeLines(c("a <- 1L", "b <- 2L", "secret <- 3L"), file.path(d, "R", pkg))
+saveRDS(list(Built = list(R = getRversion(), Platform = R.version$platform,
+                         OStype = .Platform$OS.type),
+             DESCRIPTION = c(Package = pkg, Version = "1.2-3", Title = "Attach probe")), file.path(d, "Meta", "package.rds"))
+.libPaths(c(tempdir(), .libPaths()))
+dput(basename(find.package(pkg)))
+dput(basename(system.file("DESCRIPTION", package = pkg, mustWork = TRUE)))
+dput(format(packageVersion(pkg)))
+dput(c(getRversion() >= "4.6.2", numeric_version("1.2") == "1.2.0",
+       package_version("1.2-3") < "1.2.4"))
+dput(withVisible(requireNamespace(pkg, quietly = TRUE)))
+dput(any(search() == "package:rxattach"))
+loading <- withVisible(library(rxattach, lib.loc = tempdir()))
+dput(c(loading$visible, is.character(loading$value), any(loading$value == "rxattach")))
+dput(withVisible(library(rxattach, logical.return = TRUE)))
+dput(basename(path.package(pkg)))
+detach("package:rxattach")
+dput(withVisible(require(rxattach, lib.loc = tempdir(), quietly = TRUE, exclude = "b")))
+dput(ls(pos = 2L))
+detach("package:rxattach")
+dput(withVisible(require(rxmissing, quietly = TRUE)))
+dput(withVisible(library(rxmissing, logical.return = TRUE, quietly = TRUE)))
+temp <- withVisible(attach(list(temp_binding = 9L), name = "rxdata"))
+dput(c(temp$visible, identical(temp_binding, 9L)))
+detach(rxdata)
+unloadNamespace(pkg)
+
+
+=== case: package_use_selects_exports ===
+#@ tags: layer3,package-loader
+#@ compare: exact
+pkg <- "rxselect"
+d <- file.path(tempdir(), pkg)
+dir.create(file.path(d, "Meta"), recursive = TRUE)
+dir.create(file.path(d, "R"))
+writeLines(c("Package: rxselect", "Version: 1.0"), file.path(d, "DESCRIPTION"))
+writeLines("export(a, b)", file.path(d, "NAMESPACE"))
+writeLines(c("a <- 1L", "b <- 2L"), file.path(d, "R", pkg))
+saveRDS(list(Built = list(R = getRversion(), Platform = R.version$platform,
+                         OStype = .Platform$OS.type),
+             DESCRIPTION = c(Package = pkg, Version = "1.0")), file.path(d, "Meta", "package.rds"))
+.libPaths(c(tempdir(), .libPaths()))
+dput(withVisible(use(pkg, include.only = "b")))
+dput(ls(pos = 2L))
+dput(withVisible(use(pkg, include.only = "a")))
+dput(ls(pos = 2L))
+dput(sort(getNamespaceExports(pkg)))
+detach("package:rxselect")
+dput(withCallingHandlers(withVisible(use(pkg, include.only = "unknown")),
+                        message = function(e) invokeRestart("muffleMessage")))
+dput(any(search() == "package:rxselect"))
+dput(tryCatch(use(rxselect, include.only = "a"), error = function(e) TRUE))
+unloadNamespace(pkg)

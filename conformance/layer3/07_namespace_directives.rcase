@@ -1,0 +1,38 @@
+=== case: package_namespace_directives ===
+#@ tags: layer3,package-loader
+#@ compare: exact
+d <- file.path(tempdir(), "rxparse")
+dir.create(d)
+writeLines(c(
+    "{ export(x, 'y', c(a,b)); exportPattern('^pub') }",
+    "if (getRversion() >= '4.6.2' && .Platform$OS.type == 'unix') { export(new) } else { export(old) }",
+    "if (FALSE) unsupported()",
+    "if (Sys.info()[['sysname']] %in% c('Darwin','Linux')) export(unixHost)",
+    "import(p1, p2, except = c(a, b))",
+    "importFrom(stats, median, alias = 'sd', except = c(k,l))",
+    "exportClasses(A); exportClassPattern('^B'); exportMethods(f)",
+    "importClassesFrom(methods, B); importMethodsFrom(methods, g)",
+    "S3method(print, A); S3method(summary, B, fun)",
+    "S3method(rxgen::talk, A, talkA); S3method('rxgen::talk', B)",
+    "useDynLib(probe, sym, alias = actual, .registration = TRUE, .fixes = 'C_')"
+), file.path(d, "NAMESPACE"))
+ns <- parseNamespaceFile("rxparse", tempdir())
+stopifnot(identical(ns$exports, c("x", "y", "c(a, b)", "new", "unixHost")),
+          identical(ns$exportPatterns, "^pub"),
+          identical(ns$imports[[1L]], list("p1", except = c("a", "b"))),
+          identical(ns$imports[[2L]], list("p2", except = c("a", "b"))),
+          identical(ns$imports[[3L]], list("stats", c("median", alias = "sd", except = "c(k, l)"))),
+          identical(ns$exportClasses, "A"), identical(ns$exportClassPatterns, "^B"),
+          identical(ns$exportMethods, "f"),
+          identical(ns$importClasses, list(list("methods", "B"))),
+          identical(ns$importMethods, list(list("methods", "g"))),
+          identical(ns$S3methods[, 1L], c("print", "summary", "talk", "rxgen::talk")),
+          identical(ns$S3methods[, 4L], c(NA_character_, NA_character_, "rxgen", NA_character_)),
+          identical(ns$nativeRoutines$probe$symbolNames, c(sym = "sym", alias = "actual")),
+          identical(ns$nativeRoutines$probe$registrationFixes, c("C_", "")),
+          isTRUE(ns$nativeRoutines$probe$useRegistration))
+writeLines("if (TRUE) { unsupported() }", file.path(d, "NAMESPACE"))
+dput(tryCatch(parseNamespaceFile("rxparse", tempdir()), error = function(e) grepl("unknown namespace directive", conditionMessage(e))))
+writeLines("S3method(print, A, impl, extra)", file.path(d, "NAMESPACE"))
+dput(tryCatch(parseNamespaceFile("rxparse", tempdir()), error = function(e) TRUE))
+dput(length(parseNamespaceFile("rxmissing", tempdir(), FALSE)$exports))

@@ -1,0 +1,36 @@
+=== case: package_s3_registration_deferred ===
+#@ tags: layer3,package-loader
+#@ compare: exact
+fixture <- function(pkg, namespace, code) {
+    d <- file.path(tempdir(), pkg)
+    dir.create(file.path(d, "Meta"), recursive = TRUE)
+    dir.create(file.path(d, "R"))
+    writeLines(c(paste0("Package: ", pkg), "Version: 1.0"), file.path(d, "DESCRIPTION"))
+    writeLines(namespace, file.path(d, "NAMESPACE"))
+    writeLines(code, file.path(d, "R", pkg))
+    saveRDS(list(Built = list(R = getRversion(), Platform = R.version$platform,
+                              OStype = .Platform$OS.type),
+                 DESCRIPTION = c(Package = pkg, Version = "1.0")), file.path(d, "Meta", "package.rds"))
+}
+fixture("rxgen", "export(talk)", c("talk <- function(x) UseMethod('talk')",
+                                  "talk.default <- function(x) 'default'"))
+fixture("rxmeth", c("S3method(print, rxa)", "S3method(summary, rxb, summarize)",
+                    "S3method(rxgen::talk, rxa, talk_impl)"),
+        c("print.rxa <- function(x, ...) 'printed'",
+          "summarize <- function(object, ...) 'summarized'",
+          "talk_impl <- function(x) 'deferred'"))
+fixture("rxquoted", "S3method('rxgen::talk', rxb, talk_impl)", "talk_impl <- function(x) 'quoted'")
+.libPaths(c(tempdir(), .libPaths()))
+n <- loadNamespace("rxmeth", lib.loc = tempdir())
+x <- structure(1L, class = "rxa")
+y <- structure(1L, class = "rxb")
+dput(c(isNamespaceLoaded("rxgen"), any(search() == "package:rxmeth")))
+dput(print(x))
+dput(summary(y))
+dput(rxgen::talk(x))
+dput(isNamespaceLoaded("rxgen"))
+dput(tryCatch(loadNamespace("rxquoted", lib.loc = tempdir()), error = function(e) TRUE))
+unloadNamespace(n)
+dput(rxgen::talk(x))
+registerS3method("talk", "rxb", function(x) "registered", getNamespace("rxgen"))
+dput(rxgen::talk(y))

@@ -1,0 +1,54 @@
+=== case: package_namespace_lifecycle ===
+#@ tags: layer3,package-loader
+#@ compare: exact
+fixture <- function(pkg, namespace, code) {
+    d <- file.path(tempdir(), pkg)
+    dir.create(file.path(d, "Meta"), recursive = TRUE)
+    dir.create(file.path(d, "R"))
+    writeLines(c(paste0("Package: ", pkg), "Version: 1.0"), file.path(d, "DESCRIPTION"))
+    writeLines(namespace, file.path(d, "NAMESPACE"))
+    writeLines(code, file.path(d, "R", pkg))
+    saveRDS(list(Built = list(R = getRversion(), Platform = R.version$platform,
+                              OStype = .Platform$OS.type),
+                 DESCRIPTION = c(Package = pkg, Version = "1.0")), file.path(d, "Meta", "package.rds"))
+}
+fixture("rxtype", c("importFrom(stats, md = median)", "export(probe, created)", "exportPattern('^pub')"),
+        c("hidden <- 9", "pub2 <- 8L", "probe <- function() c(hidden, md(1:3), rxglobal)",
+          ".onLoad <- function(lib, pkg) {",
+          "  ns <- parent.env(environment())",
+          "  cat('load', environmentIsLocked(ns), bindingIsLocked('hidden', ns), isNamespaceLoaded(pkg), '\n')",
+          "  assign('created', 42L, ns)",
+          "}",
+          ".onAttach <- function(lib, pkg) cat('attach', pkg, '\n')",
+          ".onDetach <- function(libpath) cat('detach', basename(libpath), '\n')",
+          ".onUnload <- function(libpath) cat('unload', basename(libpath), '\n')"))
+fixture("rxuser", "importFrom(rxtype, probe)", character())
+rxglobal <- 501
+loaded <- withVisible(loadNamespace("rxtype", lib.loc = tempdir()))
+ns <- loaded$value
+dput(c(loaded$visible, identical(ns, loadNamespace("rxtype", tempdir())),
+       environmentIsLocked(ns), bindingIsLocked("hidden", ns),
+       any(loadedNamespaces() == "rxtype"), any(search() == "package:rxtype")))
+im <- parent.env(ns)
+dput(c(environmentName(ns), environmentName(im), environmentName(parent.env(im)),
+       environmentName(parent.env(parent.env(im)))))
+dput(rxtype::probe())
+dput(rxtype:::hidden)
+dput(getFromNamespace("hidden", "rxtype"))
+assignInNamespace("hidden", 10, "rxtype")
+dput(rxtype:::hidden)
+dput(bindingIsLocked("hidden", ns))
+dput(rxtype::created)
+dput(sort(getNamespaceExports(ns)))
+dput(getNamespaceName(ns))
+dput(getNamespaceVersion(ns))
+dput(getNamespaceImports(ns)$stats)
+a <- withVisible(attachNamespace(ns))
+dput(c(a$visible, identical(environment(rxtype::probe), ns),
+       environmentIsLocked(a$value), bindingIsLocked("probe", a$value)))
+dput(sort(ls(a$value)))
+loadNamespace("rxuser", lib.loc = tempdir()) -> consumer
+dput(tryCatch(unloadNamespace(ns), error = function(e) grepl("imported by", conditionMessage(e))))
+unloadNamespace(consumer)
+dput(withVisible(unloadNamespace(ns)))
+dput(c(isNamespaceLoaded("rxtype"), any(search() == "package:rxtype")))
