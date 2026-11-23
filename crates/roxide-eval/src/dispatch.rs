@@ -389,7 +389,10 @@ impl Ctx {
             for &(_, (_, value)) in &candidates {
                 if self.session.is_s4(value)? {
                     let symbol = self.session.intern(generic)?;
-                    if let Some(result) = hooks.dispatch(self, symbol, &call, args)? {
+                    let dollar = self.dollar_method_args(generic, call, args)?;
+                    if let Some(result) =
+                        hooks.dispatch(self, symbol, &call, dollar.as_ref().unwrap_or(args))?
+                    {
                         return Ok(Some(result));
                     }
                     break;
@@ -453,9 +456,15 @@ impl Ctx {
         let Some((candidate, method)) = methods.pop() else {
             return Ok(None);
         };
+        let dollar = self.dollar_method_args(generic, call, args)?;
+        let args = dollar.as_ref().unwrap_or(args);
         let mut pairs = Vec::with_capacity(args.len() + 1);
         for (i, (tag, value)) in args.iter().enumerate() {
-            let expr = promised.map_or(Ok(value), |args| self.promise_expr(args.get(i)))?;
+            let expr = if dollar.is_some() && i == 1 {
+                value
+            } else {
+                promised.map_or(Ok(value), |args| self.promise_expr(args.get(i)))?
+            };
             let tag = if group == Some(GroupGeneric::Ops) {
                 None
             } else {
@@ -476,6 +485,26 @@ impl Ctx {
             method,
         )
         .map(Some)
+    }
+
+    fn dollar_method_args(
+        &mut self,
+        generic: &str,
+        call: Call,
+        args: &Args,
+    ) -> EvalResult<Option<Args>> {
+        if !matches!(generic, "$" | "$<-") || self.session.type_of(args.get(1))? == SexpType::Str {
+            return Ok(None);
+        }
+        let name = self.name(args.get(1), call.err_call())?;
+        let name = self.session.scalar_str(&name)?;
+        self.protect(name);
+        Ok(Some(Args::from_pairs(
+            args.iter()
+                .enumerate()
+                .map(|(i, (tag, value))| (tag, if i == 1 { name } else { value }))
+                .collect(),
+        )))
     }
 
     fn resolve_ops(

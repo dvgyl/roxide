@@ -39,6 +39,8 @@ pub enum ValueError {
     EmbeddedNul,
     /// Attempted to modify a locked binding or locked environment.
     LockedBinding(String),
+    /// A new binding cannot be added to a locked environment.
+    LockedEnvironment,
     /// Invalid attribute value (e.g. `names` length mismatch).
     InvalidAttribute(String),
     /// Index out of bounds.
@@ -68,6 +70,7 @@ impl fmt::Display for ValueError {
             Self::LockedBinding(name) => {
                 write!(f, "cannot change value of locked binding for '{name}'")
             }
+            Self::LockedEnvironment => f.write_str("cannot add bindings to a locked environment"),
             Self::InvalidAttribute(msg) => f.write_str(msg),
             Self::IndexOutOfBounds { index, len } => {
                 write!(f, "subscript out of bounds ({index} >= {len})")
@@ -858,7 +861,7 @@ impl ValueApi for RSession {
                 Some(prev)
             } else {
                 if e.locked {
-                    return Err(ValueError::LockedBinding(sym_name));
+                    return Err(ValueError::LockedEnvironment);
                 }
                 let idx = e.entries.len();
                 e.entries.push((sym, binding));

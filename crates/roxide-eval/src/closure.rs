@@ -288,6 +288,7 @@ impl Ctx {
             let matched = ctx.match_args(&formals, &actuals, call, true)?;
             let env = ctx.session.alloc_env(enclos)?;
             ctx.protect(env);
+            let mut supplied_formals = vec![false; formals.len()];
             for (i, (tag, default)) in formals.iter().enumerate() {
                 let Some(tag) = tag else { continue };
                 let supplied = matched.slots[i].map_or(SEXP_MISSING, |i| actuals.get(i));
@@ -309,6 +310,7 @@ impl Ctx {
                 } else {
                     (ctx.session.alloc_promise(default, env)?, 1)
                 };
+                supplied_formals[i] = missing == 0;
                 ctx.session.env_define_binding(
                     env,
                     tag,
@@ -333,6 +335,7 @@ impl Ctx {
                 fun,
                 caller,
                 actuals,
+                supplied: supplied_formals,
                 dispatch,
             };
             let actuals = frame.actuals.values().to_vec();
@@ -351,25 +354,28 @@ impl Ctx {
 
     /// Read the active bindings of a generic call `frame` for forwarding to [`Ctx::apply_matched`].
     ///
-    /// Maps any formal binding with `missing > 0` (omitted argument, even if defaulted in the
-    /// generic) to `SEXP_MISSING`, while preserving supplied promises and `...` (`DOTSXP`) intact.
+    /// Read current values only for formals supplied at entry. Keep omitted formals missing.
     pub fn generic_frame_args(&mut self, frame: FrameId) -> EvalResult<Vec<(Sym, SexpId)>> {
-        let Some((_call, cloenv, fun, _caller)) = self.frame_info(frame) else {
+        let Some(frame) = self.frames.iter().find(|entry| entry.id == frame) else {
             return Err(self.stop(SEXP_NIL, "unknown call frame"));
         };
-        let (formals, _, _) = self.session.closure_parts(fun)?;
-        let formal_pairs: Vec<_> = self.session.pairlist_iter(formals).collect();
-        let mut out = Vec::with_capacity(formal_pairs.len());
-        for (tag, _) in formal_pairs {
-            let Some(sym) = tag else { continue };
-            let value = match self.session.env_get(cloenv, sym) {
-                Some(binding) if binding.missing > 0 => SEXP_MISSING,
-                Some(binding) => binding.value,
-                None => SEXP_MISSING,
-            };
-            out.push((sym, value));
-        }
-        Ok(out)
+        let (formals, _, _) = self.session.closure_parts(frame.fun)?;
+        Ok(self
+            .session
+            .pairlist_iter(formals)
+            .zip(&frame.supplied)
+            .filter_map(|((tag, _), &supplied)| {
+                let tag = tag?;
+                let value = if supplied {
+                    self.session
+                        .env_get(frame.cloenv, tag)
+                        .map_or(SEXP_MISSING, |binding| binding.value)
+                } else {
+                    SEXP_MISSING
+                };
+                Some((tag, value))
+            })
+            .collect())
     }
 
     /// Invoke closure `fun` with pre-matched formal bindings (preserving promises and
@@ -403,7 +409,8 @@ impl Ctx {
                 .collect();
             let actuals = Args::from_pairs(actual_pairs);
 
-            for (tag, default) in formals.iter() {
+            let mut supplied_formals = vec![false; formals.len()];
+            for (i, (tag, default)) in formals.iter().enumerate() {
                 let Some(tag) = tag else { continue };
                 let supplied = matched.iter().find(|&&(k, _)| k == tag).map(|&(_, v)| v);
                 let (value, missing) = if ctx.session.sym_name(tag)? == "..." {
@@ -418,6 +425,7 @@ impl Ctx {
                         _ => (ctx.session.alloc_promise(default, env)?, 1),
                     }
                 };
+                supplied_formals[i] = missing == 0;
                 ctx.session.env_define_binding(
                     env,
                     tag,
@@ -452,6 +460,7 @@ impl Ctx {
                 fun,
                 caller,
                 actuals,
+                supplied: supplied_formals,
                 dispatch: None,
             };
             let actual_vals = frame.actuals.values().to_vec();

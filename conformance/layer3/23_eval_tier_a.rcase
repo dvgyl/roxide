@@ -1,0 +1,147 @@
+=== case: promise_and_active_binding_visibility ===
+#@ tags: layer3,eval
+read <- function(x) withVisible(x)
+forced <- function(x) { force(x); withVisible(x) }
+dots <- function(...) withVisible(..1)
+makeActiveBinding("binding", function() invisible(4L), globalenv())
+dput(read(invisible(1L)))
+dput(forced(invisible(2L)))
+dput(dots(invisible(3L)))
+dput(withVisible(binding))
+dput(withVisible(if (FALSE) 1L))
+
+=== case: cat_output_and_common_numeric_format ===
+#@ tags: layer3,eval
+print(1e5)
+print(c(1, 1e6))
+print(c(0.001, 0.0015, 0.002))
+print(c(1e5, 1.5e5, 3e5))
+cat(1e6, "\n", sep="")
+f <- file.path(tempdir(), "roxide-cat.txt")
+cat("abc", "de", fill = 6, file = f)
+cat("last\n", file = f, append = TRUE)
+dput(readLines(f))
+con <- textConnection("result", "w")
+cat(c("one", "two"), sep = "\n", file = con)
+close(con)
+dput(result)
+
+=== case: dollar_dispatch_and_next_method_arguments ===
+#@ tags: layer3,eval,s4
+`$.rx` <- function(x, name) list(name, substitute(name))
+`$<-.rx` <- function(x, name, value) list(name, value)
+x <- structure(list(), class = "rx")
+dput(x$field)
+x$field <- 4L
+dput(x)
+invisible(setGeneric("evalTierGeneric", function(x, y = "default") standardGeneric("evalTierGeneric")))
+invisible(setMethod("evalTierGeneric", "numeric", function(x, y) c(y, missing(y))))
+invisible(setMethod("evalTierGeneric", "integer", function(x, y) {
+    y <- "assigned"
+    callNextMethod()
+}))
+dput(evalTierGeneric(1L))
+dput(evalTierGeneric(1L, "given"))
+
+=== case: environment_lookup_and_locking ===
+#@ tags: layer3,eval
+e <- list2env(list(alpha = 1L, .beta = 2L), parent = baseenv())
+dput(sort(names(e)))
+dput(identical(e, as.environment(e)))
+dput(identical(as.environment("package:base"), baseenv()))
+dput(identical(parent.env(as.environment(list(x = 1L))), emptyenv()))
+dput(get0("tier_a_absent", e, ifnotfound = "fallback"))
+dput(mget(c("alpha", ".beta", "gamma"), e, ifnotfound = list(NULL, NULL, identity)))
+dput(objects(envir = e, all.names = TRUE))
+delayedAssign("later", alpha + 2L, eval.env = e, assign.env = e)
+e$alpha <- 11L
+dput(get0("later", e))
+fn <- function() 16L
+makeActiveBinding("active", fn, e)
+dput(identical(activeBindingFunction(as.name("active"), e), fn))
+lockEnvironment(e)
+dput(tryCatch(assign("new", 1L, envir = e), error = conditionMessage))
+lockBinding(as.name("alpha"), e)
+dput(tryCatch(assign("alpha", 3L, envir = e), error = conditionMessage))
+
+=== case: call_frames_and_lazy_dispatch ===
+#@ tags: layer3,eval
+outer <- function() inner(1L, 2L, 3L)
+inner <- function(x, ...) {
+    on.exit(invisible(7L))
+    dput(nargs())
+    dput(sys.parent())
+    dput(as.integer(sys.parents()))
+    dput(length(sys.frames()))
+    dput(deparse1(sys.calls()[[1L]]))
+    dput(sys.on.exit())
+}
+outer()
+factorial2 <- function(n) if (n <= 1L) 1L else n * Recall(n - 1L)
+dput(factorial2(5L))
+dput(forceAndCall(1, function(a, b) a, 9L, stop("unused")))
+dput(local({ x <- 4L; f <- function() eval.parent(quote(x)); f() }))
+dput(withVisible(switch("x", x =, y = invisible(9L))))
+dput(switch(2L, stop("unused"), 7L))
+dput(withVisible(switch("missing", x = 1L)))
+
+=== case: language_objects_and_list_rewriting ===
+#@ tags: layer3,eval
+f <- function(x = 2L) x + 1L
+dput(formals(f))
+dput(body(f))
+dput(body(args(f)))
+dput(formals(sum))
+formals(f) <- alist(y = 4L)
+body(f) <- quote(y * 2L)
+dput(f())
+dput(as.function(alist(x = 3L, x + 2L))())
+dput(eval(call("function", as.pairlist(alist(x = 3L)), quote(x + 4L)))())
+dput(as.call(list(as.name("f"), x = 56L)))
+dput(do.call(identity, list(quote(x + y)), quote = TRUE))
+dput(do.call(identity, list(as.name("x")), quote = TRUE))
+quote <- function(...) stop("unused")
+dput(do.call(identity, list(as.name("x")), quote = TRUE))
+x <- 3L
+dput(bquote(f(.(x), ..(list(y = 5L, 6L))), splice = TRUE))
+dput(str2lang("f(a = 2L)"))
+dput(str2expression(c("a", "2L")))
+dput((function(mode = c("red", "green")) match.arg(mode))("gr"))
+dput(identical(match.fun("sum"), sum))
+dput(identical(formals(Vectorize(f)), formals(f)))
+dput(identical(Vectorize(f, character()), f))
+dput(Negate(is.null)(NULL))
+dput(ifelse(c(TRUE, NA, FALSE), 1L, 2L))
+dput(c(is.primitive(sum), is.call(str2lang("f()")), is.name(as.name("x")),
+       is.symbol(as.name("x")), is.pairlist(NULL), is.expression(str2expression("x")),
+       is.language(str2expression("x")), is.recursive(list()), is.object(structure(1L, class="x"))))
+
+=== case: condition_types_and_restart_lookup ===
+#@ tags: layer3,eval
+result <- try(stop("failed", call. = FALSE), silent = TRUE)
+dput(class(result))
+dput(conditionMessage(attr(result, "condition")))
+dput(geterrmessage())
+invisible(try(stop("shown", call. = FALSE)))
+dput(withVisible(try(invisible(2L))))
+dput(class(simpleCondition("simple")))
+dput(class(errorCondition("bad", code = 1L, class = "rx")))
+dput(warningCondition("warn", code = 2L)$code)
+dput(suppressWarnings({ warning("silenced"); 3L }))
+dput(suppressMessages({ message("silenced"); 4L }))
+dput(suppressPackageStartupMessages({ packageStartupMessage("silenced"); 5L }))
+dput(withCallingHandlers(packageStartupMessage("hidden"),
+    packageStartupMessage = function(m) { dput(class(m)); tryInvokeRestart("muffleMessage") }))
+dput(withRestarts({
+    dput(computeRestarts()[[1L]]$name)
+    tryInvokeRestart("resume", 22L)
+}, resume = identity))
+dput(withVisible(tryInvokeRestart("absent")))
+
+=== case: exit_finalizer_runs_at_session_end ===
+#@ tags: layer3,eval
+local({
+    e <- new.env()
+    e$count <- 9L
+    reg.finalizer(e, function(e) dput(e$count), onexit = TRUE)
+})

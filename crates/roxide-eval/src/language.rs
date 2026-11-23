@@ -16,6 +16,71 @@ use crate::{Args, Arity, Call, Ctx, EvalResult, Module};
 
 pub(crate) const MODULE: Module = Module {
     prims: &[
+        primitive!("formals", function_parts, Eval, Arity::Exact(1), On),
+        primitive!(
+            "formals<-",
+            set_function_parts,
+            Eval,
+            Arity::Range(2, 3),
+            On
+        ),
+        primitive!("body", function_parts, Eval, Arity::Exact(1), On),
+        primitive!("body<-", set_function_parts, Eval, Arity::Range(2, 3), On),
+        primitive!("args", function_parts, Eval, Arity::Exact(1), On),
+        primitive!("alist", alist, Unevaluated, Arity::Any, On),
+        primitive!("as.pairlist", as_pairlist, Eval, Arity::Exact(1), On),
+        primitive!("as.function", as_function, Eval, Arity::Range(1, 2), On),
+        primitive!("call", construct_call, EvalKeepMissing, Arity::Any, On),
+        primitive!("as.call", as_call, Eval, Arity::Exact(1), On),
+        primitive!("bquote", bquote, Unevaluated, Arity::Range(1, 3), On),
+        primitive!("match.arg", match_arg, Eval, Arity::Range(1, 3), On),
+        primitive!("match.fun", match_fun, Eval, Arity::Range(1, 2), On),
+        primitive!("Recall", recall, Unevaluated, Arity::Any, SetByFn),
+        primitive!("nargs", nargs, Eval, Arity::Exact(0), On),
+        primitive!("str2lang", str_to_language, Eval, Arity::Exact(1), On),
+        primitive!("str2expression", str_to_language, Eval, Arity::Exact(1), On),
+        primitive!(
+            "eval.parent",
+            eval_parent,
+            Eval,
+            Arity::Range(1, 2),
+            SetByFn
+        ),
+        primitive!(
+            "forceAndCall",
+            force_and_call,
+            Unevaluated,
+            Arity::Any,
+            SetByFn
+        ),
+        primitive!("switch", switch, Unevaluated, Arity::Any, SetByFn),
+        primitive!(
+            "is.primitive",
+            language_predicate,
+            Eval,
+            Arity::Exact(1),
+            On
+        ),
+        primitive!("is.call", language_predicate, Eval, Arity::Exact(1), On),
+        primitive!("is.name", language_predicate, Eval, Arity::Exact(1), On),
+        primitive!("is.symbol", language_predicate, Eval, Arity::Exact(1), On),
+        primitive!("is.pairlist", language_predicate, Eval, Arity::Exact(1), On),
+        primitive!(
+            "is.expression",
+            language_predicate,
+            Eval,
+            Arity::Exact(1),
+            On
+        ),
+        primitive!("is.language", language_predicate, Eval, Arity::Exact(1), On),
+        primitive!(
+            "is.recursive",
+            language_predicate,
+            Eval,
+            Arity::Exact(1),
+            On
+        ),
+        primitive!("is.object", language_predicate, Eval, Arity::Exact(1), On),
         primitive!("function", closure, Unevaluated, Arity::Range(2, 3), On),
         primitive!("quote", quote, Unevaluated, Arity::Exact(1), On),
         primitive!("missing", missing, Unevaluated, Arity::Exact(1), On),
@@ -38,7 +103,6 @@ pub(crate) const MODULE: Module = Module {
         primitive!("eval", evaluate, Unevaluated, Arity::Range(1, 3), SetByFn),
         primitive!("evalq", evaluate, Unevaluated, Arity::Range(1, 3), SetByFn),
         primitive!("local", evaluate, Unevaluated, Arity::Range(1, 2), SetByFn),
-        primitive!("force", force, Eval, Arity::Exact(1), On),
         primitive!(
             "withVisible",
             with_visible,
@@ -52,7 +116,56 @@ pub(crate) const MODULE: Module = Module {
         primitive!("do.call", do_call, Eval, Arity::Range(2, 4), SetByFn),
         primitive!(".Internal", internal, Unevaluated, Arity::Exact(1), SetByFn),
     ],
-    prelude: "",
+    prelude: r#"
+identity <- function(x) x
+force <- function(x) x
+Negate <- function(f) {
+    f <- match.fun(f)
+    function(...) !f(...)
+}
+Vectorize <- function(FUN, vectorize.args = arg.names, SIMPLIFY = TRUE, USE.NAMES = TRUE) {
+    FUN <- match.fun(FUN)
+    arg.names <- names(formals(FUN))
+    if (is.null(arg.names)) stop("FUN must be a function with formal arguments")
+    if (!is.character(vectorize.args) && !is.null(vectorize.args))
+        stop("'vectorize.args' must be a character vector")
+    if (length(vectorize.args) == 0L) return(FUN)
+    includes <- function(x, choices) vapply(x, function(name) any(name == choices), FALSE)
+    if (!all(includes(vectorize.args, arg.names)))
+        stop("must specify formal argument names in 'vectorize.args'")
+    if (any(includes(vectorize.args, c("FUN", "SIMPLIFY", "USE.NAMES", "MoreArgs"))))
+        stop("'FUN', 'SIMPLIFY', 'USE.NAMES' and 'MoreArgs' cannot be vectorized")
+    wrapped <- function() {
+        supplied <- as.list(match.call(expand.dots = FALSE))[-1L]
+        values <- lapply(supplied, eval, envir = parent.frame())
+        varying <- includes(names(values), vectorize.args)
+        do.call(mapply, c(list(FUN = FUN), values[varying],
+                          list(MoreArgs = values[!varying], SIMPLIFY = SIMPLIFY,
+                               USE.NAMES = USE.NAMES)), quote = TRUE)
+    }
+    formals(wrapped) <- formals(FUN)
+    wrapped
+}
+ifelse <- function(test, yes, no) {
+    if (is.null(attributes(test)) && length(test) == 1L) {
+        if (is.na(test)) return(NA)
+        if (test && length(yes) == 1L && is.null(attributes(yes))) return(yes)
+        if (!test && length(no) == 1L && is.null(attributes(no))) return(no)
+    }
+    if (!is.logical(test)) {
+        saved <- attributes(test)
+        test <- as.logical(test)
+        attributes(test) <- saved
+    }
+    result <- test
+    indices <- seq_along(test)
+    positive <- indices[!is.na(test) & test]
+    negative <- indices[!is.na(test) & !test]
+    if (length(positive)) result[positive] <- rep(yes, length.out = length(test))[positive]
+    if (length(negative)) result[negative] <- rep(no, length.out = length(test))[negative]
+    result
+}
+"#,
 };
 
 impl Ctx {
@@ -162,7 +275,7 @@ impl Ctx {
     }
 
     pub(crate) fn list_args(&mut self, list: SexpId) -> EvalResult<Args> {
-        if self.session.type_of(list)? == SexpType::Vec {
+        if matches!(self.session.type_of(list)?, SexpType::Vec | SexpType::Expr) {
             let names_sym = self.session.intern("names")?;
             let names = self.session.attr(list, names_sym);
             let tags = if names == SEXP_NIL {
@@ -208,10 +321,6 @@ fn quote(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
             ));
         }
     }
-    Ok(args.get(0))
-}
-
-fn force(_: &mut Ctx, _: &Call, args: &mut Args) -> EvalResult {
     Ok(args.get(0))
 }
 
@@ -534,6 +643,7 @@ fn evaluate(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
         fun: SEXP_NIL,
         caller: call.env,
         actuals: args.clone(),
+        supplied: Vec::new(),
         dispatch: None,
     };
     ctx.run_frame(frame, |ctx| {
@@ -754,13 +864,19 @@ fn do_call(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
         what
     };
     let args = if quote {
-        let q = ctx.session.intern("quote")?.as_sexp();
+        let namespace = ctx.session.intern("::")?.as_sexp();
+        let base = ctx.session.intern("base")?.as_sexp();
+        let quote = ctx.session.intern("quote")?.as_sexp();
+        let quote = ctx.make_call(
+            namespace,
+            &Args::from_pairs(vec![(None, base), (None, quote)]),
+        )?;
         let pairs = args
             .iter()
             .map(|(tag, value)| {
                 Ok((
                     tag,
-                    ctx.make_call(q, &Args::from_pairs(vec![(None, value)]))?,
+                    ctx.make_call(quote, &Args::from_pairs(vec![(None, value)]))?,
                 ))
             })
             .collect::<EvalResult<Vec<_>>>()?;
@@ -800,4 +916,524 @@ fn internal(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
         ArgInput::Expressions,
         true,
     )
+}
+
+fn function_parts(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    let kind = ctx.prims[usize::from(call.prim.0)].name;
+    let mut fun = args.get(0);
+    if matches!(ctx.session.type_of(fun)?, SexpType::Str | SexpType::Sym) {
+        let name = ctx.name(fun, call.err_call())?;
+        let tag = ctx.session.intern(&name)?;
+        fun = ctx.find_fun_at(tag, call.env, call.err_call())?;
+    }
+    let (formals, body) = if let Ok((formals, body, _)) = ctx.session.closure_parts(fun) {
+        (formals, body)
+    } else if kind == "args"
+        && let Some(name) = ctx.primitive_name(fun)
+    {
+        let signature: &[&str] = match name {
+            "sum" | "min" | "max" | "prod" | "any" | "all" => &["...", "na.rm"],
+            "c" => &["..."],
+            "rep" => &["x", "..."],
+            "seq.int" => &["from", "to", "by", "length.out", "along.with", "..."],
+            "log" => &["x", "base"],
+            "round" | "signif" => &["x", "digits", "..."],
+            "length" | "sqrt" | "abs" | "sin" | "cos" | "tan" | "exp" | "is.null" | "is.na"
+            | "names" | "is.finite" | "is.infinite" => &["x"],
+            _ => return Ok(SEXP_NIL),
+        };
+        let mut pairs = Vec::with_capacity(signature.len());
+        for &name in signature {
+            let default = match name {
+                "na.rm" => roxide_value::FALSE_SCALAR,
+                "base" => {
+                    let head = ctx.session.intern("exp")?.as_sexp();
+                    let value = ctx.session.scalar_real(1.0)?;
+                    ctx.make_call(head, &Args::from_pairs(vec![(None, value)]))?
+                }
+                "digits" if ctx.primitive_name(fun) == Some("round") => {
+                    ctx.session.scalar_real(0.0)?
+                }
+                "digits" => ctx.session.scalar_real(6.0)?,
+                _ => SEXP_MISSING,
+            };
+            pairs.push((Some(ctx.session.intern(name)?), default));
+        }
+        (ctx.pairlist(&Args::from_pairs(pairs), false)?, SEXP_NIL)
+    } else {
+        return Ok(SEXP_NIL);
+    };
+    match kind {
+        "args" => Ok(ctx.session.alloc_closure(formals, SEXP_NIL, GLOBAL_ENV)?),
+        "formals" => Ok(formals),
+        _ => Ok(body),
+    }
+}
+
+fn set_function_parts(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    let matched = ctx.match_names(args, &["fun", "envir", "value"], call.err_call())?;
+    let fun = ctx.matched_arg(args, &matched, 0).unwrap_or(SEXP_NIL);
+    let (mut formals, mut body, env) = ctx
+        .session
+        .closure_parts(fun)
+        .map_err(|_| ctx.stop(call.err_call(), "argument is not a function"))?;
+    let (env, value) = if args.len() == 2 && args.named(&ctx.session, "value").is_none() {
+        (env, args.get(1))
+    } else {
+        (
+            ctx.matched_arg(args, &matched, 1).unwrap_or(env),
+            ctx.matched_arg(args, &matched, 2).unwrap_or(SEXP_NIL),
+        )
+    };
+    ctx.require_env(env, call.err_call())?;
+    if ctx.prims[usize::from(call.prim.0)].name == "formals<-" {
+        let pairs = ctx.list_args(value)?;
+        if pairs.iter().any(|(tag, _)| tag.is_none())
+            || !matches!(
+                ctx.session.type_of(value)?,
+                SexpType::Vec | SexpType::List | SexpType::Nil
+            )
+        {
+            return Err(ctx.stop(
+                call.err_call(),
+                "invalid formal argument list for 'function'",
+            ));
+        }
+        formals = ctx.pairlist(&pairs, false)?;
+    } else {
+        body = value;
+    }
+    Ok(ctx.session.alloc_closure(formals, body, env)?)
+}
+
+fn alist(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    let args = ctx.expand_dots(args, call.env, call.err_call())?;
+    let pairs = args
+        .iter()
+        .map(|(tag, value)| Ok((tag, ctx.promise_expr(value)?)))
+        .collect::<EvalResult<Vec<_>>>()?;
+    ctx.list(&Args::from_pairs(pairs))
+}
+
+fn as_pairlist(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    let mut value = args.get(0);
+    match ctx.session.type_of(value)? {
+        SexpType::List | SexpType::Nil => return Ok(value),
+        SexpType::Vec | SexpType::Expr => {}
+        _ => {
+            value = ctx
+                .session
+                .coerce(value, SexpType::Vec)
+                .map_err(|_| ctx.stop(call.err_call(), "cannot coerce to pairlist"))?
+                .0;
+        }
+    }
+    let pairs = ctx.list_args(value)?;
+    ctx.pairlist(&pairs, false)
+}
+
+fn as_function(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    let matched = ctx.match_names(args, &["x", "envir"], call.err_call())?;
+    let value = ctx.matched_arg(args, &matched, 0).unwrap_or(SEXP_NIL);
+    if matches!(
+        ctx.session.type_of(value)?,
+        SexpType::Clo | SexpType::Builtin | SexpType::Special
+    ) {
+        return Ok(value);
+    }
+    let env = ctx.matched_arg(args, &matched, 1).unwrap_or(call.env);
+    ctx.require_env(env, call.err_call())?;
+    let mut pairs: Vec<_> = ctx.list_args(value)?.iter().collect();
+    let Some((_, body)) = pairs.pop() else {
+        return Err(ctx.stop(call.err_call(), "list argument expected"));
+    };
+    if pairs.iter().any(|(tag, _)| tag.is_none()) {
+        return Err(ctx.stop(
+            call.err_call(),
+            "invalid formal argument list for 'function'",
+        ));
+    }
+    let formals = ctx.pairlist(&Args::from_pairs(pairs), false)?;
+    Ok(ctx.session.alloc_closure(formals, body, env)?)
+}
+
+fn construct_call(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    let name = ctx.string(args.get(0), call.err_call())?;
+    let head = ctx.session.intern(&name)?.as_sexp();
+    ctx.make_call(head, &Args::from_pairs(args.iter().skip(1).collect()))
+}
+
+fn as_call(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    let value = args.get(0);
+    if ctx.session.type_of(value)? == SexpType::Lang {
+        return Ok(value);
+    }
+    let pairs = ctx.list_args(value)?;
+    if pairs.is_empty() {
+        return Err(ctx.stop(call.err_call(), "invalid length 0 argument"));
+    }
+    ctx.make_call(
+        pairs.get(0),
+        &Args::from_pairs(pairs.iter().skip(1).collect()),
+    )
+}
+
+fn bquote(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    let matched = ctx.match_names(args, &["expr", "where", "splice"], call.err_call())?;
+    let env = ctx.eval_arg(args, &matched, 1, call, call.env)?;
+    ctx.require_env(env, call.err_call())?;
+    ctx.protect(env);
+    let splice = ctx.eval_flag(args, &matched, 2, call, false)?;
+    let expr = ctx.matched_arg(args, &matched, 0).unwrap_or(SEXP_MISSING);
+    let expr = ctx.promise_expr(expr)?;
+    bquote_expr(ctx, expr, env, splice, 0)
+}
+
+fn bquote_expr(ctx: &mut Ctx, expr: SexpId, env: SexpId, splice: bool, depth: usize) -> EvalResult {
+    if depth >= ctx.opts.expressions.min(256) {
+        return Err(ctx.stop(SEXP_NIL, "bquote expression is too deeply nested"));
+    }
+    let ty = ctx.session.type_of(expr)?;
+    if !matches!(ty, SexpType::Lang | SexpType::List) {
+        return Ok(expr);
+    }
+    if ty == SexpType::Lang {
+        let (head, tail, _) = ctx.session.cons_parts(expr)?;
+        match ctx.session.sym_name_of(head).ok() {
+            Some(".") => return ctx.eval(ctx.session.cons_parts(tail)?.0, env),
+            Some("..") if splice => {
+                return Err(ctx.stop(SEXP_NIL, "can only splice inside a call"));
+            }
+            _ => {}
+        }
+    }
+    let items: Vec<_> = ctx.session.pairlist_iter(expr).collect();
+    let mut pairs = Vec::new();
+    for (i, (tag, item)) in items.into_iter().enumerate() {
+        if splice && (i > 0 || ty == SexpType::List) && ctx.session.type_of(item)? == SexpType::Lang
+        {
+            let (head, tail, _) = ctx.session.cons_parts(item)?;
+            if ctx.session.sym_name_of(head).ok() == Some("..") {
+                let value = ctx.eval(ctx.session.cons_parts(tail)?.0, env)?;
+                ctx.protect(value);
+                let value = match ctx.session.type_of(value)? {
+                    SexpType::Vec | SexpType::Expr | SexpType::Nil => value,
+                    SexpType::Lgl
+                    | SexpType::Int
+                    | SexpType::Real
+                    | SexpType::Cplx
+                    | SexpType::Str
+                    | SexpType::Raw => ctx.session.coerce(value, SexpType::Vec)?.0,
+                    _ => return Err(ctx.stop(SEXP_NIL, "can only splice vectors")),
+                };
+                ctx.protect(value);
+                pairs.extend(ctx.list_args(value)?.iter());
+                continue;
+            }
+        }
+        let value = bquote_expr(ctx, item, env, splice, depth + 1)?;
+        ctx.protect(value);
+        pairs.push((tag, value));
+    }
+    let args = Args::from_pairs(pairs);
+    if ty == SexpType::Lang {
+        ctx.make_call(
+            args.get(0),
+            &Args::from_pairs(args.iter().skip(1).collect()),
+        )
+    } else {
+        ctx.pairlist(&args, false)
+    }
+}
+
+fn match_fun(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    let matched = ctx.match_names(args, &["FUN", "descend"], call.err_call())?;
+    let fun = ctx.matched_arg(args, &matched, 0).unwrap_or(SEXP_NIL);
+    if matches!(
+        ctx.session.type_of(fun)?,
+        SexpType::Clo | SexpType::Builtin | SexpType::Special
+    ) {
+        return Ok(fun);
+    }
+    let name = ctx.name(fun, call.err_call())?;
+    let tag = ctx.session.intern(&name)?;
+    if let Some(descend) = ctx.matched_arg(args, &matched, 1)
+        && !ctx.truth(descend, call.err_call())?
+    {
+        return ctx
+            .get_var(tag, call.env)?
+            .ok_or_else(|| ctx.stop(call.err_call(), format!("object '{name}' not found")));
+    }
+    ctx.find_fun_at(tag, call.env, call.err_call())
+}
+
+fn match_arg(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    let matched = ctx.match_names(args, &["arg", "choices", "several.ok"], call.err_call())?;
+    let value = ctx.matched_arg(args, &matched, 0).unwrap_or(SEXP_NIL);
+    let choices = if let Some(choices) = ctx.matched_arg(args, &matched, 1) {
+        choices
+    } else {
+        let expr = ctx.session.cons_parts(call.expr)?.1;
+        let raw = Args::from_pairs(ctx.session.pairlist_iter(expr).collect());
+        let raw = ctx.matched_arg(&raw, &matched, 0).unwrap_or(SEXP_MISSING);
+        let sym = ctx.sym_from_sexp(raw)?;
+        let Some(frame) = ctx.frame(call.env) else {
+            return Err(ctx.stop(call.err_call(), "'choices' is missing"));
+        };
+        let (formals, _, _) = ctx.session.closure_parts(frame.fun)?;
+        let default = ctx
+            .session
+            .pairlist_iter(formals)
+            .find_map(|(tag, value)| (tag == Some(sym)).then_some(value))
+            .unwrap_or(SEXP_MISSING);
+        ctx.eval(default, call.env)?
+    };
+    ctx.protect(choices);
+    let several = match ctx.matched_arg(args, &matched, 2) {
+        Some(several) => ctx.truth(several, call.err_call())?,
+        None => false,
+    };
+    let choices = ctx.session.str_slice(choices)?.to_vec();
+    let values = if value == SEXP_NIL {
+        Vec::new()
+    } else {
+        ctx.session.str_slice(value)?.to_vec()
+    };
+    if value == SEXP_NIL || (!several && values == choices) {
+        return Ok(ctx
+            .session
+            .alloc_str_from(&choices[..choices.len().min(1)])?);
+    }
+    if !several && values.len() != 1 {
+        return Err(ctx.stop(call.err_call(), "'arg' must be of length 1"));
+    }
+    let mut selected = Vec::new();
+    for value in values {
+        if choices.contains(&value) {
+            selected.push(value);
+        } else if value != CharId::NA {
+            let prefix = ctx.session.char_bytes(value)?;
+            let mut matches = choices.iter().filter(|&&id| {
+                !prefix.is_empty()
+                    && ctx
+                        .session
+                        .char_bytes(id)
+                        .is_ok_and(|choice| choice.starts_with(prefix))
+            });
+            if let Some(&exact) = matches.next()
+                && matches.next().is_none()
+            {
+                selected.push(exact);
+            }
+        }
+    }
+    if selected.is_empty() {
+        let labels = choices
+            .iter()
+            .map(|&id| {
+                Ok(format!(
+                    "“{}”",
+                    String::from_utf8_lossy(ctx.session.char_bytes(id)?)
+                ))
+            })
+            .collect::<EvalResult<Vec<_>>>()?;
+        return Err(ctx.stop(
+            call.err_call(),
+            format!("'arg' should be one of {}", labels.join(", ")),
+        ));
+    }
+    Ok(ctx.session.alloc_str_from(&selected)?)
+}
+
+fn recall(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    let Some(frame) = ctx
+        .frame(call.env)
+        .cloned()
+        .filter(|frame| frame.fun != SEXP_NIL)
+    else {
+        return Err(ctx.stop(call.err_call(), "'Recall' called from outside a closure"));
+    };
+    let args = ctx.promise_args(args, call.env, call.err_call())?;
+    ctx.invoke_closure(frame.fun, args, frame.call, call.env, frame.dispatch)
+}
+
+fn nargs(ctx: &mut Ctx, call: &Call, _: &mut Args) -> EvalResult {
+    let Some(frame) = ctx.frame(call.env).filter(|frame| frame.fun != SEXP_NIL) else {
+        return Ok(SEXP_NIL);
+    };
+    Ok(ctx.session.scalar_int(frame.actuals.len() as i32)?)
+}
+
+fn str_to_language(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    let single = ctx.prims[usize::from(call.prim.0)].name == "str2lang";
+    if ctx.session.type_of(args.get(0))? != SexpType::Str {
+        return Err(ctx.stop(call.err_call(), "argument must be character"));
+    }
+    if single && ctx.session.xlength(args.get(0))? != 1 {
+        return Err(ctx.stop(call.err_call(), "argument must be a character string"));
+    }
+    let text = ctx.session.intern("text")?;
+    let source = ctx.session.intern("keep.source")?;
+    let expr = parse(
+        ctx,
+        call,
+        &mut Args::from_pairs(vec![
+            (Some(text), args.get(0)),
+            (Some(source), roxide_value::FALSE_SCALAR),
+        ]),
+    )?;
+    if !single {
+        return Ok(expr);
+    }
+    if ctx.session.xlength(expr)? != 1 {
+        return Err(ctx.stop(
+            call.err_call(),
+            "parsing result not of length one, but 0 or > 1",
+        ));
+    }
+    Ok(ctx.session.list_get(expr, 0)?)
+}
+
+fn eval_parent(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    let matched = ctx.match_names(args, &["expr", "n"], call.err_call())?;
+    let expr = ctx.matched_arg(args, &matched, 0).unwrap_or(SEXP_NIL);
+    let n = ctx.matched_arg(args, &matched, 1);
+    let env = if n.is_some_and(|value| ctx.integer(value, call.err_call()).ok() == Some(0)) {
+        call.env
+    } else {
+        let args = n.map_or_else(Vec::new, |value| vec![(None, value)]);
+        let fun = ctx.session.intern("parent.frame")?;
+        let fun = ctx.find_fun(fun, BASE_ENV)?;
+        ctx.apply(fun, &args, call.err_call(), call.env)?
+    };
+    if ctx.session.type_of(expr)? == SexpType::Expr {
+        let mut result = SEXP_NIL;
+        for i in 0..ctx.session.xlength(expr)? {
+            result = ctx.eval(ctx.session.list_get(expr, i)?, env)?;
+        }
+        Ok(result)
+    } else {
+        ctx.eval(expr, env)
+    }
+}
+
+fn force_and_call(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    if args.len() < 2 {
+        return Err(ctx.stop(call.err_call(), "at least two arguments are required"));
+    }
+    let n = ctx.eval(args.get(0), call.env)?;
+    let n = ctx.integer(n, call.err_call())?.max(0) as usize;
+    let head = args.get(1);
+    let fun = if ctx.session.type_of(head)? == SexpType::Sym {
+        let tag = ctx.sym_from_sexp(head)?;
+        ctx.find_fun_at(tag, call.env, call.err_call())?
+    } else {
+        ctx.eval(head, call.env)?
+    };
+    ctx.protect(fun);
+    let args = Args::from_pairs(args.iter().skip(2).collect());
+    let expr = ctx.make_call(head, &args)?;
+    ctx.protect(expr);
+    if ctx.session.type_of(fun)? != SexpType::Clo {
+        return ctx.invoke_raw(fun, ctx.session.cons_parts(expr)?.1, expr, call.env);
+    }
+    let promises = ctx.promise_args(&args, call.env, call.err_call())?;
+    for &value in promises.values() {
+        ctx.protect(value);
+    }
+    for &value in promises.values().iter().take(n) {
+        if value == SEXP_MISSING {
+            return Err(ctx.stop(call.err_call(), "argument is missing, with no default"));
+        }
+        ctx.force(value)?;
+    }
+    ctx.invoke_closure(fun, promises, expr, call.env, None)
+}
+
+fn language_predicate(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    use SexpType::*;
+    let value = args.get(0);
+    let ty = ctx.session.type_of(value)?;
+    let flag = match ctx.prims[usize::from(call.prim.0)].name {
+        "is.primitive" => matches!(ty, Builtin | Special),
+        "is.call" => ty == Lang,
+        "is.name" | "is.symbol" => ty == Sym,
+        "is.pairlist" => matches!(ty, List | Nil),
+        "is.expression" => ty == Expr,
+        "is.language" => matches!(ty, Sym | Lang | Expr),
+        "is.recursive" => matches!(
+            ty,
+            Vec | List | Expr | Lang | Clo | Env | Prom | Dot | Builtin | Special
+        ),
+        _ => ctx.session.is_object(value)?,
+    };
+    Ok(ctx.session.scalar_lgl(logical(flag))?)
+}
+
+fn switch(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    let args = ctx.expand_dots(args, call.env, call.err_call())?;
+    for &value in args.values() {
+        ctx.protect(value);
+    }
+    if args.is_empty() {
+        return Err(ctx.stop(call.err_call(), "'EXPR' is missing"));
+    }
+    let expr = ctx.eval(args.get(0), call.env)?;
+    if ctx.session.xlength(expr)? != 1 {
+        return Err(ctx.stop(call.err_call(), "EXPR must be a length 1 vector"));
+    }
+    let mut selected = None;
+    if args.len() == 1 {
+        ctx.warn_now(call.err_call(), "'switch' with no alternatives")?;
+    } else if ctx.session.type_of(expr)? == SexpType::Str {
+        let id = ctx.session.str_slice(expr)?[0];
+        let mut defaults = args
+            .iter()
+            .skip(1)
+            .enumerate()
+            .filter_map(|(i, (name, value))| name.is_none().then_some((i + 1, value)));
+        for (i, (tag, _)) in args.iter().enumerate().skip(1) {
+            if let Some(tag) = tag
+                && id != CharId::NA
+                && ctx.session.sym_name(tag)?.as_bytes() == ctx.session.char_bytes(id)?
+            {
+                selected = args.values()[i..]
+                    .iter()
+                    .copied()
+                    .find(|&value| value != SEXP_MISSING);
+                break;
+            }
+        }
+        if let Some((_, first)) = defaults.next() {
+            if let Some((_, second)) = defaults.next() {
+                let deparse = |value| {
+                    ctx.deparse_lines(value, DeparseOpts::default())
+                        .map(|v| v.join(" "))
+                };
+                let message = format!(
+                    "duplicate 'switch' defaults: '{}' and '{}'",
+                    deparse(first)?,
+                    deparse(second)?
+                );
+                return Err(ctx.stop(call.err_call(), message));
+            }
+            selected = selected.or(Some(first));
+        }
+    } else {
+        let integer = ctx.session.coerce(expr, SexpType::Int)?.0;
+        if let Some(index) = ctx.session.int(integer)?.iter().next()
+            && index > 0
+            && (index as usize) < args.len()
+        {
+            selected = Some(args.get(index as usize));
+        }
+    }
+    if let Some(expr) = selected {
+        if expr == SEXP_MISSING {
+            return Err(ctx.stop(call.err_call(), "empty alternative in numeric switch"));
+        }
+        return ctx.eval(expr, call.env);
+    }
+    ctx.visible = false;
+    Ok(SEXP_NIL)
 }

@@ -74,123 +74,107 @@ pub fn format_int_vec(vals: &[i32]) -> Vec<String> {
         .collect()
 }
 
-/// Format a single double in minimal R scalar form (used by `cat()` and `dput()`).
+/// Format a single double using the same notation rule as a one-element vector.
 #[must_use]
 pub fn format_real_scalar(x: f64, opts: FormatOpts) -> String {
-    if is_na_real(x) {
-        return String::from("NA");
-    }
-    if is_nan_not_na(x) {
-        return String::from("NaN");
-    }
-    if x.is_infinite() {
-        return if x.is_sign_negative() {
-            String::from("-Inf")
-        } else {
-            String::from("Inf")
-        };
-    }
-    if x == 0.0 {
-        return String::from("0");
-    }
-    let digits = opts.digits.clamp(1, 22);
-    let abs = x.abs();
-    let exp = abs.log10().floor() as i32;
-    // Choose fixed vs scientific matching R's scipen heuristic.
-    let use_sci = exp < -(4 + opts.scipen) || exp >= (digits as i32 + 5 + opts.scipen);
-    if use_sci {
-        let prec = digits.saturating_sub(1);
-        let raw = format!("{x:.prec$e}");
-        trim_sci_zeros(&raw)
-    } else {
-        let dec = if exp < 0 {
-            ((-exp) as usize) + digits - 1
-        } else {
-            digits.saturating_sub((exp as usize) + 1)
-        };
-        let raw = format!("{x:.dec$}");
-        trim_fixed_zeros(&raw)
-    }
+    format_real_vec(&[x], opts).pop().unwrap_or_default()
 }
 
-/// Format a double vector with R's aligned fixed-decimal width across elements (used by `print()`).
+/// Format a double vector with common notation and decimal precision.
 #[must_use]
 pub fn format_real_vec(vals: &[f64], opts: FormatOpts) -> Vec<String> {
-    if vals.len() <= 1 {
-        return vals.iter().map(|&x| format_real_scalar(x, opts)).collect();
-    }
-    let digits = opts.digits.clamp(1, 22);
-    // Determine shared fixed decimal places across finite entries when using fixed mode.
-    let mut max_dec = 0usize;
-    let mut any_sci = false;
-    for &x in vals {
-        if !x.is_finite() || x == 0.0 {
-            continue;
+    let precision = opts.digits.clamp(1, 22) - 1;
+    let mut fixed_places = 0;
+    let mut integer_width = 1;
+    let mut scientific_places = 0;
+    let mut exponent_width = 2;
+    let mut negative = false;
+    for &value in vals.iter().filter(|value| value.is_finite()) {
+        let value = if value == 0.0 { 0.0 } else { value };
+        negative |= value.is_sign_negative();
+        let raw = format!("{value:.precision$e}");
+        let (mantissa, exponent) = raw.split_once('e').unwrap_or((&raw, "0"));
+        let exponent = exponent.parse::<i32>().unwrap_or(0);
+        let places = mantissa
+            .split_once('.')
+            .map_or(0, |(_, fraction)| fraction.trim_end_matches('0').len());
+        scientific_places = scientific_places.max(places);
+        fixed_places = fixed_places.max((places as i32 - exponent).max(0) as usize);
+        integer_width =
+            integer_width.max((exponent + 1).max(1) as usize + usize::from(value < 0.0));
+        if exponent.unsigned_abs() >= 100 {
+            exponent_width = 3;
         }
-        let exp = x.abs().log10().floor() as i32;
-        if exp < -(4 + opts.scipen) || exp >= (digits as i32 + 5 + opts.scipen) {
-            any_sci = true;
-            break;
-        }
-        let s = format_real_scalar(x, opts);
-        if let Some(dot) = s.find('.') {
-            max_dec = max_dec.max(s.len() - dot - 1);
-        }
     }
-    if any_sci {
-        return vals.iter().map(|&x| format_real_scalar(x, opts)).collect();
-    }
+    let decimal_width = |places| places + usize::from(places > 0);
+    let fixed_width = integer_width + decimal_width(fixed_places);
+    let scientific_width =
+        3 + exponent_width + usize::from(negative) + decimal_width(scientific_places);
+    let scientific = fixed_width as i64 > scientific_width as i64 + i64::from(opts.scipen);
     vals.iter()
-        .map(|&x| {
-            if is_na_real(x) {
-                String::from("NA")
-            } else if is_nan_not_na(x) {
-                String::from("NaN")
-            } else if x.is_infinite() {
-                if x.is_sign_negative() {
-                    String::from("-Inf")
+        .map(|&value| {
+            if is_na_real(value) {
+                "NA".to_owned()
+            } else if is_nan_not_na(value) {
+                "NaN".to_owned()
+            } else if value.is_infinite() {
+                if value.is_sign_negative() {
+                    "-Inf"
                 } else {
-                    String::from("Inf")
+                    "Inf"
                 }
-            } else if max_dec == 0 {
-                let v = if x == 0.0 { 0.0 } else { x };
-                format!("{v:.0}")
+                .to_owned()
             } else {
-                let v = if x == 0.0 { 0.0 } else { x };
-                format!("{v:.max_dec$}")
+                let value = if value == 0.0 { 0.0 } else { value };
+                if scientific {
+                    let raw = format!("{value:.scientific_places$e}");
+                    let (mantissa, exp) = raw.split_once('e').unwrap_or((&raw, "0"));
+                    let exponent = exp.parse::<i32>().unwrap_or(0);
+                    format!(
+                        "{mantissa}e{}{:02}",
+                        if exponent < 0 { '-' } else { '+' },
+                        exponent.unsigned_abs()
+                    )
+                } else {
+                    format!("{value:.fixed_places$}")
+                }
             }
         })
         .collect()
 }
 
-fn trim_fixed_zeros(s: &str) -> String {
-    if !s.contains('.') {
-        return s.to_owned();
-    }
-    let trimmed = s.trim_end_matches('0').trim_end_matches('.');
-    if trimmed == "-0" {
-        String::from("0")
-    } else {
-        trimmed.to_owned()
-    }
-}
-
-fn trim_sci_zeros(s: &str) -> String {
-    let Some((mant, exp)) = s.split_once('e') else {
-        return s.to_owned();
-    };
-    let clean_mant = trim_fixed_zeros(mant);
-    let exp_num: i32 = exp.parse().unwrap_or(0);
-    if exp_num < 0 {
-        format!("{clean_mant}e-{:02}", exp_num.unsigned_abs())
-    } else {
-        format!("{clean_mant}e+{exp_num:02}")
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chooses_notation_for_the_entire_vector() {
+        let opts = FormatOpts::default();
+        assert_eq!(format_real_vec(&[1.0, 1e6], opts), ["1e+00", "1e+06"]);
+        assert_eq!(
+            format_real_vec(&[1e5, 1.5e5, 3e5], opts),
+            ["100000", "150000", "300000"]
+        );
+        assert_eq!(
+            format_real_vec(&[0.001, 0.0015, 0.002], opts),
+            ["0.0010", "0.0015", "0.0020"]
+        );
+        assert_eq!(format_real_scalar(1e5, opts), "1e+05");
+        assert_eq!(
+            format_real_scalar(1e6, FormatOpts { scipen: 2, ..opts }),
+            "1000000"
+        );
+        assert_eq!(
+            format_real_scalar(
+                1e6,
+                FormatOpts {
+                    scipen: i32::MAX,
+                    ..opts
+                }
+            ),
+            "1000000"
+        );
+    }
 
     #[test]
     fn formats_smoke_numbers_matching_gnu_r() {

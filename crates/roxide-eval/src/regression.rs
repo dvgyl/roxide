@@ -428,3 +428,61 @@ fn s4_dispatch_can_call_another_s4_generic() -> crate::EvalResult<()> {
     assert_eq!(ctx.session().int(result)?.to_vec(), [42]);
     Ok(())
 }
+
+#[test]
+fn forcing_promises_preserves_the_visibility_of_the_first_evaluation() {
+    check(
+        r#"
+f <- function(x) {
+    dput(withVisible(x))
+    dput(withVisible(x))
+}
+f(invisible(7L))
+g <- function(...) dput(withVisible(..1))
+g(invisible(8L))
+"#,
+        concat!(
+            "list(value = 7L, visible = FALSE)\n",
+            "list(value = 7L, visible = TRUE)\n",
+            "list(value = 8L, visible = FALSE)\n",
+        ),
+        "",
+    );
+}
+
+#[test]
+fn exit_finalizers_run_once_and_keep_their_arguments_alive() {
+    use crate::Ctx;
+    use roxide_host::PureHost;
+    use roxide_value::{GLOBAL_ENV, ValueApi};
+
+    let mut ctx = Ctx::new(Box::new(PureHost::default()), GcPolicy::Torture).unwrap();
+    ctx.run_global(
+        "finalizers",
+        r#"
+result <- 0L
+local({
+    e <- new.env()
+    assign("n", 5L, envir=e)
+    reg.finalizer(e, function(e) result <<- result + get("n", envir=e), onexit=TRUE)
+})
+"#,
+    )
+    .unwrap();
+    ctx.run_exit_finalizers();
+    ctx.run_exit_finalizers();
+    let result = ctx.session_mut().intern("result").unwrap();
+    let value = ctx.get_var(result, GLOBAL_ENV).unwrap().unwrap();
+    assert_eq!(ctx.session().int(value).unwrap().to_vec(), vec![5]);
+}
+
+#[test]
+fn missing_namespaces_signal_the_package_error_class() {
+    check(
+        r#"
+dput(tryCatch(roxideMissingPackage::value, error = function(e) class(e)))
+"#,
+        "c(\"packageNotFoundError\", \"error\", \"condition\")\n",
+        "",
+    );
+}

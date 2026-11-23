@@ -99,6 +99,7 @@ impl Ctx {
     }
 
     fn eval_symbol(&mut self, expr: SexpId, env: SexpId) -> EvalResult {
+        self.visible = true;
         if expr == SEXP_MISSING {
             return Err(self.stop(SEXP_NIL, "argument is missing, with no default"));
         }
@@ -116,9 +117,7 @@ impl Ctx {
                     format!("argument \"{name}\" is missing, with no default"),
                 ));
             }
-            let value = self.eval(value, env)?;
-            self.visible = true;
-            return Ok(value);
+            return self.eval(value, env);
         }
         let Some(val) = self.get_var(sym, env)? else {
             let name = self.session.sym_name(sym)?.to_owned();
@@ -133,7 +132,6 @@ impl Ctx {
                 format!("argument \"{name}\" is missing, with no default"),
             ));
         }
-        self.visible = true;
         Ok(val)
     }
 
@@ -277,7 +275,7 @@ impl Ctx {
         }
         match self.session.env_define(env, sym, val) {
             Ok(()) => Ok(()),
-            Err(error @ ValueError::LockedBinding(_)) => {
+            Err(error @ (ValueError::LockedBinding(_) | ValueError::LockedEnvironment)) => {
                 let call = self.frame(env).map_or(SEXP_NIL, |frame| frame.call);
                 let message = if env == roxide_value::EMPTY_ENV {
                     String::from("cannot assign values in the empty environment")
@@ -542,6 +540,9 @@ impl Ctx {
         self.visible = true;
         if dispatch && let Some(result) = self.dispatch_primitive(def, call, args, raw)? {
             return Ok(result);
+        }
+        if def.name == "names" && self.session.type_of(args.get(0))? == SexpType::Env {
+            return self.environment_names(args.get(0));
         }
         let result = if self.has_stream_sink() {
             self.invoke_streaming_primitive(def.fun, &call, args)

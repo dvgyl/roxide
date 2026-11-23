@@ -10,6 +10,38 @@ use crate::{Args, Arity, Call, Ctx, Dispatch, EvalResult, FrameId, Module, Trans
 pub(crate) const MODULE: Module = Module {
     prims: &[
         primitive!(
+            "simpleCondition",
+            simple_condition,
+            Eval,
+            Arity::Range(1, 2),
+            On
+        ),
+        primitive!("errorCondition", custom_condition, Eval, Arity::Any, On),
+        primitive!("warningCondition", custom_condition, Eval, Arity::Any, On),
+        primitive!("try", try_eval, Unevaluated, Arity::Range(1, 3), SetByFn),
+        primitive!(
+            "geterrmessage",
+            get_error_message,
+            Eval,
+            Arity::Exact(0),
+            On
+        ),
+        primitive!("packageStartupMessage", notify, Eval, Arity::Any, Off),
+        primitive!(
+            "computeRestarts",
+            compute_restarts,
+            Eval,
+            Arity::Range(0, 1),
+            On
+        ),
+        primitive!(
+            "tryInvokeRestart",
+            invoke_restart,
+            Eval,
+            Arity::Any,
+            SetByFn
+        ),
+        primitive!(
             "simpleError",
             simple_condition,
             Eval,
@@ -71,7 +103,19 @@ pub(crate) const MODULE: Module = Module {
         primitive!("getOption", get_option, Eval, Arity::Range(1, 2), On),
         primitive!("stopifnot", stop_if_not, Unevaluated, Arity::Any, Off),
     ],
-    prelude: "",
+    prelude: r#"
+suppressWarnings <- function(expr, classes = "warning") {
+    withCallingHandlers(expr, warning = function(w) {
+        if (inherits(w, classes)) tryInvokeRestart("muffleWarning")
+    })
+}
+suppressMessages <- function(expr, classes = "message") {
+    withCallingHandlers(expr, message = function(m) {
+        if (inherits(m, classes)) tryInvokeRestart("muffleMessage")
+    })
+}
+suppressPackageStartupMessages <- function(expr) suppressMessages(expr, "packageStartupMessage")
+"#,
 };
 
 struct Handler {
@@ -91,6 +135,7 @@ struct Restart {
 pub(crate) struct Conditions {
     handlers: Vec<Handler>,
     restarts: Vec<Restart>,
+    last_error: String,
 }
 
 impl Conditions {
@@ -184,7 +229,32 @@ impl Ctx {
         }
     }
 
+    /// Signal an error with the given classes before the standard error classes.
+    pub fn stop_with_class(
+        &mut self,
+        call: SexpId,
+        text: impl Into<String>,
+        classes: &[&str],
+    ) -> Unwind {
+        let text = text.into();
+        let result = self.scoped(|ctx| {
+            ctx.protect(call);
+            let message = ctx.session.scalar_str(&text)?;
+            let cond = ctx.make_condition(
+                message,
+                call,
+                classes.iter().copied().chain(["error", "condition"]),
+            )?;
+            ctx.raise_condition(cond, call, &text)
+        });
+        match result {
+            Err(err) => err,
+            Ok(()) => Unwind::TopLevel,
+        }
+    }
+
     fn raise_condition(&mut self, cond: SexpId, call: SexpId, text: &str) -> EvalResult<()> {
+        self.conditions.last_error = text.to_owned();
         self.signal_condition(cond)?;
         let call_lines = if call == SEXP_NIL {
             None
@@ -192,6 +262,7 @@ impl Ctx {
             self.deparse_lines(call, DeparseOpts::default()).ok()
         };
         let formatted = diag_format::error(call_lines.as_deref(), text);
+        self.conditions.last_error.clone_from(&formatted);
         let _ = self.host.write_err(formatted.as_bytes());
         if !self.interactive && call != SEXP_NIL {
             self.print_call_trace(call);
@@ -313,7 +384,24 @@ impl Ctx {
 
     fn push_restart(&mut self, target: FrameId, name: String, fun: SexpId) -> EvalResult<()> {
         let value = self.session.scalar_str(&name)?;
-        let restart = self.list(&Args::from_pairs(vec![(None, value), (None, fun)]))?;
+        let args = if name == "abort" {
+            vec![(None, value), (None, SEXP_NIL)]
+        } else {
+            let tags = [
+                "name",
+                "exit",
+                "handler",
+                "description",
+                "test",
+                "interactive",
+            ];
+            let description = self.session.scalar_str("")?;
+            tags.into_iter()
+                .zip([value, SEXP_NIL, fun, description, SEXP_NIL, SEXP_NIL])
+                .map(|(tag, value)| Ok((Some(self.session.intern(tag)?), value)))
+                .collect::<EvalResult<Vec<_>>>()?
+        };
+        let restart = self.list(&Args::from_pairs(args))?;
         let class = self.session.scalar_str("restart")?;
         let tag = self.session.intern("class")?;
         self.session.set_attrib(restart, tag, class)?;
@@ -485,6 +573,11 @@ impl Ctx {
 fn simple_condition(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     let matched = ctx.match_names(args, &["message", "call"], call.err_call())?;
     let name = ctx.prims[usize::from(call.prim.0)].name;
+    if name == "simpleCondition" {
+        let message = ctx.matched_arg(args, &matched, 0).unwrap_or(SEXP_NIL);
+        let condition_call = ctx.matched_arg(args, &matched, 1).unwrap_or(SEXP_NIL);
+        return ctx.make_condition(message, condition_call, ["simpleCondition", "condition"]);
+    }
     let kind = match name {
         "simpleError" => "error",
         "simpleWarning" => "warning",
@@ -516,7 +609,22 @@ fn condition_field(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
 
 fn notify(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     let name = ctx.prims[usize::from(call.prim.0)].name;
-    let kind = if name == "stop" { "error" } else { name };
+    let kind = match name {
+        "stop" => "error",
+        "packageStartupMessage" => "message",
+        name => name,
+    };
+    let startup = name == "packageStartupMessage"
+        || (name == "message" && {
+            // The package loader's base prelude routes startup messages through message().
+            let symbol = ctx.session.intern("packageStartupMessage")?;
+            ctx.session
+                .env_get(roxide_value::BASE_ENV, symbol)
+                .is_some_and(|binding| {
+                    ctx.frame(call.env)
+                        .is_some_and(|frame| frame.fun == binding.value)
+                })
+        });
     let object = args.get(0);
     if args.len() == 1
         && ctx
@@ -583,7 +691,22 @@ fn notify(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
         SEXP_NIL
     };
     ctx.protect(value);
-    ctx.emit_condition(kind, err_call, text, immediate)?;
+    if startup {
+        let msg = ctx.session.scalar_str(&text)?;
+        let condition = ctx.make_condition(
+            msg,
+            err_call,
+            [
+                "packageStartupMessage",
+                "simpleMessage",
+                "message",
+                "condition",
+            ],
+        )?;
+        ctx.emit_existing("message", condition, err_call, text, false)?;
+    } else {
+        ctx.emit_condition(kind, err_call, text, immediate)?;
+    }
     Ok(value)
 }
 
@@ -764,6 +887,10 @@ fn invoke_restart(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
             .rfind(|entry| entry.value == r)
     };
     let Some(entry) = found else {
+        if ctx.prims[usize::from(call.prim.0)].name == "tryInvokeRestart" {
+            ctx.visible = false;
+            return Ok(SEXP_NIL);
+        }
         return Err(ctx.stop(call.err_call(), "no such restart"));
     };
     let (target, restart) = (entry.target, entry.value);
@@ -892,4 +1019,130 @@ fn stop_if_not(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
         }
     }
     Ok(SEXP_NIL)
+}
+
+fn custom_condition(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    let matched = ctx.match_names(args, &["message", "...", "class", "call"], call.err_call())?;
+    let message = ctx.matched_arg(args, &matched, 0).unwrap_or(SEXP_NIL);
+    let msg = ctx.session.coerce(message, SexpType::Str)?.0;
+    let condition_call = ctx.matched_arg(args, &matched, 3).unwrap_or(SEXP_NIL);
+    let kind = if ctx.prims[usize::from(call.prim.0)].name == "errorCondition" {
+        "error"
+    } else {
+        "warning"
+    };
+    let mut classes = match ctx.matched_arg(args, &matched, 2) {
+        Some(value) if value != SEXP_NIL => ctx.session.str_slice(value)?.to_vec(),
+        _ => Vec::new(),
+    };
+    for class in [kind, "condition"] {
+        classes.push(
+            ctx.session
+                .mk_char(class.as_bytes(), roxide_value::Encoding::Utf8)?,
+        );
+    }
+    let message = ctx.session.intern("message")?;
+    let call_tag = ctx.session.intern("call")?;
+    let mut fields = vec![(Some(message), msg), (Some(call_tag), condition_call)];
+    for i in matched.dots {
+        let tag = args.name(i);
+        if tag == Some(message) || tag == Some(call_tag) {
+            return Err(ctx.stop(call.err_call(), "duplicate condition fields"));
+        }
+        fields.push((tag, args.get(i)));
+    }
+    let cond = ctx.list(&Args::from_pairs(fields))?;
+    let classes = ctx.session.alloc_str_from(&classes)?;
+    let tag = ctx.session.intern("class")?;
+    ctx.session.set_attrib(cond, tag, classes)?;
+    Ok(cond)
+}
+
+fn try_eval(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    let matched = ctx.match_names(args, &["expr", "silent", "outFile"], call.err_call())?;
+    let id = ctx.next_frame();
+    let base = ctx.conditions.handlers.len();
+    ctx.conditions.handlers.push(Handler {
+        target: Some(id),
+        class: "error".to_owned(),
+        fun: SEXP_NIL,
+    });
+    let mut traced = matched;
+    traced.dots.push(0);
+    let result = ctx.eval_try_expr(args, &traced, call);
+    ctx.conditions.handlers.truncate(base);
+    let Err(Unwind::Transfer {
+        target,
+        kind: Transfer::ExitingHandler { cond, .. },
+    }) = result
+    else {
+        return result;
+    };
+    if target != id {
+        return result;
+    }
+    ctx.protect(cond);
+    let silent = ctx.eval_flag(args, &traced, 1, call, false)?;
+    let fields = ctx.list_args(cond)?;
+    let error_call = fields.named(&ctx.session, "call").unwrap_or(SEXP_NIL);
+    let message = fields.named(&ctx.session, "message").unwrap_or(SEXP_NIL);
+    let message = ctx.concat_message(&Args::from_pairs(vec![(None, message)]), &[])?;
+    let text = if error_call == SEXP_NIL {
+        format!("Error : {message}\n")
+    } else {
+        let display_call = if ctx
+            .session
+            .cons_parts(error_call)
+            .is_ok_and(|(head, _, _)| ctx.session.sym_name_of(head).ok() == Some("doTryCatch"))
+        {
+            call.expr
+        } else {
+            error_call
+        };
+        let lines = ctx.deparse_lines(display_call, DeparseOpts::default())?;
+        diag_format::error(Some(&lines), &message)
+    };
+    ctx.conditions.last_error.clone_from(&text);
+    let value = ctx.session.scalar_str(&text)?;
+    ctx.protect(value);
+    if !silent {
+        let out = ctx.eval_arg(args, &traced, 2, call, SEXP_NIL)?;
+        if out == SEXP_NIL {
+            let _ = ctx.host.write_err(text.as_bytes());
+        } else {
+            let file = ctx.session.intern("file")?;
+            ctx.call_function(
+                "cat",
+                &[(None, value), (Some(file), out)],
+                roxide_value::BASE_ENV,
+            )?;
+        }
+    }
+    let class = ctx.session.scalar_str("try-error")?;
+    let class_tag = ctx.session.intern("class")?;
+    ctx.session.set_attrib(value, class_tag, class)?;
+    let condition_tag = ctx.session.intern("condition")?;
+    ctx.session.set_attrib(value, condition_tag, cond)?;
+    ctx.visible = false;
+    Ok(value)
+}
+
+fn get_error_message(ctx: &mut Ctx, _: &Call, _: &mut Args) -> EvalResult {
+    Ok(ctx.session.scalar_str(&ctx.conditions.last_error)?)
+}
+
+fn compute_restarts(ctx: &mut Ctx, _: &Call, _: &mut Args) -> EvalResult {
+    let mut pairs: Vec<_> = ctx
+        .conditions
+        .restarts
+        .iter()
+        .rev()
+        .map(|entry| (None, entry.value))
+        .collect();
+    let id = ctx.next_frame();
+    ctx.push_restart(id, "abort".to_owned(), SEXP_NIL)?;
+    if let Some(abort) = ctx.conditions.restarts.pop() {
+        pairs.push((None, abort.value));
+    }
+    ctx.list(&Args::from_pairs(pairs))
 }

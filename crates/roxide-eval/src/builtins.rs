@@ -1,7 +1,11 @@
 //! Milestone 0 core primitives (`<-`, `=`, `(`, `{`, `+`, `-`, `*`, `/`, `^`, `c`, `print`, `dput`, `cat`, `is.null`, `length`, `invisible`).
 
+use std::io::Write;
+use std::path::Path;
+
 use roxide_diag::msg;
 use roxide_gc::SexpId;
+use roxide_host::OpenMode;
 use roxide_value::format::format_real_scalar;
 use roxide_value::{
     BASE_ENV, BASE_NAMESPACE, CharId, DeparseOpts, EMPTY_ENV, Encoding, FormatOpts, GLOBAL_ENV,
@@ -707,16 +711,30 @@ fn prim_dput(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     })
 }
 
-fn prim_cat(ctx: &mut Ctx, _call: &Call, args: &mut Args) -> EvalResult {
-    let sep = if let Some(sep_val) = args.named(&ctx.session, "sep") {
-        let slice = ctx.session.str_slice(sep_val)?;
-        if let Some(&cid) = slice.first() {
-            String::from_utf8_lossy(ctx.session.char_bytes(cid)?).into_owned()
-        } else {
-            String::from(" ")
-        }
+fn prim_cat(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    let separators = cat_strings(ctx, args.named(&ctx.session, "sep"), call)?;
+    let separators = if args.named(&ctx.session, "sep").is_none() {
+        vec![" ".to_owned()]
+    } else if separators.is_empty() {
+        vec![String::new()]
     } else {
-        String::from(" ")
+        separators
+    };
+    let labels = cat_strings(ctx, args.named(&ctx.session, "labels"), call)?;
+    let width = match args.named(&ctx.session, "fill") {
+        Some(fill) if ctx.session.type_of(fill)? == SexpType::Lgl => {
+            if ctx.truth(fill, call.err_call())? {
+                ctx.opts.width
+            } else {
+                0
+            }
+        }
+        Some(fill) => ctx.integer(fill, call.err_call())?.max(0) as usize,
+        None => 0,
+    };
+    let append = match args.named(&ctx.session, "append") {
+        Some(value) => ctx.truth(value, call.err_call())?,
+        None => false,
     };
 
     let fmt_opts = FormatOpts {
@@ -724,7 +742,7 @@ fn prim_cat(ctx: &mut Ctx, _call: &Call, args: &mut Args) -> EvalResult {
         scipen: ctx.opts.scipen,
     };
     let mut pieces = Vec::new();
-    for (tag, val) in args.iter() {
+    for (i, (tag, val)) in args.iter().enumerate() {
         if let Some(sym) = tag
             && matches!(
                 ctx.session.sym_name(sym).ok(),
@@ -753,23 +771,119 @@ fn prim_cat(ctx: &mut Ctx, _call: &Call, args: &mut Args) -> EvalResult {
                     pieces.push(format_real_scalar(x, fmt_opts));
                 }
             }
-            _ => {}
+            SexpType::Sym => pieces.push(ctx.session.sym_name_of(val)?.to_owned()),
+            SexpType::Raw => {
+                pieces.extend(ctx.session.raw(val)?.iter().map(|x| format!("{x:02x}")))
+            }
+            SexpType::Cplx => {
+                for x in ctx.session.cplx(val)?.iter() {
+                    let real = format_real_scalar(x.re, fmt_opts);
+                    let imaginary = format_real_scalar(x.im.abs(), fmt_opts);
+                    let sign = if x.im < 0.0 { '-' } else { '+' };
+                    pieces.push(format!("{real}{sign}{imaginary}i"));
+                }
+            }
+            ty => {
+                return Err(ctx.stop(
+                    call.err_call(),
+                    format!(
+                        "argument {} (type '{}') cannot be handled by 'cat'",
+                        i + 1,
+                        ty.type_name(false)
+                    ),
+                ));
+            }
         }
     }
 
     let mut out = String::new();
+    let mut column = 0;
+    let mut line = 0;
     for (i, piece) in pieces.iter().enumerate() {
         if i > 0 {
-            out.push_str(&sep);
+            let sep = &separators[(i - 1) % separators.len()];
+            out.push_str(sep);
+            column = cat_column(column, sep);
+            if width > 0 && column > 0 && column + piece.chars().count() >= width {
+                out.push('\n');
+                column = 0;
+            }
+        }
+        if column == 0 && width > 0 && !labels.is_empty() {
+            let label = &labels[line % labels.len()];
+            out.push_str(label);
+            out.push(' ');
+            column = label.chars().count() + 1;
+            line += 1;
         }
         out.push_str(piece);
+        column = cat_column(column, piece);
+        ctx.check_vector_len(out.len(), 1, call.err_call())?;
     }
-    // GNU R cat(): if sep contains '\n' and any pieces were printed, append trailing '\n' unless already emitted.
-    if !pieces.is_empty() && sep.contains('\n') {
+    if !pieces.is_empty() && (width > 0 || separators.iter().any(|sep| sep.contains('\n'))) {
         out.push('\n');
     }
-    let _ = ctx.host.write_out(out.as_bytes());
+    if let Some(file) = args.named(&ctx.session, "file") {
+        if ctx.session.type_of(file)? == SexpType::Str {
+            let path = ctx.string(file, call.err_call())?;
+            if !path.is_empty() {
+                let mode = OpenMode {
+                    truncate: !append,
+                    append,
+                    ..OpenMode::write_truncate()
+                };
+                let result = ctx
+                    .host()
+                    .open(Path::new(&path), mode)
+                    .and_then(|mut file| {
+                        file.write_all(out.as_bytes())
+                            .map_err(roxide_host::HostError::from_io)
+                    });
+                result.map_err(|error| ctx.stop(call.err_call(), error.to_string()))?;
+                return Ok(SEXP_NIL);
+            }
+        } else {
+            let text = ctx.session.scalar_str(&out)?;
+            let sep = ctx.session.scalar_str("")?;
+            ctx.call_function(
+                "writeLines",
+                &[(None, text), (None, file), (None, sep)],
+                BASE_ENV,
+            )?;
+            return Ok(SEXP_NIL);
+        }
+    }
+    ctx.host
+        .write_out(out.as_bytes())
+        .map_err(|error| ctx.stop(call.err_call(), error.to_string()))?;
     Ok(SEXP_NIL)
+}
+
+fn cat_column(column: usize, text: &str) -> usize {
+    text.rsplit_once('\n').map_or_else(
+        || column + text.chars().count(),
+        |(_, last)| last.chars().count(),
+    )
+}
+
+fn cat_strings(ctx: &mut Ctx, value: Option<SexpId>, call: &Call) -> EvalResult<Vec<String>> {
+    let Some(value) = value.filter(|&value| value != SEXP_NIL) else {
+        return Ok(Vec::new());
+    };
+    if ctx.session.type_of(value)? != SexpType::Str {
+        return Err(ctx.stop(call.err_call(), "invalid separator or labels"));
+    }
+    ctx.session
+        .str_slice(value)?
+        .iter()
+        .map(|&id| {
+            if id == CharId::NA {
+                Ok("NA".to_owned())
+            } else {
+                Ok(String::from_utf8_lossy(ctx.session.char_bytes(id)?).into_owned())
+            }
+        })
+        .collect()
 }
 
 fn prim_is_null(ctx: &mut Ctx, _call: &Call, args: &mut Args) -> EvalResult {

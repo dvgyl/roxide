@@ -174,7 +174,11 @@ impl Ctx {
         if let Some(loader) = self.namespace_loader {
             return loader.load(self, name, call);
         }
-        Err(self.stop(call, format!("there is no package called '{name}'")))
+        Err(self.stop_with_class(
+            call,
+            format!("there is no package called ‘{name}’"),
+            &["packageNotFoundError"],
+        ))
     }
 
     /// Create a fresh `(ns, imports)` environment pair with canonical `.__NAMESPACE__.`,

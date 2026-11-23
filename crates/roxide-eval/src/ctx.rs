@@ -112,6 +112,7 @@ pub(crate) struct Frame {
     pub(crate) fun: SexpId,
     pub(crate) caller: SexpId,
     pub(crate) actuals: Args,
+    pub(crate) supplied: Vec<bool>,
     pub(crate) dispatch: Option<crate::dispatch::MethodFrame>,
 }
 
@@ -1058,7 +1059,12 @@ impl Ctx {
                                 let print = ctx.find_fun(print, BASE_ENV)?;
                                 ctx.apply(print, &[(None, v)], SEXP_NIL, env)?;
                             } else {
-                                builtins::print_value(ctx, v, ctx.opts.digits)?;
+                                let default = ctx.session.intern("print.default")?;
+                                if let Some(print) = ctx.get_local(default, BASE_ENV)? {
+                                    ctx.apply(print, &[(None, v)], SEXP_NIL, env)?;
+                                } else {
+                                    builtins::print_value(ctx, v, ctx.opts.digits)?;
+                                }
                             }
                         }
                         Ok(v)

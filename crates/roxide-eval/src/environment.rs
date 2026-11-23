@@ -1,4 +1,4 @@
-use roxide_gc::SexpId;
+use roxide_gc::{SexpId, Trace, Tracer};
 use roxide_value::{
     BASE_ENV, BASE_NAMESPACE, EMPTY_ENV, GLOBAL_ENV, RLogical, SEXP_MISSING, SEXP_NIL,
     SEXP_UNBOUND, SexpType, Sym, ValueApi,
@@ -11,6 +11,37 @@ pub(crate) const MODULE: Module = Module {
     prims: &[
         primitive!("assign", assign, Eval, Arity::Any, Off),
         primitive!("get", get, Eval, Arity::Any, On),
+        primitive!("get0", get, Eval, Arity::Any, On),
+        primitive!("mget", mget, Eval, Arity::Range(2, 5), On),
+        primitive!("list2env", list_to_env, Eval, Arity::Range(1, 5), On),
+        primitive!("as.environment", as_environment, Eval, Arity::Exact(1), On),
+        primitive!(
+            "reg.finalizer",
+            register_finalizer,
+            Eval,
+            Arity::Range(2, 3),
+            On
+        ),
+        primitive!(
+            "activeBindingFunction",
+            active_binding_function,
+            Eval,
+            Arity::Exact(2),
+            On
+        ),
+        primitive!(
+            "delayedAssign",
+            delayed_assign,
+            Unevaluated,
+            Arity::Range(2, 4),
+            Off
+        ),
+        primitive!("objects", ls, Eval, Arity::Any, On),
+        primitive!("sys.calls", sys_stack, Eval, Arity::Exact(0), On),
+        primitive!("sys.frames", sys_stack, Eval, Arity::Exact(0), On),
+        primitive!("sys.parent", sys_stack, Eval, Arity::Range(0, 1), On),
+        primitive!("sys.parents", sys_stack, Eval, Arity::Exact(0), On),
+        primitive!("sys.on.exit", sys_stack, Eval, Arity::Exact(0), On),
         primitive!("exists", get, Eval, Arity::Any, On),
         primitive!("rm", remove, Unevaluated, Arity::Any, Off),
         primitive!("remove", remove, Unevaluated, Arity::Any, Off),
@@ -270,66 +301,394 @@ fn assign(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
 }
 
 fn get(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
-    let exists = ctx.prims[usize::from(call.prim.0)].name == "exists";
-    let matched = ctx.match_names(
-        args,
-        &["x", "pos", "envir", "mode", "inherits"],
-        call.err_call(),
-    )?;
-    let name = ctx.string(
-        ctx.matched_arg(args, &matched, 0).unwrap_or(SEXP_NIL),
-        call.err_call(),
-    )?;
+    let kind = ctx.prims[usize::from(call.prim.0)].name;
+    let parameters = if kind == "get0" {
+        ["x", "envir", "mode", "inherits", "ifnotfound"]
+    } else {
+        ["x", "pos", "envir", "mode", "inherits"]
+    };
+    let matched = ctx.match_names(args, &parameters, call.err_call())?;
+    let arg = |i| ctx.matched_arg(args, &matched, i);
+    let (name, position, envir, mode, inherit, fallback) = if kind == "get0" {
+        (arg(0), None, arg(1), arg(2), arg(3), arg(4))
+    } else {
+        (arg(0), arg(1), arg(2), arg(3), arg(4), None)
+    };
+    let name = ctx.string(name.unwrap_or(SEXP_NIL), call.err_call())?;
     let sym = ctx.session.intern(&name)?;
-    let mut env = if let Some(env) = ctx.matched_arg(args, &matched, 2) {
+    let env = if let Some(env) = envir {
         ctx.require_env(env, call.err_call())?
-    } else if let Some(pos) = ctx.matched_arg(args, &matched, 1) {
+    } else if let Some(pos) = position {
         ctx.search_env(pos, call)?
     } else {
         call.env
     };
-    let mode = ctx
-        .matched_arg(args, &matched, 3)
+    let mode = mode
         .map(|value| ctx.string(value, call.err_call()))
         .transpose()?;
-    let inherits = scalar_flag(ctx, ctx.matched_arg(args, &matched, 4), true, call)?;
-    while let Some(found) = ctx.binding_env(sym, env, inherits)? {
-        if exists && mode.as_deref().is_none_or(|mode| mode == "any") {
-            return Ok(ctx.session.scalar_lgl(logical(true))?);
-        }
-        let value = ctx.get_var(sym, found)?.unwrap_or(SEXP_NIL);
-        if value == SEXP_MISSING && !exists {
-            return Err(ctx.stop(
-                call.err_call(),
-                format!("argument \"{name}\" is missing, with no default"),
-            ));
-        }
-        let ty = ctx.session.type_of(value)?;
-        let compatible = match mode.as_deref() {
-            None | Some("any") => true,
-            Some("function") => matches!(ty, SexpType::Builtin | SexpType::Special | SexpType::Clo),
-            Some("numeric") => matches!(ty, SexpType::Int | SexpType::Real),
-            Some(mode) => ty.type_name(false) == mode,
-        };
-        if compatible {
-            return if exists {
-                Ok(ctx.session.scalar_lgl(logical(true))?)
-            } else {
-                Ok(value)
-            };
-        }
-        if !inherits {
-            break;
-        }
-        env = ctx.session.env_enclos(found)?;
-    }
+    let inherits = scalar_flag(ctx, inherit, true, call)?;
+    let exists = kind == "exists";
+    let found = ctx.lookup_mode(sym, env, mode.as_deref().unwrap_or("any"), inherits, exists)?;
     if exists {
-        return Ok(ctx.session.scalar_lgl(logical(false))?);
+        return Ok(ctx.session.scalar_lgl(logical(found.is_some()))?);
+    }
+    if found == Some(SEXP_MISSING) {
+        return Err(ctx.stop(
+            call.err_call(),
+            format!("argument \"{name}\" is missing, with no default"),
+        ));
+    }
+    if let Some(value) = found {
+        return Ok(value);
+    }
+    if kind == "get0" {
+        return Ok(fallback.unwrap_or(SEXP_NIL));
     }
     let mode = mode
         .filter(|mode| mode != "any")
         .map_or(String::new(), |mode| format!(" of mode '{mode}'"));
     Err(ctx.stop(call.err_call(), format!("object '{name}'{mode} not found")))
+}
+
+impl Ctx {
+    fn lookup_mode(
+        &mut self,
+        sym: Sym,
+        mut env: SexpId,
+        mode: &str,
+        inherits: bool,
+        exists: bool,
+    ) -> EvalResult<Option<SexpId>> {
+        while let Some(found) = self.binding_env(sym, env, inherits)? {
+            if exists && mode == "any" {
+                return Ok(Some(SEXP_NIL));
+            }
+            let Some(value) = self.get_local(sym, found)? else {
+                return Ok(None);
+            };
+            let ty = self.session.type_of(value)?;
+            let compatible = match mode {
+                "any" => true,
+                "function" => matches!(ty, SexpType::Builtin | SexpType::Special | SexpType::Clo),
+                "numeric" => matches!(ty, SexpType::Int | SexpType::Real),
+                mode => ty.type_name(false) == mode,
+            };
+            if compatible || value == SEXP_MISSING {
+                return Ok(Some(value));
+            }
+            if !inherits {
+                break;
+            }
+            env = self.session.env_enclos(found)?;
+        }
+        Ok(None)
+    }
+
+    pub(crate) fn environment_names(&mut self, env: SexpId) -> EvalResult {
+        let names = self
+            .session
+            .env_entries(env)?
+            .into_iter()
+            .map(|(tag, _)| Ok(self.session.sym_name(tag)?.to_owned()))
+            .collect::<EvalResult<Vec<_>>>()?;
+        self.strings(names.iter().map(String::as_str))
+    }
+}
+
+fn mget(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    let matched = ctx.match_names(
+        args,
+        &["x", "envir", "mode", "ifnotfound", "inherits"],
+        call.err_call(),
+    )?;
+    let names = ctx.matched_arg(args, &matched, 0).unwrap_or(SEXP_NIL);
+    let env = ctx.matched_arg(args, &matched, 1).unwrap_or(call.env);
+    ctx.require_env(env, call.err_call())?;
+    let modes = ctx.matched_arg(args, &matched, 2);
+    let fallback = ctx.matched_arg(args, &matched, 3);
+    let inherits = scalar_flag(ctx, ctx.matched_arg(args, &matched, 4), false, call)?;
+    let keys = ctx.session.str_slice(names)?.to_vec();
+    let modes = match modes {
+        Some(value) => ctx.session.str_slice(value)?.to_vec(),
+        None => Vec::new(),
+    };
+    let fallback = fallback
+        .map(|value| {
+            let value = ctx.session.coerce(value, SexpType::Vec)?.0;
+            ctx.protect(value);
+            ctx.list_args(value)
+        })
+        .transpose()?;
+    if (!modes.is_empty() && modes.len() != 1 && modes.len() != keys.len())
+        || fallback
+            .as_ref()
+            .is_some_and(|v| v.len() != 1 && v.len() != keys.len())
+    {
+        return Err(ctx.stop(
+            call.err_call(),
+            "wrong length for 'mode' or 'ifnotfound' argument",
+        ));
+    }
+    let result = ctx.session.alloc_list(keys.len())?;
+    ctx.protect(result);
+    for (i, key) in keys.into_iter().enumerate() {
+        let name = String::from_utf8_lossy(ctx.session.char_bytes(key)?).into_owned();
+        let sym = ctx.session.intern(&name)?;
+        let mode = if modes.is_empty() {
+            "any".to_owned()
+        } else {
+            String::from_utf8_lossy(ctx.session.char_bytes(modes[i % modes.len()])?).into_owned()
+        };
+        let value = match ctx.lookup_mode(sym, env, &mode, inherits, false)? {
+            Some(value) => value,
+            None => {
+                let Some(fallback) = &fallback else {
+                    return Err(ctx.stop(call.err_call(), format!("value for ‘{name}’ not found")));
+                };
+                let value = fallback.get(i % fallback.len());
+                if is_function(ctx, value)? {
+                    let key = ctx.session.alloc_str_from(&[key])?;
+                    ctx.apply(value, &[(None, key)], SEXP_NIL, call.env)?
+                } else {
+                    value
+                }
+            }
+        };
+        ctx.session.list_set(result, i, value)?;
+    }
+    let tag = ctx.session.intern("names")?;
+    ctx.session.set_attrib(result, tag, names)?;
+    Ok(result)
+}
+
+fn as_environment(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    match ctx.session.type_of(args.get(0))? {
+        SexpType::Vec => populate_environment(ctx, call, args.get(0), SEXP_NIL, EMPTY_ENV),
+        SexpType::Int | SexpType::Real if ctx.session.xlength(args.get(0))? > 1 => {
+            let values = ctx.session.coerce(args.get(0), SexpType::Int)?.0;
+            let values = ctx.session.int(values)?.to_vec();
+            let mut result = Vec::with_capacity(values.len());
+            for value in values {
+                let position = ctx.session.scalar_int(value)?;
+                result.push((None, ctx.search_env(position, call)?));
+            }
+            ctx.list(&Args::from_pairs(result))
+        }
+        _ => ctx.search_env(args.get(0), call),
+    }
+}
+
+fn list_to_env(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    let matched = ctx.match_names(
+        args,
+        &["x", "envir", "parent", "hash", "size"],
+        call.err_call(),
+    )?;
+    let list = ctx.matched_arg(args, &matched, 0).unwrap_or(SEXP_NIL);
+    let env = ctx.matched_arg(args, &matched, 1).unwrap_or(SEXP_NIL);
+    let parent = ctx.matched_arg(args, &matched, 2).unwrap_or(call.env);
+    populate_environment(ctx, call, list, env, parent)
+}
+
+fn populate_environment(
+    ctx: &mut Ctx,
+    call: &Call,
+    list: SexpId,
+    env: SexpId,
+    parent: SexpId,
+) -> EvalResult {
+    if ctx.session.type_of(list)? != SexpType::Vec {
+        return Err(ctx.stop(call.err_call(), "first argument must be a named list"));
+    }
+    let pairs = ctx.list_args(list)?;
+    let names = ctx.session.intern("names")?;
+    if !pairs.is_empty() && ctx.session.attr(list, names) == SEXP_NIL {
+        return Err(ctx.stop(
+            call.err_call(),
+            "names(x) must be a character vector of the same length as x",
+        ));
+    }
+    if pairs.iter().any(|(tag, _)| tag.is_none()) {
+        return Err(ctx.stop(call.err_call(), "attempt to use zero-length variable name"));
+    }
+    let env = if env == SEXP_NIL {
+        ctx.require_env(parent, call.err_call())?;
+        ctx.session.alloc_env(parent)?
+    } else {
+        ctx.require_env(env, call.err_call())?
+    };
+    ctx.protect(env);
+    for (tag, value) in pairs.iter() {
+        if let Some(tag) = tag {
+            ctx.assign(tag, value, env)?;
+        }
+    }
+    Ok(env)
+}
+
+fn active_binding_function(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    let sym = binding_sym(ctx, args.get(0), call.err_call())?;
+    let env = ctx.require_env(args.get(1), call.err_call())?;
+    let name = ctx.session.sym_name(sym)?.to_owned();
+    match ctx.session.env_get(env, sym) {
+        Some(binding) if binding.active => Ok(binding.value),
+        Some(_) => Err(ctx.stop(call.err_call(), format!("no active binding for \"{name}\""))),
+        None => Err(ctx.stop(call.err_call(), format!("no binding for \"{name}\""))),
+    }
+}
+
+fn delayed_assign(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    let matched = ctx.match_names(
+        args,
+        &["x", "value", "eval.env", "assign.env"],
+        call.err_call(),
+    )?;
+    let name = ctx.eval_arg(args, &matched, 0, call, SEXP_NIL)?;
+    let name = ctx.string(name, call.err_call())?;
+    let sym = ctx.session.intern(&name)?;
+    let eval_env = ctx.eval_arg(args, &matched, 2, call, call.env)?;
+    let assign_env = ctx.eval_arg(args, &matched, 3, call, call.env)?;
+    ctx.require_env(eval_env, call.err_call())?;
+    ctx.require_env(assign_env, call.err_call())?;
+    let value = ctx.matched_arg(args, &matched, 1).unwrap_or(SEXP_MISSING);
+    let promise = ctx.session.alloc_promise(value, eval_env)?;
+    ctx.assign(sym, promise, assign_env)?;
+    Ok(SEXP_NIL)
+}
+
+fn is_function(ctx: &Ctx, value: SexpId) -> EvalResult<bool> {
+    Ok(matches!(
+        ctx.session.type_of(value)?,
+        SexpType::Clo | SexpType::Builtin | SexpType::Special
+    ))
+}
+
+#[derive(Default)]
+struct ExitFinalizers(Vec<(SexpId, SexpId)>);
+
+impl Trace for ExitFinalizers {
+    fn trace(&self, tracer: &mut Tracer<'_>) {
+        for &(env, fun) in &self.0 {
+            tracer.edge(env);
+            tracer.edge(fun);
+        }
+    }
+}
+
+impl crate::CtxExt for ExitFinalizers {}
+
+fn register_finalizer(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    let matched = ctx.match_names(args, &["e", "f", "onexit"], call.err_call())?;
+    let env = ctx.matched_arg(args, &matched, 0).unwrap_or(SEXP_NIL);
+    let fun = ctx.matched_arg(args, &matched, 1).unwrap_or(SEXP_NIL);
+    if !matches!(ctx.session.type_of(env)?, SexpType::Env | SexpType::ExtPtr) {
+        return Err(ctx.stop(
+            call.err_call(),
+            "first argument must be environment or external pointer",
+        ));
+    }
+    if !is_function(ctx, fun)? {
+        return Err(ctx.stop(call.err_call(), "second argument must be a function"));
+    }
+    if scalar_flag(ctx, ctx.matched_arg(args, &matched, 2), false, call)? {
+        ctx.ext::<ExitFinalizers>().0.push((env, fun));
+    }
+    Ok(SEXP_NIL)
+}
+
+impl Ctx {
+    /// Run registered exit finalizers once, in reverse registration order.
+    pub fn run_exit_finalizers(&mut self) {
+        let finalizers = std::mem::take(&mut self.ext::<ExitFinalizers>().0);
+        if finalizers.is_empty() {
+            return;
+        }
+        let _ = self.scoped(|ctx| {
+            let visible = ctx.visible;
+            for &(env, fun) in &finalizers {
+                ctx.protect(env);
+                ctx.protect(fun);
+            }
+            for (env, fun) in finalizers.into_iter().rev() {
+                let _ = ctx.apply(fun, &[(None, env)], SEXP_NIL, GLOBAL_ENV);
+            }
+            ctx.visible = visible;
+            Ok(())
+        });
+    }
+}
+
+fn sys_stack(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    let current = ctx
+        .frames
+        .iter()
+        .rposition(|frame| frame.cloenv == call.env)
+        .map_or(0, |index| index + 1);
+    let parent = |frames: &[crate::ctx::Frame], child: usize| {
+        let Some(frame) = child.checked_sub(1).and_then(|i| frames.get(i)) else {
+            return 0;
+        };
+        frames[..child - 1]
+            .iter()
+            .rposition(|entry| entry.cloenv == frame.caller)
+            .map_or(0, |index| index + 1)
+    };
+    match ctx.prims[usize::from(call.prim.0)].name {
+        "sys.parent" => {
+            let n = if args.is_empty() {
+                1
+            } else {
+                ctx.integer(args.get(0), call.err_call())?
+            };
+            if n < 0 {
+                return Err(ctx.stop(call.err_call(), "invalid 'n' value"));
+            }
+            let mut index = current;
+            for _ in 0..n {
+                index = parent(&ctx.frames, index);
+                if index == 0 {
+                    break;
+                }
+            }
+            Ok(ctx.session.scalar_int(index as i32)?)
+        }
+        "sys.parents" => {
+            let parents: Vec<_> = (1..=current)
+                .map(|i| parent(&ctx.frames, i) as i32)
+                .collect();
+            Ok(ctx.session.alloc_int_from(&parents)?)
+        }
+        "sys.on.exit" => {
+            let Some(frame) = ctx.frame(call.env) else {
+                return Ok(SEXP_NIL);
+            };
+            match frame.on_exit.as_slice() {
+                [] => Ok(SEXP_NIL),
+                [expr] => Ok(*expr),
+                exprs => {
+                    let pairs = exprs.iter().map(|&expr| (None, expr)).collect();
+                    let head = ctx.session.intern("{")?.as_sexp();
+                    ctx.make_call(head, &Args::from_pairs(pairs))
+                }
+            }
+        }
+        kind => {
+            let pairs = ctx.frames[..current]
+                .iter()
+                .map(|frame| {
+                    (
+                        None,
+                        if kind == "sys.calls" {
+                            frame.call
+                        } else {
+                            frame.cloenv
+                        },
+                    )
+                })
+                .collect();
+            ctx.pairlist(&Args::from_pairs(pairs), false)
+        }
+    }
 }
 
 fn remove(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
@@ -795,4 +1154,12 @@ fn topenv(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
         guard += 1;
     }
     Ok(GLOBAL_ENV)
+}
+
+impl Drop for Ctx {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            self.run_exit_finalizers();
+        }
+    }
 }
