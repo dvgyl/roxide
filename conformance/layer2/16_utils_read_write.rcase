@@ -1,0 +1,184 @@
+=== case: type_convert_spelling ===
+#@ tags: table_io,type_convert
+#@ compare: exact
+for (x in c("T","TRUE","True","false","F","FALSE","False","true","007","0x1A",
+            "2147483648","-2147483648","+3"," 3","3 ","1.0","-0 ","1i","1+2i",
+            "1 +2i","1+ 2i","NaNi","1+NAi","Inf","NaN","   ","  NA")) {
+    y <- type.convert(c(x, "NA", ""), as.is = TRUE)
+    cat(typeof(y), "\n")
+    dput(y)
+}
+dput(type.convert(c("T","1"), as.is = TRUE))
+dput(type.convert(c("T","F"), as.is = TRUE, tryLogical = FALSE))
+dput(type.convert(c("NA",""), na.strings = character(), as.is = TRUE))
+dput(type.convert(c("absent","","x"), na.strings = c("absent",""), as.is = TRUE))
+dput(type.convert(character(), as.is = TRUE))
+dput(type.convert(character(), as.is = TRUE, tryLogical = FALSE))
+dput(type.convert(list(a = c("01","2"), b = c("F","TRUE")), as.is = TRUE))
+d <- type.convert(data.frame(a = c("1","2"), b = c("X","Y")), as.is = TRUE)
+dput(d$a)
+dput(d$b)
+
+=== case: type_convert_decimal_and_precision ===
+#@ tags: table_io,type_convert
+#@ compare: exact
+for (x in c("1,25","1,0","1,2e2","1,2+3,4i","0x1,8p1","0x1p2","1.25",
+            "0x1.8p1","1.234,5","1,234.5","1,2,3"))
+    dput(type.convert(x, as.is = TRUE, dec = ","))
+for (mode in c("allow.loss","warn.loss","no.loss")) {
+    for (x in list("9007199254740991","9007199254740992","9007199254740993",
+                   "9007199254740994","9007199254740992e-10","0.10000000000000001",
+                   "1.234567890123456789","1e309","1e-400","9007199254740993i",
+                   "1+9007199254740993i", c("9007199254740993","0i"),
+                   c("0i","9007199254740993"), c("1","9007199254740993","x"))) {
+        withCallingHandlers({
+            y <- type.convert(x, as.is = TRUE, numerals = mode)
+            if (is.double(y)) {
+                cat(sprintf("%.17g", y), "\n")
+            } else if (is.complex(y)) {
+                cat(sprintf("%.17g%+.17gi", Re(y), Im(y)), "\n")
+            } else {
+                dput(y)
+            }
+        }, warning = function(w) {
+            cat(conditionMessage(w), "\n")
+            invokeRestart("muffleWarning")
+        })
+    }
+}
+
+=== case: scan_and_count_fields ===
+#@ tags: table_io,scan
+#@ compare: exact
+dput(scan(text = "skip\n1,2 # note\n3,4\n5,6", sep = ",", skip = 1L,
+          comment.char = "#", nmax = 3L, what = integer(), quiet = TRUE))
+dput(scan(text = "1,one,TRUE\n2,\"two,two\",false\n3,NA,T", sep = ",",
+          what = list(id = integer(), label = character(), flag = logical()), nmax = 2L, quiet = TRUE))
+dput(scan(text = "1:2\n3:4", sep = ":", n = 3L, quiet = TRUE))
+dput(scan(text = "ff 00 0a", what = raw(), quiet = TRUE))
+dput(scan(text = "1+2i 3i", what = complex(), quiet = TRUE))
+dput(scan(text = "one 'two three' four #drop\nfive", what = character(),
+          comment.char = "#", quiet = TRUE))
+con <- textConnection(c("ignored", 'a,"b','c",d', "", "e,f"))
+dput(count.fields(con, sep = ",", skip = 1L, blank.lines.skip = FALSE))
+close(con)
+
+=== case: table_header_and_row_names ===
+#@ tags: table_io,reader
+#@ compare: exact
+d <- read.table(text = "a b\n01 1 2\n02 3 4")
+dput(names(d))
+dput(rownames(d))
+dput(d$a)
+d <- read.table(text = "a b\n01 1 2\n02 3 4", row.names = NULL)
+dput(names(d))
+dput(rownames(d))
+dput(d$row.names)
+d <- read.table(text = "a b\n01 1 2\n02 3 4", row.names = "a")
+dput(names(d))
+dput(rownames(d))
+d <- read.table(text = "a b\n01 1 2\n02 3 4", row.names = c("r1","r2"))
+dput(names(d))
+dput(rownames(d))
+for (key in c("01","NA")) {
+    tryCatch(read.table(text = paste0("a b\n01 1 2\n", key, " 3 4"), row.names = 1L),
+             error = function(e) cat(conditionMessage(e), "\n"))
+}
+dput(names(read.csv(text = "a,a,a.1,1 x,if,,a-b,a b\n1,2,3,4,5,6,7,8")))
+dput(names(read.csv(text = "a,a,a.1,1 x,if,,a-b,a b\n1,2,3,4,5,6,7,8", check.names = FALSE)))
+dput(make.names(c("a_b", "a-b", "NA", ".2", NA), unique = TRUE, allow_ = FALSE))
+
+=== case: table_dialects_and_width ===
+#@ tags: table_io,reader
+#@ compare: exact
+d <- read.csv(text = 'id,note,extra\n1,"first\n\nsecond", x  \n2,"a""b"\n3,last,z',
+              strip.white = TRUE, nrows = 2L)
+dput(d$id)
+dput(d$note)
+dput(d$extra)
+d <- read.table(text = 'skip # ignored\na b\n1 "a\\"b" # note\n2 two',
+                header = TRUE, skip = 1L)
+dput(d$a)
+dput(d$b)
+dput(read.csv2(text = "x;y\n1,25;2\n3,5;4")$x)
+dput(read.delim(text = "x\ty\n1\t2\n3\t4")$y)
+dput(read.delim2(text = "x\ty\n1,25\t2")$x)
+dput(read.csv(text = "a,b\n1,2\n3\n4,5\n6,7\n8,9,10")$a)
+dput(read.csv(text = "a,b\n1,2\n\n3,4", blank.lines.skip = FALSE)$a)
+tryCatch(read.table(text = "1 2 3\n4 5"), error = function(e) cat(conditionMessage(e), "\n"))
+
+=== case: table_classes_and_missing ===
+#@ tags: table_io,reader
+#@ compare: exact
+d <- read.csv(text = "a-b,drop,n,l,date,f\n007,z,3 4,T R U E,2024-02-29,b\n008,z,5,false,2024-03-01,a",
+              colClasses = c(a.b = "character", drop = "NULL", n = "integer",
+                             l = "logical", date = "Date", f = "factor"))
+dput(names(d))
+dput(d$a.b)
+dput(d$n)
+dput(d$l)
+dput(as.numeric(d$date))
+dput(d$f)
+dput(read.csv(text = "a,b\nx,1\n,2\nNA,3", stringsAsFactors = TRUE)$a)
+dput(read.csv(text = "a,b\nx,1\n,2\nNA,3", stringsAsFactors = FALSE)$a)
+dput(read.csv(text = "x,y\n  NA  ,1\na,2", strip.white = TRUE)$x)
+dput(read.csv(text = "a,b\n")$b)
+tryCatch(read.csv(text = "x\n1.0", colClasses = "integer"),
+         error = function(e) cat(conditionMessage(e), "\n"))
+
+=== case: table_write_stdout ===
+#@ tags: table_io,writer
+#@ compare: exact
+d <- data.frame(n = c(1.25, NA), text = c('a"b', 'c\\d'), flag = c(TRUE,FALSE))
+write.table(d, quote = TRUE)
+write.table(d, sep = "|", dec = ",", row.names = FALSE, col.names = c("N","T","F"), na = "")
+write.csv(d)
+write.csv2(d, row.names = FALSE)
+write.table(matrix(c(1,2,3,4), 2L), quote = FALSE, col.names = FALSE)
+
+=== case: table_write_read_file_and_connection ===
+#@ tags: table_io,writer,reader
+#@ compare: exact
+d <- data.frame(n = c(1.25, NA), text = c('a"b', 'c\\d'))
+p <- tempfile()
+write.csv(d, p)
+dput(readLines(p))
+back <- read.csv(p)
+dput(rownames(back))
+dput(back$n)
+dput(back$text)
+write.csv2(d, p, row.names = FALSE)
+back <- read.csv2(p)
+dput(back$n)
+dput(back$text)
+write.table(d[1,], p, row.names = FALSE)
+write.table(d[2,], p, append = TRUE, row.names = FALSE, col.names = FALSE)
+dput(readLines(p))
+unlink(p)
+con <- textConnection("result", "w")
+write.csv(d, con, row.names = FALSE)
+dput(textConnectionValue(con))
+close(con)
+con <- textConnection(c("a,b", "1,2", "3,4"))
+dput(read.csv(con)$b)
+close(con)
+
+=== case: bounded_connection_reads ===
+#@ tags: table_io,reader,scan
+#@ compare: exact
+con <- textConnection(c("1 2 3", "4 5"))
+dput(scan(con, nmax = 1L, quiet = TRUE))
+dput(scan(con, nmax = 2L, quiet = TRUE))
+dput(readLines(con))
+close(con)
+con <- textConnection(c("a,b", "1,2,3", "4,5", "6,7"))
+d <- read.csv(con, nrows = 1L)
+dput(rownames(d))
+dput(d$b)
+dput(readLines(con))
+close(con)
+con <- textConnection(c("a,b", "1,2,3", "4,5"))
+d <- read.csv(con, header = FALSE, nrows = 1L)
+dput(names(d))
+dput(readLines(con))
+close(con)
