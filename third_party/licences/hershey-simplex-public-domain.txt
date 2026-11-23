@@ -1,0 +1,9 @@
+Hershey Simplex Vector Font — Public Domain Provenance
+Author: Dr. Allen Vincent Hershey (U.S. Naval Weapons Laboratory, Dahlgren, VA, 1967)
+Distribution: U.S. National Bureau of Standards (NBS) / National Technical Information Service (NTIS)
+
+The Hershey vector font dataset was created by a U.S. federal government employee
+as part of official duties and published into the Public Domain via NBS/NTIS
+Special Publication 424 (1976). Roxide uses clean-room Roman Simplex stroke
+polylines derived from these public-domain vector coordinates for headless PNG
+text rendering.

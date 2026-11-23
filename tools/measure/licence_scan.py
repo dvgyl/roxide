@@ -34,7 +34,7 @@ FORBIDDEN_SOURCE_PATTERNS = [
 ]
 
 SCAN_DIRS = ["crates", "stdlib", "conformance", "tools", "scripts"]
-TEXT_EXTENSIONS = {".rs", ".r", ".R", ".py", ".sh", ".toml", ".md", ".c", ".h", ".txt", ".json"}
+TEXT_EXTENSIONS = {".rs", ".r", ".R", ".py", ".sh", ".toml", ".md", ".c", ".h", ".txt", ".json", ".tsv", ".rcase"}
 
 
 def should_skip(path: pathlib.Path) -> bool:

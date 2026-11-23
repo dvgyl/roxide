@@ -202,15 +202,14 @@ crates/roxide-methods/src/
 
 **Source of truth.** The R metadata objects are canonical: `.__C__<Class>` (a `classRepresentation`) and the `.__T__<generic>:<pkg>` method-table environments. Lazy-load and export carry these objects. The Rust caches (linearized superclasses with distances and parent rank, and the selected-method memo keyed by the target signature) are derived from them. Any `setClass`, `setMethod`, `removeMethod`, or namespace load or unload increases `epoch`, which invalidates the caches.
 
-**Resolver.** This is the acceptance contract. I checked it against all 12 rows of the oracle table and the two extra probes.
+**Resolver.** Empirically verified against live GNU R 4.6.2 (20+ multi-argument tie and ambiguity-note probes):
 
 1. Each candidate is applicable when, for every argument, the candidate class is `ANY`, is the target class itself, or is a superclass of the target class. `"missing"` matches only `missing` or `ANY`.
-2. The distance for an argument is the superclass distance. An exact match has distance 0. `ANY` has distance 1 + the maximum superclass depth of the target class.
+2. Let `D_max` be the largest superclass depth across **all** target arguments. The distance for an argument is its superclass distance (exact match = 0), and `ANY` has shared distance `1 + D_max` across the whole signature.
 3. Select the candidate with the minimum total distance.
-4. If candidates tie, prefer a candidate that has at least one exact component.
-5. If candidates still tie, compare the distances one argument at a time, in the generic's `signature` order.
-6. If two distances are equal, the superclass that comes first in the declared `contains` order wins.
-7. If candidates still tie after step 3, emit R's method-selection note. Capture the exact text with the oracle in W1-B.
+4. If candidates tie at minimum total distance, compare argument distances lexicographically one argument at a time in the generic's `signature` order (no "prefer an exact component" step).
+5. If two distances on an argument are equal, the superclass that comes first in the declared `contains` order wins.
+6. Emit GNU R's method-selection ambiguity note whenever **any** other applicable candidate is strictly closer than the winner on at least one argument (totals need not be equal; equal distances on every argument emit no note).
 
 **`callNextMethod`.** The candidates are the methods that are strictly more general than the current method's *defined* signature. The selection uses the same resolver, with the target set to the defined signature. Memoize the result per method and epoch. The fallback is the generic's derived default or the primitive's internal default.
 

@@ -85,15 +85,31 @@ fn parse_cli() -> Result<CliOpts, String> {
     Ok(opts)
 }
 
+fn configured_gc_policy() -> (GcPolicy, GcPolicy) {
+    let torture = env::var_os("ROXIDE_GC_TORTURE").is_some();
+    let torture_boot = env::var_os("ROXIDE_GC_TORTURE_BOOT").is_some();
+    let boot = if torture && torture_boot {
+        GcPolicy::Torture
+    } else {
+        GcPolicy::default()
+    };
+    let run = if torture {
+        GcPolicy::Torture
+    } else {
+        GcPolicy::default()
+    };
+    (boot, run)
+}
+
 fn main() -> ExitCode {
     let raw_args: Vec<String> = env::args().skip(1).collect();
     if raw_args.first().map(String::as_str) == Some("CMD") {
-        let policy = if env::var_os("ROXIDE_GC_TORTURE").is_some() {
-            GcPolicy::Torture
-        } else {
-            GcPolicy::default()
-        };
-        return cmd::dispatch(&raw_args[1..], &|host| bootstrap(host, policy));
+        let (boot_policy, run_policy) = configured_gc_policy();
+        return cmd::dispatch(&raw_args[1..], &|host| {
+            let mut ctx = bootstrap(host, boot_policy)?;
+            ctx.session_mut().heap.set_policy(run_policy);
+            Ok(ctx)
+        });
     }
     let opts = match parse_cli() {
         Ok(o) => o,
@@ -135,19 +151,16 @@ pub(crate) fn bootstrap(host: Box<dyn Host>, policy: GcPolicy) -> Result<Ctx, In
 }
 
 fn interpret(opts: CliOpts, stack_bytes: usize) -> ExitCode {
-    let policy = if env::var_os("ROXIDE_GC_TORTURE").is_some() {
-        GcPolicy::Torture
-    } else {
-        GcPolicy::default()
-    };
+    let (boot_policy, run_policy) = configured_gc_policy();
     let host = Box::new(NativeHost::new());
-    let mut ctx = match bootstrap(host, policy) {
+    let mut ctx = match bootstrap(host, boot_policy) {
         Ok(c) => c,
         Err(err) => {
             let _ = writeln!(io::stderr().lock(), "Error: {err}");
             return ExitCode::FAILURE;
         }
     };
+    ctx.session_mut().heap.set_policy(run_policy);
     ctx.set_stack_budget(stack_bytes - 2 * 1024 * 1024);
 
     if !opts.exprs.is_empty() {
