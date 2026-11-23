@@ -1,0 +1,140 @@
+=== case: formula_algebra_and_attributes ===
+#@ tags: layer2,model
+#@ compare: exact
+d <- data.frame(y = 1:3, a = 1:3, b = 2:4, c = 3:5, z = 4:6)
+for (f in list(y ~ a+b, y ~ a+a, y ~ a*b, y ~ a:b, y ~ a %in% b, y ~ a/b,
+               y ~ (a+b)/c, y ~ a/(b+c), y ~ a %in% (b+c), y ~ (a+b+c)^2,
+               y ~ (a+b+c)^3, y ~ (a*b*c)^2, y ~ a^2, y ~ a*b-a, y ~ a-a,
+               y ~ -a, y ~ 1-a, y ~ 0+a+b, y ~ a+b-1, y ~ 0+a+1, y ~ a+0-0,
+               y ~ z+I(a+b)+offset(c), y ~ a+offset(b)+offset(c), y ~ offset(b):a,
+               y ~ ., y ~ .-z, ~ ., cbind(y,z) ~ .)) {
+    t <- terms(f, data = d)
+    cat(paste(attr(t, "term.labels"), collapse=" "), "|", attr(t, "intercept"), attr(t, "response"),
+        "|", paste(attr(t, "offset"), collapse=" "), "|", paste(attr(t, "factors"), collapse=" "), "\n")
+}
+for (keep in c(FALSE, TRUE)) {
+    t <- terms(y ~ b:a+c+a+b, keep.order = keep)
+    cat(class(t), deparse(attr(t, "variables")), attr(t, "order"), "\n")
+    cat(rownames(attr(t, "factors")), "|", colnames(attr(t, "factors")), "\n")
+}
+s <- attr(terms(y ~ f(a)+offset(b), specials = c("f", "missing", "offset")), "specials")
+cat(typeof(s), names(s), s$f, is.null(s$missing), s$offset, "\n")
+err <- function(e) cat(conditionMessage(e), "\n")
+for (f in list(y ~ (a+b)^0, y ~ (a+b)^1.5, y ~ (a+b)^-1, y ~ .))
+    tryCatch(terms(f), error = err)
+show <- function(f) {
+    attributes(f) <- NULL
+    cat(deparse(f), "\n")
+}
+old <- local(y ~ a*b+c)
+for (f in list(. ~ .-b+z, . ~ .-1, log(.) ~ .+I(a^2), z ~ ., . ~ .^2)) {
+    new <- update(old, f)
+    show(new)
+    cat(identical(environment(new), environment(old)), "\n")
+}
+show(reformulate(c("b", "a:b"), response = "y", intercept = FALSE))
+show(formula(delete.response(terms(y ~ x+offset(z)))))
+show(formula(drop.terms(terms(y ~ x+offset(z)), 1, keep.response = TRUE)))
+tryCatch(model.frame(y ~ x-w, data.frame(y=1,x=2)), error = err)
+
+=== case: frame_evaluation_and_poly_prediction ===
+#@ tags: layer2,model
+#@ compare: exact
+d <- data.frame(y = 1:5, z = 10:14, x = 2:6, f = factor(c("a","b","c","a","b")),
+                o = ordered(c("a","b","c","d","e")), ch = c("a","b","c","d","e"),
+                ell = c(TRUE, FALSE, TRUE, FALSE, TRUE), w = 2:6,
+                row.names = c("one","two","three","four","five"))
+outside <- 10L
+m <- model.frame(y ~ poly(z,2) + log(x) + f + o + ch + I(z^2) + ell + offset(z),
+                 d, subset = z < 12, weights = w, offset = z + outside)
+cat(names(m), "\n")
+cat(rownames(m), model.weights(m), model.offset(m), "\n")
+cat(attr(attr(m, "terms"), "dataClasses"), "\n")
+pv <- attr(attr(m, "terms"), "predvars")
+co <- as.list(pv[[3]])$coefs
+cat(names(co), sprintf("%.10g", co$alpha), sprintf("%.10g", co$norm2), "\n")
+cat(levels(m$f), "\n")
+cat(levels(model.frame(y ~ f, d, subset=z < 12, drop.unused.levels=TRUE)$f), "\n")
+cat(names(model.response(m)), model.response(m), "\n")
+cat(names(get_all_vars(y ~ log(x)+I(z^2), d)), "\n")
+x <- c(4, 7, 16, 33, 45)
+p <- poly(x, 3)
+q <- poly(x[c(2,4)], 3, coefs = attr(p, "coefs"))
+cat(max(abs(p[c(2,4), ] - q)) < 1e-12, "\n")
+cat(poly(2:4, 2, raw = TRUE), "\n")
+
+=== case: missing_actions_and_padding ===
+#@ tags: layer2,model
+#@ compare: exact
+d <- data.frame(y = c(1,NA,3,4,5), x = c(11,12,NaN,14,15), w = c(1,2,3,NA,5),
+                row.names = c("one","two","three","four","five"))
+for (act in list(na.omit, na.exclude, na.pass, NULL, "na.omit")) {
+    m <- model.frame(y ~ x, d, weights = w, na.action = act)
+    a <- na.action(m)
+    cat(rownames(m), "|", if (is.null(a)) "NULL" else class(a), a, names(a), "\n")
+    cat(naresid(a, 1:2), "|", napredict(a, 1:2), "\n")
+}
+tryCatch(model.frame(y ~ x, d, weights = w, na.action = na.fail),
+         error = function(e) cat(conditionMessage(e), "\n"))
+s <- model.frame(y ~ x, d, subset = c(5,3,1), na.action = "na.exclude")
+cat(rownames(s), names(na.action(s)), na.action(s), "\n")
+cat(complete.cases(d, matrix(c(NA, rep(0,9)), 5)), "\n")
+a <- na.action(model.frame(y ~ x, d, weights = w, na.action = na.exclude))
+v <- napredict(a, c(one=1L, five=2L))
+cat(names(v), v, typeof(v), "\n")
+m <- napredict(a, matrix(1:4, 2, dimnames = list(c("one","five"),c("a","b"))))
+cat(dim(m), rownames(m), colnames(m), m, "\n")
+m <- naresid(a, structure(1:8, dim = c(2L,2L,2L), dimnames = list(NULL,c("a","b"),c("x","y"))))
+cat(dim(m), is.null(dimnames(m)[[1L]]), dimnames(m)[[2L]], dimnames(m)[[3L]], m, "\n")
+d <- data.frame(x = 1:3, y = 2:4)
+for (act in list(na.omit, na.exclude, na.fail, na.pass)) {
+    cat(is.null(na.action(model.frame(y ~ x, d, na.action=act))), "\n")
+}
+
+=== case: design_matrix_marginality ===
+#@ tags: layer2,model
+#@ compare: exact
+d <- data.frame(f = factor(rep(c("a","b","c"), 2)), g = factor(rep(c("U","V"), each=3)),
+                x = 1:6, o = ordered(c("a","b","c","d","e"))[c(1:5,1)],
+                l = rep(c(TRUE,FALSE),3), ch = rep(c("a","b","c"),2))
+show <- function(m) {
+    cat(dim(m), rownames(m), "|", paste(colnames(m), collapse=" "), "|", paste(attr(m, "assign"), collapse=" "), "\n")
+    cs <- attr(m, "contrasts")
+    cat(paste(names(cs), collapse=" "), "|")
+    for (spec in cs) cat(spec)
+    cat("\n")
+    v <- round(as.double(m), 8)
+    v[v == 0] <- 0
+    cat(paste(sprintf("%.8f", v), collapse=" "), "\n")
+}
+for (f in list(~f, ~0+f, ~f+g, ~0+f+g, ~f:g, ~0+f:g, ~g+f:g-1,
+               ~f*g, ~f+x+f:x, ~o, ~0+o, ~1, ~0, ~l+ch+offset(x))) {
+    show(model.matrix(f, d))
+}
+show(model.matrix(~f, d, contrasts.arg = list(f = "contr.sum")))
+cm <- contr.helmert(c("a","b","c"))
+dimnames(cm) <- list(rownames(cm), c("A","B"))
+m <- model.matrix(~f, d, contrasts.arg = list(f = cm))
+cat(colnames(m), identical(attr(m,"contrasts")$f, cm), "\n")
+tryCatch(model.matrix(~0+f, data.frame(f=factor("a"))),
+         error = function(e) cat(conditionMessage(e), "\n"))
+
+=== case: contrast_constructors_and_assignment ===
+#@ tags: layer2,model
+#@ compare: exact
+show <- function(m) {
+    v <- round(as.double(m), 8)
+    v[v == 0] <- 0
+    cat(dim(m), rownames(m), colnames(m), sprintf("%.8f", v), "\n")
+}
+for (f in list(contr.treatment, contr.sum, contr.helmert, contr.SAS)) {
+    show(f(c("a","b","c")))
+    show(f(c("a","b","c"), contrasts = FALSE))
+}
+show(contr.poly(5))
+show(contr.poly(4, scores = c(2,3,5,9), contrasts = FALSE))
+f <- factor(c("a","b","c"))
+contrasts(f) <- "contr.sum"
+show(contrasts(f))
+show(contrasts(C(f, "contr.helmert")))
+cat(levels(relevel(f, "c")), "\n")
