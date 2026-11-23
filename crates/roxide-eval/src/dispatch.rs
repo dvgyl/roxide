@@ -233,9 +233,11 @@ impl Ctx {
 
     fn lookup_method(
         &mut self,
+        generic: &str,
         name: &str,
         caller: SexpId,
         definition: SexpId,
+        default: bool,
     ) -> EvalResult<Option<SexpId>> {
         if let Some(fun) = self.optional_fun(name, caller, BASE_ENV)? {
             return Ok(Some(fun));
@@ -250,17 +252,28 @@ impl Ctx {
         if definition != BASE_NAMESPACE && definition != BASE_ENV {
             return self.optional_fun(name, definition, self.session.env_enclos(definition)?);
         }
-        // These methods belong to base generics and are registered by other packages.
-        let package = match name {
-            "print.formula" | "print.htest" | "print.integrate" | "[.terms" => Some("stats"),
-            "format.object_size" | "print.object_size" | "print.sessionInfo" => Some("utils"),
-            "print.Rd" => Some("tools"),
-            _ => None,
-        };
-        if let Some(pkg) = self.packages.iter().find(|pkg| Some(pkg.name) == package) {
-            let ns = pkg.namespace;
-            if let Some(fun) = self.optional_fun(name, ns, self.session.env_enclos(ns)?)? {
-                return Ok(Some(fun));
+        // Built-in packages register S3 methods for these base generics until M3 NAMESPACE tables.
+        let base_cross_pkg = !default
+            && name != "format.pval"
+            && matches!(
+                generic,
+                "print"
+                    | "format"
+                    | "summary"
+                    | "diff"
+                    | "as.matrix"
+                    | "as.character"
+                    | "as.data.frame"
+                    | "labels"
+                    | "["
+                    | "[["
+            );
+        if base_cross_pkg {
+            for index in 0..self.packages.len() {
+                let ns = self.packages[index].namespace;
+                if let Some(fun) = self.optional_fun(name, ns, self.session.env_enclos(ns)?)? {
+                    return Ok(Some(fun));
+                }
             }
         }
         self.optional_fun(name, BASE_ENV, SEXP_NIL)
@@ -278,7 +291,13 @@ impl Ctx {
                 names.push(format!("{}.{class}", group_name(group)));
             }
             for (index_in_class, name) in names.into_iter().enumerate() {
-                if let Some(fun) = self.lookup_method(&name, method.caller, method.definition)? {
+                if let Some(fun) = self.lookup_method(
+                    &method.generic,
+                    &name,
+                    method.caller,
+                    method.definition,
+                    false,
+                )? {
                     return Ok(Some(Candidate {
                         fun,
                         name,
@@ -291,7 +310,13 @@ impl Ctx {
         }
         if default {
             let name = format!("{}.default", method.generic);
-            if let Some(fun) = self.lookup_method(&name, method.caller, method.definition)? {
+            if let Some(fun) = self.lookup_method(
+                &method.generic,
+                &name,
+                method.caller,
+                method.definition,
+                true,
+            )? {
                 return Ok(Some(Candidate {
                     fun,
                     name,
