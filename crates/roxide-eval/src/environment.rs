@@ -81,15 +81,26 @@ impl Ctx {
         }
         if self.session.type_of(position)? == SexpType::Str {
             let name = self.string(position, call.err_call())?;
-            return match name.as_str() {
-                ".GlobalEnv" => Ok(GLOBAL_ENV),
-                "package:base" => Ok(BASE_ENV),
-                "package:utils" => Ok(self.utils),
-                _ => Err(self.stop(
-                    call.err_call(),
-                    format!("no item called \"{name}\" on the search list"),
-                )),
-            };
+            if name == ".GlobalEnv" {
+                return Ok(GLOBAL_ENV);
+            }
+            if name == "package:base" {
+                return Ok(BASE_ENV);
+            }
+            if let Some(pkg_name) = name.strip_prefix("package:") {
+                if let Some(pkg) = self.packages.iter().find(|p| p.name == pkg_name)
+                    && let Some(attached) = pkg.attached
+                {
+                    return Ok(attached);
+                }
+                if pkg_name == "utils" {
+                    return Ok(self.utils);
+                }
+            }
+            return Err(self.stop(
+                call.err_call(),
+                format!("no item called \"{name}\" on the search list"),
+            ));
         }
         match self.integer(position, call.err_call())? {
             -1 => Ok(call.env),
@@ -474,28 +485,61 @@ fn namespace(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     let package = ctx.name(args.get(0), call.err_call())?;
     let name = ctx.name(args.get(1), call.err_call())?;
     let sym = ctx.session.intern(&name)?;
-    let env = match package.as_str() {
-        "base" => BASE_ENV,
-        "utils" => ctx.utils,
-        _ => {
-            return Err(ctx.stop(
+    let is_triple = ctx.prims[usize::from(call.prim.0)].name == ":::";
+    if package == "base" {
+        return ctx.get_var(sym, BASE_ENV)?.ok_or_else(|| {
+            ctx.stop(
                 call.err_call(),
-                format!("there is no package called '{package}'"),
-            ));
+                format!("'{name}' is not an exported object from 'namespace:base'"),
+            )
+        });
+    }
+    if let Some(pkg) = ctx.packages.iter().find(|p| p.name == package).copied() {
+        let export = if is_triple {
+            ctx.session
+                .env_get(pkg.namespace, sym)
+                .map(|b| b.value)
+                .filter(|&v| v != SEXP_UNBOUND)
+        } else if !name.starts_with('.') {
+            ctx.session
+                .env_get(pkg.namespace, sym)
+                .map(|b| b.value)
+                .filter(|&v| v != SEXP_UNBOUND)
+                .or_else(|| {
+                    (package == "utils" && matches!(name.as_str(), "head" | "tail"))
+                        .then(|| ctx.session.env_get(BASE_ENV, sym).map(|b| b.value))
+                        .flatten()
+                        .filter(|&v| v != SEXP_UNBOUND)
+                })
+        } else {
+            None
+        };
+        if let Some(val) = export {
+            return Ok(val);
         }
-    };
-    let export = if package == "utils"
-        && ctx.session.env_get(env, sym).is_none()
-        && !matches!(name.as_str(), "head" | "tail")
-    {
-        None
-    } else {
-        ctx.get_var(sym, env)?
-    };
-    export.ok_or_else(|| {
-        ctx.stop(
+        return Err(ctx.stop(
             call.err_call(),
             format!("'{name}' is not an exported object from 'namespace:{package}'"),
-        )
-    })
+        ));
+    }
+    if package == "utils" {
+        let env = ctx.utils;
+        let export = if ctx.session.env_get(env, sym).is_none()
+            && !matches!(name.as_str(), "head" | "tail")
+        {
+            None
+        } else {
+            ctx.get_var(sym, env)?
+        };
+        return export.ok_or_else(|| {
+            ctx.stop(
+                call.err_call(),
+                format!("'{name}' is not an exported object from 'namespace:{package}'"),
+            )
+        });
+    }
+    Err(ctx.stop(
+        call.err_call(),
+        format!("there is no package called '{package}'"),
+    ))
 }

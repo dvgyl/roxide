@@ -3,12 +3,18 @@
 //! Clean-room GNU R 4.6.2 `base` package primitives and R-level wrappers.
 //!
 //! Split into disjoint worker-owned submodules (`ops`, `subset`, `strings`,
-//! `io_os`, `datetime`, `serialize`) wired together solely through [`MODULES`].
+//! `io_os`, `datetime`, `serialize`, `random`, `linalg`, `special`, `scan`,
+//! `dcf`) wired together solely through [`MODULES`].
 
 pub mod datetime;
+pub mod dcf;
 pub mod io_os;
+pub mod linalg;
 pub mod ops;
+pub mod random;
+pub mod scan;
 pub mod serialize;
+pub mod special;
 pub mod strings;
 pub mod subset;
 
@@ -22,6 +28,11 @@ pub const MODULES: &[&Module] = &[
     &io_os::MODULE,
     &datetime::MODULE,
     &serialize::MODULE,
+    &random::MODULE,
+    &linalg::MODULE,
+    &special::MODULE,
+    &scan::MODULE,
+    &dcf::MODULE,
 ];
 
 /// Register all `roxide-base` primitives and clean-room R preludes on `ctx`.

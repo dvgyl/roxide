@@ -1,7 +1,7 @@
 //! [`Ctx`] evaluator context, argument bundle [`Args`], frame stack, and GC root wiring.
 
 use std::any::{Any, TypeId};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use roxide_diag::{SourceMap, SrcFileId, format as diag_format};
 use roxide_gc::{GcPolicy, RootSet, SexpId, Tracer};
@@ -13,8 +13,8 @@ use roxide_value::{
 };
 
 use crate::api::{
-    ArgEval, CtxExt, EvalResult, InternalError, Module, OptionsCache, PrimDef, PrimKind, S4Hooks,
-    Unwind,
+    ArgEval, CtxExt, EvalResult, InternalError, Module, OptionsCache, Package, PrimDef, PrimKind,
+    S4Hooks, Unwind,
 };
 use crate::builtins;
 
@@ -114,6 +114,14 @@ pub(crate) struct ExtEntry {
     trace_fn: fn(&dyn Any, &mut Tracer<'_>),
 }
 
+/// Registered non-base package namespace and optional attached search-path environment.
+#[derive(Clone, Copy)]
+pub(crate) struct RegisteredPackage {
+    pub(crate) name: &'static str,
+    pub(crate) namespace: SexpId,
+    pub(crate) attached: Option<SexpId>,
+}
+
 /// Core Roxide execution context owning the [`RSession`], [`Host`], frames, and primitive table.
 pub struct Ctx {
     pub(crate) session: RSession,
@@ -122,6 +130,10 @@ pub struct Ctx {
     pub(crate) opts: OptionsCache,
     pub(crate) prims: Vec<&'static PrimDef>,
     pub(crate) internals: HashMap<&'static str, PrimId>,
+    pub(crate) registered_prims: HashSet<(SexpId, &'static str)>,
+    pub(crate) overridable_prims: HashSet<(SexpId, &'static str)>,
+    pub(crate) overridable_internals: HashSet<&'static str>,
+    pub(crate) packages: Vec<RegisteredPackage>,
     pub(crate) frames: Vec<Frame>,
     pub(crate) loops: Vec<(FrameId, SexpId)>,
     pub(crate) conditions: crate::conditions::Conditions,
@@ -150,6 +162,7 @@ struct CtxRoots<'a> {
     conditions: &'a crate::conditions::Conditions,
     options: &'a [(Sym, SexpId)],
     utils: SexpId,
+    packages: &'a [RegisteredPackage],
     extensions: &'a HashMap<TypeId, ExtEntry>,
 }
 
@@ -176,6 +189,12 @@ impl RootSet for CtxRoots<'_> {
         tracer.edge(self.eval_env);
         self.conditions.trace(tracer);
         tracer.edge(self.utils);
+        for pkg in self.packages {
+            tracer.edge(pkg.namespace);
+            if let Some(attached) = pkg.attached {
+                tracer.edge(attached);
+            }
+        }
         for &(_, value) in self.options {
             tracer.edge(value);
         }
@@ -202,6 +221,10 @@ impl Ctx {
             opts,
             prims: Vec::new(),
             internals: HashMap::new(),
+            registered_prims: HashSet::new(),
+            overridable_prims: HashSet::new(),
+            overridable_internals: HashSet::new(),
+            packages: Vec::new(),
             frames: Vec::new(),
             loops: Vec::new(),
             conditions: Default::default(),
@@ -223,13 +246,13 @@ impl Ctx {
         };
         let global = ctx.session.intern(".GlobalEnv")?;
         ctx.session.env_define(BASE_ENV, global, GLOBAL_ENV)?;
-        ctx.register_module(&builtins::CORE_MODULE)?;
-        ctx.register_module(&crate::control::MODULE)?;
-        ctx.register_module(&crate::language::MODULE)?;
-        ctx.register_module(&crate::environment::MODULE)?;
-        ctx.register_module(&crate::fallback::MODULE)?;
-        ctx.register_module(&crate::conditions::MODULE)?;
-        ctx.register_module(&crate::dispatch::MODULE)?;
+        ctx.register_module_in(&builtins::CORE_MODULE, BASE_ENV, true)?;
+        ctx.register_module_in(&crate::control::MODULE, BASE_ENV, true)?;
+        ctx.register_module_in(&crate::language::MODULE, BASE_ENV, true)?;
+        ctx.register_module_in(&crate::environment::MODULE, BASE_ENV, true)?;
+        ctx.register_module_in(&crate::fallback::MODULE, BASE_ENV, true)?;
+        ctx.register_module_in(&crate::conditions::MODULE, BASE_ENV, true)?;
+        ctx.register_module_in(&crate::dispatch::MODULE, BASE_ENV, true)?;
         Ok(ctx)
     }
 
@@ -240,26 +263,106 @@ impl Ctx {
     }
 
     /// Register a [`Module`]'s primitives and `.Internal` entries in `BASE_ENV`.
+    ///
+    /// Rejects duplicate non-overridable primitive or `.Internal` registrations (ADR-0011).
     pub fn register_module(&mut self, module: &Module) -> Result<(), InternalError> {
+        self.register_module_in(module, BASE_ENV, false)
+    }
+
+    /// Register a non-base R [`Package`] (`stats`, `utils`, `tools`, ...) (ADR-0011).
+    ///
+    /// Creates `namespace:<name>` (parent `BASE_ENV`), registers all package modules and preludes
+    /// into that namespace, and when `pkg.attach` is true attaches `package:<name>` onto the
+    /// search path immediately below `.GlobalEnv`.
+    pub fn register_package(&mut self, pkg: &Package) -> Result<(), InternalError> {
+        if pkg.name == "base" || self.packages.iter().any(|p| p.name == pkg.name) {
+            return Err(InternalError {
+                message: format!("package '{}' is already registered", pkg.name),
+            });
+        }
+        let ns = self.session.alloc_env(BASE_ENV)?;
+        let mark = self.session.heap.protect_mark();
+        self.session.heap.protect(ns);
+        let result = (|| -> Result<(), InternalError> {
+            for module in pkg.modules {
+                self.register_module_in(module, ns, false)?;
+            }
+            let attached = if pkg.attach {
+                let parent = self.session.env_enclos(GLOBAL_ENV)?;
+                let pkg_env = self.session.alloc_env(parent)?;
+                self.session.heap.protect(pkg_env);
+                let name_sym = self.session.intern("name")?;
+                let label = self.session.scalar_str(&format!("package:{}", pkg.name))?;
+                self.session.set_attrib(pkg_env, name_sym, label)?;
+                for (sym, binding) in self.session.env_entries(ns)? {
+                    let sym_name = self.session.sym_name(sym)?;
+                    if !sym_name.starts_with('.') {
+                        self.session.env_define_binding(pkg_env, sym, binding)?;
+                    }
+                }
+                self.session.env_set_enclos(GLOBAL_ENV, pkg_env)?;
+                Some(pkg_env)
+            } else {
+                None
+            };
+            self.packages.push(RegisteredPackage {
+                name: pkg.name,
+                namespace: ns,
+                attached,
+            });
+            Ok(())
+        })();
+        self.session.heap.unprotect_to(mark);
+        result
+    }
+
+    fn register_module_in(
+        &mut self,
+        module: &Module,
+        target_env: SexpId,
+        overridable: bool,
+    ) -> Result<(), InternalError> {
         for prim in module.prims {
             let id = PrimId(u16::try_from(self.prims.len()).map_err(|_| InternalError {
                 message: String::from("primitive table is full"),
             })?);
-            self.prims.push(prim);
             match prim.kind {
                 PrimKind::Primitive => {
+                    let key = (target_env, prim.name);
+                    if self.registered_prims.contains(&key) && !self.overridable_prims.remove(&key)
+                    {
+                        return Err(InternalError {
+                            message: format!("duplicate primitive registration '{}'", prim.name),
+                        });
+                    }
+                    self.prims.push(prim);
+                    self.registered_prims.insert(key);
+                    if overridable {
+                        self.overridable_prims.insert(key);
+                    }
                     let sym = self.session.intern(prim.name)?;
                     let special = matches!(prim.args, ArgEval::Unevaluated | ArgEval::EvalDollar);
                     let pval = self.session.alloc_prim(id, special)?;
-                    self.session.env_define(BASE_ENV, sym, pval)?;
+                    self.session.env_define(target_env, sym, pval)?;
                 }
                 PrimKind::Internal => {
+                    if self.internals.contains_key(prim.name)
+                        && !self.overridable_internals.remove(prim.name)
+                    {
+                        return Err(InternalError {
+                            message: format!("duplicate .Internal registration '{}'", prim.name),
+                        });
+                    }
+                    self.prims.push(prim);
+                    if overridable {
+                        self.overridable_internals.insert(prim.name);
+                    }
                     self.internals.insert(prim.name, id);
                 }
             }
         }
         if !module.prelude.is_empty() {
-            self.run_script("<prelude>", module.prelude, BASE_ENV, false)
+            self.run_script("<prelude>", module.prelude, target_env, false)
                 .map_err(|_| InternalError {
                     message: String::from("error evaluating module prelude"),
                 })?;
@@ -406,6 +509,7 @@ impl Ctx {
                 conditions: &self.conditions,
                 options: &self.options,
                 utils: self.utils,
+                packages: &self.packages,
                 extensions: &self.extensions,
             };
             let _ = self.session.collect(&roots);

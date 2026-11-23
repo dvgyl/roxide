@@ -3,7 +3,6 @@
 mod arithmetic;
 pub(crate) mod attributes;
 pub(crate) mod common;
-mod strings;
 mod summary;
 pub(crate) mod types;
 
@@ -175,9 +174,6 @@ pub const MODULE: Module = Module {
         primitive!("unclass", attributes::unclass),
         primitive!("inherits", attributes::inherits),
         primitive!("c", types::combine),
-        primitive!("paste", strings::paste),
-        primitive!("paste0", strings::paste0),
-        primitive!("nchar", strings::nchar),
     ],
     prelude: "",
 };

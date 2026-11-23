@@ -1,0 +1,11 @@
+[package]
+name = "roxide-math"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Pure-Rust zero-dependency clean-room numerical, PRNG, distribution, linear algebra, FFT, and optimization kernels for Roxide (ADR-0009)"
+
+[dependencies]
+
+[lints]
+workspace = true

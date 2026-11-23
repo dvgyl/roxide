@@ -12,6 +12,7 @@ roxide-host = { workspace = true }
 roxide-syntax = { workspace = true }
 roxide-value = { workspace = true }
 roxide-eval = { workspace = true }
+roxide-math = { workspace = true }
 
 regex = { workspace = true }
 fancy-regex = { workspace = true }

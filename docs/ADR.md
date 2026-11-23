@@ -44,14 +44,18 @@ All major architectural contracts and deviations from `docs/ARCHITECTURE.md` are
 - **Status:** Accepted (approved refinements over initial `docs/ARCHITECTURE.md` draft)
 - **Context:** Keeping `roxide-gc` generic and cleanly separating syntax/deparsing/printing avoids circular dependencies and unlocks parallel `roxide-base` / `roxide-stats` development.
 - **Decision:**
-  - Final acyclic dependency DAG:
+  - Final acyclic dependency DAG (amended by ADR-0009 so `roxide-math` is a pure zero-dependency leaf crate):
     - `roxide-diag` (leaf)
+    - `roxide-math` (leaf — zero Roxide deps, zero external deps, `#![forbid(unsafe_code)]`; amended per ADR-0009)
     - `roxide-host` -> `roxide-diag`
     - `roxide-gc` -> `roxide-diag`
     - `roxide-syntax` -> `roxide-diag`
     - `roxide-value` -> `roxide-diag`, `roxide-gc`, `roxide-syntax`
     - `roxide-eval` -> `roxide-diag`, `roxide-host`, `roxide-gc`, `roxide-syntax`, `roxide-value`
-    - `roxide-base`, `roxide-math`, `roxide-stats`, `roxide-methods`, `roxide-utils`, `roxide-graphics` -> `roxide-eval` (+ lower layers)
+    - `roxide-base` -> `roxide-eval`, `roxide-math` (+ lower layers)
+    - `roxide-stats` -> `roxide-eval`, `roxide-base`, `roxide-math` (+ lower layers)
+    - `roxide-utils` -> `roxide-eval`, `roxide-host`, `roxide-base` (+ lower layers; no `roxide-math`/`roxide-stats` dep)
+    - `roxide-methods`, `roxide-graphics` -> `roxide-eval` (+ lower layers)
     - `roxide-harness` -> standalone (depends on zero engine crates)
   - `ALTREP` traits (`AltClass`, `AltVector<T>`, `AltString`, `CompactIntSeq`, `CompactRealSeq`, `AltRegistry`) live in `roxide-value::alt` so `roxide-gc` remains generic.
   - Pure number/string formatting (`roxide-value::format`) and `deparse()` (`roxide-value::deparse`, reusing `roxide-syntax::ops` precedence) live in `roxide-value`; S3-dispatched `print()` lives in `roxide-base::print` (with a default core printer available from M0).
@@ -109,4 +113,45 @@ All major architectural contracts and deviations from `docs/ARCHITECTURE.md` are
   - Adopt `lzma-rust2` (`Apache-2.0`, `default-features = false, features = ["std", "encoder", "xz"]`) for pure-Rust `.xz` streams — explicitly rejecting `xz2`/`lzma-sys` because its bundled XZ source archive contains GPL/LGPL components.
   - Adopt `zstd` (`BSD-3-Clause`, `default-features = false, features = ["vendored"]`, `zstd-sys` `BSD-3-Clause AND BSD-2-Clause` bundling libzstd 1.5.7 under BSD terms) for Zstandard streams and exact GNU R 4.6.2 `extSoftVersion()[["zstd"]] == "1.5.7"` parity.
   - Enforce zero copyleft dependencies in `Cargo.lock` and preserve `#![forbid(unsafe_code)]` across all `roxide-base` code.
+
+---
+
+## ADR-0009: Pure Leaf `roxide-math`, Arm64 FMA Parity, BSD Netlib LAPACK/BLAS & Paper-Only Licence Map
+
+- **Status:** Accepted (amends ADR-0004 and `docs/MATH_SPEC.md` §3)
+- **Context:** Milestone 2 requires bit-exact PRNG reproducibility, high-accuracy `d/p/q/r*` distributions, reference BLAS/LAPACK sign and rounding parity (empirically verified against GNU R 4.6.2 arm64 using reference `libRblas`/`libRlapack` 3.12.1 with FMA contraction), mixed-radix FFT, and numerical optimization/quadrature without introducing copyleft code or slow crate rebuild loops.
+- **Decision:**
+  - **`roxide-math` is a pure leaf crate** (`#![forbid(unsafe_code)]`, zero Roxide dependencies, zero external crates). Kernels operate strictly on `f64`/`i32`/`u32` and slices (`MatRef`/`MatMut`/`Cplx`/`Tail`/`Flags`), keeping math builds fast, eliminating GC rooting hazards inside math kernels, and enabling direct `Rmath.h` reuse by `roxide-capi` in Milestone 4.
+  - **Zero new external crates for M2:** Use Rust `std` floating-point math (`exp`, `ln`, `powf`, `ln_1p`, `exp_m1`, `hypot`) rather than `libm` so macOS calls the same Apple libm as GNU R 4.6.2. Implement `sinpi`, `cospi`, `tanpi`, `log1pmx`, and `lgamma1p` directly.
+  - **Arm64 FMA parity:** Use `f64::mul_add` in BLAS, LINPACK, LAPACK, and empirically verified polynomial loops where GNU R 4.6.2 contracts multiply-add on arm64.
+  - **Clean-room algorithm sourcing & licence map:**
+    - Reference Netlib BLAS & LAPACK 3.12.1 (`BSD-3-Clause`, upstream Netlib only — never GNU R's bundled copy; attributed in `docs/PRIOR_ART.md` & `THIRD_PARTY_NOTICES.md`) for faithful decomposition and `svd`/`eigen` sign conventions.
+    - QUADPACK (`Public Domain`) and Knuth `ran_array` (`Public Domain`) are clean-room permissible.
+    - Pure-Rust Singleton (1969) mixed-radix FFT (radices 2, 3, 4, 5 + odd-prime butterfly, optional Bluestein fallback for large primes), amending `docs/MATH_SPEC.md` §3.
+    - **Paper-only rule:** ACM-licensed or Applied Statistics algorithms (`TOMS 708` / DiDonato & Morris 1992 `pbeta`, `TOMS 643` / Mehta & Patel `fisher.test`, `TOMS 778` / Byrd-Lu-Nocedal-Zhu 1995 `L-BFGS-B`, `AS 241` / Wichura 1988 `qnorm`, `AS 136` / Hartigan-Wong 1979 `kmeans`, `AS R94` / Royston 1995 `shapiro.test`) MUST be implemented strictly from the published mathematical papers, never from ACM/GPL code.
+
+---
+
+## ADR-0010: `.GlobalEnv$.Random.seed` Single-Source-of-Truth Contract
+
+- **Status:** Accepted (empirically verified against live GNU R 4.6.2 oracle)
+- **Context:** R user code inspects, saves (`old <- .Random.seed`), mutates, restores (`.Random.seed <<- old`), and deletes (`rm(.Random.seed)`) `.Random.seed` directly in `.GlobalEnv`, while local `.Random.seed` bindings inside functions have no effect.
+- **Decision:**
+  - `.GlobalEnv$.Random.seed` is the sole authoritative RNG state, following R's documented `GetRNGstate`/`PutRNGstate` model: read from `env_get(GLOBAL_ENV, ".Random.seed")` at RNG entry, operate on a pure-Rust `roxide_math::rng::Rng` with no GC safepoints during draws, and write back to `GLOBAL_ENV` on exit.
+  - `RngExt` (`CtxExt` in `roxide-base::random`) stores only the non-serialized Box–Muller spare (`bm_saved: Option<f64>`) and holds **zero `SexpId`s**.
+  - **Copy-on-modify invariant:** `put_rng` overwrites an existing `INTSXP` binding in place **only** when it is unshared (`!maybe_shared`) and matches the exact encoded length; otherwise it allocates a fresh `INTSXP` so saved copies (`old <- .Random.seed`) are never mutated.
+  - Missing, non-integer, NA-kind, or invalid-kind `.Random.seed` values emit GNU R 4.6.2's exact warnings and reseed via `Host` (`now`/`pid`, deterministic on `PureHost`); valid-kind wrong-length vectors raise an R error (`'.Random.seed' has wrong length`), while `set.seed()` reads only kind codes and ignores wrong length.
+
+---
+
+## ADR-0011: Package Namespaces (`Ctx::register_package`), `C_` Internal Naming & Duplicate Checks
+
+- **Status:** Accepted
+- **Context:** Milestone 2 adds `stats`, `utils`, and `tools` packages alongside `base`, split across parallel disjoint submodules. GNU R exposes package functions inside `namespace:<pkg>` and attaches default packages onto `search()` (`.GlobalEnv -> package:stats -> package:utils -> ... -> package:base`).
+- **Decision:**
+  - Introduce `Package { name, attach, modules }` and `Ctx::register_package(&mut self, pkg: &Package)` in `roxide-eval`. Each package gets a dedicated GC-traced namespace environment (`namespace:<name>`, enclosing `BASE_ENV`) where its primitives and preludes execute; when `attach` is `true`, an attached `package:<name>` environment is spliced onto the search path below `GLOBAL_ENV`.
+  - Resolve `::` and `:::` dynamically against registered package namespaces (keeping `"base"` mapped to `BASE_ENV`).
+  - Enforce duplicate-name rejection in `register_module` / `register_package` for non-fallback primitive and `.Internal` registrations so parallel workers cannot silently shadow each other.
+  - Name `stats`/`utils`/`tools` `.Internal` entry points with R's visible native symbol names (`C_fft`, `C_lmfit`, `C_cor`, etc.) so they cannot collide with `base` internals and bridge cleanly to `.Call` in Milestone 4.
+
 

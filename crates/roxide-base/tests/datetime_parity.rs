@@ -8,7 +8,7 @@ use roxide_eval::{
 };
 use roxide_gc::{GcPolicy, Trace, Tracer};
 use roxide_host::{Host, NativeHost, PureHost};
-use roxide_value::{DeparseOpts, GLOBAL_ENV, SEXP_NIL, SexpType, ValueApi, dput};
+use roxide_value::{DeparseOpts, GLOBAL_ENV, dput};
 
 const CASES: &str = include_str!("../../../conformance/layer1/06_files_io_datetime.rcase");
 
@@ -34,11 +34,7 @@ const fn primitive(name: &'static str, fun: PrimFn) -> PrimDef {
 }
 
 const TEST_MODULE: Module = Module {
-    prims: &[
-        primitive("dput", capture),
-        primitive("unclass", unclass),
-        primitive("as.numeric", numeric),
-    ],
+    prims: &[primitive("dput", capture)],
     prelude: "",
 };
 
@@ -52,25 +48,9 @@ fn capture(ctx: &mut Ctx, _: &Call, args: &mut Args) -> EvalResult {
     Ok(x)
 }
 
-fn unclass(ctx: &mut Ctx, _: &Call, args: &mut Args) -> EvalResult {
-    let session = ctx.session_mut();
-    let x = session.shallow_duplicate(args.get(0))?;
-    let tag = session.intern("class")?;
-    session.set_attrib(x, tag, SEXP_NIL)?;
-    Ok(x)
-}
-
-fn numeric(ctx: &mut Ctx, _: &Call, args: &mut Args) -> EvalResult {
-    let session = ctx.session_mut();
-    let (x, _) = session.coerce(args.get(0), SexpType::Real)?;
-    let values = session.real(x)?.to_vec();
-    Ok(session.alloc_real_from(&values)?)
-}
-
 fn run(name: &str, script: &str, host: Box<dyn Host>) -> String {
     let mut ctx = Ctx::new(host, GcPolicy::Torture).expect("Create R session");
     roxide_base::register_all(&mut ctx).expect("Register base modules");
-    // The working tree can run these cases before the shared coercion functions arrive.
     ctx.register_module(&TEST_MODULE)
         .expect("Register test functions");
     ctx.run_script(name, script, GLOBAL_ENV, false)

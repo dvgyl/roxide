@@ -12,6 +12,10 @@ Every external Rust crate, C library, published algorithm, or specification adop
 | `bzip2` (+ `libbz2-rs-sys`) | `0.6.x` (Rust backend) | `MIT OR Apache-2.0` (`bzip2-1.0.6`) | Pure-Rust bzip2 streams (`bzfile`, `.rds`/`.RData` bzip2) | ADR-0008 |
 | `lzma-rust2` | `0.25.x` (`std`, `encoder`, `xz`) | `Apache-2.0` | Pure-Rust XZ/LZMA2 streams (`xzfile`, `.rds`/`.RData` xz; avoids GPL/LGPL `xz2`/`lzma-sys` bundle) | ADR-0008 |
 | `zstd` (+ `zstd-safe`, `zstd-sys` vendored libzstd 1.5.7) | `0.14.x` (`vendored`) | `BSD-3-Clause` (`BSD-3-Clause AND BSD-2-Clause`) | Zstandard streams (`saveRDS`/`readRDS`, `extSoftVersion()[["zstd"]] == "1.5.7"`) | ADR-0008 |
+| Netlib Reference BLAS & LAPACK | `3.12.1` (upstream Netlib reference, never GNU R's bundled copy) | `BSD-3-Clause` | Clean-room Rust port of reference BLAS/LAPACK algorithms (`roxide-math::linalg`) for sign & rounding parity | ADR-0009 |
+| QUADPACK | Piessens et al. (1983) | `Public Domain` | Adaptive Gauss-Kronrod quadrature (`dqags`/`dqagi` for `stats::integrate`) | ADR-0009 |
+| Knuth TAOCP `ran_array` | Knuth (1997 / 2002) | `Public Domain` | `Knuth-TAOCP` & `Knuth-TAOCP-2002` PRNG engines (`roxide-math::rng`) | ADR-0009 |
+| Published numerical & statistical papers (paper-only clean-room implementations) | Singleton 1969 (FFT); Wichura 1988 AS 241 (`qnorm`); DiDonato & Morris 1992 (`pbeta`); Mehta & Patel (`fisher.test`); Byrd/Lu/Nocedal/Zhu 1995 (`L-BFGS-B`); Hartigan & Wong 1979 AS 136 (`kmeans`); Royston 1995 AS R94 (`shapiro.test`); Marsaglia / L'Ecuyer / Kinderman-Ramage / Ahrens-Dieter / Kachitvichyanukul & Schmeiser | Clean-room mathematical equations (never ACM/GPL code) | Pure-Rust `roxide-math` & `roxide-stats` numerical kernels | ADR-0009 |
 
 ## Forbidden Sources (Strict Clean-Room Wall)
 

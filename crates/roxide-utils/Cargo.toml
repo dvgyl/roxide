@@ -1,0 +1,17 @@
+[package]
+name = "roxide-utils"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Clean-room GNU R 4.6.2 utils and tools package primitives and R-level wrappers"
+
+[dependencies]
+roxide-diag = { workspace = true }
+roxide-gc = { workspace = true }
+roxide-host = { workspace = true }
+roxide-value = { workspace = true }
+roxide-eval = { workspace = true }
+roxide-base = { workspace = true }
+
+[lints]
+workspace = true

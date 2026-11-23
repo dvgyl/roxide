@@ -260,6 +260,7 @@ dependencies = [
  "roxide-eval",
  "roxide-gc",
  "roxide-host",
+ "roxide-math",
  "roxide-syntax",
  "roxide-value",
  "zstd",
@@ -273,6 +274,8 @@ dependencies = [
  "roxide-eval",
  "roxide-gc",
  "roxide-host",
+ "roxide-stats",
+ "roxide-utils",
 ]
 
 [[package]]
@@ -309,10 +312,39 @@ dependencies = [
 ]
 
 [[package]]
+name = "roxide-math"
+version = "0.1.0"
+
+[[package]]
+name = "roxide-stats"
+version = "0.1.0"
+dependencies = [
+ "roxide-base",
+ "roxide-diag",
+ "roxide-eval",
+ "roxide-gc",
+ "roxide-host",
+ "roxide-math",
+ "roxide-value",
+]
+
+[[package]]
 name = "roxide-syntax"
 version = "0.1.0"
 dependencies = [
  "roxide-diag",
+]
+
+[[package]]
+name = "roxide-utils"
+version = "0.1.0"
+dependencies = [
+ "roxide-base",
+ "roxide-diag",
+ "roxide-eval",
+ "roxide-gc",
+ "roxide-host",
+ "roxide-value",
 ]
 
 [[package]]

@@ -4,9 +4,9 @@ use roxide_diag::msg;
 use roxide_gc::SexpId;
 use roxide_value::format::format_real_scalar;
 use roxide_value::{
-    CharId, DeparseOpts, Encoding, FormatOpts, NA_INTEGER, NA_REAL, RLogical, SEXP_NIL, SexpType,
-    ValueApi, deparse, encode_string, format_int_vec, format_lgl_vec, format_real_vec, int_add,
-    int_mul, int_sub, nan_propagate,
+    BASE_ENV, BASE_NAMESPACE, CharId, DeparseOpts, EMPTY_ENV, Encoding, FormatOpts, GLOBAL_ENV,
+    NA_INTEGER, NA_REAL, RLogical, SEXP_NIL, SexpType, ValueApi, deparse, encode_string,
+    format_int_vec, format_lgl_vec, format_real_vec, int_add, int_mul, int_sub, nan_propagate,
 };
 
 use crate::api::{
@@ -566,6 +566,34 @@ pub(crate) fn print_value(ctx: &mut Ctx, val: SexpId, digits: usize) -> EvalResu
                     }
                 }
                 format_vector_output(&items, false)
+            }
+        }
+        SexpType::Env => {
+            if val == GLOBAL_ENV {
+                String::from("<environment: R_GlobalEnv>\n")
+            } else if val == BASE_ENV {
+                String::from("<environment: base>\n")
+            } else if val == BASE_NAMESPACE {
+                String::from("<environment: namespace:base>\n")
+            } else if val == EMPTY_ENV {
+                String::from("<environment: R_EmptyEnv>\n")
+            } else if let Some(pkg) = ctx.packages.iter().find(|p| p.namespace == val) {
+                format!("<environment: namespace:{}>\n", pkg.name)
+            } else if let Some(pkg) = ctx.packages.iter().find(|p| p.attached == Some(val)) {
+                format!("<environment: package:{}>\n", pkg.name)
+            } else {
+                let name_sym = ctx.session.intern("name")?;
+                let attr_name = ctx.session.attr(val, name_sym);
+                if attr_name != SEXP_NIL
+                    && ctx.session.type_of(attr_name)? == SexpType::Str
+                    && let Some(&cid) = ctx.session.str_slice(attr_name)?.first()
+                    && cid != CharId::NA
+                {
+                    let label = String::from_utf8_lossy(ctx.session.char_bytes(cid)?);
+                    format!("<environment: {label}>\n")
+                } else {
+                    format!("<environment: 0x{:x}>\n", val.to_bits())
+                }
             }
         }
         _ => {

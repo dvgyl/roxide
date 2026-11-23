@@ -118,7 +118,10 @@ fn interpret(opts: CliOpts, stack_bytes: usize) -> ExitCode {
         }
     };
     ctx.set_stack_budget(stack_bytes - 2 * 1024 * 1024);
-    if let Err(err) = roxide_base::register_all(&mut ctx) {
+    if let Err(err) = roxide_base::register_all(&mut ctx)
+        .and_then(|()| roxide_utils::register(&mut ctx))
+        .and_then(|()| roxide_stats::register(&mut ctx))
+    {
         let _ = writeln!(io::stderr().lock(), "Error: {err}");
         return ExitCode::FAILURE;
     }

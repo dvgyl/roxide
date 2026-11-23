@@ -206,12 +206,22 @@ impl Call {
     }
 }
 
-/// Registration unit exported by each `roxide-base` / `roxide-stats` submodule (ADR-0007).
+/// Registration unit exported by each `roxide-base` / `roxide-stats` / `roxide-utils` submodule (ADR-0007).
 pub struct Module {
     /// Static primitive / internal definitions owned by this submodule.
     pub prims: &'static [PrimDef],
     /// Optional clean-room R prelude evaluated during package bootstrap.
     pub prelude: &'static str,
+}
+
+/// Package registration descriptor for non-base R packages (`stats`, `utils`, `tools`, ...) (ADR-0011).
+pub struct Package {
+    /// Package name (e.g. `"stats"`, `"utils"`, `"tools"`).
+    pub name: &'static str,
+    /// Whether to attach `package:<name>` onto the search path below `.GlobalEnv`.
+    pub attach: bool,
+    /// Ordered list of disjoint submodule units owned by this package.
+    pub modules: &'static [&'static Module],
 }
 
 /// Cached hot session options (`digits`, `scipen`, `warn`, `expressions`, `width`).

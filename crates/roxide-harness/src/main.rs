@@ -10,12 +10,12 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use roxide_harness::parser::load_cases;
-use roxide_harness::runner::{compare, run_case};
+use roxide_harness::runner::{compare_with_mode, run_case};
 
 const HELP: &str = "\
 Usage: roxide-harness [OPTIONS]
 
-  --suite <name>         Select all, layer1, smoke, or a tag (default: all).
+  --suite <name>         Select all, layer1, layer2, smoke, or a tag (default: all).
   --file <path>          Use one .rcase file. Tag filters still apply.
   --case <substring>     Select case names that contain the substring.
   --roxide <path>        Set the Roxide executable (default: ROXIDE_BIN or target/debug/roxide).
@@ -78,13 +78,13 @@ fn parse_args() -> Result<Option<Options>, String> {
 
 fn run(options: Options, stdout: &mut impl Write) -> Result<ExitCode, String> {
     let suite = options.suite.as_deref().unwrap_or("all");
-    let root = if suite == "layer1" {
-        Path::new("conformance/layer1")
-    } else {
-        Path::new("conformance")
+    let root = match suite {
+        "layer1" => Path::new("conformance/layer1"),
+        "layer2" => Path::new("conformance/layer2"),
+        _ => Path::new("conformance"),
     };
     let tag = match suite {
-        "all" | "layer1" => None,
+        "all" | "layer1" | "layer2" => None,
         tag => Some(tag),
     };
     if let Some(file) = &options.file
@@ -126,7 +126,12 @@ fn run(options: Options, stdout: &mut impl Write) -> Result<ExitCode, String> {
     for case in cases {
         let differences = match run_case(&case.script, &oracle, roxide.as_deref(), timeout) {
             Ok(output) => match output.roxide {
-                Some(roxide) => compare(&output.oracle, &roxide, options.ignore_stderr_text),
+                Some(roxide) => compare_with_mode(
+                    &output.oracle,
+                    &roxide,
+                    case.compare,
+                    options.ignore_stderr_text,
+                ),
                 None => match output.oracle.status.code() {
                     Some(code) if (code != 0) == case.expect_error => Vec::new(),
                     _ => {

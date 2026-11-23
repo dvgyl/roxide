@@ -38,7 +38,7 @@ pub mod testing;
 
 pub use api::{
     ArgEval, Arity, Call, CtxExt, Dispatch, EvalResult, GroupGeneric, InternalError, Module,
-    OptionsCache, PrimDef, PrimFn, PrimKind, S4Hooks, Transfer, Unwind, Visibility,
+    OptionsCache, Package, PrimDef, PrimFn, PrimKind, S4Hooks, Transfer, Unwind, Visibility,
 };
 pub use ctx::{Args, Ctx, FrameId};
 

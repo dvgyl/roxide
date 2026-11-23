@@ -4,6 +4,23 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// Comparison mode for stdout matching against GNU R 4.6.2.
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
+pub enum CompareMode {
+    /// Exact byte-for-byte stdout comparison (default, used for Layer 1 & Tier T0).
+    #[default]
+    Exact,
+    /// Token-level numeric comparison allowing up to `max_ulp` ULPs on finite floats.
+    Ulp(u64),
+    /// Token-level numeric comparison allowing relative tolerance `rel` and optional absolute floor `abs`.
+    Rel {
+        /// Maximum relative error `|a - b| / max(|a|, |b|)`.
+        rel: f64,
+        /// Maximum absolute error `|a - b|` (0.0 when omitted).
+        abs: f64,
+    },
+}
+
 /// An R script and its conformance metadata.
 #[derive(Debug)]
 pub struct Case {
@@ -13,6 +30,8 @@ pub struct Case {
     pub tags: Vec<String>,
     /// Whether the oracle must return a nonzero exit code in oracle-only mode.
     pub expect_error: bool,
+    /// Stdout comparison mode (`exact`, `ulp=N`, or `rel=X[,abs=Y]`).
+    pub compare: CompareMode,
     /// The script text with its original line endings.
     pub script: String,
     /// The path to the case file.
@@ -84,6 +103,7 @@ fn parse_cases(path: &Path, text: &str) -> Result<Vec<Case>, String> {
     let mut names = HashSet::new();
     let mut in_metadata = false;
     let mut has_expect_error = false;
+    let mut has_compare = false;
 
     for (index, line) in text.split_inclusive('\n').enumerate() {
         let number = index + 1;
@@ -103,12 +123,14 @@ fn parse_cases(path: &Path, text: &str) -> Result<Vec<Case>, String> {
                 name: name.to_owned(),
                 tags: Vec::new(),
                 expect_error: false,
+                compare: CompareMode::Exact,
                 script: String::new(),
                 path: path.to_owned(),
                 line: number,
             });
             in_metadata = true;
             has_expect_error = false;
+            has_compare = false;
             continue;
         }
 
@@ -139,7 +161,11 @@ fn parse_cases(path: &Path, text: &str) -> Result<Vec<Case>, String> {
                     };
                     has_expect_error = true;
                 }
-                "tags" | "expect_error" => return Err(fail("duplicate case metadata")),
+                "compare" if !has_compare => {
+                    case.compare = parse_compare_mode(value.trim()).map_err(fail)?;
+                    has_compare = true;
+                }
+                "tags" | "expect_error" | "compare" => return Err(fail("duplicate case metadata")),
                 key => return Err(fail(&format!("unknown case metadata '{key}'"))),
             }
         } else {
@@ -148,6 +174,56 @@ fn parse_cases(path: &Path, text: &str) -> Result<Vec<Case>, String> {
         }
     }
     Ok(cases)
+}
+
+fn parse_compare_mode(spec: &str) -> Result<CompareMode, &'static str> {
+    if spec == "exact" {
+        return Ok(CompareMode::Exact);
+    }
+    if let Some(rest) = spec.strip_prefix("ulp=") {
+        let ulp = rest
+            .parse::<u64>()
+            .map_err(|_| "compare ulp=<N> requires a nonnegative integer")?;
+        return Ok(CompareMode::Ulp(ulp));
+    }
+    if spec.starts_with("rel=") {
+        let mut rel: Option<f64> = None;
+        let mut abs: f64 = 0.0;
+        let mut seen_abs = false;
+        for part in spec.split(',').map(str::trim) {
+            if let Some(val) = part.strip_prefix("rel=") {
+                if rel.is_some() {
+                    return Err("duplicate rel= parameter in compare metadata");
+                }
+                let parsed = val
+                    .parse::<f64>()
+                    .map_err(|_| "compare rel=<X> requires a finite nonnegative float")?;
+                if !parsed.is_finite() || parsed < 0.0 {
+                    return Err("compare rel=<X> requires a finite nonnegative float");
+                }
+                rel = Some(parsed);
+            } else if let Some(val) = part.strip_prefix("abs=") {
+                if seen_abs {
+                    return Err("duplicate abs= parameter in compare metadata");
+                }
+                let parsed = val
+                    .parse::<f64>()
+                    .map_err(|_| "compare abs=<Y> requires a finite nonnegative float")?;
+                if !parsed.is_finite() || parsed < 0.0 {
+                    return Err("compare abs=<Y> requires a finite nonnegative float");
+                }
+                abs = parsed;
+                seen_abs = true;
+            } else {
+                return Err("compare must be 'exact', 'ulp=<N>', or 'rel=<X>[,abs=<Y>]'");
+            }
+        }
+        return Ok(CompareMode::Rel {
+            rel: rel.ok_or("compare rel=<X> requires a rel parameter")?,
+            abs,
+        });
+    }
+    Err("compare must be 'exact', 'ulp=<N>', or 'rel=<X>[,abs=<Y>]'")
 }
 
 #[cfg(test)]

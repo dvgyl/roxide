@@ -2,12 +2,15 @@
 resolver = "3"
 members = [
     "crates/roxide-diag",
+    "crates/roxide-math",
     "crates/roxide-host",
     "crates/roxide-gc",
     "crates/roxide-syntax",
     "crates/roxide-value",
     "crates/roxide-eval",
     "crates/roxide-base",
+    "crates/roxide-stats",
+    "crates/roxide-utils",
     "crates/roxide-cli",
     "crates/roxide-harness",
 ]
@@ -20,12 +23,15 @@ repository = "https://github.com/dvgyl/roxide"
 
 [workspace.dependencies]
 roxide-diag = { path = "crates/roxide-diag" }
+roxide-math = { path = "crates/roxide-math" }
 roxide-host = { path = "crates/roxide-host" }
 roxide-gc = { path = "crates/roxide-gc" }
 roxide-syntax = { path = "crates/roxide-syntax" }
 roxide-value = { path = "crates/roxide-value" }
 roxide-eval = { path = "crates/roxide-eval" }
 roxide-base = { path = "crates/roxide-base" }
+roxide-stats = { path = "crates/roxide-stats" }
+roxide-utils = { path = "crates/roxide-utils" }
 
 # Vetted permissive dependencies (ADR-0008, docs/PRIOR_ART.md)
 regex = "1.13"

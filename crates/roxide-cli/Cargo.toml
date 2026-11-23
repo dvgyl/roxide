@@ -14,6 +14,8 @@ roxide-base = { workspace = true }
 roxide-eval = { workspace = true }
 roxide-gc = { workspace = true }
 roxide-host = { workspace = true }
+roxide-stats = { workspace = true }
+roxide-utils = { workspace = true }
 
 [lints]
 workspace = true
