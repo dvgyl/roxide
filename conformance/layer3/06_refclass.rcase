@@ -1,0 +1,110 @@
+=== case: reference_class_construction_and_aliases ===
+#@ tags: layer3,s4,refclass
+Count <- setRefClass("RxCount", fields = c(n = "numeric", label = "character"),
+    methods = list(add = function(by = 1) {
+        n <<- n + by
+        n
+    }))
+a <- Count$new(n = 2, label = "counter")
+b <- a
+b$n <- 99L
+cat(a$n, typeof(a$n), b$add(), a$n, "\n")
+cat(isS4(a), typeof(a), slotNames(a), typeof(a@.xData), "\n")
+cat(is(a, "envRefClass"), is(a, "refClass"), identical(a, a$.self), "\n")
+cat(isS4(Count), typeof(Count), class(Count), Count$className, "\n")
+cat(names(Count$fields()), unname(Count$fields()), "\n")
+cat(getRefClass("RxCount")(n = 3)$n, new("RxCount", n = 4)$n, "\n")
+cat(a$getRefClass()$className, class(a$getClass()), class(Count$def), "\n")
+error <- function(expr) tryCatch(expr, error = function(e) cat(conditionMessage(e), "\n"))
+error(a$n <- "invalid")
+error(a$unknown)
+error(a$unknown <- 1)
+error(Count$new(unknown = 1))
+error(getRefClass("RxUndefined"))
+
+=== case: reference_class_active_fields_and_methods ===
+#@ tags: layer3,s4,refclass
+Active <- setRefClass("RxActive",
+    fields = list(n = "numeric", item = "ANY", doubled = function(value) {
+        if (missing(value)) n * 2 else n <<- value / 2
+    }),
+    methods = list(add = function(by) {
+        doubled <<- doubled + by
+        .self
+    }, run = function() {
+        usingMethods("add")
+        add(4)
+    }))
+a <- Active(n = 3, item = NULL)
+cat(bindingIsActive("n", a@.xData), bindingIsActive("item", a@.xData),
+    bindingIsActive("doubled", a@.xData), "\n")
+cat(a$doubled, "\n")
+a$doubled <- 10
+cat(a$n, identical(a$run(), a), a$doubled, "\n")
+cat(is.null(a$item), "\n")
+cat(names(Active$accessors("n")), "\n")
+cat(a$getN(), withVisible(a$setN(6))$visible, a$getN(), "\n")
+cat(a$field("n"), withVisible(a$field("n", 7))$visible, a$n, "\n")
+error <- function(expr) tryCatch(expr, error = function(e) cat(conditionMessage(e), "\n"))
+error(Active$lock("doubled"))
+
+=== case: reference_class_inheritance_and_initialization ===
+#@ tags: layer3,s4,refclass
+Parent <- setRefClass("RxParent", fields = c(n = "numeric", id = "character"),
+    methods = list(bump = function(step) {
+        n <<- n + step
+        n
+    }))
+invisible(Parent$lock("id"))
+Child <- setRefClass("RxChild", contains = "RxParent", fields = list(tag = "character"),
+    methods = list(initialize = function(tag = "child", ...) {
+        callSuper(...)
+        tagValue <- tag
+        .self$tag <- tagValue
+    }, bump = function(step) callSuper(step * 2)))
+a <- Child$new(n = 2, id = "first")
+cat(names(Child$fields()), Child$lock(), is(a, "RxParent"), "\n")
+cat(a$tag, a$bump(3), a$n, a$id, "\n")
+error <- function(expr) tryCatch(expr, error = function(e) cat(conditionMessage(e), "\n"))
+error(a$id <- "second")
+error(a$callSuper())
+b <- Child$new()
+b$id <- "once"
+cat(b$id, "\n")
+error(b$id <- "twice")
+exported <- a$export("RxParent")
+cat(class(exported), exported$n, "\n")
+target <- Child$new()
+invisible(target$import(exported))
+cat(target$n, target$id, target$tag, "\n")
+
+=== case: reference_class_copy_and_display ===
+#@ tags: layer3,s4,refclass
+Node <- setRefClass("RxNode", fields = c(value = "numeric"))
+Box <- setRefClass("RxBox", fields = list(node = "RxNode", tag = "character"))
+node <- Node(value = 2)
+box <- Box(node = node, tag = "original")
+deep <- box$copy()
+shallow <- box$copy(shallow = TRUE)
+node$value <- 9
+deep$tag <- "copy"
+cat(box$node$value, deep$node$value, shallow$node$value, "\n")
+cat(box$tag, deep$tag, shallow$tag, "\n")
+cat(identical(box$node, shallow$node), identical(box@.xData, shallow@.xData), "\n")
+show(node)
+node$show()
+
+=== case: reference_class_generator_methods_and_help ===
+#@ tags: layer3,s4,refclass
+Gen <- setRefClass("RxMethodHelp")
+invisible(Gen$methods(greeting = function(name = "reader") {
+    "Return a greeting."
+    paste("Hello", name)
+}))
+cat(any(Gen$methods() == "greeting"), "\n")
+cat(is(Gen$methods("greeting"), "refMethodDef"), "\n")
+Gen$help(greeting)
+object <- Gen$new()
+cat(object$greeting(), "\n")
+invisible(Gen$methods(greeting = function(name = "reader") paste("Hi", name)))
+cat(object$greeting(), Gen$new()$greeting(), "\n")
