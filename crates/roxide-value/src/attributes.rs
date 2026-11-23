@@ -136,7 +136,12 @@ impl RSession {
 
     /// Copy the bindings in an environment frame in insertion order.
     pub fn env_entries(&self, env: SexpId) -> Result<Vec<(Sym, Binding)>, ValueError> {
-        let obj = self.heap.get(env)?;
+        let target = if env == crate::session::BASE_NAMESPACE {
+            crate::session::BASE_ENV
+        } else {
+            env
+        };
+        let obj = self.heap.get(target)?;
         match &obj.body {
             Body::Env(frame) => Ok(frame.entries.clone()),
             _ => Err(ValueError::TypeMismatch {
@@ -148,8 +153,13 @@ impl RSession {
 
     /// Remove a binding from an unlocked frame. Return whether the binding existed.
     pub fn env_remove(&mut self, env: SexpId, sym: Sym) -> Result<bool, ValueError> {
+        let target = if env == crate::session::BASE_NAMESPACE {
+            crate::session::BASE_ENV
+        } else {
+            env
+        };
         let name = self.sym_name(sym)?.to_owned();
-        let frame = self.env_frame_mut(env)?;
+        let frame = self.env_frame_mut(target)?;
         let Some(&index) = frame.index.get(&sym) else {
             return Ok(false);
         };
@@ -167,7 +177,103 @@ impl RSession {
 
     /// Set or clear the frame lock. Keep the individual binding locks.
     pub fn env_set_locked(&mut self, env: SexpId, locked: bool) -> Result<(), ValueError> {
-        self.env_frame_mut(env)?.locked = locked;
+        let target = if env == crate::session::BASE_NAMESPACE {
+            crate::session::BASE_ENV
+        } else {
+            env
+        };
+        self.env_frame_mut(target)?.locked = locked;
+        Ok(())
+    }
+
+    /// Return whether an environment frame is locked.
+    pub fn env_is_locked(&self, env: SexpId) -> Result<bool, ValueError> {
+        let target = if env == crate::session::BASE_NAMESPACE {
+            crate::session::BASE_ENV
+        } else {
+            env
+        };
+        let obj = self.heap.get(target)?;
+        match &obj.body {
+            Body::Env(frame) => Ok(frame.locked),
+            _ => Err(ValueError::TypeMismatch {
+                expected: "environment",
+                actual: obj.sexp_type().type_name(obj.flags.s4),
+            }),
+        }
+    }
+
+    /// Lock or unlock a single binding inside an environment frame.
+    pub fn env_lock_binding(
+        &mut self,
+        env: SexpId,
+        sym: Sym,
+        locked: bool,
+    ) -> Result<bool, ValueError> {
+        let target = if env == crate::session::BASE_NAMESPACE {
+            crate::session::BASE_ENV
+        } else {
+            env
+        };
+        let frame = self.env_frame_mut(target)?;
+        let Some(&index) = frame.index.get(&sym) else {
+            return Ok(false);
+        };
+        frame.entries[index].1.locked = locked;
+        Ok(true)
+    }
+
+    /// Return whether a binding exists and is locked in an environment frame.
+    pub fn env_binding_is_locked(&self, env: SexpId, sym: Sym) -> Result<Option<bool>, ValueError> {
+        let target = if env == crate::session::BASE_NAMESPACE {
+            crate::session::BASE_ENV
+        } else {
+            env
+        };
+        let obj = self.heap.get(target)?;
+        match &obj.body {
+            Body::Env(frame) => Ok(frame
+                .index
+                .get(&sym)
+                .map(|&idx| frame.entries[idx].1.locked)),
+            _ => Err(ValueError::TypeMismatch {
+                expected: "environment",
+                actual: obj.sexp_type().type_name(obj.flags.s4),
+            }),
+        }
+    }
+
+    /// Return whether a binding exists and is active in an environment frame.
+    pub fn env_binding_is_active(&self, env: SexpId, sym: Sym) -> Result<Option<bool>, ValueError> {
+        let target = if env == crate::session::BASE_NAMESPACE {
+            crate::session::BASE_ENV
+        } else {
+            env
+        };
+        let obj = self.heap.get(target)?;
+        match &obj.body {
+            Body::Env(frame) => Ok(frame
+                .index
+                .get(&sym)
+                .map(|&idx| frame.entries[idx].1.active)),
+            _ => Err(ValueError::TypeMismatch {
+                expected: "environment",
+                actual: obj.sexp_type().type_name(obj.flags.s4),
+            }),
+        }
+    }
+
+    /// Lock all current bindings in an environment frame.
+    pub fn env_lock_all_bindings(&mut self, env: SexpId) -> Result<(), ValueError> {
+        let target = if env == crate::session::BASE_NAMESPACE {
+            crate::session::BASE_ENV
+        } else {
+            env
+        };
+        let frame = self.env_frame_mut(target)?;
+        for (_, binding) in &mut frame.entries {
+            binding.locked = true;
+        }
         Ok(())
     }
 

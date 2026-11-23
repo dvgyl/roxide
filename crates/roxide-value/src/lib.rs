@@ -36,5 +36,5 @@ pub use na::{
 pub use object::{Binding, CharId, Encoding, PrimId, PromiseState, RObject, SexpType, Sym};
 pub use session::{
     BASE_ENV, BASE_NAMESPACE, EMPTY_ENV, FALSE_SCALAR, GLOBAL_ENV, NA_LGL_SCALAR, RHeap, RSession,
-    SEXP_MISSING, SEXP_NIL, SEXP_UNBOUND, TRUE_SCALAR,
+    SEXP_MISSING, SEXP_NIL, SEXP_S4_NULL, SEXP_UNBOUND, TRUE_SCALAR,
 };

@@ -661,13 +661,13 @@ pub(super) fn all_vars(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResul
 }
 
 pub(super) fn environment_name(ctx: &mut Ctx, _: &Call, args: &mut Args) -> EvalResult {
-    use roxide_value::{BASE_ENV, EMPTY_ENV, GLOBAL_ENV};
+    use roxide_value::{BASE_ENV, BASE_NAMESPACE, EMPTY_ENV, GLOBAL_ENV};
     let x = args.get(0);
     let name = match x {
-        BASE_ENV => "base".to_owned(),
+        BASE_ENV | BASE_NAMESPACE => "base".to_owned(),
         EMPTY_ENV => "R_EmptyEnv".to_owned(),
         GLOBAL_ENV => "R_GlobalEnv".to_owned(),
-        _ => ctx.namespace_name(x).map(str::to_owned).unwrap_or_else(|| {
+        _ => ctx.namespace_name(x).unwrap_or_else(|| {
             string(ctx.session(), get(ctx.session(), x, "name")).unwrap_or_default()
         }),
     };

@@ -1,0 +1,18 @@
+[package]
+name = "roxide-graphics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+flate2.workspace = true
+roxide-base.workspace = true
+roxide-diag.workspace = true
+roxide-eval.workspace = true
+roxide-gc.workspace = true
+roxide-host.workspace = true
+roxide-value.workspace = true
+
+[lints]
+workspace = true

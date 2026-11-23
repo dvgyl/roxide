@@ -448,8 +448,19 @@ pub(super) fn class(ctx: &mut Ctx, _: &Call, args: &mut Args) -> EvalResult {
 pub(super) fn inherits(ctx: &mut Ctx, _: &Call, args: &mut Args) -> EvalResult {
     let [x, what, which] = formals(ctx.session(), args, ["x", "what", "which"]);
     let which = flag(ctx, which, false)?;
+    let classes = if ctx.session().is_s4(x)?
+        && let Some(chain) = ctx.s4_class_chain(x)?
+        && let Ok(slice) = ctx.session().str_slice(chain)
+        && !slice.is_empty()
+    {
+        slice
+            .iter()
+            .map(|&id| text(ctx.session(), id))
+            .collect::<std::vec::Vec<_>>()
+    } else {
+        class_names(ctx.session_mut(), x)?
+    };
     let s = ctx.session_mut();
-    let classes = class_names(s, x)?;
     let what = s.str_slice(what)?;
     let matches: std::vec::Vec<_> = what
         .iter()

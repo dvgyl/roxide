@@ -7,9 +7,10 @@ use roxide_gc::{HeapError, SexpId};
 use crate::alt::{AltKind, AltMaterialized, AltVector};
 use crate::na::{Elem, RComplex, RLogical};
 use crate::object::{
-    Attrs, Binding, Body, CharId, Cons, EnvData, PrimId, PromiseState, RObject, RVec, SexpType, Sym,
+    Attrs, Binding, Body, CharId, Cons, EnvData, ObjFlags, PrimId, PromiseState, RObject, RVec,
+    SexpType, Sym,
 };
-use crate::session::{RHeap, RSession, SEXP_NIL};
+use crate::session::{BASE_ENV, BASE_NAMESPACE, RHeap, RSession, SEXP_NIL};
 
 /// Coercion warning flags returned by [`ValueApi::coerce`].
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
@@ -236,6 +237,8 @@ pub trait ValueApi {
     fn scalar_lgl(&mut self, v: RLogical) -> Result<SexpId, ValueError>;
     /// Allocate a scalar UTF-8/native string.
     fn scalar_str(&mut self, s: &str) -> Result<SexpId, ValueError>;
+    /// Allocate an S4 object (`Body::Obj` with `flags.s4 = true`; ADR-0012).
+    fn alloc_s4_object(&mut self) -> Result<SexpId, ValueError>;
 
     /// Read element `i` of a `VECSXP` or `EXPRSXP`.
     fn list_get(&self, x: SexpId, i: usize) -> Result<SexpId, ValueError>;
@@ -324,7 +327,8 @@ impl ValueApi for RSession {
     }
 
     fn xlength(&self, x: SexpId) -> Result<usize, ValueError> {
-        let obj = self.heap.get(x)?;
+        let target = if x == BASE_NAMESPACE { BASE_ENV } else { x };
+        let obj = self.heap.get(target)?;
         Ok(match &obj.body {
             Body::Nil => 0,
             Body::Lgl(v) => v.len(),
@@ -584,6 +588,15 @@ impl ValueApi for RSession {
         self.alloc_str_from(&[cid])
     }
 
+    fn alloc_s4_object(&mut self) -> Result<SexpId, ValueError> {
+        let mut obj = RObject::new(Body::Obj);
+        obj.flags = ObjFlags {
+            object: false,
+            s4: true,
+        };
+        Ok(self.heap.alloc(obj)?)
+    }
+
     fn list_get(&self, x: SexpId, i: usize) -> Result<SexpId, ValueError> {
         let slice = self.list_slice(x)?;
         slice.get(i).copied().ok_or(ValueError::IndexOutOfBounds {
@@ -790,7 +803,8 @@ impl ValueApi for RSession {
     }
 
     fn env_get(&self, env: SexpId, sym: Sym) -> Option<Binding> {
-        let obj = self.heap.get(env).ok()?;
+        let target = if env == BASE_NAMESPACE { BASE_ENV } else { env };
+        let obj = self.heap.get(target).ok()?;
         let Body::Env(e) = &obj.body else {
             return None;
         };
@@ -799,11 +813,15 @@ impl ValueApi for RSession {
     }
 
     fn env_define(&mut self, env: SexpId, sym: Sym, val: SexpId) -> Result<(), ValueError> {
-        if self.env_get(env, sym).is_some_and(|binding| binding.active) {
+        let target = if env == BASE_NAMESPACE { BASE_ENV } else { env };
+        if self
+            .env_get(target, sym)
+            .is_some_and(|binding| binding.active)
+        {
             return Err(ValueError::LockedBinding(self.sym_name(sym)?.to_owned()));
         }
         self.env_define_binding(
-            env,
+            target,
             sym,
             Binding {
                 value: val,
@@ -820,9 +838,10 @@ impl ValueApi for RSession {
         sym: Sym,
         binding: Binding,
     ) -> Result<(), ValueError> {
+        let target = if env == BASE_NAMESPACE { BASE_ENV } else { env };
         let sym_name = self.sym_name(sym).unwrap_or("").to_owned();
         let old_val = {
-            let obj = self.heap.get_mut(env)?;
+            let obj = self.heap.get_mut(target)?;
             let ty = obj.sexp_type().type_name(obj.flags.s4);
             let Body::Env(e) = &mut obj.body else {
                 return Err(ValueError::TypeMismatch {

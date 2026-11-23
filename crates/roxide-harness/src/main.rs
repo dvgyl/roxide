@@ -15,7 +15,7 @@ use roxide_harness::runner::{compare_with_mode, run_case};
 const HELP: &str = "\
 Usage: roxide-harness [OPTIONS]
 
-  --suite <name>         Select all, layer1, layer2, smoke, or a tag (default: all).
+  --suite <name>         Select all, layer1, layer2, layer3, smoke, or a tag (default: all).
   --file <path>          Use one .rcase file. Tag filters still apply.
   --case <substring>     Select case names that contain the substring.
   --roxide <path>        Set the Roxide executable (default: ROXIDE_BIN or target/debug/roxide).
@@ -81,10 +81,11 @@ fn run(options: Options, stdout: &mut impl Write) -> Result<ExitCode, String> {
     let root = match suite {
         "layer1" => Path::new("conformance/layer1"),
         "layer2" => Path::new("conformance/layer2"),
+        "layer3" => Path::new("conformance/layer3"),
         _ => Path::new("conformance"),
     };
     let tag = match suite {
-        "all" | "layer1" | "layer2" => None,
+        "all" | "layer1" | "layer2" | "layer3" => None,
         tag => Some(tag),
     };
     if let Some(file) = &options.file

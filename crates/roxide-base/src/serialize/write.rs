@@ -135,15 +135,15 @@ impl Writer<'_> {
 
             let attrs = session.attrs(id)?;
             if ty == SexpType::Env {
-                for &(name, namespace, attached) in &self.registry.packages {
-                    if id == namespace {
+                for (name, namespace, attached) in &self.registry.packages {
+                    if id == *namespace {
                         self.word(NAMESPACE)?;
                         self.word(0)?;
                         self.word(2)?;
                         self.string(name.as_bytes(), Encoding::Native)?;
                         return self.string(b"4.6.2", Encoding::Native);
                     }
-                    if Some(id) == attached {
+                    if Some(id) == *attached {
                         self.word(PACKAGE)?;
                         self.word(0)?;
                         self.word(1)?;

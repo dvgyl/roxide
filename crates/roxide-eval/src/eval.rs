@@ -18,15 +18,6 @@ pub(crate) enum ArgInput<'a> {
 }
 
 impl Ctx {
-    /// List registered package namespaces and their attached environments.
-    pub fn package_environments(
-        &self,
-    ) -> impl Iterator<Item = (&'static str, SexpId, Option<SexpId>)> + '_ {
-        self.packages
-            .iter()
-            .map(|pkg| (pkg.name, pkg.namespace, pkg.attached))
-    }
-
     /// Evaluate an R expression `expr` in environment `env`.
     pub fn eval(&mut self, expr: SexpId, env: SexpId) -> EvalResult {
         let marker = 0_u8;

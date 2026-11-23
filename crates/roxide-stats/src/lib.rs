@@ -35,6 +35,7 @@ pub const MODULES: &[&Module] = &[
 pub const PACKAGE: Package = Package {
     name: "stats",
     attach: true,
+    exports: None,
     modules: MODULES,
 };
 

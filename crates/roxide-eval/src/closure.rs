@@ -1,7 +1,7 @@
 use roxide_gc::SexpId;
 use roxide_value::{Binding, PromiseState, SEXP_MISSING, SEXP_NIL, SexpType, Sym, ValueApi};
 
-use crate::ctx::Frame;
+use crate::ctx::{Frame, FrameId};
 use crate::dispatch::MethodFrame;
 use crate::{Args, Ctx, EvalResult, Transfer, Unwind};
 
@@ -345,6 +345,125 @@ impl Ctx {
             }
             ctx.session
                 .release_call_frame(env, &actuals, &result_roots(&result));
+            result
+        })
+    }
+
+    /// Read the active bindings of a generic call `frame` for forwarding to [`Ctx::apply_matched`].
+    ///
+    /// Maps any formal binding with `missing > 0` (omitted argument, even if defaulted in the
+    /// generic) to `SEXP_MISSING`, while preserving supplied promises and `...` (`DOTSXP`) intact.
+    pub fn generic_frame_args(&mut self, frame: FrameId) -> EvalResult<Vec<(Sym, SexpId)>> {
+        let Some((_call, cloenv, fun, _caller)) = self.frame_info(frame) else {
+            return Err(self.stop(SEXP_NIL, "unknown call frame"));
+        };
+        let (formals, _, _) = self.session.closure_parts(fun)?;
+        let formal_pairs: Vec<_> = self.session.pairlist_iter(formals).collect();
+        let mut out = Vec::with_capacity(formal_pairs.len());
+        for (tag, _) in formal_pairs {
+            let Some(sym) = tag else { continue };
+            let value = match self.session.env_get(cloenv, sym) {
+                Some(binding) if binding.missing > 0 => SEXP_MISSING,
+                Some(binding) => binding.value,
+                None => SEXP_MISSING,
+            };
+            out.push((sym, value));
+        }
+        Ok(out)
+    }
+
+    /// Invoke closure `fun` with pre-matched formal bindings (preserving promises and
+    /// `SEXP_MISSING` markers) plus extra frame variables (`.Generic`, `.Method`, `.defined`, `.target`).
+    pub fn apply_matched(
+        &mut self,
+        fun: SexpId,
+        matched: &[(Sym, SexpId)],
+        call: SexpId,
+        caller: SexpId,
+        frame_vars: &[(Sym, SexpId)],
+    ) -> EvalResult {
+        self.scoped(|ctx| {
+            for root in [fun, call, caller] {
+                ctx.protect(root);
+            }
+            for &(_, value) in matched {
+                ctx.protect(value);
+            }
+            for &(_, value) in frame_vars {
+                ctx.protect(value);
+            }
+            let (formals, body, enclos) = ctx.session.closure_parts(fun)?;
+            let formals = Args::from_pairs(ctx.session.pairlist_iter(formals).collect());
+            let env = ctx.session.alloc_env(enclos)?;
+            ctx.protect(env);
+            let actual_pairs: Vec<_> = matched
+                .iter()
+                .filter(|&&(_, v)| v != SEXP_MISSING)
+                .map(|&(sym, val)| (Some(sym), val))
+                .collect();
+            let actuals = Args::from_pairs(actual_pairs);
+
+            for (tag, default) in formals.iter() {
+                let Some(tag) = tag else { continue };
+                let supplied = matched.iter().find(|&&(k, _)| k == tag).map(|&(_, v)| v);
+                let (value, missing) = if ctx.session.sym_name(tag)? == "..." {
+                    match supplied {
+                        Some(v) if v != SEXP_MISSING => (v, 0),
+                        _ => (SEXP_MISSING, 1),
+                    }
+                } else {
+                    match supplied {
+                        Some(v) if v != SEXP_MISSING => (v, 0),
+                        _ if default == SEXP_MISSING => (SEXP_MISSING, 1),
+                        _ => (ctx.session.alloc_promise(default, env)?, 1),
+                    }
+                };
+                ctx.session.env_define_binding(
+                    env,
+                    tag,
+                    Binding {
+                        value,
+                        missing,
+                        locked: false,
+                        active: false,
+                    },
+                )?;
+            }
+
+            for &(sym, val) in frame_vars {
+                ctx.session.env_define_binding(
+                    env,
+                    sym,
+                    Binding {
+                        value: val,
+                        missing: 0,
+                        locked: false,
+                        active: false,
+                    },
+                )?;
+            }
+
+            let id = ctx.next_frame();
+            let frame = Frame {
+                id,
+                call,
+                cloenv: env,
+                on_exit: Vec::new(),
+                fun,
+                caller,
+                actuals,
+                dispatch: None,
+            };
+            let actual_vals = frame.actuals.values().to_vec();
+            for &value in &actual_vals {
+                ctx.session.heap.inc_ref(value);
+            }
+            let result = ctx.run_frame(frame, |ctx| ctx.eval(body, env));
+            for &value in &actual_vals {
+                ctx.session.heap.dec_ref(value);
+            }
+            ctx.session
+                .release_call_frame(env, &actual_vals, &result_roots(&result));
             result
         })
     }

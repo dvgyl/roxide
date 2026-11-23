@@ -16,6 +16,9 @@ Every external Rust crate, C library, published algorithm, or specification adop
 | QUADPACK | Piessens et al. (1983) | `Public Domain` | Adaptive Gauss-Kronrod quadrature (`dqags`/`dqagi` for `stats::integrate`) | ADR-0009 |
 | Knuth TAOCP `ran_array` | Knuth (1997 / 2002) | `Public Domain` | `Knuth-TAOCP` & `Knuth-TAOCP-2002` PRNG engines (`roxide-math::rng`) | ADR-0009 |
 | Published numerical & statistical papers (paper-only clean-room implementations) | Singleton 1969 (FFT); Wichura 1988 AS 241 (`qnorm`); DiDonato & Morris 1992 (`pbeta`); Mehta & Patel (`fisher.test`); Byrd/Lu/Nocedal/Zhu 1995 (`L-BFGS-B`); Hartigan & Wong 1979 AS 136 (`kmeans`); Royston 1995 AS R94 (`shapiro.test`); Marsaglia / L'Ecuyer / Kinderman-Ramage / Ahrens-Dieter / Kachitvichyanukul & Schmeiser | Clean-room mathematical equations (never ACM/GPL code) | Pure-Rust `roxide-math` & `roxide-stats` numerical kernels | ADR-0009 |
+| Adobe Core-14 Helvetica AFM Font Metrics | Adobe AFM Specification 4.1 (Core-14 Helvetica metric tables) | Permissive Adobe AFM Notice | Clean-room text advance widths (`strwidth`, legend geometry, PDF/SVG metrics) in `roxide-graphics` | ADR-0015 |
+| Hershey Simplex Vector Font | Allen Vincent Hershey / US NBS / NTIS (1967) | `Public Domain` | Clean-room stroke glyphs for headless PNG rasterizer in `roxide-graphics` | ADR-0015 |
+| PDF 1.4, SVG 1.1, PNG (ISO/IEC 15948), POSIX.1-1988 `ustar` Specifications | Adobe PDF 1.4; W3C SVG 1.1; W3C PNG; IEEE Std 1003.1 | Public Specifications | Clean-room file writers (`roxide-graphics`) and pure-Rust tar archive reader (`roxide-pkg`) | ADR-0014, ADR-0015 |
 
 ## Forbidden Sources (Strict Clean-Room Wall)
 

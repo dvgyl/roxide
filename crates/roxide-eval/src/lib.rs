@@ -34,13 +34,16 @@ pub mod api;
 pub mod builtins;
 pub mod ctx;
 pub mod eval;
+pub mod namespace;
 pub mod testing;
 
 pub use api::{
     ArgEval, Arity, Call, CtxExt, Dispatch, EvalResult, GroupGeneric, InternalError, Module,
-    OptionsCache, Package, PrimDef, PrimFn, PrimKind, S4Hooks, Transfer, Unwind, Visibility,
+    NamespaceLoader, OptionsCache, Package, PrimDef, PrimFn, PrimKind, S4Hooks, ScriptOpts,
+    Transfer, Unwind, Visibility,
 };
 pub use ctx::{Args, Ctx, FrameId};
+pub use namespace::NsRecord;
 
 #[cfg(test)]
 mod regression;

@@ -518,6 +518,7 @@ fn package_namespaces_and_primitives_roundtrip() {
     ctx.register_package(&roxide_eval::Package {
         name: "stats",
         attach: true,
+        exports: None,
         modules: &[&MODULE],
     })
     .expect("Register test package");

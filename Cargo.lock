@@ -273,7 +273,10 @@ dependencies = [
  "roxide-base",
  "roxide-eval",
  "roxide-gc",
+ "roxide-graphics",
  "roxide-host",
+ "roxide-methods",
+ "roxide-pkg",
  "roxide-stats",
  "roxide-utils",
 ]
@@ -301,6 +304,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "roxide-graphics"
+version = "0.1.0"
+dependencies = [
+ "flate2",
+ "roxide-base",
+ "roxide-diag",
+ "roxide-eval",
+ "roxide-gc",
+ "roxide-host",
+ "roxide-value",
+]
+
+[[package]]
 name = "roxide-harness"
 version = "0.1.0"
 
@@ -314,6 +330,32 @@ dependencies = [
 [[package]]
 name = "roxide-math"
 version = "0.1.0"
+
+[[package]]
+name = "roxide-methods"
+version = "0.1.0"
+dependencies = [
+ "roxide-base",
+ "roxide-eval",
+ "roxide-gc",
+ "roxide-value",
+]
+
+[[package]]
+name = "roxide-pkg"
+version = "0.1.0"
+dependencies = [
+ "bzip2",
+ "flate2",
+ "lzma-rust2",
+ "roxide-base",
+ "roxide-diag",
+ "roxide-eval",
+ "roxide-gc",
+ "roxide-host",
+ "roxide-syntax",
+ "roxide-value",
+]
 
 [[package]]
 name = "roxide-stats"

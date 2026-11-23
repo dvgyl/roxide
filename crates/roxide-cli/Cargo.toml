@@ -13,7 +13,10 @@ path = "src/main.rs"
 roxide-base = { workspace = true }
 roxide-eval = { workspace = true }
 roxide-gc = { workspace = true }
+roxide-graphics = { workspace = true }
 roxide-host = { workspace = true }
+roxide-methods = { workspace = true }
+roxide-pkg = { workspace = true }
 roxide-stats = { workspace = true }
 roxide-utils = { workspace = true }
 

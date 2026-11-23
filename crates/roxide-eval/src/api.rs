@@ -4,7 +4,7 @@ use std::any::Any;
 use std::fmt;
 
 use roxide_gc::{SexpId, Trace};
-use roxide_value::{PrimId, Sym, ValueError};
+use roxide_value::{PrimId, SEXP_NIL, Sym, ValueError};
 
 use crate::ctx::{Args, Ctx, FrameId};
 
@@ -214,14 +214,34 @@ pub struct Module {
     pub prelude: &'static str,
 }
 
-/// Package registration descriptor for non-base R packages (`stats`, `utils`, `tools`, ...) (ADR-0011).
+/// Package registration descriptor for non-base R packages (`stats`, `utils`, `tools`, ...) (ADR-0011, ADR-0013).
 pub struct Package {
     /// Package name (e.g. `"stats"`, `"utils"`, `"tools"`).
     pub name: &'static str,
     /// Whether to attach `package:<name>` onto the search path below `.GlobalEnv`.
     pub attach: bool,
+    /// Optional explicit export list. `None` exports all bindings whose names do not start with `.`.
+    pub exports: Option<&'static [&'static str]>,
     /// Ordered list of disjoint submodule units owned by this package.
     pub modules: &'static [&'static Module],
+}
+
+/// Execution options for [`Ctx::run_script_with_opts`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScriptOpts {
+    /// Automatically print visible top-level results.
+    pub auto_print: bool,
+    /// Echo each top-level expression's source lines with `"> "` and `"+ "` prompts (`R CMD BATCH`).
+    pub echo: bool,
+}
+
+impl Default for ScriptOpts {
+    fn default() -> Self {
+        Self {
+            auto_print: true,
+            echo: false,
+        }
+    }
 }
 
 /// Cached hot session options (`digits`, `scipen`, `warn`, `expressions`, `width`).
@@ -260,14 +280,53 @@ impl Default for OptionsCache {
 /// GC-traced per-module session state stored inside [`Ctx`] via `ctx.ext::<T>()` (ADR-0007).
 pub trait CtxExt: Any + Trace + 'static {}
 
-/// Stateless S4 dispatch hook. Store session state in a traced [`CtxExt`].
+/// Stateless S4 dispatch and object hooks (ADR-0012). Store session state in a traced [`CtxExt`].
 pub trait S4Hooks {
-    /// Attempt S4 dispatch; return `Ok(Some(res))` if handled, `Ok(None)` to fall through.
+    /// Attempt S4 primitive/group generic dispatch; return `Ok(Some(res))` if handled.
     fn dispatch(
         &self,
         ctx: &mut Ctx,
         generic: Sym,
         call: &Call,
         args: &Args,
-    ) -> EvalResult<Option<SexpId>>;
+    ) -> EvalResult<Option<SexpId>> {
+        let _ = (ctx, generic, call, args);
+        Ok(None)
+    }
+
+    /// Execute `standardGeneric(name)` in the active generic call `frame`.
+    fn standard_generic(&self, ctx: &mut Ctx, name: Sym, frame: FrameId) -> EvalResult<SexpId> {
+        let _ = (name, frame);
+        Err(ctx.stop(SEXP_NIL, "S4 methods support is not loaded"))
+    }
+
+    /// Print an S4 object via `methods::show(value)`.
+    fn show(&self, ctx: &mut Ctx, value: SexpId, env: SexpId) -> EvalResult<()> {
+        let _ = env;
+        ctx.print_value_default(value, ctx.opts().digits)
+    }
+
+    /// Return the full S4 superclass chain (`STRSXP`) used by S3 dispatch and `inherits()` on S4 instances.
+    fn class_chain(&self, ctx: &mut Ctx, value: SexpId) -> EvalResult<Option<SexpId>> {
+        let _ = (ctx, value);
+        Ok(None)
+    }
+
+    /// Validate and optionally coerce `value` prior to storing into S4 slot `name` on `obj`.
+    fn check_slot(
+        &self,
+        ctx: &mut Ctx,
+        obj: SexpId,
+        name: Sym,
+        value: SexpId,
+    ) -> EvalResult<SexpId> {
+        let _ = (ctx, obj, name);
+        Ok(value)
+    }
+}
+
+/// On-demand package namespace loader hook installed by `roxide-pkg` (ADR-0013).
+pub trait NamespaceLoader {
+    /// Load and register the namespace for `name`, returning its `ENVSXP`.
+    fn load(&self, ctx: &mut Ctx, name: &str, call: SexpId) -> EvalResult<SexpId>;
 }

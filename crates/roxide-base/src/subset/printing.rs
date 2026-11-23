@@ -21,6 +21,9 @@ pub(super) fn print(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
             "argument \"x\" is missing, with no default",
         ));
     }
+    if ctx.session().is_s4(x)? && ctx.show_s4(x, call.env)? {
+        return Ok(x);
+    }
     let digits = args.named(ctx.session(), "digits");
     let digits = if let Some(v) = digits {
         number(ctx.session_mut(), v)?.clamp(1.0, 22.0) as usize

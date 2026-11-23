@@ -18,3 +18,7 @@ This file tracks all third-party crates, libraries, datasets, and published algo
 - **R Language Definition / R Internals / Writing R Extensions** — Clean-room behavioral specification reference (no GNU R source code or test suites consulted or copied).
 - **IEEE 754-2019** — Binary floating-point arithmetic specification (quiet/signaling NaN payload semantics for `NA_real_`).
 - **Howard Hinnant's Proleptic Gregorian Civil Calendar Algorithms** (Public Domain) — Clean civil date / epoch-day conversions in `roxide-base::datetime`.
+- **Netlib Reference BLAS & LAPACK 3.12.1** (`BSD-3-Clause`, upstream Netlib reference) — Clean-room Rust linear algebra reference algorithms in `roxide-math::linalg`.
+- **QUADPACK** (Piessens et al., 1983, Public Domain) & **Knuth TAOCP `ran_array`** (Public Domain) — Adaptive quadrature and Knuth PRNG engines in `roxide-math`.
+- **Adobe Core-14 Helvetica AFM Metrics** (Permissive Adobe AFM notice: *"This file and the 14 PostScript(R) AFM files it accompanies may be used, copied, and distributed for any purpose and without charge, with or without modification, provided that all copyright notices are retained"*) — Font advance metrics in `roxide-graphics`.
+- **Hershey Simplex Vector Font** (Allen Vincent Hershey / US NBS / NTIS, Public Domain) — Vector glyph strokes for the clean-room PNG rasterizer in `roxide-graphics`.

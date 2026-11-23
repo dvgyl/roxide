@@ -562,11 +562,13 @@ impl Reader<'_, '_> {
                     .registry
                     .packages
                     .iter()
-                    .find_map(|&(pkg, ns, attached)| {
-                        if ty == NAMESPACE && name == pkg {
-                            Some(ns)
-                        } else if ty == PACKAGE && name.strip_prefix("package:") == Some(pkg) {
-                            attached
+                    .find_map(|(pkg, ns, attached)| {
+                        if ty == NAMESPACE && name == pkg.as_str() {
+                            Some(*ns)
+                        } else if ty == PACKAGE
+                            && name.strip_prefix("package:") == Some(pkg.as_str())
+                        {
+                            *attached
                         } else {
                             None
                         }

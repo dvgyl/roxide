@@ -13,15 +13,16 @@ use roxide_host::{
 };
 use roxide_syntax::{ParseStep, Parser};
 use roxide_value::{
-    BASE_ENV, DeparseOpts, GLOBAL_ENV, KeepSource, PrimId, RSession, SEXP_NIL, Sym, ValueApi,
-    deparse, lower,
+    BASE_ENV, BASE_NAMESPACE, DeparseOpts, EMPTY_ENV, GLOBAL_ENV, KeepSource, PrimId, RSession,
+    SEXP_NIL, Sym, ValueApi, deparse, lower,
 };
 
 use crate::api::{
-    ArgEval, Call, CtxExt, EvalResult, InternalError, Module, OptionsCache, Package, PrimDef,
-    PrimKind, S4Hooks, Unwind,
+    ArgEval, Call, CtxExt, EvalResult, InternalError, Module, NamespaceLoader, OptionsCache,
+    Package, PrimDef, PrimKind, S4Hooks, ScriptOpts, Unwind,
 };
 use crate::builtins;
+use crate::namespace::{DeferredS3, NsRecord};
 
 /// Monotonically increasing frame identifier for targeted non-local transfers.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -119,14 +120,6 @@ pub(crate) struct ExtEntry {
     trace_fn: fn(&dyn Any, &mut Tracer<'_>),
 }
 
-/// Registered non-base package namespace and optional attached search-path environment.
-#[derive(Clone, Copy)]
-pub(crate) struct RegisteredPackage {
-    pub(crate) name: &'static str,
-    pub(crate) namespace: SexpId,
-    pub(crate) attached: Option<SexpId>,
-}
-
 /// Core Roxide execution context owning the [`RSession`], [`Host`], frames, and primitive table.
 pub struct Ctx {
     pub(crate) session: RSession,
@@ -138,12 +131,14 @@ pub struct Ctx {
     pub(crate) registered_prims: HashSet<(SexpId, &'static str)>,
     pub(crate) overridable_prims: HashSet<(SexpId, &'static str)>,
     pub(crate) overridable_internals: HashSet<&'static str>,
-    pub(crate) packages: Vec<RegisteredPackage>,
+    pub(crate) namespaces: Vec<NsRecord>,
+    pub(crate) pending_s3: Vec<DeferredS3>,
+    pub(crate) namespace_loader: Option<&'static dyn NamespaceLoader>,
+    pub(crate) autoloads: SexpId,
     pub(crate) frames: Vec<Frame>,
     pub(crate) loops: Vec<(FrameId, SexpId)>,
     pub(crate) conditions: crate::conditions::Conditions,
     pub(crate) options: Vec<(Sym, SexpId)>,
-    pub(crate) utils: SexpId,
     pub(crate) next_frame_id: u64,
     pub(crate) expr_depth: usize,
     pub(crate) overflow_headroom: usize,
@@ -329,8 +324,9 @@ struct CtxRoots<'a> {
     eval_env: SexpId,
     conditions: &'a crate::conditions::Conditions,
     options: &'a [(Sym, SexpId)],
-    utils: SexpId,
-    packages: &'a [RegisteredPackage],
+    autoloads: SexpId,
+    namespaces: &'a [NsRecord],
+    pending_s3: &'a [DeferredS3],
     extensions: &'a HashMap<TypeId, ExtEntry>,
 }
 
@@ -356,12 +352,12 @@ impl RootSet for CtxRoots<'_> {
         }
         tracer.edge(self.eval_env);
         self.conditions.trace(tracer);
-        tracer.edge(self.utils);
-        for pkg in self.packages {
-            tracer.edge(pkg.namespace);
-            if let Some(attached) = pkg.attached {
-                tracer.edge(attached);
-            }
+        tracer.edge(self.autoloads);
+        for rec in self.namespaces {
+            rec.trace(tracer);
+        }
+        for entry in self.pending_s3 {
+            entry.trace(tracer);
         }
         for &(_, value) in self.options {
             tracer.edge(value);
@@ -376,7 +372,14 @@ impl Ctx {
     /// Construct a new [`Ctx`] with the given [`Host`] and [`GcPolicy`], registering core M0 primitives.
     pub fn new(host: Box<dyn Host>, policy: GcPolicy) -> Result<Self, InternalError> {
         let mut session = RSession::new(policy)?;
-        let utils = session.alloc_env(BASE_ENV)?;
+        let autoloads = session.alloc_env(BASE_ENV)?;
+        let name_sym = session.intern("name")?;
+        let autoloads_label = session.scalar_str("Autoloads")?;
+        session.set_attrib(autoloads, name_sym, autoloads_label)?;
+        session.env_set_enclos(GLOBAL_ENV, autoloads)?;
+        let base_s3 = session.alloc_env(BASE_ENV)?;
+        let s3_sym = session.intern(".__S3MethodsTable__.")?;
+        session.env_define(BASE_NAMESPACE, s3_sym, base_s3)?;
         let max_expressions = host.limits().max_expressions;
         let opts = OptionsCache {
             expressions: max_expressions,
@@ -395,12 +398,14 @@ impl Ctx {
             registered_prims: HashSet::new(),
             overridable_prims: HashSet::new(),
             overridable_internals: HashSet::new(),
-            packages: Vec::new(),
+            namespaces: Vec::new(),
+            pending_s3: Vec::new(),
+            namespace_loader: None,
+            autoloads,
             frames: Vec::new(),
             loops: Vec::new(),
             conditions: Default::default(),
             options: Vec::new(),
-            utils,
             next_frame_id: 1,
             expr_depth: 0,
             overflow_headroom: 0,
@@ -440,47 +445,91 @@ impl Ctx {
         self.register_module_in(module, BASE_ENV, false)
     }
 
-    /// Register a non-base R [`Package`] (`stats`, `utils`, `tools`, ...) (ADR-0011).
+    /// Register a non-base R [`Package`] (`stats`, `utils`, `tools`, ...) (ADR-0011, ADR-0013).
     ///
-    /// Creates `namespace:<name>` (parent `BASE_ENV`), registers all package modules and preludes
-    /// into that namespace, and when `pkg.attach` is true attaches `package:<name>` onto the
-    /// search path immediately below `.GlobalEnv`.
+    /// Creates `namespace:<name> -> imports:<name> -> BASE_NAMESPACE`, registers all package modules
+    /// and preludes into that namespace, populates `.__NAMESPACE__.` and `.__S3MethodsTable__.`,
+    /// and when `pkg.attach` is true attaches `package:<name>` at position 2 on `search()`.
     pub fn register_package(&mut self, pkg: &Package) -> Result<(), InternalError> {
-        if pkg.name == "base" || self.packages.iter().any(|p| p.name == pkg.name) {
+        if pkg.name == "base" || self.namespaces.iter().any(|p| p.name == pkg.name) {
             return Err(InternalError {
                 message: format!("package '{}' is already registered", pkg.name),
             });
         }
-        let ns = self.session.alloc_env(BASE_ENV)?;
+        let (ns, imports) = self
+            .ns_create(pkg.name, "4.6.2", None)
+            .map_err(|_| InternalError {
+                message: format!("failed to create namespace '{}'", pkg.name),
+            })?;
         let mark = self.session.heap.protect_mark();
         self.session.heap.protect(ns);
+        self.session.heap.protect(imports);
         let result = (|| -> Result<(), InternalError> {
             for module in pkg.modules {
                 self.register_module_in(module, ns, false)?;
             }
-            let attached = if pkg.attach {
-                let parent = self.session.env_enclos(GLOBAL_ENV)?;
-                let pkg_env = self.session.alloc_env(parent)?;
-                self.session.heap.protect(pkg_env);
-                let name_sym = self.session.intern("name")?;
-                let label = self.session.scalar_str(&format!("package:{}", pkg.name))?;
-                self.session.set_attrib(pkg_env, name_sym, label)?;
-                for (sym, binding) in self.session.env_entries(ns)? {
-                    let sym_name = self.session.sym_name(sym)?;
-                    if !sym_name.starts_with('.') {
-                        self.session.env_define_binding(pkg_env, sym, binding)?;
+            let exports_env = self
+                .ns_exports_env(ns)
+                .map_err(|_| InternalError {
+                    message: format!("missing exports env for '{}'", pkg.name),
+                })?
+                .ok_or_else(|| InternalError {
+                    message: format!("missing exports env for '{}'", pkg.name),
+                })?;
+            self.session.heap.protect(exports_env);
+
+            let mut exported_bindings = Vec::new();
+            if let Some(explicit) = pkg.exports {
+                for &name in explicit {
+                    let sym = self.session.intern(name)?;
+                    let val = self.session.scalar_str(name)?;
+                    self.session.env_define(exports_env, sym, val)?;
+                    if let Some(binding) = self.session.env_get(ns, sym) {
+                        exported_bindings.push((sym, binding));
                     }
                 }
-                self.session.env_set_enclos(GLOBAL_ENV, pkg_env)?;
+            } else {
+                for (sym, binding) in self.session.env_entries(ns)? {
+                    let sym_name = self.session.sym_name(sym)?.to_owned();
+                    if !sym_name.starts_with('.') {
+                        let val = self.session.scalar_str(&sym_name)?;
+                        self.session.env_define(exports_env, sym, val)?;
+                        exported_bindings.push((sym, binding));
+                    }
+                }
+            }
+
+            self.register_builtin_s3_methods(ns)
+                .map_err(|_| InternalError {
+                    message: format!("failed to register S3 methods for '{}'", pkg.name),
+                })?;
+
+            let attached = if pkg.attach {
+                let pkg_env = self.session.alloc_env(EMPTY_ENV)?;
+                self.session.heap.protect(pkg_env);
+                for (sym, binding) in exported_bindings {
+                    self.session.env_define_binding(pkg_env, sym, binding)?;
+                }
+                self.search_attach(pkg_env, 2, &format!("package:{}", pkg.name))
+                    .map_err(|_| InternalError {
+                        message: format!("failed to attach 'package:{}'", pkg.name),
+                    })?;
                 Some(pkg_env)
             } else {
                 None
             };
-            self.packages.push(RegisteredPackage {
-                name: pkg.name,
-                namespace: ns,
+
+            self.ns_register(NsRecord {
+                name: pkg.name.to_owned(),
+                ns,
+                imports,
                 attached,
-            });
+                path: None,
+                builtin: true,
+            })
+            .map_err(|_| InternalError {
+                message: format!("failed to register namespace '{}'", pkg.name),
+            })?;
             Ok(())
         })();
         self.session.heap.unprotect_to(mark);
@@ -763,6 +812,64 @@ impl Ctx {
         self.s4_hooks = Some(hooks);
     }
 
+    /// Print an S4 value through installed `S4Hooks::show`, returning `true` if handled.
+    pub fn show_s4(&mut self, value: SexpId, env: SexpId) -> EvalResult<bool> {
+        if let Some(hooks) = self.s4_hooks {
+            hooks.show(self, value, env)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Query the full S4 superclass chain (`STRSXP`) for `value` via `S4Hooks::class_chain`.
+    pub fn s4_class_chain(&mut self, value: SexpId) -> EvalResult<Option<SexpId>> {
+        if let Some(hooks) = self.s4_hooks {
+            hooks.class_chain(self, value)
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Validate/coerce an S4 slot assignment via `S4Hooks::check_slot`.
+    pub fn check_s4_slot(&mut self, obj: SexpId, name: Sym, value: SexpId) -> EvalResult<SexpId> {
+        if let Some(hooks) = self.s4_hooks {
+            hooks.check_slot(self, obj, name, value)
+        } else {
+            Ok(value)
+        }
+    }
+
+    /// Return the identifier of the innermost active closure frame, if any.
+    #[must_use]
+    pub fn current_frame_id(&self) -> Option<FrameId> {
+        self.frames.last().map(|frame| frame.id)
+    }
+
+    /// Inspect `(call, cloenv, fun, caller)` of an active closure frame by [`FrameId`].
+    #[must_use]
+    pub fn frame_info(&self, id: FrameId) -> Option<(SexpId, SexpId, SexpId, SexpId)> {
+        self.frames
+            .iter()
+            .rfind(|frame| frame.id == id)
+            .map(|frame| (frame.call, frame.cloenv, frame.fun, frame.caller))
+    }
+
+    /// Return the parent active closure frame [`FrameId`] of `id`, if one exists.
+    #[must_use]
+    pub fn parent_frame_id(&self, id: FrameId) -> Option<FrameId> {
+        let idx = self.frames.iter().rposition(|frame| frame.id == id)?;
+        if idx == 0 {
+            return None;
+        }
+        let caller = self.frames[idx].caller;
+        self.frames[..idx]
+            .iter()
+            .rposition(|frame| frame.cloenv == caller)
+            .map(|p| self.frames[p].id)
+            .or_else(|| Some(self.frames[idx - 1].id))
+    }
+
     /// Protect a [`SexpId`] on the heap's protect stack.
     pub fn protect(&mut self, id: SexpId) {
         self.session.heap.protect(id);
@@ -811,8 +918,9 @@ impl Ctx {
                 eval_env: self.eval_env,
                 conditions: &self.conditions,
                 options: &self.options,
-                utils: self.utils,
-                packages: &self.packages,
+                autoloads: self.autoloads,
+                namespaces: &self.namespaces,
+                pending_s3: &self.pending_s3,
                 extensions: &self.extensions,
             };
             let _ = self.session.collect(&roots);
@@ -855,11 +963,41 @@ impl Ctx {
         env: SexpId,
         auto_print: bool,
     ) -> EvalResult<()> {
+        self.run_script_with_opts(
+            name,
+            src,
+            env,
+            ScriptOpts {
+                auto_print,
+                echo: false,
+            },
+        )
+    }
+
+    /// Parse and execute a complete R script string in `env` with explicit [`ScriptOpts`].
+    pub fn run_script_with_opts(
+        &mut self,
+        name: &str,
+        src: &str,
+        env: SexpId,
+        opts: ScriptOpts,
+    ) -> EvalResult<()> {
         let fid: SrcFileId = self.sources.add_file(name, src);
         let mut parser = Parser::new(src, fid);
+        let mut last_echoed = 0usize;
         loop {
             match parser.parse_next() {
                 ParseStep::Eof => {
+                    if opts.echo
+                        && let Some(tail) = src.get(last_echoed..)
+                        && !tail.is_empty()
+                    {
+                        for line in tail.lines() {
+                            let _ = self.host.write_out(b"> ");
+                            let _ = self.host.write_out(line.as_bytes());
+                            let _ = self.host.write_out(b"\n");
+                        }
+                    }
                     self.flush_warnings();
                     return Ok(());
                 }
@@ -874,15 +1012,48 @@ impl Ctx {
                     return Err(self.stop(call, err.message));
                 }
                 ParseStep::Expr(node) => {
+                    if opts.echo {
+                        let span = parser.ast().span(node);
+                        let lo = (span.lo as usize).min(src.len());
+                        let hi = (span.hi as usize).min(src.len());
+                        if lo >= last_echoed
+                            && let Some(between) = src.get(last_echoed..lo)
+                        {
+                            for line in between.lines() {
+                                let _ = self.host.write_out(b"> ");
+                                let _ = self.host.write_out(line.as_bytes());
+                                let _ = self.host.write_out(b"\n");
+                            }
+                        }
+                        if lo <= hi
+                            && let Some(snippet) = src.get(lo..hi)
+                        {
+                            for (idx, line) in snippet.lines().enumerate() {
+                                let prefix = if idx == 0 { "> " } else { "+ " };
+                                let _ = self.host.write_out(prefix.as_bytes());
+                                let _ = self.host.write_out(line.as_bytes());
+                                let _ = self.host.write_out(b"\n");
+                            }
+                            last_echoed = hi;
+                            if src.as_bytes().get(last_echoed) == Some(&b'\r') {
+                                last_echoed += 1;
+                            }
+                            if src.as_bytes().get(last_echoed) == Some(&b'\n') {
+                                last_echoed += 1;
+                            }
+                        }
+                    }
                     let expr = lower(parser.ast(), node, &mut self.session, KeepSource::No);
                     let expr = self.condition_result(SEXP_NIL, expr.map_err(Into::into))?;
                     let val = self.scoped(|ctx| {
                         ctx.protect(expr);
                         ctx.visible = true;
                         let v = ctx.eval(expr, env)?;
-                        if auto_print && ctx.visible {
+                        if opts.auto_print && ctx.visible {
                             ctx.protect(v);
-                            if ctx.session.is_object(v)? {
+                            if ctx.session.is_s4(v)? && ctx.show_s4(v, env)? {
+                                // Printed by S4 `show()`.
+                            } else if ctx.session.is_object(v)? {
                                 let print = ctx.session.intern("print")?;
                                 let print = ctx.find_fun(print, BASE_ENV)?;
                                 ctx.apply(print, &[(None, v)], SEXP_NIL, env)?;

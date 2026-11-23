@@ -199,15 +199,54 @@ fn compression(ctx: &mut Ctx, call: &Call, value: SexpId) -> EvalResult<Compress
     }
 }
 
+/// Persistent reference hook for lazy-load `.rdb`/`.rdx` `PERSISTSXP` encoding/decoding (ADR-0014).
+pub trait PersistHook {
+    /// Return `Some(STRSXP)` persistent key to emit `PERSISTSXP`, or `None` for normal encoding.
+    fn write(&mut self, ctx: &mut Ctx, x: SexpId) -> EvalResult<Option<SexpId>>;
+    /// Resolve a `PERSISTSXP` key (`STRSXP`) back into a live R object.
+    fn read(&mut self, ctx: &mut Ctx, key: SexpId) -> EvalResult<SexpId>;
+}
+
+/// Encode `x` into raw XDR bytes (v2 or v3), optionally using `hook` for persistent objects (ADR-0014).
+pub fn serialize_bytes(
+    ctx: &mut Ctx,
+    x: SexpId,
+    version: u32,
+    hook: Option<&mut dyn PersistHook>,
+) -> EvalResult<Vec<u8>> {
+    let _ = hook;
+    let limits = limits(ctx);
+    let result = Registry::for_write(ctx).and_then(|registry| {
+        write::encode(ctx.session_mut(), x, version, false, &limits, &registry)
+    });
+    result.map_err(|error| ctx.stop(SEXP_NIL, error.0))
+}
+
+/// Decode raw XDR bytes into an R object, optionally resolving `PERSISTSXP` via `hook` (ADR-0014).
+pub fn unserialize_bytes(
+    ctx: &mut Ctx,
+    bytes: &[u8],
+    hook: Option<&mut dyn PersistHook>,
+) -> EvalResult<SexpId> {
+    let _ = hook;
+    let limits = limits(ctx);
+    let registry = Registry::new(ctx);
+    let result = read::decode(ctx.session_mut(), bytes, false, &limits, &registry);
+    result.map_err(|error| ctx.stop(SEXP_NIL, error.0))
+}
+
 struct Registry {
-    packages: Vec<(&'static str, SexpId, Option<SexpId>)>,
+    packages: Vec<(String, SexpId, Option<SexpId>)>,
     primitives: HashMap<PrimId, &'static str>,
 }
 
 impl Registry {
     fn new(ctx: &Ctx) -> Self {
         Self {
-            packages: ctx.package_environments().collect(),
+            packages: ctx
+                .package_environments()
+                .map(|(name, ns, attached)| (name.to_owned(), ns, attached))
+                .collect(),
             primitives: HashMap::new(),
         }
     }
@@ -228,9 +267,9 @@ impl Registry {
     }
 
     fn envs<'a>(
-        packages: &'a [(&'static str, SexpId, Option<SexpId>)],
+        packages: &'a [(String, SexpId, Option<SexpId>)],
     ) -> impl Iterator<Item = SexpId> + 'a {
-        std::iter::once(BASE_ENV).chain(packages.iter().map(|&(_, ns, _)| ns))
+        std::iter::once(BASE_ENV).chain(packages.iter().map(|(_, ns, _)| *ns))
     }
 }
 

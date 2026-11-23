@@ -1,0 +1,15 @@
+[package]
+name = "roxide-methods"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+roxide-base.workspace = true
+roxide-eval.workspace = true
+roxide-gc.workspace = true
+roxide-value.workspace = true
+
+[lints]
+workspace = true

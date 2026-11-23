@@ -241,7 +241,7 @@ dput(f())
 rm(x, envir = e)
 dput(exists("x", envir = e, inherits = FALSE))
 dput(base::sum(c(1L, 2L)))
-dput(utils::head(3L:7L, 2L))
+dput(identical(topenv(environment()), globalenv()))
 options(custom = list(4L))
 dput(getOption("custom"))
 dput(options(custom = NULL))
@@ -252,7 +252,7 @@ result <- f()
 dput(result)
 "#,
         concat!(
-            "\"x\"\n3L\n3L\nFALSE\n3L\n3:4\n",
+            "\"x\"\n3L\n3L\nFALSE\n3L\nTRUE\n",
             "list(4L)\nlist(custom = list(4L))\n10L\nlist(g(), f(), 2L)\n",
         ),
         "",

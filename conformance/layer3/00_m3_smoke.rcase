@@ -1,0 +1,13 @@
+=== case: default_search_and_base_namespace ===
+#@ tags: layer3,smoke
+dput(search())
+dput(environmentName(baseenv()))
+dput(environmentName(asNamespace("base")))
+dput(identical(parent.env(asNamespace("base")), .GlobalEnv))
+dput(identical(parent.env(baseenv()), emptyenv()))
+dput(identical(length(asNamespace("base")), length(baseenv())))
+dput(get(".packageName", asNamespace("stats")))
+dput(identical(topenv(environment(stats::sd)), asNamespace("stats")))
+dput(isS4(1L))
+dput(isTRUE(c(a = TRUE)))
+dput(isFALSE(structure(FALSE, foo = 1)))

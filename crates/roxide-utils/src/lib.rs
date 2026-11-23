@@ -20,6 +20,7 @@ pub const TOOLS_MODULES: &[&Module] = &[&tools_rd::MODULE, &tools_license::MODUL
 pub const UTILS_PACKAGE: Package = Package {
     name: "utils",
     attach: true,
+    exports: None,
     modules: UTILS_MODULES,
 };
 
@@ -27,6 +28,7 @@ pub const UTILS_PACKAGE: Package = Package {
 pub const TOOLS_PACKAGE: Package = Package {
     name: "tools",
     attach: false,
+    exports: None,
     modules: TOOLS_MODULES,
 };
 

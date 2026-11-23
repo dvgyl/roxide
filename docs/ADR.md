@@ -154,4 +154,53 @@ All major architectural contracts and deviations from `docs/ARCHITECTURE.md` are
   - Enforce duplicate-name rejection in `register_module` / `register_package` for non-fallback primitive and `.Internal` registrations so parallel workers cannot silently shadow each other.
   - Name `stats`/`utils`/`tools` `.Internal` entry points with R's visible native symbol names (`C_fft`, `C_lmfit`, `C_cor`, etc.) so they cannot collide with `base` internals and bridge cleanly to `.Call` in Milestone 4.
 
+---
+
+## ADR-0012: S4 Object Model (`OBJSXP` + `flags.s4`), `SEXP_S4_NULL`, and Multiple Dispatch
+
+- **Status:** Accepted (empirically verified against live GNU R 4.6.2 oracle; see `docs/M3_SPEC.md`)
+- **Context:** Milestone 3 implements S4 classes, slots, inheritance, multiple dispatch, `callNextMethod()`, `show()`, and Reference Classes in `roxide-methods` without adding a new `SEXPTYPE` or coupling `roxide-eval` directly to `roxide-methods`.
+- **Decision:**
+  - Represent an S4 instance as any `SEXPTYPE` with `ObjFlags::s4 == true`: `Body::Obj` (`SexpType::Obj`) for slot-only classes and underlying vector/environment types for `.Data` / `.xData` classes.
+  - Add permanent singleton `SEXP_S4_NULL = SexpId::permanent(12)` — an interned `SYMSXP` with bytes `b"\x01NULL\x01"` — distinguishing present `NULL` slots from absent slots while matching GNU R's XDR serialization and `attributes()` layout.
+  - Preserve `flags.s4` in `duplicate`/`unshare`, compare it in `identical()`, and store package-qualified S4 `class` attributes as `STRSXP` vectors carrying their own `package` attribute.
+  - Keep R metadata objects (`__C__<Class>` `classRepresentation` and `.__T__<generic>:<pkg>` method-table environments) canonical; derive epoch-invalidated Rust class/method caches in `MethodsExt: CtxExt`.
+  - Multiple-dispatch acceptance contract: filter applicable candidates (`"missing"` matches only `missing` or `ANY`), score `ANY` at `1 + max_superclass_depth(target)`, select minimum total inheritance distance, break ties by (a) having at least one exact component, (b) lexicographic distance in generic `signature` order, and (c) declared `contains` parent order; emit GNU R's ambiguity note when tied at minimum total distance.
+  - Extend `S4Hooks` in `roxide-eval` (`dispatch`, `standard_generic`, `show`, `class_chain`, `check_slot`) as the sole boundary between `roxide-eval` and `roxide-methods`.
+
+---
+
+## ADR-0013: Dynamic Namespace Registry, `BASE_NAMESPACE` Alias, and `roxide-pkg` Crate
+
+- **Status:** Accepted (amends ADR-0004 DAG and ADR-0011)
+- **Context:** Built-in and installed pure-R packages require a unified dynamic namespace registry, exact lexical scoping (`namespace:pkg -> imports:pkg -> baseNamespace -> .GlobalEnv -> search`), `NAMESPACE` directives (`export`, `import`, `S3method` incl. deferred cross-package registration), and `library()`/`require()`/`use()`/`loadNamespace()`/`unloadNamespace()`.
+- **Decision:**
+  - Make `BASE_NAMESPACE` alias the frame of `BASE_ENV` while setting `BASE_NAMESPACE`'s enclosing environment to `GLOBAL_ENV` (matching GNU R's `identical(parent.env(asNamespace("base")), .GlobalEnv)` without duplicating `base` bindings).
+  - Replace static `RegisteredPackage` with dynamic `NsRecord { name, ns, imports, attached, path, builtin }` and GC-traced `pending_s3` deferred S3 registrations in `roxide-eval::namespace`, storing R's canonical `.__NAMESPACE__.` and `.__S3MethodsTable__.` environments.
+  - Resolve S3 methods strictly through the calling environment chain, the generic's defining namespace `.__S3MethodsTable__.`, and `BASE_NAMESPACE`'s table (never scanning arbitrary loaded namespaces).
+  - Add pure-Rust crate `roxide-pkg` (`#![forbid(unsafe_code)]`, depending on `roxide-eval`, `roxide-base`, `roxide-host`, `flate2`, `bzip2`, `lzma-rust2`) registered via `NamespaceLoader` in `roxide-eval`; `roxide-methods` integrates at R level (`.rx_cacheMetaData`) with zero Rust dependency between `roxide-pkg` and `roxide-methods`.
+
+---
+
+## ADR-0014: Lazy-Load `.rdb`/`.rdx` Database, `BCODESXP` Unwrap, and `R CMD INSTALL` / `BATCH`
+
+- **Status:** Accepted
+- **Context:** Installed R packages (including packages installed by GNU R 4.6.2 and pure-R packages installed via `R CMD INSTALL`) store namespace objects in `.rdb`/`.rdx` lazy-load databases with `PERSISTSXP` (`env::N`) environment references and optional `BCODESXP` byte-compiled bodies.
+- **Decision:**
+  - Expose `PersistHook`, `serialize_bytes`, and `unserialize_bytes` in `roxide-base::serialize`, adding `PERSISTSXP` (247) hook support and `BCODESXP` (21) decoding (returning `consts[0]`, the original source expression, as closure body until Milestone 4's bytecode VM).
+  - Implement clean-room POSIX `ustar` extraction over existing `flate2`, `.rdb`/`.rdx` reader/writer over `flate2`/`bzip2`/`lzma-rust2`, in-process staged `R CMD INSTALL` (build `Ctx` + test-load `Ctx`), and `R CMD BATCH` (with `ScriptOpts { auto_print, echo }`). Reject packages containing `src/` cleanly until Milestone 4.
+
+---
+
+## ADR-0015: Graphics Engine (`roxide-graphics`) and Zero-New-Dependency PDF/SVG/PNG Devices
+
+- **Status:** Accepted (amends ADR-0004 DAG: removes `roxide-stats` dependency from `roxide-graphics`)
+- **Context:** Milestone 3 requires `grDevices`, `graphics`, and `grid` along with headless `pdf()`, `svg()`, and `png()` devices while keeping `#![forbid(unsafe_code)]`, zero new external crates, and fast parallel builds.
+- **Decision:**
+  - Drop the Rust dependency from `roxide-graphics` to `roxide-stats`; R preludes invoke `stats::fivenum` / `stats::IQR` dynamically at runtime.
+  - Define a single `Device` trait in 1/72-inch, bottom-left origin, y-up device coordinates; manage device slots `1..=63`, per-device `par`/grid state, and GC-traced display lists inside `GraphicsExt: CtxExt`.
+  - Implement PDF 1.4 (`FlateDecode` via `flate2`), SVG 1.1 (`<pageSet>`/`<page>` for `onefile = TRUE`), and PNG (clean-room scanline coverage rasterizer + PNG encoder using existing `flate2` zlib & CRC32) with **zero new Cargo dependencies**.
+  - Use Adobe Core-14 Helvetica AFM advance widths (permissive Adobe notice) for text metrics and public-domain Hershey Simplex vector strokes for PNG glyph rendering. Numerical and geometry outputs (`par`, `usr`, `hist`, `boxplot`, `barplot`, `legend(plot=FALSE)`, `grid` units/viewports) target exact GNU R 4.6.2 parity; rendered files are verified structurally.
+
+
 

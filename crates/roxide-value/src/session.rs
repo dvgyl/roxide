@@ -32,6 +32,8 @@ pub const TRUE_SCALAR: SexpId = SexpId::permanent(9);
 pub const FALSE_SCALAR: SexpId = SexpId::permanent(10);
 /// Permanent shared `NA` logical scalar (index 11).
 pub const NA_LGL_SCALAR: SexpId = SexpId::permanent(11);
+/// Permanent S4 pseudo-NULL slot sentinel (`\x01NULL\x01`, index 12; ADR-0012).
+pub const SEXP_S4_NULL: SexpId = SexpId::permanent(12);
 
 /// Owns the Roxide GC heap, permanent symbol table, weak `CHARSXP` table, and ALTREP registry.
 pub struct RSession {
@@ -85,7 +87,7 @@ impl RSession {
         debug_assert_eq!(global_env, GLOBAL_ENV);
 
         let base_ns =
-            heap.alloc_permanent(RObject::new(Body::Env(Box::new(EnvData::new(EMPTY_ENV)))))?;
+            heap.alloc_permanent(RObject::new(Body::Env(Box::new(EnvData::new(GLOBAL_ENV)))))?;
         debug_assert_eq!(base_ns, BASE_NAMESPACE);
 
         let true_s = heap.alloc_permanent(RObject::new(Body::Lgl(RVec::from_vec(vec![
@@ -102,12 +104,30 @@ impl RSession {
             heap.alloc_permanent(RObject::new(Body::Lgl(RVec::from_vec(vec![RLogical::NA]))))?;
         debug_assert_eq!(na_lgl, NA_LGL_SCALAR);
 
+        let s4_null = heap.alloc_permanent(RObject::new(Body::Sym {
+            name: CharId::BLANK,
+        }))?;
+        debug_assert_eq!(s4_null, SEXP_S4_NULL);
+
+        let s4_null_bytes: &[u8] = b"\x01NULL\x01";
+        let s4_null_char = CharId(heap.alloc_permanent(RObject::new(Body::Char(RChar::new(
+            s4_null_bytes,
+            Encoding::Native,
+        ))))?);
+        if let Body::Sym { name } = &mut heap.get_mut(SEXP_S4_NULL)?.body {
+            *name = s4_null_char;
+        }
+
         let mut chars = HashMap::new();
         chars.insert((Box::from(&b""[..]), Encoding::Native), CharId::BLANK);
+        chars.insert((Box::from(s4_null_bytes), Encoding::Native), s4_null_char);
+
+        let mut symbols = HashMap::new();
+        symbols.insert(Box::from(s4_null_bytes), Sym(SEXP_S4_NULL));
 
         Ok(Self {
             heap,
-            symbols: HashMap::new(),
+            symbols,
             chars,
             alt: AltRegistry::new(),
         })

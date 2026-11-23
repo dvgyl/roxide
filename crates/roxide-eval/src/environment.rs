@@ -1,6 +1,7 @@
 use roxide_gc::SexpId;
 use roxide_value::{
-    BASE_ENV, EMPTY_ENV, GLOBAL_ENV, SEXP_MISSING, SEXP_NIL, SEXP_UNBOUND, SexpType, Sym, ValueApi,
+    BASE_ENV, BASE_NAMESPACE, EMPTY_ENV, GLOBAL_ENV, RLogical, SEXP_MISSING, SEXP_NIL,
+    SEXP_UNBOUND, SexpType, Sym, ValueApi,
 };
 
 use crate::control::logical;
@@ -27,6 +28,53 @@ pub(crate) const MODULE: Module = Module {
         primitive!("globalenv", constant_env, Eval, Arity::Exact(0), On),
         primitive!("environment", environment, Eval, Arity::Range(0, 1), On),
         primitive!("environment<-", set_env, Eval, Arity::Exact(2), On),
+        primitive!("parent.env", parent_env, Eval, Arity::Exact(1), On),
+        primitive!("parent.env<-", set_parent_env, Eval, Arity::Exact(2), On),
+        primitive!("search", search, Eval, Arity::Exact(0), On),
+        primitive!(
+            "lockEnvironment",
+            lock_environment,
+            Eval,
+            Arity::Range(1, 2),
+            Off
+        ),
+        primitive!(
+            "environmentIsLocked",
+            env_is_locked,
+            Eval,
+            Arity::Exact(1),
+            On
+        ),
+        primitive!("lockBinding", lock_binding, Eval, Arity::Exact(2), Off),
+        primitive!("unlockBinding", unlock_binding, Eval, Arity::Exact(2), Off),
+        primitive!(
+            "bindingIsLocked",
+            binding_is_locked,
+            Eval,
+            Arity::Exact(2),
+            On
+        ),
+        primitive!(
+            "bindingIsActive",
+            binding_is_active,
+            Eval,
+            Arity::Exact(2),
+            On
+        ),
+        primitive!("asNamespace", as_namespace, Eval, Arity::Range(1, 2), On),
+        primitive!("isNamespace", is_namespace, Eval, Arity::Exact(1), On),
+        primitive!(
+            "loadedNamespaces",
+            loaded_namespaces,
+            Eval,
+            Arity::Exact(0),
+            On
+        ),
+        primitive!("isTRUE", is_true_false, Eval, Arity::Exact(1), On),
+        primitive!("isFALSE", is_true_false, Eval, Arity::Exact(1), On),
+        primitive!("as.name", as_name, Eval, Arity::Exact(1), On),
+        primitive!("as.symbol", as_name, Eval, Arity::Exact(1), On),
+        primitive!("topenv", topenv, Eval, Arity::Range(0, 2), On),
         primitive!("parent.frame", parent_frame, Eval, Arity::Range(0, 1), On),
         primitive!("sys.call", sys_frame, Eval, Arity::Range(0, 1), On),
         primitive!("sys.function", sys_frame, Eval, Arity::Range(0, 1), On),
@@ -79,22 +127,12 @@ impl Ctx {
         if self.session.type_of(position)? == SexpType::Env {
             return Ok(position);
         }
+        let path = self.search_path()?;
         if self.session.type_of(position)? == SexpType::Str {
             let name = self.string(position, call.err_call())?;
-            if name == ".GlobalEnv" {
-                return Ok(GLOBAL_ENV);
-            }
-            if name == "package:base" {
-                return Ok(BASE_ENV);
-            }
-            if let Some(pkg_name) = name.strip_prefix("package:") {
-                if let Some(pkg) = self.packages.iter().find(|p| p.name == pkg_name)
-                    && let Some(attached) = pkg.attached
-                {
-                    return Ok(attached);
-                }
-                if pkg_name == "utils" {
-                    return Ok(self.utils);
+            for &env in &path {
+                if self.search_entry_name(env)? == name {
+                    return Ok(env);
                 }
             }
             return Err(self.stop(
@@ -104,9 +142,29 @@ impl Ctx {
         }
         match self.integer(position, call.err_call())? {
             -1 => Ok(call.env),
-            1 => Ok(GLOBAL_ENV),
+            n if n >= 1 && (n as usize) <= path.len() => Ok(path[n as usize - 1]),
             _ => Err(self.stop(call.err_call(), "invalid 'pos' argument")),
         }
+    }
+
+    pub(crate) fn search_entry_name(&mut self, env: SexpId) -> EvalResult<String> {
+        if env == GLOBAL_ENV {
+            return Ok(String::from(".GlobalEnv"));
+        }
+        if env == BASE_ENV {
+            return Ok(String::from("package:base"));
+        }
+        let name_sym = self.session.intern("name")?;
+        let attr = self.session.attr(env, name_sym);
+        if attr != SEXP_NIL
+            && self.session.type_of(attr)? == SexpType::Str
+            && let Ok(slice) = self.session.str_slice(attr)
+            && let Some(&first) = slice.first()
+            && first != roxide_value::CharId::NA
+        {
+            return Ok(String::from_utf8_lossy(self.session.char_bytes(first)?).into_owned());
+        }
+        Ok(String::new())
     }
 
     fn binding_env(&self, sym: Sym, mut env: SexpId, inherits: bool) -> EvalResult<Option<SexpId>> {
@@ -494,52 +552,247 @@ fn namespace(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
             )
         });
     }
-    if let Some(pkg) = ctx.packages.iter().find(|p| p.name == package).copied() {
-        let export = if is_triple {
-            ctx.session
-                .env_get(pkg.namespace, sym)
-                .map(|b| b.value)
-                .filter(|&v| v != SEXP_UNBOUND)
-        } else if !name.starts_with('.') {
-            ctx.session
-                .env_get(pkg.namespace, sym)
-                .map(|b| b.value)
-                .filter(|&v| v != SEXP_UNBOUND)
-                .or_else(|| {
-                    (package == "utils" && matches!(name.as_str(), "head" | "tail"))
-                        .then(|| ctx.session.env_get(BASE_ENV, sym).map(|b| b.value))
-                        .flatten()
-                        .filter(|&v| v != SEXP_UNBOUND)
-                })
+    let ns = ctx.load_namespace(&package, call.err_call())?;
+    if is_triple {
+        if let Some(binding) = ctx.session.env_get(ns, sym)
+            && binding.value != SEXP_UNBOUND
+        {
+            return ctx.read_binding(binding, ns);
+        }
+        return Err(ctx.stop(call.err_call(), format!("object '{name}' not found")));
+    }
+    let exported = if let Some(exports_env) = ctx.ns_exports_env(ns)? {
+        if let Some(exp_binding) = ctx.session.env_get(exports_env, sym) {
+            let target_sym = if ctx.session.type_of(exp_binding.value)? == SexpType::Str {
+                let mapped = ctx.string(exp_binding.value, call.err_call())?;
+                ctx.session.intern(&mapped)?
+            } else {
+                sym
+            };
+            // Resolve strictly within `ns` and its `imports:<pkg>` frame (never `.GlobalEnv`/`base`).
+            if let Some(binding) = ctx.session.env_get(ns, target_sym)
+                && binding.value != SEXP_UNBOUND
+            {
+                Some(ctx.read_binding(binding, ns)?)
+            } else {
+                let imports = ctx.session.env_enclos(ns)?;
+                if imports != SEXP_NIL
+                    && imports != BASE_NAMESPACE
+                    && imports != BASE_ENV
+                    && imports != GLOBAL_ENV
+                    && imports != EMPTY_ENV
+                    && let Some(binding) = ctx.session.env_get(imports, target_sym)
+                    && binding.value != SEXP_UNBOUND
+                {
+                    Some(ctx.read_binding(binding, imports)?)
+                } else {
+                    None
+                }
+            }
         } else {
             None
-        };
-        if let Some(val) = export {
-            return Ok(val);
         }
-        return Err(ctx.stop(
+    } else if !name.starts_with('.') {
+        ctx.session
+            .env_get(ns, sym)
+            .filter(|b| b.value != SEXP_UNBOUND)
+            .map(|b| ctx.read_binding(b, ns))
+            .transpose()?
+    } else {
+        None
+    };
+    exported.ok_or_else(|| {
+        ctx.stop(
             call.err_call(),
             format!("'{name}' is not an exported object from 'namespace:{package}'"),
+        )
+    })
+}
+
+fn parent_env(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    let env = ctx.require_env(args.get(0), call.err_call())?;
+    if env == EMPTY_ENV {
+        return Err(ctx.stop(call.err_call(), "the empty environment has no parent"));
+    }
+    Ok(ctx.session.env_enclos(env)?)
+}
+
+fn set_parent_env(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    let env = ctx.require_env(args.get(0), call.err_call())?;
+    let value = ctx.require_env(args.get(1), call.err_call())?;
+    if env == EMPTY_ENV {
+        return Err(ctx.stop(
+            call.err_call(),
+            "can not set parent of the empty environment",
         ));
     }
-    if package == "utils" {
-        let env = ctx.utils;
-        let export = if ctx.session.env_get(env, sym).is_none()
-            && !matches!(name.as_str(), "head" | "tail")
-        {
-            None
-        } else {
-            ctx.get_var(sym, env)?
-        };
-        return export.ok_or_else(|| {
-            ctx.stop(
-                call.err_call(),
-                format!("'{name}' is not an exported object from 'namespace:{package}'"),
-            )
-        });
+    ctx.session.env_set_enclos(env, value)?;
+    Ok(env)
+}
+
+fn search(ctx: &mut Ctx, _: &Call, _: &mut Args) -> EvalResult {
+    let path = ctx.search_path()?;
+    let mut names = Vec::with_capacity(path.len());
+    for env in path {
+        names.push(ctx.search_entry_name(env)?);
     }
-    Err(ctx.stop(
-        call.err_call(),
-        format!("there is no package called '{package}'"),
-    ))
+    ctx.strings(names.iter().map(String::as_str))
+}
+
+fn lock_environment(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    let env = ctx.require_env(args.get(0), call.err_call())?;
+    let bindings = if args.len() >= 2 {
+        ctx.truth(args.get(1), call.err_call())?
+    } else {
+        false
+    };
+    ctx.session.env_set_locked(env, true)?;
+    if bindings {
+        ctx.session.env_lock_all_bindings(env)?;
+    }
+    Ok(SEXP_NIL)
+}
+
+fn env_is_locked(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    let env = ctx.require_env(args.get(0), call.err_call())?;
+    let locked = ctx.session.env_is_locked(env)?;
+    Ok(ctx
+        .session
+        .scalar_lgl(RLogical::from_option(Some(locked)))?)
+}
+
+fn binding_sym(ctx: &mut Ctx, val: SexpId, call: SexpId) -> EvalResult<Sym> {
+    if ctx.session.type_of(val)? == SexpType::Sym && val != SEXP_MISSING {
+        ctx.sym_from_sexp(val)
+    } else {
+        let name = ctx.string(val, call)?;
+        Ok(ctx.session.intern(&name)?)
+    }
+}
+
+fn lock_binding(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    let sym = binding_sym(ctx, args.get(0), call.err_call())?;
+    let env = ctx.require_env(args.get(1), call.err_call())?;
+    if !ctx.session.env_lock_binding(env, sym, true)? {
+        let name = ctx.session.sym_name(sym)?.to_owned();
+        return Err(ctx.stop(call.err_call(), format!("no binding for \"{name}\"")));
+    }
+    Ok(SEXP_NIL)
+}
+
+fn unlock_binding(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    let sym = binding_sym(ctx, args.get(0), call.err_call())?;
+    let env = ctx.require_env(args.get(1), call.err_call())?;
+    if !ctx.session.env_lock_binding(env, sym, false)? {
+        let name = ctx.session.sym_name(sym)?.to_owned();
+        return Err(ctx.stop(call.err_call(), format!("no binding for \"{name}\"")));
+    }
+    Ok(SEXP_NIL)
+}
+
+fn binding_is_locked(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    let sym = binding_sym(ctx, args.get(0), call.err_call())?;
+    let env = ctx.require_env(args.get(1), call.err_call())?;
+    let Some(locked) = ctx.session.env_binding_is_locked(env, sym)? else {
+        let name = ctx.session.sym_name(sym)?.to_owned();
+        return Err(ctx.stop(call.err_call(), format!("no binding for \"{name}\"")));
+    };
+    Ok(ctx
+        .session
+        .scalar_lgl(RLogical::from_option(Some(locked)))?)
+}
+
+fn binding_is_active(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    let sym = binding_sym(ctx, args.get(0), call.err_call())?;
+    let env = ctx.require_env(args.get(1), call.err_call())?;
+    let Some(active) = ctx.session.env_binding_is_active(env, sym)? else {
+        let name = ctx.session.sym_name(sym)?.to_owned();
+        return Err(ctx.stop(call.err_call(), format!("no binding for \"{name}\"")));
+    };
+    Ok(ctx
+        .session
+        .scalar_lgl(RLogical::from_option(Some(active)))?)
+}
+
+fn as_namespace(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    let arg = args.get(0);
+    if ctx.session.type_of(arg)? == SexpType::Env && ctx.is_namespace_env(arg) {
+        return Ok(arg);
+    }
+    let name = ctx.string(arg, call.err_call())?;
+    let base_ok = if args.len() >= 2 {
+        ctx.truth(args.get(1), call.err_call())?
+    } else {
+        true
+    };
+    if name == "base" {
+        if !base_ok {
+            return Err(ctx.stop(call.err_call(), "namespace 'base' is not allowed here"));
+        }
+        return Ok(BASE_NAMESPACE);
+    }
+    ctx.load_namespace(&name, call.err_call())
+}
+
+fn is_namespace(ctx: &mut Ctx, _: &Call, args: &mut Args) -> EvalResult {
+    let arg = args.get(0);
+    let yes = ctx.session.type_of(arg)? == SexpType::Env && ctx.is_namespace_env(arg);
+    Ok(ctx.session.scalar_lgl(RLogical::from_option(Some(yes)))?)
+}
+
+fn loaded_namespaces(ctx: &mut Ctx, _: &Call, _: &mut Args) -> EvalResult {
+    let names = ctx.ns_loaded_names();
+    ctx.strings(names.iter().map(String::as_str))
+}
+
+fn is_true_false(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    let want = ctx.prims[usize::from(call.prim.0)].name == "isTRUE";
+    let x = args.get(0);
+    let ok = ctx.session.type_of(x)? == SexpType::Lgl
+        && ctx.session.xlength(x)? == 1
+        && ctx.session.lgl(x)?.get(0).get() == Some(want);
+    Ok(ctx.session.scalar_lgl(RLogical::from_option(Some(ok)))?)
+}
+
+fn as_name(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    let x = args.get(0);
+    if ctx.session.type_of(x)? == SexpType::Sym {
+        return Ok(x);
+    }
+    let (coerced, _) = ctx.session.coerce(x, SexpType::Str)?;
+    let name = ctx.string(coerced, call.err_call())?;
+    if name.is_empty() {
+        return Err(ctx.stop(call.err_call(), "attempt to use zero-length variable name"));
+    }
+    Ok(ctx.session.intern(&name)?.as_sexp())
+}
+
+fn topenv(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    let matched = ctx.match_names(args, &["envir", "matchThisEnv"], call.err_call())?;
+    let mut env = match ctx.matched_arg(args, &matched, 0) {
+        Some(v) if v != SEXP_NIL => ctx.require_env(v, call.err_call())?,
+        _ => call.env,
+    };
+    let match_this = match ctx.matched_arg(args, &matched, 1) {
+        Some(v) => v,
+        None => ctx.option_value("topLevelEnvironment")?.unwrap_or(SEXP_NIL),
+    };
+    let ns_sym = ctx.session.intern(".__NAMESPACE__.")?;
+    let pkg_sym = ctx.session.intern(".packageName")?;
+    let mut guard = 0usize;
+    while env != SEXP_NIL && guard < 1024 {
+        if env == GLOBAL_ENV
+            || env == BASE_ENV
+            || env == BASE_NAMESPACE
+            || env == EMPTY_ENV
+            || (match_this != SEXP_NIL && env == match_this)
+            || ctx.session.env_get(env, ns_sym).is_some()
+            || ctx.session.env_get(env, pkg_sym).is_some()
+        {
+            return Ok(env);
+        }
+        env = ctx.session.env_enclos(env)?;
+        guard += 1;
+    }
+    Ok(GLOBAL_ENV)
 }

@@ -11,6 +11,9 @@ members = [
     "crates/roxide-base",
     "crates/roxide-stats",
     "crates/roxide-utils",
+    "crates/roxide-methods",
+    "crates/roxide-pkg",
+    "crates/roxide-graphics",
     "crates/roxide-cli",
     "crates/roxide-harness",
 ]
@@ -32,6 +35,9 @@ roxide-eval = { path = "crates/roxide-eval" }
 roxide-base = { path = "crates/roxide-base" }
 roxide-stats = { path = "crates/roxide-stats" }
 roxide-utils = { path = "crates/roxide-utils" }
+roxide-methods = { path = "crates/roxide-methods" }
+roxide-pkg = { path = "crates/roxide-pkg" }
+roxide-graphics = { path = "crates/roxide-graphics" }
 
 # Vetted permissive dependencies (ADR-0008, docs/PRIOR_ART.md)
 regex = "1.13"

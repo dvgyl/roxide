@@ -577,9 +577,9 @@ pub(crate) fn print_value(ctx: &mut Ctx, val: SexpId, digits: usize) -> EvalResu
                 String::from("<environment: namespace:base>\n")
             } else if val == EMPTY_ENV {
                 String::from("<environment: R_EmptyEnv>\n")
-            } else if let Some(pkg) = ctx.packages.iter().find(|p| p.namespace == val) {
+            } else if let Some(pkg) = ctx.namespaces.iter().find(|p| p.ns == val) {
                 format!("<environment: namespace:{}>\n", pkg.name)
-            } else if let Some(pkg) = ctx.packages.iter().find(|p| p.attached == Some(val)) {
+            } else if let Some(pkg) = ctx.namespaces.iter().find(|p| p.attached == Some(val)) {
                 format!("<environment: package:{}>\n", pkg.name)
             } else {
                 let name_sym = ctx.session.intern("name")?;
@@ -639,6 +639,9 @@ fn prim_print(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
             _ => digits,
         };
         digits = d;
+    }
+    if ctx.session.is_s4(val)? && ctx.show_s4(val, call.env)? {
+        return Ok(val);
     }
     print_value(ctx, val, digits)?;
     Ok(val)

@@ -1,6 +1,7 @@
 use roxide_gc::{SexpId, Tracer};
 use roxide_value::{
-    BASE_ENV, BASE_NAMESPACE, SEXP_MISSING, SEXP_NIL, SEXP_UNBOUND, SexpType, ValueApi,
+    BASE_ENV, BASE_NAMESPACE, RLogical, SEXP_MISSING, SEXP_NIL, SEXP_S4_NULL, SEXP_UNBOUND,
+    SexpType, ValueApi,
 };
 
 use crate::eval::ArgInput;
@@ -25,6 +26,17 @@ pub(crate) const MODULE: Module = Module {
             Arity::Exact(6),
             On
         ),
+        primitive!("@", slot_get, EvalDollar, Arity::Exact(2), On),
+        primitive!("@<-", slot_set, EvalDollar, Arity::Exact(3), On),
+        primitive!(
+            "standardGeneric",
+            standard_generic,
+            Eval,
+            Arity::Range(1, 2),
+            SetByFn
+        ),
+        primitive!("isS4", is_s4_prim, Eval, Arity::Exact(1), On),
+        primitive!("asS4", as_s4_prim, Eval, Arity::Range(1, 3), On),
     ],
     prelude: "",
 };
@@ -164,18 +176,17 @@ impl Ctx {
         Ok(None)
     }
 
-    /// Return the namespace name for a registered package environment.
-    pub fn namespace_name(&self, env: SexpId) -> Option<&'static str> {
-        if env == BASE_NAMESPACE {
-            return Some("base");
-        }
-        self.packages
-            .iter()
-            .find(|pkg| pkg.namespace == env)
-            .map(|pkg| pkg.name)
-    }
-
     pub(crate) fn classes(&mut self, value: SexpId, implicit: bool) -> EvalResult<Vec<String>> {
+        if self.session.is_s4(value)?
+            && let Some(chain) = self.s4_class_chain(value)?
+            && let Ok(slice) = self.session.str_slice(chain)
+            && !slice.is_empty()
+        {
+            return slice
+                .iter()
+                .map(|&id| Ok(String::from_utf8_lossy(self.session.char_bytes(id)?).into_owned()))
+                .collect();
+        }
         let class_tag = self.session.intern("class")?;
         let explicit = self.session.attr(value, class_tag);
         if explicit != SEXP_NIL {
@@ -217,7 +228,7 @@ impl Ctx {
     ) -> EvalResult<Option<SexpId>> {
         let sym = self.session.intern(name)?;
         while env != SEXP_NIL && env != end {
-            if !self.packages.iter().any(|pkg| pkg.attached == Some(env))
+            if !self.namespaces.iter().any(|pkg| pkg.attached == Some(env))
                 && let Some(binding) = self.session.env_get(env, sym)
                 && binding.value != SEXP_MISSING
                 && binding.value != SEXP_UNBOUND
@@ -237,11 +248,11 @@ impl Ctx {
 
     fn lookup_method(
         &mut self,
-        generic: &str,
+        _generic: &str,
         name: &str,
         caller: SexpId,
         definition: SexpId,
-        default: bool,
+        _default: bool,
     ) -> EvalResult<Option<SexpId>> {
         if let Some(fun) = self.optional_fun(name, caller, BASE_ENV)? {
             return Ok(Some(fun));
@@ -256,28 +267,10 @@ impl Ctx {
         if definition != BASE_NAMESPACE && definition != BASE_ENV {
             return self.optional_fun(name, definition, self.session.env_enclos(definition)?);
         }
-        // Built-in packages register S3 methods for these base generics until M3 NAMESPACE tables.
-        let base_cross_pkg = !default
-            && name != "format.pval"
-            && matches!(
-                generic,
-                "print"
-                    | "format"
-                    | "summary"
-                    | "diff"
-                    | "as.matrix"
-                    | "as.character"
-                    | "as.data.frame"
-                    | "labels"
-                    | "["
-                    | "[["
-            );
-        if base_cross_pkg {
-            for index in 0..self.packages.len() {
-                let ns = self.packages[index].namespace;
-                if let Some(fun) = self.optional_fun(name, ns, self.session.env_enclos(ns)?)? {
-                    return Ok(Some(fun));
-                }
+        if let Some(table) = self.session.env_get(BASE_NAMESPACE, s3) {
+            let tag = self.session.intern(name)?;
+            if let Some(fun) = self.session.env_get(table.value, tag) {
+                return Ok(Some(fun.value));
             }
         }
         self.optional_fun(name, BASE_ENV, SEXP_NIL)
@@ -774,4 +767,203 @@ fn choose_ops_method(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult 
         }
     }
     Ok(roxide_value::FALSE_SCALAR)
+}
+
+fn slot_name(ctx: &mut Ctx, raw: SexpId, call: SexpId) -> EvalResult<String> {
+    match ctx.session.type_of(raw)? {
+        SexpType::Sym if raw != SEXP_MISSING => Ok(ctx.session.sym_name_of(raw)?.to_owned()),
+        SexpType::Str => ctx.string(raw, call),
+        _ => Err(ctx.stop(call, "invalid slot name")),
+    }
+}
+
+fn first_class_name(ctx: &mut Ctx, obj: SexpId) -> EvalResult<String> {
+    let classes = ctx.classes(obj, true)?;
+    Ok(classes.into_iter().next().unwrap_or_else(|| {
+        ctx.session
+            .type_of(obj)
+            .map_or("NULL", |t| t.type_name(false))
+            .to_owned()
+    }))
+}
+
+fn slot_get(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    let obj = args.get(0);
+    let name = slot_name(ctx, args.get(1), call.err_call())?;
+    if !ctx.session.is_s4(obj)? {
+        let classes = ctx.classes(obj, true)?;
+        for cls in &classes {
+            if let Some(fun) =
+                ctx.lookup_method("@", &format!("@.{cls}"), call.env, BASE_NAMESPACE, false)?
+            {
+                let name_val = ctx.session.scalar_str(&name)?;
+                return ctx.scoped(|ctx| {
+                    ctx.protect(obj);
+                    ctx.protect(name_val);
+                    ctx.apply(
+                        fun,
+                        &[(None, obj), (None, name_val)],
+                        call.err_call(),
+                        call.env,
+                    )
+                });
+            }
+        }
+        if let Some(fun) = ctx.lookup_method("@", "@.default", call.env, BASE_NAMESPACE, true)? {
+            let name_val = ctx.session.scalar_str(&name)?;
+            return ctx.scoped(|ctx| {
+                ctx.protect(obj);
+                ctx.protect(name_val);
+                ctx.apply(
+                    fun,
+                    &[(None, obj), (None, name_val)],
+                    call.err_call(),
+                    call.env,
+                )
+            });
+        }
+        let cls = first_class_name(ctx, obj)?;
+        return Err(ctx.stop(
+            call.err_call(),
+            format!("no applicable method for `@` applied to an object of class \"{cls}\""),
+        ));
+    }
+    if name == ".Data" {
+        if ctx.session.type_of(obj)? == SexpType::Obj {
+            return Ok(SEXP_NIL);
+        }
+        let copy = ctx.session.shallow_duplicate(obj)?;
+        ctx.session.clear_attrs(copy)?;
+        ctx.session.set_s4_flag(copy, false)?;
+        return Ok(copy);
+    }
+    let sym = ctx.session.intern(&name)?;
+    let val = ctx.session.attr(obj, sym);
+    if val == SEXP_NIL {
+        let cls = first_class_name(ctx, obj)?;
+        return Err(ctx.stop(
+            call.err_call(),
+            format!("no slot of name \"{name}\" for this object of class \"{cls}\""),
+        ));
+    }
+    if val == SEXP_S4_NULL {
+        return Ok(SEXP_NIL);
+    }
+    Ok(val)
+}
+
+fn slot_set(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    let obj = args.get(0);
+    let name = slot_name(ctx, args.get(1), call.err_call())?;
+    let val = args.get(2);
+    if !ctx.session.is_s4(obj)? {
+        let classes = ctx.classes(obj, true)?;
+        for cls in &classes {
+            if let Some(fun) = ctx.lookup_method(
+                "@<-",
+                &format!("@<-.{cls}"),
+                call.env,
+                BASE_NAMESPACE,
+                false,
+            )? {
+                let name_val = ctx.session.scalar_str(&name)?;
+                return ctx.scoped(|ctx| {
+                    ctx.protect(obj);
+                    ctx.protect(name_val);
+                    ctx.protect(val);
+                    ctx.apply(
+                        fun,
+                        &[(None, obj), (None, name_val), (None, val)],
+                        call.err_call(),
+                        call.env,
+                    )
+                });
+            }
+        }
+        if let Some(fun) =
+            ctx.lookup_method("@<-", "@<-.default", call.env, BASE_NAMESPACE, true)?
+        {
+            let name_val = ctx.session.scalar_str(&name)?;
+            return ctx.scoped(|ctx| {
+                ctx.protect(obj);
+                ctx.protect(name_val);
+                ctx.protect(val);
+                ctx.apply(
+                    fun,
+                    &[(None, obj), (None, name_val), (None, val)],
+                    call.err_call(),
+                    call.env,
+                )
+            });
+        }
+        if ctx.s4_hooks.is_some() {
+            let sym = ctx.session.intern(&name)?;
+            let _ = ctx.check_s4_slot(obj, sym, val)?;
+        }
+        let cls = first_class_name(ctx, obj)?;
+        return Err(ctx.stop(
+            call.err_call(),
+            format!("no applicable method for `@<-` applied to an object of class \"{cls}\""),
+        ));
+    }
+    let sym = ctx.session.intern(&name)?;
+    let checked = ctx.check_s4_slot(obj, sym, val)?;
+    ctx.scoped(|ctx| {
+        ctx.protect(obj);
+        ctx.protect(checked);
+        if name == ".Data" && ctx.session.type_of(obj)? != SexpType::Obj {
+            let target = ctx.session.shallow_duplicate(checked)?;
+            ctx.protect(target);
+            ctx.session.clear_attrs(target)?;
+            for (k, v) in ctx.session.attrs(obj)? {
+                ctx.session.set_attrib(target, k, v)?;
+            }
+            ctx.session.set_s4_flag(target, true)?;
+            return Ok(target);
+        }
+        let target = ctx.session.unshare(obj)?;
+        ctx.protect(target);
+        let stored = if checked == SEXP_NIL {
+            SEXP_S4_NULL
+        } else {
+            checked
+        };
+        ctx.session.set_attrib(target, sym, stored)?;
+        Ok(target)
+    })
+}
+
+fn standard_generic(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    let name = ctx.string(args.get(0), call.err_call())?;
+    let sym = ctx.session.intern(&name)?;
+    let Some(frame_id) = ctx.current_frame_id() else {
+        return Err(ctx.stop(
+            call.err_call(),
+            "standardGeneric() called outside a generic function",
+        ));
+    };
+    let Some(hooks) = ctx.s4_hooks else {
+        return Err(ctx.stop(call.err_call(), "S4 methods support is not loaded"));
+    };
+    hooks.standard_generic(ctx, sym, frame_id)
+}
+
+fn is_s4_prim(ctx: &mut Ctx, _: &Call, args: &mut Args) -> EvalResult {
+    let flag = ctx.session.is_s4(args.get(0))?;
+    Ok(ctx.session.scalar_lgl(RLogical::from_option(Some(flag)))?)
+}
+
+fn as_s4_prim(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    let obj = args.get(0);
+    let flag = if args.len() >= 2 {
+        ctx.truth(args.get(1), call.err_call())?
+    } else {
+        true
+    };
+    if obj == SEXP_NIL {
+        return Ok(SEXP_NIL);
+    }
+    let copy = ctx.session.shallow_duplicate(obj)?;
+    ctx.session.set_s4_flag(copy, flag)?;
+    Ok(copy)
 }

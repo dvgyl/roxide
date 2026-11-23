@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
 
-//! Multi-call command-line interface for Roxide (`roxide`, `R`, `Rscript`).
+//! Multi-call command-line interface for Roxide (`roxide`, `R`, `Rscript`, `R CMD`).
+
+mod cmd;
 
 use std::env;
 use std::fs;
@@ -8,11 +10,18 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::process::ExitCode;
 
-use roxide_eval::{Ctx, Unwind};
+use roxide_eval::{Ctx, InternalError, Package, Unwind};
 use roxide_gc::GcPolicy;
-use roxide_host::NativeHost;
+use roxide_host::{Host, NativeHost};
 
 const VERSION_LINE: &str = "Roxide 0.1.0 (targeting GNU R 4.6.2)";
+
+const DATASETS_PACKAGE: Package = Package {
+    name: "datasets",
+    attach: true,
+    exports: None,
+    modules: &[],
+};
 
 #[derive(Default)]
 struct CliOpts {
@@ -77,6 +86,15 @@ fn parse_cli() -> Result<CliOpts, String> {
 }
 
 fn main() -> ExitCode {
+    let raw_args: Vec<String> = env::args().skip(1).collect();
+    if raw_args.first().map(String::as_str) == Some("CMD") {
+        let policy = if env::var_os("ROXIDE_GC_TORTURE").is_some() {
+            GcPolicy::Torture
+        } else {
+            GcPolicy::default()
+        };
+        return cmd::dispatch(&raw_args[1..], &|host| bootstrap(host, policy));
+    }
     let opts = match parse_cli() {
         Ok(o) => o,
         Err(err) => {
@@ -103,6 +121,19 @@ fn main() -> ExitCode {
     }
 }
 
+/// Construct a fully bootstrapped Roxide session with all built-in packages in GNU R 4.6.2 order.
+pub(crate) fn bootstrap(host: Box<dyn Host>, policy: GcPolicy) -> Result<Ctx, InternalError> {
+    let mut ctx = Ctx::new(host, policy)?;
+    roxide_base::register_all(&mut ctx)?;
+    roxide_pkg::register(&mut ctx)?;
+    roxide_methods::register(&mut ctx)?;
+    ctx.register_package(&DATASETS_PACKAGE)?;
+    roxide_utils::register(&mut ctx)?;
+    roxide_graphics::register(&mut ctx)?;
+    roxide_stats::register(&mut ctx)?;
+    Ok(ctx)
+}
+
 fn interpret(opts: CliOpts, stack_bytes: usize) -> ExitCode {
     let policy = if env::var_os("ROXIDE_GC_TORTURE").is_some() {
         GcPolicy::Torture
@@ -110,7 +141,7 @@ fn interpret(opts: CliOpts, stack_bytes: usize) -> ExitCode {
         GcPolicy::default()
     };
     let host = Box::new(NativeHost::new());
-    let mut ctx = match Ctx::new(host, policy) {
+    let mut ctx = match bootstrap(host, policy) {
         Ok(c) => c,
         Err(err) => {
             let _ = writeln!(io::stderr().lock(), "Error: {err}");
@@ -118,13 +149,6 @@ fn interpret(opts: CliOpts, stack_bytes: usize) -> ExitCode {
         }
     };
     ctx.set_stack_budget(stack_bytes - 2 * 1024 * 1024);
-    if let Err(err) = roxide_base::register_all(&mut ctx)
-        .and_then(|()| roxide_utils::register(&mut ctx))
-        .and_then(|()| roxide_stats::register(&mut ctx))
-    {
-        let _ = writeln!(io::stderr().lock(), "Error: {err}");
-        return ExitCode::FAILURE;
-    }
 
     if !opts.exprs.is_empty() {
         for expr in &opts.exprs {
