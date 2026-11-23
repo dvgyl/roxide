@@ -160,15 +160,6 @@ pub(super) struct ConnectionLines<'a> {
     options: InputOptions<'a>,
 }
 
-#[derive(Default)]
-struct Remainders(std::collections::HashMap<i32, String>);
-
-impl roxide_gc::Trace for Remainders {
-    fn trace(&self, _: &mut roxide_gc::Tracer<'_>) {}
-}
-
-impl roxide_eval::CtxExt for Remainders {}
-
 impl<'a> ConnectionLines<'a> {
     pub(super) fn open(
         ctx: &mut Ctx,
@@ -188,19 +179,11 @@ impl<'a> ConnectionLines<'a> {
     }
 
     pub(super) fn take_remainder(&self, ctx: &mut Ctx) -> String {
-        ctx.ext::<Remainders>()
-            .0
-            .remove(&self.id)
-            .unwrap_or_default()
+        String::from_utf8_lossy(&crate::io_os::connection::take_pushback(ctx, self.id)).into_owned()
     }
 
     pub(super) fn save_remainder(&self, ctx: &mut Ctx, rest: &str) {
-        let limit = ctx.host().limits().max_vector_bytes;
-        let remainders = &mut ctx.ext::<Remainders>().0;
-        let used: usize = remainders.values().map(String::len).sum();
-        if !rest.is_empty() && used.saturating_add(rest.len()) <= limit {
-            remainders.insert(self.id, rest.into());
-        }
+        crate::io_os::connection::set_pushback(ctx, self.id, rest.as_bytes());
     }
 
     pub(super) fn next(&self, ctx: &mut Ctx, call: &Call) -> EvalResult<Option<String>> {

@@ -10,7 +10,8 @@ mod lines;
 mod system;
 
 use roxide_eval::{
-    ArgEval, Arity, Call, Ctx, Dispatch, EvalResult, Module, PrimDef, PrimFn, PrimKind, Visibility,
+    ArgEval, Args, Arity, Call, Ctx, Dispatch, EvalResult, Module, PrimDef, PrimFn, PrimKind,
+    Visibility,
 };
 use roxide_gc::SexpId;
 use roxide_value::{CharId, Encoding, NA_INTEGER, SexpType, ValueApi};
@@ -92,6 +93,7 @@ pub const MODULE: Module = Module {
         internal("rox_io_unsetenv", system::unsetenv, 1, Visibility::Off),
         internal("rox_io_system2", system::system2, 10, Visibility::On),
         internal("rox_io_versions", system::versions, 0, Visibility::On),
+        internal("rox_io_dump_lines", dump_lines, 2, Visibility::On),
     ],
     prelude: r#"
 file <- function(description = "", open = "", blocking = TRUE, encoding = getOption("encoding"),
@@ -169,8 +171,99 @@ system2 <- function(command, args = character(), stdout = "", stderr = "", stdin
     .Internal(rox_io_system2(command, args, stdout, stderr, stdin, input, env, wait,
                              timeout, receive.console.signals))
 extSoftVersion <- function() .Internal(rox_io_versions())
+dump <- function(list, file = "dumpdata.R", append = FALSE,
+                 control = c("keepNA", "keepInteger", "niceNames", "showAttributes"),
+                 envir = parent.frame(), evaluate = TRUE) {
+    if (!is.character(list)) stop("'list' must be a character vector")
+    if (is.character(file)) {
+        if (length(file) != 1L || is.na(file)) stop("invalid 'file' argument")
+        if (nzchar(file)) {
+            con <- file(file, if (is.logical(append) && length(append) == 1L && !is.na(append) && append) "a" else "w")
+            on.exit(close(con))
+        } else {
+            con <- stdout()
+        }
+    } else {
+        con <- file
+    }
+    written <- character()
+    for (nm in list) {
+        if (!is.na(nm) && exists(nm, envir = envir, inherits = FALSE)) {
+            val <- get(nm, envir = envir, inherits = FALSE)
+            writeLines(.Internal(rox_io_dump_lines(nm, val)), con = con)
+            written <- c(written, nm)
+        } else {
+            warning(sprintf("object '%s' not found", nm), domain = NA)
+        }
+    }
+    invisible(written)
+}
 "#,
 };
+
+fn dump_lines(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    let name = text(ctx, call, args.get(0), "list")?;
+    let mut lines = Vec::new();
+    lines.push(format!("{} <-", format_dump_lhs(&name)));
+    lines.extend(roxide_value::dput(
+        ctx.session(),
+        args.get(1),
+        roxide_value::DeparseOpts::default(),
+    )?);
+    strings(ctx, lines.into_iter().map(Some), Encoding::Native)
+}
+
+fn format_dump_lhs(name: &str) -> String {
+    let reserved = matches!(
+        name,
+        "if" | "else"
+            | "repeat"
+            | "while"
+            | "function"
+            | "for"
+            | "in"
+            | "next"
+            | "break"
+            | "TRUE"
+            | "FALSE"
+            | "NULL"
+            | "Inf"
+            | "NaN"
+            | "NA"
+            | "NA_integer_"
+            | "NA_real_"
+            | "NA_complex_"
+            | "NA_character_"
+            | "..."
+    ) || (name.starts_with("..")
+        && name.len() > 2
+        && name[2..].bytes().all(|b| b.is_ascii_digit()));
+    let mut bytes = name.bytes();
+    let syntactic = !reserved
+        && match bytes.next() {
+            Some(b) if b.is_ascii_alphabetic() => true,
+            Some(b'.') => !bytes.clone().next().is_some_and(|b| b.is_ascii_digit()),
+            _ => false,
+        }
+        && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_');
+    if syntactic {
+        return name.to_owned();
+    }
+    let mut out = String::with_capacity(name.len() + 2);
+    out.push('`');
+    for ch in name.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '`' => out.push_str("\\`"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            other => out.push(other),
+        }
+    }
+    out.push('`');
+    out
+}
 
 const fn internal(
     name: &'static str,

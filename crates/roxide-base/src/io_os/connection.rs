@@ -36,6 +36,7 @@ struct Connection {
     path: Option<FilePath>,
     mode: Mode,
     stream: Option<Stream>,
+    pushback: Cursor<Vec<u8>>,
 }
 
 #[derive(Clone)]
@@ -309,6 +310,7 @@ pub(super) fn file(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
             path: Some(path),
             mode,
             stream,
+            pushback: Cursor::default(),
         },
     )
 }
@@ -351,6 +353,7 @@ pub(super) fn raw(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
             path: None,
             mode,
             stream: Some(Stream::Raw(buffer)),
+            pushback: Cursor::default(),
         },
     )
 }
@@ -464,6 +467,7 @@ pub(super) fn text(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
             path: None,
             mode,
             stream: Some(stream),
+            pushback: Cursor::default(),
         },
     )
 }
@@ -587,6 +591,89 @@ impl BufRead for Console<'_> {
     }
 }
 
+struct PrefixedReader<'a, R: BufRead + ?Sized> {
+    prefix: &'a mut Cursor<Vec<u8>>,
+    inner: &'a mut R,
+}
+
+impl<R: BufRead + ?Sized> PrefixedReader<'_, R> {
+    fn has_prefix(&self) -> bool {
+        self.prefix.position() < self.prefix.get_ref().len() as u64
+    }
+}
+
+impl<R: BufRead + ?Sized> Read for PrefixedReader<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let available = self.fill_buf()?;
+        let len = available.len().min(buf.len());
+        buf[..len].copy_from_slice(&available[..len]);
+        self.consume(len);
+        Ok(len)
+    }
+}
+
+impl<R: BufRead + ?Sized> BufRead for PrefixedReader<'_, R> {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        if self.has_prefix() {
+            self.prefix.fill_buf()
+        } else {
+            self.inner.fill_buf()
+        }
+    }
+
+    fn consume(&mut self, amount: usize) {
+        if self.has_prefix() {
+            self.prefix.consume(amount);
+            if !self.has_prefix() {
+                self.prefix.get_mut().clear();
+                self.prefix.set_position(0);
+            }
+        } else {
+            self.inner.consume(amount);
+        }
+    }
+}
+
+pub(crate) fn take_pushback(ctx: &mut Ctx, id: i32) -> Vec<u8> {
+    let table = ctx.ext::<ConnTable>();
+    let cursor = if id == 0 {
+        &mut table.stdin
+    } else if let Some(connection) = table.entries.get_mut(&id) {
+        &mut connection.pushback
+    } else {
+        return Vec::new();
+    };
+    let pos = (cursor.position() as usize).min(cursor.get_ref().len());
+    let rest = cursor.get_ref()[pos..].to_vec();
+    cursor.get_mut().clear();
+    cursor.set_position(0);
+    rest
+}
+
+pub(crate) fn set_pushback(ctx: &mut Ctx, id: i32, data: &[u8]) {
+    if data.is_empty() {
+        return;
+    }
+    let limit = ctx.host().limits().max_vector_bytes;
+    let table = ctx.ext::<ConnTable>();
+    let cursor = if id == 0 {
+        &mut table.stdin
+    } else if let Some(connection) = table.entries.get_mut(&id) {
+        &mut connection.pushback
+    } else {
+        return;
+    };
+    let pos = (cursor.position() as usize).min(cursor.get_ref().len());
+    let existing = &cursor.get_ref()[pos..];
+    if data.len().saturating_add(existing.len()) > limit {
+        return;
+    }
+    let mut combined = Vec::with_capacity(data.len() + existing.len());
+    combined.extend_from_slice(data);
+    combined.extend_from_slice(existing);
+    *cursor = Cursor::new(combined);
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Access {
     Lines,
@@ -672,9 +759,26 @@ pub(crate) fn read<T>(
                     },
                 ));
             }
-            operate(ctx, call, id, Mode::read(binary), access, |_, stream| {
-                read_from(stream, |input| read(input, limit))
-            })
+            operate(
+                ctx,
+                call,
+                id,
+                Mode::read(binary),
+                access,
+                |_, stream, pushback| {
+                    read_from(stream, |input| {
+                        if !binary && pushback.position() < pushback.get_ref().len() as u64 {
+                            let mut prefixed = PrefixedReader {
+                                prefix: pushback,
+                                inner: input,
+                            };
+                            read(&mut prefixed, limit)
+                        } else {
+                            read(input, limit)
+                        }
+                    })
+                },
+            )
         }
     }
 }
@@ -710,7 +814,7 @@ pub(crate) fn read_serialized<T>(
         id,
         Mode::read(true),
         Access::Serialized(serialization),
-        |ctx, stream| {
+        |ctx, stream, _| {
             if serialization == Serialization::Workspace {
                 prepare_workspace(
                     stream,
@@ -761,7 +865,7 @@ pub(crate) fn write_serialized(
         id,
         Mode::write(true),
         Access::Serialized(serialization),
-        |ctx, stream| write_to(ctx, stream, data),
+        |ctx, stream, _| write_to(ctx, stream, data),
     )
 }
 
@@ -795,9 +899,14 @@ pub(super) fn write(
         };
         return result.map_err(|e| ctx.stop(call.err_call(), e.to_string()));
     }
-    operate(ctx, call, id, Mode::write(binary), access, |ctx, stream| {
-        write_to(ctx, stream, data)
-    })
+    operate(
+        ctx,
+        call,
+        id,
+        Mode::write(binary),
+        access,
+        |ctx, stream, _| write_to(ctx, stream, data),
+    )
 }
 
 fn check_buffer(ctx: &mut Ctx, size: usize) -> io::Result<()> {
@@ -841,7 +950,7 @@ fn operate<T>(
     id: i32,
     mode: Mode,
     access: Access,
-    operation: impl FnOnce(&mut Ctx, &mut Stream) -> io::Result<T>,
+    operation: impl FnOnce(&mut Ctx, &mut Stream, &mut Cursor<Vec<u8>>) -> io::Result<T>,
 ) -> EvalResult<T> {
     let table = ctx.ext::<ConnTable>();
     let Some(connection) = table.entries.get(&id) else {
@@ -855,7 +964,8 @@ fn operate<T>(
             return Err(ctx.stop(call.err_call(), "invalid connection"));
         };
         let mut stream = path.open(ctx, call, mode)?;
-        let result = operation(ctx, &mut stream);
+        let mut empty = Cursor::default();
+        let result = operation(ctx, &mut stream, &mut empty);
         let closed = finish(ctx, stream);
         return io_result(ctx, call, result.and_then(|value| closed.map(|()| value)));
     }
@@ -884,9 +994,12 @@ fn operate<T>(
     }
     // Stream operations return I/O errors. Restore the entry before an R calling handler can run.
     let mut connection = take(ctx, call, id)?;
-    let result = connection.stream.as_mut().map_or_else(
+    let Connection {
+        stream, pushback, ..
+    } = &mut connection;
+    let result = stream.as_mut().map_or_else(
         || Err(io::Error::other("invalid connection")),
-        |stream| operation(ctx, stream),
+        |stream| operation(ctx, stream, pushback),
     );
     ctx.ext::<ConnTable>().entries.insert(id, connection);
     io_result(ctx, call, result)

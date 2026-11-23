@@ -651,13 +651,57 @@ fn prim_dput(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
             "argument \"x\" is missing, with no default",
         ));
     }
-    let val = args.get(0);
+    let val = args.named(&ctx.session, "x").unwrap_or_else(|| args.get(0));
+    let file = args.named(&ctx.session, "file").or_else(|| {
+        let mut pos = 0usize;
+        for (tag, v) in args.iter() {
+            if tag.is_none() {
+                if pos == 1 {
+                    return Some(v);
+                }
+                pos += 1;
+            }
+        }
+        None
+    });
     let lines = roxide_value::dput(&ctx.session, val, DeparseOpts::default())?;
-    for line in lines {
-        let _ = ctx.host.write_out(line.as_bytes());
-        let _ = ctx.host.write_out(b"\n");
+    let write_to_stdout = match file {
+        None => true,
+        Some(f) if ctx.session.type_of(f)? == SexpType::Str => {
+            let slice = ctx.session.str_slice(f)?;
+            slice.len() == 1
+                && slice[0] != roxide_value::CharId::NA
+                && ctx.session.char_bytes(slice[0])?.is_empty()
+        }
+        Some(_) => false,
+    };
+    if write_to_stdout {
+        for line in lines {
+            let _ = ctx.host.write_out(line.as_bytes());
+            let _ = ctx.host.write_out(b"\n");
+        }
+        return Ok(val);
     }
-    Ok(val)
+    let dest = file.unwrap_or(SEXP_NIL);
+    ctx.scoped(|ctx| {
+        ctx.protect(val);
+        ctx.protect(dest);
+        let mut ids = Vec::with_capacity(lines.len());
+        for line in &lines {
+            ids.push(ctx.session.mk_char(line.as_bytes(), Encoding::Native)?);
+        }
+        let text = ctx.session.alloc_str_from(&ids)?;
+        ctx.protect(text);
+        let sym = ctx.session.intern("writeLines")?;
+        let fun = ctx.find_fun(sym, BASE_ENV)?;
+        ctx.apply(
+            fun,
+            &[(None, text), (None, dest)],
+            call.err_call(),
+            call.env,
+        )?;
+        Ok(val)
+    })
 }
 
 fn prim_cat(ctx: &mut Ctx, _call: &Call, args: &mut Args) -> EvalResult {

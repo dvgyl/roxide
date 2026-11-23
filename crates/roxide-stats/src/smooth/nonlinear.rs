@@ -161,7 +161,7 @@ impl Objective<'_> {
                 .session()
                 .int(dims)
                 .is_ok_and(|dim| dim.len() == 2 && dim.iter().all(|v| v as usize == n));
-            if !square || !matches!(ctx.session().type_of(out)?, SexpType::Real | SexpType::Int) {
+            if !square || ctx.session().type_of(out)? != SexpType::Real {
                 return Err(ctx.stop(
                     call.err_call(),
                     format!("Hessian function must return a square numeric matrix of order {n}"),

@@ -568,20 +568,41 @@ fn parse(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
         .map(|value| ctx.integer(value, call.err_call()))
         .transpose()?
         .unwrap_or(-1);
-    let text = ctx.matched_arg(args, &matched, 2).unwrap_or(SEXP_NIL);
-    if text == SEXP_NIL {
-        let file = ctx.matched_arg(args, &matched, 0);
-        if file.is_some_and(|file| file != SEXP_NIL) {
-            return Err(ctx.stop(call.err_call(), "parse requires a text argument"));
-        }
-        return Ok(ctx.session.alloc_expr_from(&[])?);
-    }
     let keep_source = match ctx.matched_arg(args, &matched, 4) {
         Some(value) => ctx.truth(value, call.err_call())?,
         None => ctx
             .option_value("keep.source")?
             .is_some_and(|value| value == roxide_value::TRUE_SCALAR),
     };
+    let mut text = ctx.matched_arg(args, &matched, 2).unwrap_or(SEXP_NIL);
+    let mut source_name = String::from("<text>");
+    if text == SEXP_NIL {
+        let Some(file) = ctx
+            .matched_arg(args, &matched, 0)
+            .filter(|&file| file != SEXP_NIL)
+        else {
+            return Ok(ctx.session.alloc_expr_from(&[])?);
+        };
+        if ctx.session.type_of(file)? == SexpType::Str {
+            let slice = ctx.session.str_slice(file)?;
+            if slice.len() == 1 && slice[0] != CharId::NA {
+                let name = String::from_utf8_lossy(ctx.session.char_bytes(slice[0])?).into_owned();
+                if name.is_empty() {
+                    return Ok(ctx.session.alloc_expr_from(&[])?);
+                }
+                source_name = name;
+            }
+        }
+        let read_sym = ctx.session.intern("readLines")?;
+        let read_fun = ctx.find_fun(read_sym, BASE_ENV)?;
+        let warn_sym = ctx.session.intern("warn")?;
+        text = ctx.apply(
+            read_fun,
+            &[(None, file), (Some(warn_sym), roxide_value::FALSE_SCALAR)],
+            call.err_call(),
+            call.env,
+        )?;
+    }
     let lines = ctx
         .session
         .str_slice(text)?
@@ -594,7 +615,7 @@ fn parse(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
         })
         .collect::<EvalResult<Vec<_>>>()?;
     let source = lines.join("\n");
-    let file_id = ctx.sources.add_file("<text>", source.as_str());
+    let file_id = ctx.sources.add_file(&source_name, source.as_str());
     let mut parser = Parser::new(&source, file_id);
     let mut expressions = Vec::new();
     let mut spans = Vec::new();

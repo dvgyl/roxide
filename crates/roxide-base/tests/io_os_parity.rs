@@ -280,3 +280,46 @@ stopifnot(identical(Sys.getenv("WAVE_EXISTING"), "before"))
 "#,
     );
 }
+
+#[test]
+fn scan_pushback_shared_with_read_lines_and_dput_dump_parity() {
+    let mut ctx = context(Box::new(PureHost::new()));
+    run(
+        &mut ctx,
+        r#"
+con <- textConnection("1 2   3 4\n5 6\n")
+stopifnot(identical(scan(con, integer(), nmax = 2L, quiet = TRUE), 1:2))
+stopifnot(identical(readLines(con, 1L), "3 4"))
+stopifnot(identical(readLines(con, 1L), "5 6"))
+close(con)
+
+con2 <- textConnection("10 20 30\n")
+stopifnot(identical(scan(con2, integer(), nmax = 1L, quiet = TRUE), 10L))
+close(con2)
+
+tf <- tempfile()
+v <- withVisible(dput(c(a = 1L, b = 2L), file = tf))
+stopifnot(!v$visible, identical(v$value, c(a = 1L, b = 2L)))
+stopifnot(identical(readLines(tf), "structure(1:2, names = c(\"a\", \"b\"))"))
+
+env <- new.env(parent = emptyenv())
+assign("x", 1:3, envir = env)
+assign("a b", 10L, envir = env)
+warns <- character()
+res <- withCallingHandlers(
+    withVisible(dump(c("x", "a b", "missing_var"), file = tf, envir = env)),
+    warning = function(w) {
+        warns <<- c(warns, conditionMessage(w))
+        invokeRestart("muffleWarning")
+    }
+)
+stopifnot(!res$visible, identical(res$value, c("x", "a b")))
+stopifnot(identical(warns, "object 'missing_var' not found"))
+stopifnot(identical(readLines(tf), c("x <-", "1:3", "`a b` <-", "10L")))
+restored <- new.env(parent = baseenv())
+eval(parse(file = tf), envir = restored)
+stopifnot(identical(get("x", envir = restored), 1:3))
+stopifnot(identical(get("a b", envir = restored), 10L))
+"#,
+    );
+}
