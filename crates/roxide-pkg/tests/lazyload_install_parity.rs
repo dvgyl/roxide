@@ -169,8 +169,8 @@ fn tar_entry(path: &str, kind: u8, data: &[u8]) -> Vec<u8> {
 #[test]
 fn archive_extracts_supported_compression_and_rejects_unsafe_paths() {
     let mut archive = tar_entry("mypkg/", b'5', &[]);
-    archive.extend(tar_entry("mypkg/DESCRIPTION", b'0', b"Package: mypkg\n"));
-    archive.extend([0; 1024]);
+    archive.extend(tar_entry("mypkg/DESCRIPTION", b'7', b"Package: mypkg\n"));
+    archive.extend([0; 512]);
     let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
     gzip.write_all(&archive).expect("compress gzip");
     let mut bzip = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::best());
@@ -247,4 +247,73 @@ fn archive_uses_pax_and_gnu_long_paths() {
             7
         );
     }
+}
+
+#[test]
+fn lazy_bindings_resolve_deep_environment_chains() {
+    let mut ctx = context(PureHost::new());
+    ctx.run_global(
+        "fixture",
+        r#"
+        root <- new.env(parent = baseenv())
+        root$value <- 12L
+        node <- root
+        for (i in 1:80) node <- new.env(parent = node)
+        source <- new.env()
+        source$leaf <- node
+        source$root <- root
+    "#,
+    )
+    .expect("create environment chain");
+    let sym = ctx.session_mut().intern("source").expect("intern source");
+    let source = ctx
+        .get_local(sym, GLOBAL_ENV)
+        .expect("read source")
+        .expect("find source");
+    roxide_pkg::lazyload::write_lazyload_db(&mut ctx, Path::new("/work/deep"), source)
+        .expect("write environment chain");
+    ctx.run_global(
+        "check",
+        r#"
+        dst <- new.env()
+        lazyLoad("/work/deep", dst)
+        last <- dst$leaf
+        for (i in 1:80) last <- parent.env(last)
+        stopifnot(identical(last, dst$root), last$value == 12L)
+    "#,
+    )
+    .expect("read environment chain");
+}
+
+#[test]
+fn bytecode_consumes_attributes_before_the_next_item() {
+    let mut bytes = b"X\n".to_vec();
+    for word in [
+        2u32,
+        0x40602,
+        0x20300,
+        19,
+        2,
+        21 | (1 << 9),
+        0,
+        13,
+        0,
+        1,
+        13,
+        13,
+        1,
+        7,
+        254,
+        13,
+        1,
+        9,
+    ] {
+        bytes.extend(word.to_be_bytes());
+    }
+    let mut ctx = context(PureHost::new());
+    let list = unserialize_bytes(&mut ctx, &bytes, None).expect("read bytecode in a list");
+    let first = ctx.session().list_get(list, 0).expect("read first item");
+    let next = ctx.session().list_get(list, 1).expect("read next item");
+    assert_eq!(ctx.session().int(first).expect("source constant").get(0), 7);
+    assert_eq!(ctx.session().int(next).expect("integer").get(0), 9);
 }

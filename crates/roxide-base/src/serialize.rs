@@ -7,6 +7,7 @@ mod read;
 mod write;
 
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::{fmt, io};
 
@@ -153,19 +154,9 @@ fn version(ctx: &mut Ctx, call: &Call, value: SexpId) -> EvalResult<u32> {
     checked(ctx, call, result)
 }
 
-fn validate_format(ctx: &mut Ctx, call: &Call, ascii: SexpId, hook: SexpId) -> EvalResult<()> {
+fn validate_format(ctx: &mut Ctx, call: &Call, ascii: SexpId) -> EvalResult<()> {
     if flag(ctx, call, ascii)? {
         return Err(ctx.stop(call.err_call(), "ASCII serialization is unavailable"));
-    }
-    validate_hook(ctx, call, hook)
-}
-
-fn validate_hook(ctx: &mut Ctx, call: &Call, hook: SexpId) -> EvalResult<()> {
-    if hook != SEXP_NIL {
-        return Err(ctx.stop(
-            call.err_call(),
-            "serialization reference hooks are unavailable",
-        ));
     }
     Ok(())
 }
@@ -205,6 +196,75 @@ pub trait PersistHook {
     fn write(&mut self, ctx: &mut Ctx, x: SexpId) -> EvalResult<Option<SexpId>>;
     /// Resolve a `PERSISTSXP` key (`STRSXP`) back into a live R object.
     fn read(&mut self, ctx: &mut Ctx, key: SexpId) -> EvalResult<SexpId>;
+}
+
+struct RHook {
+    function: SexpId,
+    call: Call,
+}
+
+impl PersistHook for RHook {
+    fn write(&mut self, ctx: &mut Ctx, value: SexpId) -> EvalResult<Option<SexpId>> {
+        let key = self.read(ctx, value)?;
+        if key == SEXP_NIL {
+            return Ok(None);
+        }
+        if ctx
+            .session()
+            .str_slice(key)
+            .is_ok_and(|chars| !chars.is_empty())
+        {
+            return Ok(Some(key));
+        }
+        Err(ctx.stop(
+            self.call.err_call(),
+            "reference hook must return a non-empty character vector",
+        ))
+    }
+
+    fn read(&mut self, ctx: &mut Ctx, key: SexpId) -> EvalResult<SexpId> {
+        ctx.apply(
+            self.function,
+            &[(None, key)],
+            self.call.err_call(),
+            self.call.env,
+        )
+    }
+}
+
+fn encode_object(
+    ctx: &mut Ctx,
+    call: &Call,
+    value: SexpId,
+    version: u32,
+    hook: SexpId,
+) -> EvalResult<Vec<u8>> {
+    if hook == SEXP_NIL {
+        return encode(ctx, call, value, version, false);
+    }
+    serialize_bytes(
+        ctx,
+        value,
+        version,
+        Some(&mut RHook {
+            function: hook,
+            call: *call,
+        }),
+    )
+}
+
+fn decode_object(ctx: &mut Ctx, call: &Call, bytes: &[u8], hook: SexpId) -> EvalResult {
+    if hook == SEXP_NIL {
+        return decode(ctx, call, bytes, false);
+    }
+    unserialize_bytes(
+        ctx,
+        bytes,
+        Some(&mut RHook {
+            function: hook,
+            call: *call,
+        }),
+    )
 }
 
 /// Encode `x` into raw XDR bytes (v2 or v3), optionally using `hook` for persistent objects (ADR-0014).
@@ -305,7 +365,7 @@ fn decode(ctx: &mut Ctx, call: &Call, bytes: &[u8], workspace: bool) -> EvalResu
 }
 
 fn serialize(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
-    validate_format(ctx, call, args.get(2), args.get(5))?;
+    validate_format(ctx, call, args.get(2))?;
     if !flag(ctx, call, args.get(3))? {
         return Err(ctx.stop(
             call.err_call(),
@@ -314,7 +374,7 @@ fn serialize(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     }
     let dest = args.get(1);
     let version = version(ctx, call, args.get(4))?;
-    let bytes = encode(ctx, call, args.get(0), version, false)?;
+    let bytes = encode_object(ctx, call, args.get(0), version, args.get(5))?;
     if dest == SEXP_NIL {
         return Ok(ctx.session_mut().alloc_raw_from(&bytes)?);
     }
@@ -323,10 +383,10 @@ fn serialize(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
 }
 
 fn unserialize(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
-    validate_hook(ctx, call, args.get(1))?;
+    let hook = args.get(1);
     let source = args.get(0);
     if connection::is_connection(ctx, source)? {
-        return read_connection(ctx, call, source, Serialization::Stream);
+        return read_object_connection(ctx, call, source, Serialization::Stream, hook);
     }
     let limits = limits(ctx);
     let raw = ctx.session().raw(args.get(0));
@@ -337,7 +397,7 @@ fn unserialize(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
         Some(_) => return Err(ctx.stop(call.err_call(), "serialized input exceeds the byte limit")),
         None => return Err(ctx.stop(call.err_call(), "unserialize() requires a raw vector")),
     };
-    decode(ctx, call, &bytes, false)
+    decode_object(ctx, call, &bytes, hook)
 }
 
 fn read_file(ctx: &mut Ctx, call: &Call, path: &Path, workspace: bool) -> EvalResult {
@@ -366,8 +426,33 @@ fn read_connection(
     })
 }
 
+fn read_object_connection(
+    ctx: &mut Ctx,
+    call: &Call,
+    source: SexpId,
+    serialization: Serialization,
+    hook: SexpId,
+) -> EvalResult {
+    if hook == SEXP_NIL {
+        return read_connection(ctx, call, source, serialization);
+    }
+    let limits = limits(ctx);
+    let limit = limits.max_decompress_bytes.min(limits.max_vector_bytes);
+    let bytes = connection::read_serialized(ctx, call, source, serialization, |_, input| {
+        let mut bytes = Vec::new();
+        input
+            .take((limit as u64).saturating_add(1))
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > limit {
+            return Err(io::Error::other("serialized input exceeds the byte limit"));
+        }
+        Ok(bytes)
+    })?;
+    decode_object(ctx, call, &bytes, hook)
+}
+
 fn save_rds(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
-    validate_format(ctx, call, args.get(2), args.get(5))?;
+    validate_format(ctx, call, args.get(2))?;
     let dest = args.get(1);
     let version = version(ctx, call, args.get(3))?;
     if connection::is_connection(ctx, dest)? {
@@ -377,12 +462,12 @@ fn save_rds(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
                 "'compress' is ignored unless 'file' is a file name",
             );
         }
-        let bytes = encode(ctx, call, args.get(0), version, false)?;
+        let bytes = encode_object(ctx, call, args.get(0), version, args.get(5))?;
         connection::write_serialized(ctx, call, dest, Serialization::Rds, &bytes)?;
     } else {
         let path = path(ctx, call, dest)?;
         let compress = compression(ctx, call, args.get(4))?;
-        let bytes = encode(ctx, call, args.get(0), version, false)?;
+        let bytes = encode_object(ctx, call, args.get(0), version, args.get(5))?;
         let result = files::write(ctx.host(), &path, &bytes, compress, None);
         checked(ctx, call, result)?;
     }
@@ -390,13 +475,15 @@ fn save_rds(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
 }
 
 fn read_rds(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
-    validate_hook(ctx, call, args.get(1))?;
+    let hook = args.get(1);
     let source = args.get(0);
     if connection::is_connection(ctx, source)? {
-        return read_connection(ctx, call, source, Serialization::Rds);
+        return read_object_connection(ctx, call, source, Serialization::Rds, hook);
     }
     let path = path(ctx, call, source)?;
-    read_file(ctx, call, &path, false)
+    let result = files::read(ctx.host(), &path);
+    let bytes = checked(ctx, call, result)?;
+    decode_object(ctx, call, &bytes, hook)
 }
 
 fn compression_level(ctx: &mut Ctx, call: &Call, level: SexpId) -> EvalResult<Option<u32>> {
@@ -413,7 +500,7 @@ fn compression_level(ctx: &mut Ctx, call: &Call, level: SexpId) -> EvalResult<Op
 
 fn save(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     let dest = args.get(2);
-    validate_format(ctx, call, args.get(3), SEXP_NIL)?;
+    validate_format(ctx, call, args.get(3))?;
     let version = version(ctx, call, args.get(4))?;
     let env = args.get(5);
     if ctx.session().type_of(env)? != SexpType::Env {

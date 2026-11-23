@@ -9,11 +9,23 @@ writeLines(c("Package: roxinstall", "Version: 1.0", "Title: Install Probe",
              "Description: Exercise package installation.",
              "Author: Roxide Test Team", "Maintainer: Test Team <example@example.org>",
              "License: MIT", "Collate: 'z.R' 'a.R'"), file.path(src, "DESCRIPTION"))
-writeLines("export(answer)", file.path(src, "NAMESPACE"))
 writeLines("start <- 7L", file.path(src, "R", "z.R"))
-writeLines("answer <- local({ n <- start; function(x) n + x })", file.path(src, "R", "a.R"))
+sys <- new.env()
+sys$internal_tbl <- c(11L, 17L)
+save(list = "internal_tbl", envir = sys, file = file.path(src, "R", "sysdata.rda"))
+writeLines(c("answer <- local({ n <- start; function(x) n + x })",
+             "internal <- function() internal_tbl"), file.path(src, "R", "a.R"))
+writeLines("export(answer, internal)", file.path(src, "NAMESPACE"))
+description <- file.path(src, "DESCRIPTION")
+writeLines(c(readLines(description), "LazyData: true"), description)
+dir.create(file.path(src, "tests"))
+writeLines("stopifnot(TRUE)", file.path(src, "tests", "check.R"))
+dir.create(file.path(src, "data"))
+ds <- c(2L, 3L)
+save(ds, file = file.path(src, "data", "ds.rda"))
+writeLines(c("id;amount", "red;1.25", "green;1.5"), file.path(src, "data", "table_data.csv"))
 command <- file.path(R.home("bin"), "R")
-args <- c("CMD", "INSTALL", "--no-byte-compile", "--no-docs", "-l",
+args <- c("CMD", "INSTALL", "--no-byte-compile", "--no-docs", "--no-lock", "--install-tests", "--data-compress=xz", "-l",
           paste0("'", gsub("'", "'\"'\"'", c(lib, src), fixed = TRUE), "'"))
 oracle <- Sys.getenv("ROXIDE_ORACLE_R")
 if (!is.null(R.version$nickname) && nzchar(oracle)) {
@@ -40,9 +52,75 @@ if (!is.null(R.version$nickname) && nzchar(oracle)) {
     command <- file.path(getwd(), "target", "debug", "roxide")
 }
 status <- system2(command, args, stdout = TRUE, stderr = TRUE)
-stopifnot(is.null(attr(status, "status")))
+if (!is.null(attr(status, "status"))) stop(paste(status, collapse = "\n"))
 ns <- loadNamespace("roxinstall", lib.loc = lib)
 dput(getExportedValue("roxinstall", "answer")(5L))
 r <- file.path(lib, "roxinstall", "R", "roxinstall")
 dput(file.exists(paste0(r, ".rdb"), paste0(r, ".rdx")))
 dput(file.exists(file.path(lib, "00LOCK-roxinstall")))
+
+dput(getExportedValue("roxinstall", "internal")())
+dput(file.exists(file.path(lib, "roxinstall", c("R/sysdata.rdb", "R/sysdata.rdx",
+                                               "data/Rdata.rdb", "data/Rdata.rdx", "Meta/data.rds", "tests/check.R"))))
+dput(readRDS(file.path(lib, "roxinstall", "data/Rdata.rdx"))$compressed == 3)
+invisible(attachNamespace(ns))
+dput(get("ds", pos = 2L))
+dput(get("ds", envir = getNamespaceInfo(ns, "lazydata")))
+table_data <- get("table_data", pos = 2L)
+dput(as.character(table_data$id))
+dput(table_data$amount)
+
+=== case: install_s4_and_reference_class_packages ===
+#@ tags: layer3,package-install
+#@ compare: exact
+lib <- file.path(tempdir(), "lib")
+dir.create(lib)
+make_class_package <- function(pkg, code, export) {
+    path <- file.path(tempdir(), pkg)
+    dir.create(file.path(path, "R"), recursive = TRUE)
+    writeLines(c(paste("Package:", pkg), "Version: 1.0", "Title: Class Probe",
+                 "Description: Exercise class installation.", "Depends: methods",
+                 "Author: Roxide Test Team", "Maintainer: Test Team <example@example.org>",
+                 "License: MIT"), file.path(path, "DESCRIPTION"))
+    writeLines(c("import(methods)", export), file.path(path, "NAMESPACE"))
+    writeLines(code, file.path(path, "R", "class.R"))
+    path
+}
+s4 <- make_class_package("roxs4pkg", c("setClass('RxInstallS4', slots = c(value = 'integer'))",
+                         "make_s4 <- function() new('RxInstallS4', value = 4L)"),
+                         c("exportClasses(RxInstallS4)", "export(make_s4)"))
+ref <- make_class_package("roxrefpkg", "RxInstallRef <- setRefClass('RxInstallRef', fields = c(value = 'numeric'))",
+                          "export(RxInstallRef)")
+command <- file.path(R.home("bin"), "R")
+args <- c("CMD", "INSTALL", "--no-byte-compile", "--no-docs", "--no-lock", "-l",
+          paste0("'", gsub("'", "'\"'\"'", c(lib, s4, ref), fixed = TRUE), "'"))
+oracle <- Sys.getenv("ROXIDE_ORACLE_R")
+if (!is.null(R.version$nickname) && nzchar(oracle)) {
+    # The local oracle wrapper starts the R executable directly.
+    command <- oracle
+    bootstrap <- paste(
+        "install <- tools:::.install_packages",
+        "home <- tempfile(); dir.create(home); dir.create(file.path(home, 'bin'))",
+        "paths <- list.files(R.home(), full.names = TRUE)",
+        "paths <- paths[basename(paths) != 'bin']",
+        "stopifnot(all(file.symlink(paths, file.path(home, basename(paths)))))",
+        "bin <- list.files(R.home('bin'), full.names = TRUE)",
+        "bin <- bin[basename(bin) != 'R']",
+        "stopifnot(all(file.symlink(bin, file.path(home, 'bin', basename(bin)))))",
+        "wrapper <- file.path(home, 'bin', 'R')",
+        "line <- paste('exec', shQuote(Sys.getenv('ROXIDE_ORACLE_R')), '\"$@\"')",
+        "writeLines(c('#!/bin/sh', line), wrapper)",
+        "Sys.chmod(wrapper, '0755')",
+        "Sys.setenv(R_HOME = home)",
+        "install(args = commandArgs(TRUE))", sep = "; ")
+    args <- c("--vanilla", "--slave", "-e", shQuote(bootstrap),
+              "--args", args[-c(1L, 2L)])
+} else if (!file.exists(command) && is.null(R.version$nickname)) {
+    command <- file.path(getwd(), "target", "debug", "roxide")
+}
+status <- system2(command, args, stdout = TRUE, stderr = TRUE)
+if (!is.null(attr(status, "status"))) stop(paste(status, collapse = "\n"))
+invisible(loadNamespace("roxs4pkg", lib.loc = lib))
+dput(roxs4pkg::make_s4()@value)
+invisible(loadNamespace("roxrefpkg", lib.loc = lib))
+dput(isS4(roxrefpkg::RxInstallRef))

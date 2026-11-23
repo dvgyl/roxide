@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
@@ -44,6 +44,12 @@ pub(super) fn compression(ctx: &mut Ctx, value: SexpId) -> EvalResult<u8> {
     if ctx.session().type_of(value)? == SexpType::Int {
         let vector = ctx.session().int(value)?;
         if vector.len() == 1 && matches!(vector.get(0), 0..=3) {
+            return Ok(vector.get(0) as u8);
+        }
+    }
+    if ctx.session().type_of(value)? == SexpType::Real {
+        let vector = ctx.session().real(value)?;
+        if vector.len() == 1 && matches!(vector.get(0), 0.0 | 1.0 | 2.0 | 3.0) {
             return Ok(vector.get(0) as u8);
         }
     }
@@ -226,6 +232,19 @@ fn load_database(
                 continue;
             }
             let value = promise(ctx, state, key)?;
+            let value = if namespace && name == super::S3_TABLE {
+                ctx.protect(value);
+                let saved = ctx.force(value)?;
+                if let Some(current) = crate::loader::values::local(ctx, envir, &name)? {
+                    for (sym, binding) in ctx.session().env_entries(current)? {
+                        ctx.session_mut().env_define(saved, sym, binding.value)?;
+                    }
+                }
+                ctx.session().env_enclos(saved)?;
+                saved
+            } else {
+                value
+            };
             define(ctx, envir, &name, value)?;
         }
         Ok(())
@@ -258,7 +277,7 @@ struct DatabaseHook {
     file: PathBuf,
     mode: u8,
     pending: SexpId,
-    depth: usize,
+    queue: VecDeque<(SexpId, SexpId)>,
 }
 
 impl DatabaseHook {
@@ -279,7 +298,7 @@ impl DatabaseHook {
             file,
             mode,
             pending,
-            depth: 0,
+            queue: VecDeque::new(),
         })
     }
 
@@ -288,9 +307,26 @@ impl DatabaseHook {
         unserialize_bytes(ctx, &bytes, Some(self))
     }
 
-    fn finish(self, ctx: &mut Ctx, result: EvalResult) -> EvalResult {
+    fn finish(mut self, ctx: &mut Ctx, result: EvalResult) -> EvalResult {
         let value = result?;
-        for (key, binding) in ctx.session().env_entries(self.pending)? {
+        ctx.protect(value);
+        while let Some((env, reference)) = self.queue.pop_front() {
+            ctx.scoped(|ctx| self.hydrate(ctx, env, reference))?;
+        }
+        let entries = ctx.session().env_entries(self.pending)?;
+        let mut valid = HashSet::from([EMPTY_ENV, SEXP_NIL]);
+        for (_, binding) in &entries {
+            let mut path = HashSet::new();
+            let mut env = binding.value;
+            while !valid.contains(&env) {
+                if !path.insert(env) {
+                    return Err(ctx.stop(SEXP_NIL, "cyclic lazy-load environment parent chain"));
+                }
+                env = ctx.session().env_enclos(env)?;
+            }
+            valid.extend(path);
+        }
+        for (key, binding) in entries {
             ctx.session_mut()
                 .env_define(self.cache, key, binding.value)?;
         }
@@ -309,14 +345,6 @@ impl DatabaseHook {
         let desc = self.fetch(ctx, key)?;
         ctx.protect(desc);
         let parent = required(ctx, desc, "enclos")?;
-        let mut ancestor = parent;
-        let mut seen = HashSet::from([env]);
-        while !matches!(ancestor, EMPTY_ENV | SEXP_NIL) {
-            if !seen.insert(ancestor) {
-                return Err(ctx.stop(SEXP_NIL, "cyclic lazy-load environment parent chain"));
-            }
-            ancestor = ctx.session().env_enclos(ancestor)?;
-        }
         ctx.session_mut().env_set_enclos(env, parent)?;
         let bindings = required(ctx, desc, "bindings")?;
         for (name, value) in named_entries(ctx, bindings)? {
@@ -359,21 +387,14 @@ impl PersistHook for DatabaseHook {
         {
             return Ok(binding.value);
         }
-        if self.depth >= ctx.host().limits().max_expressions.min(64) {
-            return Err(ctx.stop(SEXP_NIL, "lazy-load environment chain is too deeply nested"));
-        }
         let reference = ctx
             .session()
             .env_get(self.references, symbol)
             .map(|binding| binding.value)
             .ok_or_else(|| ctx.stop(SEXP_NIL, format!("unknown lazy-load environment '{name}'")))?;
         let env = ctx.session_mut().alloc_env(EMPTY_ENV)?;
-        ctx.protect(env);
         ctx.session_mut().env_define(self.pending, symbol, env)?;
-        self.depth += 1;
-        let result = self.hydrate(ctx, env, reference);
-        self.depth -= 1;
-        result?;
+        self.queue.push_back((env, reference));
         Ok(env)
     }
 }

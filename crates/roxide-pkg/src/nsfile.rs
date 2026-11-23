@@ -431,7 +431,17 @@ fn eval_condition(ctx: &mut Ctx, ast: &Ast, node: NodeId, env: SexpId) -> EvalRe
                     return define(ctx, env, name, value);
                 }
             }
-            Node::Call { .. } => {
+            Node::Call { func, args } => {
+                if args.is_empty()
+                    && let Some((":::", [pkg, item])) = call(ast, *func)
+                    && let (Some(pkg), Some(item)) = (pkg.value, item.value)
+                    && node_name(ctx, ast, pkg)? == "tools"
+                    && node_name(ctx, ast, item)? == ".OStype"
+                {
+                    let fun = ctx.session_mut().intern(".rx_ns_os_accessor")?;
+                    let fun = ctx.find_fun(fun, BASE_ENV)?;
+                    return define(ctx, env, ":::", fun);
+                }
                 if let Some((op, args)) = call(ast, node)
                     && matches!(
                         op,
@@ -452,6 +462,7 @@ fn eval_condition(ctx: &mut Ctx, ast: &Ast, node: NodeId, env: SexpId) -> EvalRe
                             | "$"
                             | "c"
                             | "getRversion"
+                            | "packageVersion"
                             | "package_version"
                             | "numeric_version"
                             | "Sys.info"

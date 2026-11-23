@@ -33,6 +33,21 @@ pub(super) const MODULE: Module = Module {
     }
     result
 }
+.rx_ns_os_accessor <- function(pkg, item) function() .Platform$OS.type
+.rx_on_load <- function(fun, libname, pkgname) {
+    tryCatch(fun(libname, pkgname), error = function(e) {
+        call <- conditionCall(e)
+        details <- if (is.null(call)) "" else paste0("  call: ", deparse1(call), "\n")
+        stop(paste0(".onLoad failed in loadNamespace() for '", pkgname, "', details:\n",
+                    details, "  error: ", conditionMessage(e)), call. = FALSE)
+    })
+}
+.rx_read_package_data <- function(path, csv) {
+    utils::read.table(path, header = TRUE, sep = if (csv) ";" else "", as.is = FALSE)
+}
+.rx_test_load <- function(package, lib.loc) {
+    tryCatch({ loadNamespace(package, lib.loc = lib.loc); NULL }, error = conditionMessage)
+}
 parseNamespaceFile <- function(package, package.lib, mustExist = TRUE)
     .Internal(C_rx_parse_namespace(package, package.lib, mustExist))
 loadNamespace <- function(package, lib.loc = NULL, keep.source = getOption("keep.source.pkgs"),

@@ -154,6 +154,9 @@ impl Writer<'_> {
 
     fn persistent(&mut self, session: &RSession, key: SexpId) -> WireResult<()> {
         let chars = session.str_slice(key)?;
+        if chars.is_empty() {
+            return Err(invalid("empty persistent reference key"));
+        }
         self.next_reference()?;
         self.word(PERSIST)?;
         self.word(0)?;

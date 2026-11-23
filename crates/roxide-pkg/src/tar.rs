@@ -48,10 +48,6 @@ pub fn extract(host: &mut dyn Host, archive: &Path, root: &Path) -> HostResult<P
     for _ in 0..=entry_limit {
         input.read_exact(&mut header).map_err(HostError::from_io)?;
         if header == [0; BLOCK] {
-            input.read_exact(&mut header).map_err(HostError::from_io)?;
-            if header != [0; BLOCK] || input.limit() == 0 {
-                return Err(invalid("invalid tar archive terminator"));
-            }
             let mut padding = [0; 8192];
             loop {
                 let count = input.read(&mut padding).map_err(HostError::from_io)?;
@@ -97,7 +93,7 @@ pub fn extract(host: &mut dyn Host, archive: &Path, root: &Path) -> HostResult<P
                     _ => global.update(&data)?,
                 }
             }
-            0 | b'0' | b'5' => {
+            0 | b'0' | b'5' | b'7' => {
                 let path = local
                     .path
                     .take()
@@ -145,6 +141,8 @@ pub fn extract(host: &mut dyn Host, archive: &Path, root: &Path) -> HostResult<P
                         Err(err) => return Err(err),
                         Ok(_) => return Err(invalid("duplicate tar path")),
                     }
+                    // Keep the executable bits available for a host with file mode support.
+                    let _executable_mode = number(&header[100..108])? & 0o111;
                     let mut dest = host.open(&path, OpenMode::write_truncate())?;
                     let copied = io::copy(&mut (&mut input).take(size as u64), &mut dest)
                         .map_err(HostError::from_io)?;

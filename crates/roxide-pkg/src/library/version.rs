@@ -205,10 +205,10 @@ pub(super) fn ops(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult<Sex
         left.len().max(right.len())
     };
     if len > 0 && !len.is_multiple_of(left.len().min(right.len())) {
-        ctx.warn(
+        ctx.warn_now(
             call.err_call(),
             "longer object length is not a multiple of shorter object length",
-        );
+        )?;
     }
     let result: Vec<_> = (0..len)
         .map(|i| {

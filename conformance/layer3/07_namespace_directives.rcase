@@ -7,6 +7,7 @@ writeLines(c(
     "{ export(x, 'y', c(a,b)); exportPattern('^pub') }",
     "if (getRversion() >= '4.6.2' && .Platform$OS.type == 'unix') { export(new) } else { export(old) }",
     "if (FALSE) unsupported()",
+    "if (packageVersion('stats') >= '4.6.2' && tools:::.OStype() == 'unix') export(qualified)",
     "if (Sys.info()[['sysname']] %in% c('Darwin','Linux')) export(unixHost)",
     "import(p1, p2, except = c(a, b))",
     "importFrom(stats, median, alias = 'sd', except = c(k,l))",
@@ -17,7 +18,7 @@ writeLines(c(
     "useDynLib(probe, sym, alias = actual, .registration = TRUE, .fixes = 'C_')"
 ), file.path(d, "NAMESPACE"))
 ns <- parseNamespaceFile("rxparse", tempdir())
-stopifnot(identical(ns$exports, c("x", "y", "c(a, b)", "new", "unixHost")),
+stopifnot(identical(ns$exports, c("x", "y", "c(a, b)", "new", "qualified", "unixHost")),
           identical(ns$exportPatterns, "^pub"),
           identical(ns$imports[[1L]], list("p1", except = c("a", "b"))),
           identical(ns$imports[[2L]], list("p2", except = c("a", "b"))),

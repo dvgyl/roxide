@@ -246,7 +246,12 @@ impl Reader<'_, '_> {
         self.check_depth(depth)?;
         let flags = self.word()?;
         let value = self.item_with_flags(session, flags, depth + 1)?;
-        session.root(value);
+        if !matches!(
+            flags & 0xff,
+            0 | NIL | GLOBAL | BASE | BASE_NS | EMPTY | MISSING | UNBOUND | REF | 1
+        ) {
+            session.root(value);
+        }
         Ok(value)
     }
 
@@ -319,13 +324,7 @@ impl Reader<'_, '_> {
             })?)?,
             16 => {
                 let len = self.vector_len::<CharId>(8)?;
-                let mut chars = Vec::new();
-                self.reserve_vector(&mut chars, len)?;
-                for _ in 0..len {
-                    let ch = self.read_char(session, depth)?;
-                    chars.try_reserve(1).map_err(invalid)?;
-                    chars.push(ch);
-                }
+                let chars = self.characters(session, len, depth)?;
                 session.alloc_str_from(&chars)?
             }
             19 => {
@@ -354,26 +353,30 @@ impl Reader<'_, '_> {
                 }
                 session.alloc_expr_from(&exprs)?
             }
-            BCODE => return self.bytecode(session, depth),
+            BCODE => {
+                let source = self.bytecode(session, depth)?;
+                self.optional_attributes(session, flags, depth)?;
+                return Ok(source);
+            }
             24 => {
                 let len = self.vector_len::<u8>(1)?;
                 session.alloc_raw_from(self.take(len)?)?
+            }
+            25 => {
+                let object = session.alloc_s4_object()?;
+                session.set_s4_flag(object, flags & S4 != 0)?;
+                object
             }
             PERSIST => {
                 if self.word()? != 0 {
                     return Err(invalid("invalid persistent reference header"));
                 }
                 let count = self.vector_len::<CharId>(8)?;
-                let mut chars = Vec::new();
-                self.reserve_vector(&mut chars, count)?;
-                for _ in 0..count {
-                    let ch = self.read_char(session, depth)?;
-                    session.root(ch.as_sexp());
-                    chars.try_reserve(1).map_err(invalid)?;
-                    chars.push(ch);
+                if count == 0 {
+                    return Err(invalid("empty persistent reference key"));
                 }
+                let chars = self.characters(session, count, depth)?;
                 let key = session.alloc_str_from(&chars)?;
-                session.root(key);
                 let value = session.restore(key)?;
                 self.reference(value)?;
                 return Ok(value);
@@ -382,7 +385,9 @@ impl Reader<'_, '_> {
             ALTREP if self.version == 3 => return self.altrep(session, flags, depth),
             _ => return Err(invalid(format!("unsupported serialized R type {ty}"))),
         };
-        session.root(value);
+        if flags & ATTR != 0 {
+            session.root(value);
+        }
         let attrs = self.optional_attributes(session, flags, depth)?;
         apply_attributes(session, value, attrs, flags)?;
         Ok(value)
@@ -398,6 +403,32 @@ impl Reader<'_, '_> {
             return Err(invalid("invalid serialized character element"));
         }
         self.character(session, flags, depth)
+    }
+
+    fn characters(
+        &mut self,
+        session: &mut CodecSession<'_, '_>,
+        len: usize,
+        depth: usize,
+    ) -> WireResult<Vec<CharId>> {
+        let mut chars = Vec::new();
+        self.reserve_vector(&mut chars, len)?;
+        let mut protected = 0;
+        for _ in 0..len {
+            let flags = self.word()?;
+            if flags & 0xff != SexpType::Char as u32 {
+                return Err(invalid("invalid serialized character element"));
+            }
+            if flags & ATTR != 0 {
+                // Reading an attribute can call a hook. Ordinary strings have no attributes.
+                for ch in &chars[protected..] {
+                    session.root(CharId::as_sexp(*ch));
+                }
+                protected = chars.len() + 1;
+            }
+            chars.push(self.character(session, flags, depth)?);
+        }
+        Ok(chars)
     }
 
     fn character(
@@ -429,8 +460,10 @@ impl Reader<'_, '_> {
             };
             session.mk_char(bytes, encoding)?
         };
-        session.root(ch.as_sexp());
-        self.optional_attributes(session, flags, depth)?;
+        if flags & ATTR != 0 {
+            session.root(ch.as_sexp());
+            self.optional_attributes(session, flags, depth)?;
+        }
         Ok(ch)
     }
 
@@ -957,7 +990,11 @@ impl CodecSession<'_, '_> {
         let Self::Hook { ctx, hook, error } = self else {
             return Err(invalid("persistent reference requires a hook"));
         };
-        hook.read(ctx, key).map_err(|unwind| {
+        ctx.scoped(|ctx| {
+            ctx.protect(key);
+            hook.read(ctx, key)
+        })
+        .map_err(|unwind| {
             *error = Some(unwind);
             invalid("persistent reference hook failed")
         })

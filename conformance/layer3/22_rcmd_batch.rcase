@@ -1,0 +1,41 @@
+=== case: batch_output_and_workspace ===
+#@ tags: layer3,batch
+#@ compare: exact
+command <- file.path(R.home("bin"), "R")
+prefix <- "CMD"
+oracle <- Sys.getenv("ROXIDE_ORACLE_R")
+if (!is.null(R.version$nickname) && nzchar(oracle)) {
+    batch <- file.path(R.home("bin"), "BATCH")
+    home <- tempfile()
+    dir.create(file.path(home, "bin"), recursive = TRUE)
+    wrapper <- file.path(home, "bin", "R")
+    writeLines(c("#!/bin/sh", paste("exec", shQuote(oracle), '"$@"')), wrapper)
+    Sys.chmod(wrapper, "0755")
+    Sys.setenv(R_HOME = home)
+    command <- "/bin/sh"
+    prefix <- shQuote(batch)
+} else {
+    prefix <- c(prefix, "BATCH")
+    if (!file.exists(command)) command <- file.path(getwd(), "target", "debug", "roxide")
+}
+batch_run <- function(args) system2(command, c(prefix, args), stdout = FALSE, stderr = FALSE)
+setwd(tempdir())
+dir.create("scripts")
+writeLines(c("1L +", "  2L", "cat('out\\n')", "message('err')", "answer <- 7L"), "scripts/basic.R")
+dput(batch_run(c("--no-timing", "scripts/basic.R")))
+lines <- readLines("basic.Rout")
+dput(c(any(grepl("^> 1L", lines)), any(grepl("^\\+", lines)), any(lines == "[1] 3"),
+       any(lines == "out"), any(lines == "err"), !any(grepl("proc.time", lines, fixed = TRUE)),
+       file.exists(".RData")))
+writeLines("print(answer)", "restore.r")
+dput(batch_run(c("-q", "--no-save", "restore.r")))
+dput(c(any(readLines("restore.r.Rout") == "[1] 7"),
+       any(readLines("restore.r.Rout") == "> proc.time()")))
+writeLines(c("print(exists('answer'))", "stop('batch failed')"), "bad.txt")
+dput(batch_run(c("--vanilla", "--slave", "bad.txt", "failure.log")))
+lines <- readLines("failure.log")
+dput(c(any(lines == "[1] FALSE"), any(grepl("batch failed", lines)),
+       any(lines == "Execution halted"), !any(grepl("proc.time", lines, fixed = TRUE))))
+writeLines("print(commandArgs(TRUE))", "args.R")
+dput(batch_run(c("--vanilla", "--slave", "--no-timing", "--args", "-flag", "--", "args.R")))
+dput(any(grepl("-flag", readLines("args.Rout"), fixed = TRUE)))

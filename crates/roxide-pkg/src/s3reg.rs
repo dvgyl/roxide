@@ -32,10 +32,10 @@ pub(crate) fn resolve(ctx: &mut Ctx, ns: SexpId, spec: &NsSpec) -> EvalResult<Ve
             .method
             .get_or_insert_with(|| format!("{}.{}", entry.generic, entry.class));
         let Some(method) = local(ctx, ns, name)? else {
-            ctx.warn(
+            ctx.warn_now(
                 SEXP_NIL,
                 format!("S3 method ‘{name}’ was declared in NAMESPACE but not found"),
-            );
+            )?;
             continue;
         };
         ctx.protect(method);

@@ -3,6 +3,7 @@
 //! Clean-room GNU R 4.6.2 package loader, `NAMESPACE` evaluator, lazy-load DB, and `R CMD` engine (ADR-0013, ADR-0014).
 
 pub mod batch;
+mod data;
 pub mod description;
 pub mod install;
 pub mod lazyload;

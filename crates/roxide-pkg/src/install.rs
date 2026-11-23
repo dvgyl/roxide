@@ -6,12 +6,12 @@ use std::path::{Path, PathBuf};
 use roxide_eval::{Ctx, EvalResult, InternalError, Unwind};
 use roxide_gc::SexpId;
 use roxide_host::{Host, HostErrorKind, NativeHost, OpenMode};
-use roxide_value::{SEXP_NIL, ValueApi};
+use roxide_value::{EMPTY_ENV, SEXP_NIL, ValueApi};
 
 use crate::description::{Dependency, Description, is_windows, read_text, version_parts};
-use crate::lazyload::{cache_rds, write_namespace_db};
+use crate::lazyload::{DataCompression, cache_rds, write_lazyload_db, write_namespace_db};
 use crate::library::{R_VERSION, libraries};
-use crate::loader::{build_namespace, load, values::*};
+use crate::loader::{build_namespace, values::*};
 
 type Boot<'a> = &'a dyn Fn(Box<dyn Host>) -> Result<Ctx, InternalError>;
 
@@ -65,6 +65,10 @@ struct Options {
     library: Option<PathBuf>,
     no_test: bool,
     no_docs: bool,
+    install_tests: bool,
+    no_lock: bool,
+    no_staged_install: bool,
+    data_compression: DataCompression,
 }
 
 impl Options {
@@ -92,8 +96,39 @@ impl Options {
                 }
                 "--no-test-load" if !positional => options.no_test = true,
                 "--no-docs" if !positional => options.no_docs = true,
-                "--no-byte-compile" | "--no-multiarch" | "--clean" | "--preclean"
+                "--install-tests" if !positional => options.install_tests = true,
+                "--no-lock" if !positional => options.no_lock = true,
+                "--no-staged-install" if !positional => options.no_staged_install = true,
+                "--staged-install" if !positional => options.no_staged_install = false,
+                "--fake" if !positional => options.no_test = true,
+                "--no-byte-compile"
+                | "--no-multiarch"
+                | "--clean"
+                | "--preclean"
+                | "--with-keep.source"
+                | "--without-keep.source"
+                | "--html"
+                | "--no-html"
+                | "--example"
+                | "--resave-data"
+                | "--byte-compile"
+                | "--no-help"
+                | "--no-demo"
+                | "--no-libs"
+                | "--no-build-vignettes"
                     if !positional => {}
+                "--data-compress=none" if !positional => {
+                    options.data_compression = DataCompression::None
+                }
+                "--data-compress=gzip" if !positional => {
+                    options.data_compression = DataCompression::Gzip
+                }
+                "--data-compress=bzip2" if !positional => {
+                    options.data_compression = DataCompression::Bzip2
+                }
+                "--data-compress=xz" if !positional => {
+                    options.data_compression = DataCompression::Xz
+                }
                 arg if !positional && arg.starts_with('-') => {
                     return Err(format!("unknown INSTALL option '{arg}'"));
                 }
@@ -124,7 +159,13 @@ fn install(
         .host()
         .canonicalize(&library)
         .map_err(|e| ctx.stop(SEXP_NIL, format!("{}: {e}", library.display())))?;
-    paths.retain(|path| path != &library);
+    let mut seen = std::collections::HashSet::from([library.clone()]);
+    for path in &mut paths {
+        if let Ok(canonical) = ctx.host().canonicalize(path) {
+            *path = canonical;
+        }
+    }
+    paths.retain(|path| seen.insert(path.clone()));
     paths.insert(0, library.clone());
     let meta = ctx
         .host()
@@ -172,7 +213,17 @@ fn install_source(
     let Some(library) = paths.first() else {
         return Err(ctx.stop(SEXP_NIL, "no library directory"));
     };
-    let lock = library.join(format!("00LOCK-{package}"));
+    let lock = if options.no_lock {
+        let mut nonce = [0; 8];
+        ctx.host().fill_entropy(&mut nonce);
+        library.join(format!(
+            ".roxide-install-{}-{:016x}",
+            ctx.host().pid(),
+            u64::from_ne_bytes(nonce)
+        ))
+    } else {
+        library.join(format!("00LOCK-{package}"))
+    };
     let stage = lock.join("00new");
     let path = stage.join(package);
     let target = library.join(package);
@@ -191,9 +242,9 @@ fn install_source(
             &text,
             &description,
             &stage_paths,
-            options.no_docs,
+            options,
         )?;
-        if !options.no_test {
+        if !options.no_test && !options.no_staged_install && !options.no_lock {
             test_load(ctx, package, &stage_paths, host, boot)?;
         }
 
@@ -249,7 +300,7 @@ fn build(
     text: &str,
     description: &Description,
     paths: &[PathBuf],
-    no_docs: bool,
+    options: &Options,
 ) -> EvalResult<()> {
     ctx.scoped(|ctx| {
         let namespace = read_text(ctx, &source.join("NAMESPACE"))?;
@@ -266,13 +317,33 @@ fn build(
         let text = with_built(text, &format!("{R_VERSION}; ; {date}; {os}"));
         write_file(ctx, &dest.join("DESCRIPTION"), text.as_bytes())?;
         write_file(ctx, &dest.join("NAMESPACE"), namespace.as_bytes())?;
-        copy_inst(ctx, &source.join("inst"), dest, no_docs)?;
-
+        copy_tree(ctx, &source.join("inst"), dest, true, options.no_docs)?;
+        if options.install_tests {
+            copy_tree(
+                ctx,
+                &source.join("tests"),
+                &dest.join("tests"),
+                false,
+                false,
+            )?;
+        }
         set_library_paths(ctx, paths)?;
-        let ns = build_namespace(ctx, source, description, paths)?;
+        if description.lazy_data == Some(true) {
+            crate::data::install_lazy_data(ctx, source, dest, options.data_compression)?;
+        } else {
+            copy_tree(ctx, &source.join("data"), &dest.join("data"), false, false)?;
+        }
+
+        let sysdata = ctx.session_mut().alloc_env(EMPTY_ENV)?;
+        ctx.protect(sysdata);
+        crate::data::load_source_sysdata(ctx, source, sysdata)?;
+        let ns = build_namespace(ctx, source, description, paths, sysdata)?;
+        if !ctx.session().env_entries(sysdata)?.is_empty() {
+            write_lazyload_db(ctx, &dest.join("R/sysdata"), sysdata)?;
+        }
         let package = &description.package;
         let filebase = dest.join("R").join(package);
-        write_namespace_db(ctx, &filebase, ns)?;
+        write_namespace_db(ctx, &filebase, ns, sysdata)?;
         write_file(ctx, &filebase, STUB.as_bytes())?;
 
         let name = ctx.session_mut().scalar_str(package)?;
@@ -445,28 +516,56 @@ fn test_load(
     boot: Boot<'_>,
 ) -> EvalResult<()> {
     let mut test = boot(host()).map_err(Unwind::Internal)?;
-    set_library_paths(&mut test, paths)
-        .and_then(|()| load(&mut test, package, paths, SEXP_NIL, SEXP_NIL).map(|_| ()))
-        .map_err(|_| {
-            ctx.stop(
-                SEXP_NIL,
-                format!("test load failed for package '{package}'"),
-            )
-        })
+    // Use a local handler to read the condition before it reaches the top level.
+    let result = (|| {
+        set_library_paths(&mut test, paths)?;
+        let name = test.session_mut().scalar_str(package)?;
+        let paths = library_values(&mut test, paths)?;
+        let message = base_call(&mut test, ".rx_test_load", &[name, paths])?;
+        if message == SEXP_NIL {
+            Ok(None)
+        } else {
+            string(&mut test, message).map(Some)
+        }
+    })();
+    match result {
+        Ok(None) => Ok(()),
+        Ok(Some(message)) => Err(ctx.stop(
+            SEXP_NIL,
+            format!("test load failed for package '{package}': {message}"),
+        )),
+        Err(error) => Err(ctx.stop(
+            SEXP_NIL,
+            format!("test load failed for package '{package}': {error:?}"),
+        )),
+    }
 }
 
 fn set_library_paths(ctx: &mut Ctx, paths: &[PathBuf]) -> EvalResult<()> {
-    let paths: Vec<_> = paths.iter().map(|path| path.to_string_lossy()).collect();
-    let paths = strings(ctx, paths.iter().map(|path| path.as_ref()))?;
+    let paths = library_values(ctx, paths)?;
     base_call(ctx, ".libPaths", &[paths])?;
     Ok(())
 }
 
-fn copy_inst(ctx: &mut Ctx, source: &Path, dest: &Path, no_docs: bool) -> EvalResult<()> {
+fn library_values(ctx: &mut Ctx, paths: &[PathBuf]) -> EvalResult {
+    let paths: Vec<_> = paths.iter().map(|path| path.to_string_lossy()).collect();
+    strings(ctx, paths.iter().map(|path| path.as_ref()))
+}
+
+fn copy_tree(
+    ctx: &mut Ctx,
+    source: &Path,
+    dest: &Path,
+    inst: bool,
+    no_docs: bool,
+) -> EvalResult<()> {
     match ctx.host().metadata(source, false) {
         Ok(meta) if meta.is_dir && !meta.is_symlink => {}
         Err(error) if error.kind == HostErrorKind::NotFound => return Ok(()),
-        _ => return Err(ctx.stop(SEXP_NIL, "invalid package inst directory")),
+        _ => return Err(ctx.stop(SEXP_NIL, "invalid package directory")),
+    }
+    if !inst {
+        create_dir(ctx, dest, true)?;
     }
     let mut stack = vec![(source.to_path_buf(), dest.to_path_buf())];
     let limit = ctx.host().limits().max_decompress_bytes as u64;
@@ -479,7 +578,8 @@ fn copy_inst(ctx: &mut Ctx, source: &Path, dest: &Path, no_docs: bool) -> EvalRe
             .map_err(|e| ctx.stop(SEXP_NIL, e.to_string()))?;
         for entry in entries {
             if entry.name.starts_with('.')
-                || (source.ends_with("inst")
+                || (inst
+                    && source.ends_with("inst")
                     && matches!(
                         entry.name.as_str(),
                         "R" | "Meta" | "DESCRIPTION" | "NAMESPACE"
@@ -498,10 +598,10 @@ fn copy_inst(ctx: &mut Ctx, source: &Path, dest: &Path, no_docs: bool) -> EvalRe
                 .map_err(|e| ctx.stop(SEXP_NIL, e.to_string()))?;
             let dest = dest.join(&entry.name);
             if meta.is_symlink {
-                return Err(ctx.stop(SEXP_NIL, "package inst contains a symbolic link"));
+                return Err(ctx.stop(SEXP_NIL, "package directory contains a symbolic link"));
             }
             if meta.is_dir {
-                create_dir(ctx, &dest, false)?;
+                create_dir(ctx, &dest, true)?;
                 stack.push((entry.path, dest));
             } else if meta.is_file {
                 let from = ctx

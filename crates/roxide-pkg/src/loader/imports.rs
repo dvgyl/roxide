@@ -3,11 +3,11 @@ use std::path::PathBuf;
 
 use roxide_eval::{Ctx, EvalResult};
 use roxide_gc::SexpId;
-use roxide_value::{SEXP_NIL, TRUE_SCALAR, ValueApi};
+use roxide_value::{BASE_ENV, BASE_NAMESPACE, SEXP_NIL, TRUE_SCALAR, ValueApi};
 
 use super::values::*;
 use super::{env_names, export_names, exported, load};
-use crate::description::Dependency;
+use crate::description::Description;
 use crate::library::{R_VERSION, check_dependency};
 use crate::nsfile::{Import, NsSpec, Selection};
 
@@ -17,8 +17,9 @@ pub(super) fn populate(
     imports: SexpId,
     spec: &NsSpec,
     paths: &[PathBuf],
-    dependencies: &[Dependency],
+    description: &Description,
 ) -> EvalResult<()> {
+    let mut sources = BTreeMap::new();
     let mut providers = vec![(String::from("base"), TRUE_SCALAR)];
     for (directives, prefix) in [
         (&spec.imports, ""),
@@ -28,17 +29,35 @@ pub(super) fn populate(
         for import in directives {
             let provider = load(ctx, &import.package, paths, SEXP_NIL, SEXP_NIL)?;
             let version = super::namespace_version(ctx, provider)?;
-            for dependency in dependencies
+            for dependency in description
+                .imports
                 .iter()
                 .filter(|dep| dep.package == import.package)
             {
                 check_dependency(ctx, dependency, &version)?;
             }
-            let mappings = import_from(ctx, imports, provider, import, prefix)?;
-            record(ctx, &mut providers, &import.package, mappings)?;
+            let bindings = mappings(ctx, provider, import, prefix)?;
+            for (alias, name) in &bindings {
+                let value = imported(ctx, provider, &import.package, name)?;
+                ctx.protect(value);
+                let previous =
+                    sources.insert(alias.clone(), (import.package.clone(), name.clone(), value));
+                if let Some((package, prior, previous_value)) = previous
+                    && package != import.package
+                    && value != previous_value
+                {
+                    ctx.warn_now(SEXP_NIL, format!(
+                        "replacing previous import ‘{package}::{prior}’ by ‘{}::{name}’ when loading ‘{}’",
+                        import.package, description.package
+                    ))?;
+                }
+                let sym = ctx.session_mut().intern(alias)?;
+                ctx.assign(sym, value, imports)?;
+            }
+            record(ctx, &mut providers, &import.package, bindings)?;
         }
     }
-    for dependency in dependencies.iter().filter(|dep| dep.package == "R") {
+    for dependency in description.depends.iter().filter(|dep| dep.package == "R") {
         check_dependency(ctx, dependency, R_VERSION)?;
     }
     store(ctx, info, &providers)
@@ -47,6 +66,37 @@ pub(super) fn populate(
 pub(super) fn import_from(
     ctx: &mut Ctx,
     target: SexpId,
+    provider: SexpId,
+    import: &Import,
+    prefix: &str,
+) -> EvalResult<Vec<(String, String)>> {
+    let bindings = mappings(ctx, provider, import, prefix)?;
+    for (alias, name) in &bindings {
+        let value = imported(ctx, provider, &import.package, name)?;
+        let sym = ctx.session_mut().intern(alias)?;
+        ctx.assign(sym, value, target)?;
+    }
+    Ok(bindings)
+}
+
+fn imported(ctx: &mut Ctx, provider: SexpId, package: &str, name: &str) -> EvalResult {
+    let sym = ctx.session_mut().intern(name)?;
+    let exports = if provider == BASE_NAMESPACE {
+        Some(BASE_ENV)
+    } else {
+        ctx.ns_exports_env(provider)?
+    };
+    if exports.is_none_or(|exports| ctx.session().env_get(exports, sym).is_none()) {
+        return Err(ctx.stop(
+            SEXP_NIL,
+            format!("object ‘{name}’ is not exported by 'namespace:{package}'"),
+        ));
+    }
+    exported(ctx, provider, name)
+}
+
+fn mappings(
+    ctx: &mut Ctx,
     provider: SexpId,
     import: &Import,
     prefix: &str,
@@ -92,11 +142,6 @@ pub(super) fn import_from(
             selected
         }
     };
-    for (alias, name) in &bindings {
-        let value = exported(ctx, provider, name)?;
-        let sym = ctx.session_mut().intern(alias)?;
-        ctx.assign(sym, value, target)?;
-    }
     Ok(bindings)
 }
 

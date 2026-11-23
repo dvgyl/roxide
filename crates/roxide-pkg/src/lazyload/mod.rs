@@ -6,7 +6,7 @@ mod write;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use roxide_eval::{Args, Call, Ctx, EvalResult, Module, Visibility};
+use roxide_eval::{Args, Call, Ctx, EvalResult, Module, PrimDef, PrimKind, Visibility};
 use roxide_gc::SexpId;
 use roxide_host::OpenMode;
 use roxide_value::{BASE_ENV, EMPTY_ENV, SEXP_NIL, ValueApi};
@@ -16,12 +16,19 @@ use crate::loader::values::{define, field, internal, names, string};
 pub use read::load_lazyload_db;
 pub(crate) use read::load_namespace_db;
 pub use write::write_lazyload_db;
-pub(crate) use write::write_namespace_db;
+pub(crate) use write::{DataCompression, write_data_db, write_namespace_db};
 
 /// Base functions for lazy-load databases.
 pub const MODULE: Module = Module {
     prims: &[
-        internal("lazyLoadDBfetch", 4, fetch, Visibility::On),
+        PrimDef {
+            kind: PrimKind::Primitive,
+            ..internal("lazyLoadDBfetch", 4, fetch, Visibility::On)
+        },
+        PrimDef {
+            kind: PrimKind::Primitive,
+            ..internal("is.primitive", 1, is_primitive, Visibility::On)
+        },
         internal("rox_lazy_load", 3, load, Visibility::On),
         internal("rox_lazy_map", 2, map, Visibility::On),
         internal("rox_lazy_fetch", 2, read::force_record, Visibility::On),
@@ -33,8 +40,6 @@ pub const MODULE: Module = Module {
         ),
     ],
     prelude: r#"
-lazyLoadDBfetch <- function(key, filebase, compressed, hook)
-    .Internal(lazyLoadDBfetch(key, filebase, compressed, hook))
 lazyLoad <- function(filebase, envir = parent.frame(), filter)
     .Internal(rox_lazy_load(filebase, envir, if (missing(filter)) NULL else filter))
 lazyLoadDBexec <- function(filebase, fun, filter) {
@@ -53,6 +58,20 @@ lazyLoadDBexec <- function(filebase, fun, filter) {
 }
 "#,
 };
+
+fn is_primitive(ctx: &mut Ctx, _: &Call, args: &mut Args) -> EvalResult {
+    let kind = ctx.session().type_of(args.get(0))?;
+    Ok(
+        if matches!(
+            kind,
+            roxide_value::SexpType::Builtin | roxide_value::SexpType::Special
+        ) {
+            roxide_value::TRUE_SCALAR
+        } else {
+            roxide_value::FALSE_SCALAR
+        },
+    )
+}
 
 fn fetch(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     let filename = string(ctx, args.get(1))?;
@@ -88,8 +107,10 @@ fn map(ctx: &mut Ctx, _: &Call, args: &mut Args) -> EvalResult {
     Ok(state)
 }
 
+const S3_TABLE: &str = ".__S3MethodsTable__.";
+
 fn namespace_binding(name: &str) -> bool {
-    !matches!(name, ".__NAMESPACE__." | ".__S3MethodsTable__.")
+    name != ".__NAMESPACE__."
 }
 
 fn suffix(base: &Path, extension: &str) -> PathBuf {

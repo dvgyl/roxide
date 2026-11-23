@@ -8,10 +8,11 @@ writeBin(c(a, b), paste0(p, ".rdb"))
 ka <- c(0L, length(a))
 kb <- c(length(a), length(b))
 saveRDS(list(variables = list(a = ka, b = kb),
-             references = list(), compressed = FALSE), paste0(p, ".rdx"))
+             references = list(), compressed = 0.0), paste0(p, ".rdx"))
 e <- new.env()
 lazyLoad(p, e, function(names) names == "b")
 dput(ls(e))
+dput(is.primitive(lazyLoadDBfetch))
 x <- 9L
 dput(eval(e$b))
 dput(lazyLoadDBfetch(ka, paste0(p, ".rdb"), FALSE, function(key) key))
@@ -43,3 +44,31 @@ dput(a$later)
 dput(attr(a, "label"))
 a$value <- 12L
 dput(target$b$value)
+
+=== case: serialization_reference_hooks ===
+#@ tags: layer3,lazy-load,serialization
+#@ compare: exact
+e <- new.env()
+replacement <- new.env()
+write_key <- function(obj) if (identical(obj, e)) c("reference", "extra") else NULL
+read_key <- function(key) {
+    stopifnot(identical(key, c("reference", "extra")))
+    replacement
+}
+labels <- paste0("item", 1:3)
+obj <- list(labels, e, list(e, 3L))
+raw <- serialize(obj, NULL, refhook = write_key)
+check <- function(value) {
+    dput(identical(value[[1L]], labels))
+    dput(identical(value[[2L]], replacement))
+    dput(identical(value[[3L]], list(replacement, 3L)))
+}
+check(unserialize(raw, refhook = read_key))
+con <- rawConnection(raw, "rb")
+check(unserialize(con, refhook = read_key))
+close(con)
+con <- rawConnection(raw(), "wb")
+invisible(serialize(obj, con, refhook = write_key))
+dput(identical(rawConnectionValue(con), raw))
+close(con)
+dput(tryCatch(serialize(e, NULL, refhook = function(x) character()), error = function(e) TRUE))

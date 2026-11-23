@@ -134,3 +134,31 @@ fn imports_formal_class_and_method_bindings() {
     );
     assert_eq!(output, "4 8 5");
 }
+
+#[test]
+fn source_packages_load_sysdata_and_platform_files() {
+    let mut host = PureHost::new();
+    host.insert_file(
+        "/work/sourcedata/DESCRIPTION",
+        b"Package: sourcedata\nVersion: 1.0\n",
+    );
+    host.insert_file("/work/sourcedata/NAMESPACE", b"export(answer)\n");
+    host.insert_file("/work/sourcedata/R/a.s", b"answer <- internal + 1L\n");
+    host.insert_file(
+        "/work/sourcedata/R/_skip.R",
+        b"stop('invalid source name')\n",
+    );
+    host.insert_file("/work/sourcedata/R/unix/z.R", b"answer <- answer + 1L\n");
+    let output = run(
+        host,
+        GcPolicy::Torture,
+        r#"
+        internal <- 7L
+        save(internal, file = "/work/sourcedata/R/sysdata.rda")
+        internal <- 0L
+        ns <- loadNamespace("sourcedata", lib.loc = "/work")
+        cat(getExportedValue("sourcedata", "answer"))
+    "#,
+    );
+    assert_eq!(output, "9");
+}

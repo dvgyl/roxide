@@ -52,3 +52,50 @@ dput(tryCatch(unloadNamespace(ns), error = function(e) grepl("imported by", cond
 unloadNamespace(consumer)
 dput(withVisible(unloadNamespace(ns)))
 dput(c(isNamespaceLoaded("rxtype"), any(search() == "package:rxtype")))
+
+=== case: package_namespace_import_conditions ===
+#@ tags: layer3,package-loader
+#@ compare: exact
+fixture <- function(pkg, namespace, code) {
+    d <- file.path(tempdir(), pkg)
+    dir.create(file.path(d, "Meta"), recursive = TRUE)
+    dir.create(file.path(d, "R"))
+    writeLines(c(paste0("Package: ", pkg), "Version: 1.0"), file.path(d, "DESCRIPTION"))
+    writeLines(namespace, file.path(d, "NAMESPACE"))
+    writeLines(code, file.path(d, "R", pkg))
+    saveRDS(list(Built = list(R = getRversion(), Platform = R.version$platform,
+                              OStype = .Platform$OS.type),
+                 DESCRIPTION = c(Package = pkg, Version = "1.0")), file.path(d, "Meta", "package.rds"))
+}
+fixture("rxfirst", "export(shared)", "shared <- function() 1L")
+fixture("rxsecond", "export(shared)", "shared <- function() 2L")
+fixture("rxreplace", c("importFrom(rxfirst, shared)", "importFrom(rxsecond, shared)", "export(answer)"),
+        "answer <- function() shared()")
+fixture("rxprivate", "importFrom(rxfirst, missingSymbol)", character())
+invisible(withCallingHandlers(loadNamespace("rxreplace", lib.loc = tempdir()), warning = function(w) {
+    dput(conditionMessage(w))
+    invokeRestart("muffleWarning")
+}))
+dput(getExportedValue("rxreplace", "answer")())
+dput(tryCatch(loadNamespace("rxprivate", lib.loc = tempdir()), error = conditionMessage))
+
+=== case: package_namespace_load_failures ===
+#@ tags: layer3,package-loader
+#@ compare: exact
+fixture <- function(pkg, namespace, code) {
+    d <- file.path(tempdir(), pkg)
+    dir.create(file.path(d, "Meta"), recursive = TRUE)
+    dir.create(file.path(d, "R"))
+    writeLines(c(paste0("Package: ", pkg), "Version: 1.0"), file.path(d, "DESCRIPTION"))
+    writeLines(namespace, file.path(d, "NAMESPACE"))
+    writeLines(code, file.path(d, "R", pkg))
+    saveRDS(list(Built = list(R = getRversion(), Platform = R.version$platform,
+                              OStype = .Platform$OS.type),
+                 DESCRIPTION = c(Package = pkg, Version = "1.0")), file.path(d, "Meta", "package.rds"))
+}
+fixture("rxcycleA", "import(rxcycleB)", character())
+fixture("rxcycleB", "import(rxcycleA)", character())
+fixture("rxbroken", character(), '.onLoad <- function(libname, pkgname) stop("broken")')
+for (pkg in c("rxcycleA", "rxbroken")) {
+    dput(tryCatch(loadNamespace(pkg, lib.loc = tempdir()), error = conditionMessage))
+}

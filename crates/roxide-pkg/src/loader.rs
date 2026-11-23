@@ -4,7 +4,6 @@ mod imports;
 mod interface;
 pub(crate) mod values;
 
-use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use roxide_eval::{Ctx, CtxExt, EvalResult, Module, NamespaceLoader, NsRecord};
@@ -34,7 +33,7 @@ impl NamespaceLoader for PkgNamespaceLoader {
 }
 
 #[derive(Default)]
-struct Loading(BTreeSet<String>);
+struct Loading(Vec<String>);
 
 impl Trace for Loading {
     fn trace(&self, _: &mut Tracer<'_>) {}
@@ -72,11 +71,19 @@ fn load_with_options(
     if ctx.ext::<Loading>().0.len() >= depth {
         return Err(ctx.stop(call, "namespace dependency chain is too deeply nested"));
     }
-    if !ctx.ext::<Loading>().0.insert(name.to_owned()) {
-        return Err(ctx.stop(call, "cyclic namespace dependency detected"));
+    let loading = &mut ctx.ext::<Loading>().0;
+    if loading.iter().any(|package| package == name) {
+        let chain = loading
+            .iter()
+            .rev()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join("’, ‘");
+        return Err(ctx.stop(call, format!("cyclic namespace dependency detected when loading ‘{name}’, already loading ‘{chain}’")));
     }
+    loading.push(name.to_owned());
     let result = ctx.scoped(|ctx| load_new(ctx, name, paths, check, call, partial));
-    ctx.ext::<Loading>().0.remove(name);
+    ctx.ext::<Loading>().0.pop();
     result
 }
 
@@ -120,11 +127,12 @@ fn load_new(
     let (ns, imports) = ctx.ns_create(name, &description.version, Some(&path.to_string_lossy()))?;
     ctx.protect(ns);
     let info = namespace_info(ctx, ns)?;
-    imports::populate(ctx, info, imports, &spec, paths, &description.imports)?;
+    imports::populate(ctx, info, imports, &spec, paths, &description)?;
     for dependency in description.depends.iter().filter(|dep| dep.package == "R") {
         crate::library::check_dependency(ctx, dependency, crate::library::R_VERSION)?;
     }
     if !installed {
+        crate::data::load_source_sysdata(ctx, &path, ns)?;
         source(ctx, name, &path, &description.collate, ns)?;
         if partial {
             return Ok(ns);
@@ -143,12 +151,15 @@ fn load_new(
         if installed {
             // The byte stream can refer to the namespace that owns it.
             ctx.ns_register(record.clone())?;
+            crate::data::load_database(ctx, &path.join("R/sysdata"), ns)?;
             crate::lazyload::load_namespace_db(ctx, &filebase, ns)?;
             if partial {
                 ctx.ns_unregister(name);
                 return Ok(ns);
             }
         }
+        let lazydata = crate::data::lazy_env(ctx, info)?;
+        crate::data::load_database(ctx, &path.join("data/Rdata"), lazydata)?;
         if let Some(methods) = ctx.ns_lookup("methods")
             && let Some(cache) = local(ctx, methods, ".rx_cacheMetaData")?
         {
@@ -181,6 +192,7 @@ fn load_new(
         Ok(ns)
     })();
     if result.is_err() {
+        ctx.protect_eval_result(&result);
         if cached_meta {
             let _ = uncache_methods_metadata(ctx, ns);
         }
@@ -194,16 +206,18 @@ pub(crate) fn build_namespace(
     path: &Path,
     description: &Description,
     paths: &[PathBuf],
+    sysdata: SexpId,
 ) -> EvalResult<SexpId> {
     let name = &description.package;
     let spec = NsSpec::read(ctx, &path.join("NAMESPACE"))?;
     let (ns, imports) = ctx.ns_create(name, &description.version, Some(&path.to_string_lossy()))?;
     ctx.protect(ns);
     let info = namespace_info(ctx, ns)?;
-    imports::populate(ctx, info, imports, &spec, paths, &description.imports)?;
+    imports::populate(ctx, info, imports, &spec, paths, description)?;
     for dependency in description.depends.iter().filter(|dep| dep.package == "R") {
         crate::library::check_dependency(ctx, dependency, crate::library::R_VERSION)?;
     }
+    crate::data::copy_bindings(ctx, sysdata, ns)?;
     source_files(ctx, path, &description.collate, ns)?;
     ctx.ns_register(NsRecord {
         name: name.clone(),
@@ -241,24 +255,40 @@ fn source_files(ctx: &mut Ctx, path: &Path, collate: &[String], ns: SexpId) -> E
         for name in collate {
             source_file(ctx, &directory.join(name), ns)?;
         }
-    } else if ctx
+    } else {
+        source_directory(ctx, &directory, ns)?;
+    }
+    let platform = if crate::description::is_windows(ctx) {
+        "windows"
+    } else {
+        "unix"
+    };
+    source_directory(ctx, &directory.join(platform), ns)
+}
+
+fn source_directory(ctx: &mut Ctx, directory: &Path, ns: SexpId) -> EvalResult<()> {
+    if ctx
         .host()
-        .metadata(&directory, true)
+        .metadata(directory, true)
         .is_ok_and(|info| info.is_dir)
     {
         let mut entries = ctx
             .host()
-            .read_dir(&directory)
+            .read_dir(directory)
             .map_err(|e| ctx.stop(SEXP_NIL, e.to_string()))?;
         entries.sort_by(|a, b| a.name.cmp(&b.name));
         for entry in entries {
             if !entry.is_dir
-                && !entry.name.starts_with('.')
+                && entry
+                    .name
+                    .as_bytes()
+                    .first()
+                    .is_some_and(u8::is_ascii_alphanumeric)
                 && entry
                     .path
                     .extension()
                     .and_then(|ext| ext.to_str())
-                    .is_some_and(|ext| matches!(ext, "R" | "r" | "q" | "S"))
+                    .is_some_and(|ext| matches!(ext, "R" | "r" | "q" | "S" | "s"))
             {
                 source_file(ctx, &entry.path, ns)?;
             }
@@ -377,7 +407,7 @@ pub(crate) fn attach(
         exports.retain(|item| include.contains(item));
     }
     for item in exclude.iter().filter(|item| !exports.contains(item)) {
-        ctx.warn(SEXP_NIL, format!("object '{item}' not found"));
+        ctx.warn_now(SEXP_NIL, format!("object '{item}' not found"))?;
     }
     exports.retain(|item| !exclude.contains(item));
     ctx.scoped(|ctx| {
@@ -387,6 +417,13 @@ pub(crate) fn attach(
         for item in exports {
             let value = exported(ctx, ns, &item)?;
             define(ctx, env, &item, value)?;
+        }
+        let info = namespace_info(ctx, ns)?;
+        let lazydata = crate::data::lazy_env(ctx, info)?;
+        for (sym, binding) in ctx.session().env_entries(lazydata)? {
+            if ctx.session().env_get(env, sym).is_none() {
+                ctx.session_mut().env_define(env, sym, binding.value)?;
+            }
         }
         let path = package_path(ctx, &name);
         let path_value = path
@@ -430,7 +467,14 @@ fn call_hook(ctx: &mut Ctx, ns: SexpId, hook: &str, args: &[&str]) -> EvalResult
             ctx.protect(value);
             values.push((None, value));
         }
-        ctx.apply(fun, &values, SEXP_NIL, ns)?;
+        if hook == ".onLoad" {
+            let args: Vec<_> = std::iter::once(fun)
+                .chain(values.iter().map(|&(_, value)| value))
+                .collect();
+            base_call(ctx, ".rx_on_load", &args)?;
+        } else {
+            ctx.apply(fun, &values, SEXP_NIL, ns)?;
+        }
         Ok(())
     })
 }

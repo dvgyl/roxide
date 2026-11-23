@@ -289,7 +289,7 @@ pub(super) fn find_package(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalR
         if found.is_empty() {
             return Err(ctx.stop(call.err_call(), message));
         }
-        ctx.warn(call.err_call(), message);
+        ctx.warn_now(call.err_call(), message)?;
     }
     strings_from_paths(ctx, &found)
 }
