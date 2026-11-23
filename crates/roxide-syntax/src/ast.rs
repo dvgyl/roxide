@@ -145,4 +145,17 @@ impl Ast {
     pub fn args(&self, range: Range<u32>) -> &[Arg] {
         &self.args[range.start as usize..range.end as usize]
     }
+
+    pub(crate) fn replace_arg(&mut self, index: u32, value: NodeId) {
+        let span = self.span(value);
+        let arg = &mut self.args[index as usize];
+        arg.value = Some(value);
+        if arg.name.is_none() {
+            arg.span = span;
+        }
+    }
+
+    pub(crate) fn set_span(&mut self, id: NodeId, span: Span) {
+        self.spans[id.0 as usize] = span;
+    }
 }

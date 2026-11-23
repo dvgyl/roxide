@@ -11,7 +11,7 @@ pub enum Assoc {
     NonAssoc,
 }
 
-/// Precedence levels from lowest (`1`) to highest (`19`), matching R's `?Syntax`.
+/// Precedence levels from lowest (`1`) to highest (`18`), matching R's `?Syntax`.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct Prec(pub u8);
 
@@ -49,10 +49,10 @@ pub mod prec {
     pub const UNARY: Prec = Prec(14);
     /// `^`, `**` exponentiation (right-associative; tighter than unary `-`!).
     pub const POW: Prec = Prec(15);
-    /// `$`, `@` extraction.
-    pub const EXTRACT: Prec = Prec(16);
     /// `[`, `[[` indexing.
-    pub const SUBSET: Prec = Prec(17);
+    pub const SUBSET: Prec = Prec(16);
+    /// `$`, `@` extraction.
+    pub const EXTRACT: Prec = Prec(17);
     /// `::`, `:::` namespace access.
     pub const NS: Prec = Prec(18);
 }
@@ -65,7 +65,7 @@ pub fn binary(op: &str) -> Option<(Prec, Assoc)> {
         "=" => Some((prec::EQ_ASSIGN, Assoc::Right)),
         "<-" | "<<-" | ":=" => Some((prec::LEFT_ASSIGN, Assoc::Right)),
         "->" | "->>" => Some((prec::RIGHT_ASSIGN, Assoc::Left)),
-        "~" => Some((prec::TILDE, Assoc::Right)),
+        "~" => Some((prec::TILDE, Assoc::Left)),
         "|" | "||" => Some((prec::OR, Assoc::Left)),
         "&" | "&&" => Some((prec::AND, Assoc::Left)),
         "<" | "<=" | ">" | ">=" | "==" | "!=" => Some((prec::REL, Assoc::NonAssoc)),

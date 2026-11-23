@@ -226,13 +226,16 @@ impl<'s> Lexer<'s> {
 
     /// Scan and return the next [`Token`].
     pub fn next_token(&mut self) -> Result<Token, LexError> {
-        // Skip horizontal whitespace (spaces, tabs, form feed).
-        while let Some(b) = self.peek() {
-            if matches!(b, b' ' | b'\t' | b'\x0c') {
-                self.pos += 1;
-            } else {
-                break;
-            }
+        if self.src.len() > u32::MAX as usize {
+            return Err(LexError {
+                message: String::from("source exceeds the byte limit"),
+                span: self.span(0, 0),
+            });
+        }
+        while let Some(ch) = self.src[self.pos..].chars().next()
+            && matches!(ch, ' ' | '\t' | '\x0c' | '\u{1680}' | '\u{2000}'..='\u{2006}' | '\u{2008}'..='\u{200a}' | '\u{205f}' | '\u{3000}')
+        {
+            self.pos += ch.len_utf8();
         }
 
         let start = self.pos;
@@ -297,8 +300,15 @@ impl<'s> Lexer<'s> {
             return self.lex_number(start);
         }
 
-        // Identifiers / keywords (ASCII letters, `.`, `_`, or non-ASCII UTF-8)
-        if b.is_ascii_alphabetic() || b == b'.' || b == b'_' || b >= 0x80 {
+        if b == b'_' {
+            self.pos += 1;
+            return Ok(Token {
+                kind: TokKind::Placeholder,
+                span: self.span(start, self.pos),
+            });
+        }
+
+        if b == b'.' || self.src[start..].starts_with(char::is_alphabetic) {
             return Ok(self.lex_ident_or_keyword(start));
         }
 
@@ -429,8 +439,13 @@ impl<'s> Lexer<'s> {
                 _ => TokKind::Colon,
             },
             _ => {
+                let ch = self.src[start..]
+                    .chars()
+                    .next()
+                    .unwrap_or(char::REPLACEMENT_CHARACTER);
+                self.pos = start + ch.len_utf8();
                 return Err(LexError {
-                    message: format!("unexpected input '{}'", b as char),
+                    message: format!("unexpected input '{ch}'"),
                     span: self.span(start, self.pos),
                 });
             }
@@ -645,7 +660,6 @@ impl<'s> Lexer<'s> {
             "repeat" => TokKind::Repeat,
             "break" => TokKind::Break,
             "next" => TokKind::Next,
-            "_" => TokKind::Placeholder,
             _ => TokKind::Symbol,
         };
         Token {

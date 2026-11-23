@@ -7,9 +7,13 @@
 
 pub mod ast;
 pub mod lexer;
+mod literal;
 pub mod ops;
 pub mod parser;
 
 pub use ast::{Arg, ArgName, Ast, Const, Node, NodeId, StrEncoding};
 pub use lexer::{LexError, Lexer, TokKind, Token};
 pub use parser::{ParseError, ParseStep, ParseWarning, Parser};
+
+#[cfg(test)]
+mod tests;

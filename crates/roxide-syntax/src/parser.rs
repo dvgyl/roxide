@@ -1,11 +1,12 @@
 //! Clean-room Pratt parser for GNU R 4.6.2.
 
-use std::fmt;
+use std::{collections::HashSet, fmt};
 
-use roxide_diag::{Span, SrcFileId};
+use roxide_diag::{LineDirective, Span, SrcFileId};
 
-use crate::ast::{Arg, ArgName, Ast, Const, Node, NodeId, StrEncoding};
+use crate::ast::{Arg, ArgName, Ast, Const, Node, NodeId};
 use crate::lexer::{Lexer, TokKind, Token};
+use crate::literal::{decode_escaped, decode_string, parse_r_double, parse_r_int, symbol_name};
 use crate::ops::{self, Assoc, Prec};
 
 /// Non-fatal parser warning (e.g. non-integer value with `L` suffix).
@@ -47,6 +48,45 @@ pub enum ParseStep {
     Error(ParseError),
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Newlines {
+    TopLevel,
+    Block,
+    Ignore,
+}
+
+#[derive(Clone, Copy)]
+struct ExprContext {
+    newlines: Newlines,
+    allow_equals: bool,
+}
+
+impl ExprContext {
+    const TOP_LEVEL: Self = Self {
+        newlines: Newlines::TopLevel,
+        allow_equals: true,
+    };
+    const BLOCK: Self = Self {
+        newlines: Newlines::Block,
+        allow_equals: true,
+    };
+    const PAREN: Self = Self {
+        newlines: Newlines::Ignore,
+        allow_equals: true,
+    };
+    const ARGUMENT: Self = Self {
+        newlines: Newlines::Ignore,
+        allow_equals: false,
+    };
+
+    fn body(self) -> Self {
+        Self {
+            allow_equals: true,
+            ..self
+        }
+    }
+}
+
 /// R 4.6.2 Pratt parser producing an [`Ast`].
 pub struct Parser<'s> {
     src: &'s str,
@@ -55,32 +95,75 @@ pub struct Parser<'s> {
     ast: Ast,
     warnings: Vec<ParseWarning>,
     lex_error: Option<ParseError>,
+    line_directives: Vec<LineDirective>,
+    placeholders: Vec<NodeId>,
+    depth: usize,
 }
 
 impl<'s> Parser<'s> {
     /// Lex and initialize a [`Parser`] over `src`.
     #[must_use]
     pub fn new(src: &'s str, file: SrcFileId) -> Self {
-        match Lexer::new(src, file).tokenize_all() {
-            Ok(tokens) => Self {
-                src,
-                tokens,
-                cursor: 0,
-                ast: Ast::new(),
-                warnings: Vec::new(),
-                lex_error: None,
-            },
-            Err(err) => Self {
-                src,
-                tokens: Vec::new(),
-                cursor: 0,
-                ast: Ast::new(),
-                warnings: Vec::new(),
-                lex_error: Some(ParseError {
-                    message: err.message,
-                    span: err.span,
-                }),
-            },
+        let mut lexer = Lexer::new(src, file);
+        let mut tokens = Vec::new();
+        let lex_error = loop {
+            match lexer.next_token() {
+                Ok(token) => {
+                    let eof = token.kind == TokKind::Eof;
+                    tokens.push(token);
+                    if eof {
+                        break None;
+                    }
+                }
+                Err(err) => {
+                    tokens.push(Token {
+                        kind: TokKind::Eof,
+                        span: err.span,
+                    });
+                    break Some(ParseError {
+                        message: err.message,
+                        span: err.span,
+                    });
+                }
+            }
+        };
+        let line_directives = collect_line_directives(src, &tokens);
+        Self {
+            src,
+            tokens,
+            cursor: 0,
+            ast: Ast::new(),
+            warnings: Vec::new(),
+            lex_error,
+            line_directives,
+            placeholders: Vec::new(),
+            depth: 0,
+        }
+    }
+
+    /// Return source-line directives in physical line order.
+    ///
+    /// Attach these records to the source file to map byte spans to logical lines.
+    #[must_use]
+    pub fn line_directives(&self) -> &[LineDirective] {
+        &self.line_directives
+    }
+
+    fn end_of_input(&mut self, needs_more_input: bool) -> ParseStep {
+        match self.lex_error.take() {
+            Some(err)
+                if matches!(
+                    err.message.as_str(),
+                    "unterminated string literal"
+                        | "unterminated raw string literal"
+                        | "unterminated backtick symbol"
+                ) =>
+            {
+                ParseStep::Incomplete
+            }
+            Some(err) => ParseStep::Error(err),
+            None if needs_more_input => ParseStep::Incomplete,
+            None => ParseStep::Eof,
         }
     }
 
@@ -128,28 +211,36 @@ impl<'s> Parser<'s> {
 
     /// Parse the next single top-level expression.
     pub fn parse_next(&mut self) -> ParseStep {
-        if let Some(err) = self.lex_error.take() {
-            return ParseStep::Error(err);
-        }
-        self.skip_trivia_and_separators();
+        self.skip_newlines_and_comments();
         if self.is_eof() {
-            return ParseStep::Eof;
+            return self.end_of_input(false);
         }
-        match self.parse_expr(Prec(0), false) {
+        self.placeholders.clear();
+        match self.parse_expr(Prec(0), ExprContext::TOP_LEVEL) {
             Ok(expr) => {
                 // Consume optional trailing `;` or newline separator.
                 self.skip_comments();
                 if matches!(self.peek_kind(), TokKind::Semi | TokKind::Newline) {
                     self.advance();
                 } else if !self.is_eof() {
-                    return ParseStep::Error(ParseError {
-                        message: format!("unexpected '{}'", self.current_text()),
-                        span: self.current_span(),
-                    });
+                    return ParseStep::Error(self.unexpected());
+                } else if self.lex_error.is_some() {
+                    return self.end_of_input(false);
+                }
+                if let Some(&placeholder) = self.placeholders.first() {
+                    return ParseStep::Error(self.invalid_placeholder(placeholder));
                 }
                 ParseStep::Expr(expr)
             }
+            Err(err) if self.is_eof() && err.span == self.current_span() => self.end_of_input(true),
             Err(err) => ParseStep::Error(err),
+        }
+    }
+
+    fn unexpected(&self) -> ParseError {
+        ParseError {
+            message: format!("unexpected '{}'", self.current_text()),
+            span: self.current_span(),
         }
     }
 
@@ -158,9 +249,7 @@ impl<'s> Parser<'s> {
     }
 
     fn peek(&self) -> &Token {
-        self.tokens
-            .get(self.cursor)
-            .unwrap_or_else(|| &self.tokens[self.tokens.len() - 1])
+        &self.tokens[self.cursor]
     }
 
     fn peek_kind(&self) -> &TokKind {
@@ -168,23 +257,15 @@ impl<'s> Parser<'s> {
     }
 
     fn current_span(&self) -> Span {
-        if self.tokens.is_empty() {
-            Span::default()
-        } else {
-            self.peek().span
-        }
+        self.peek().span
     }
 
     fn current_text(&self) -> &'s str {
-        if self.tokens.is_empty() {
-            ""
-        } else {
-            self.slice(self.peek().span)
-        }
+        self.slice(self.peek().span)
     }
 
     fn is_eof(&self) -> bool {
-        self.tokens.is_empty() || self.peek_kind() == &TokKind::Eof
+        self.peek_kind() == &TokKind::Eof
     }
 
     fn advance(&mut self) -> Token {
@@ -216,74 +297,126 @@ impl<'s> Parser<'s> {
         }
     }
 
-    /// Parse an expression with minimum binding power `min_prec`.
-    /// When `ignore_newlines` is true (inside `(...)` or `[...]`), newlines do not terminate expressions.
-    fn parse_expr(&mut self, min_prec: Prec, ignore_newlines: bool) -> Result<NodeId, ParseError> {
-        if ignore_newlines {
+    fn skip_expr_trivia(&mut self, context: ExprContext) {
+        if context.newlines == Newlines::Ignore {
             self.skip_newlines_and_comments();
         } else {
             self.skip_comments();
         }
+    }
 
-        let mut lhs = self.parse_prefix(ignore_newlines)?;
+    fn parse_expr(&mut self, min_prec: Prec, context: ExprContext) -> Result<NodeId, ParseError> {
+        const MAX_DEPTH: usize = 256;
+        self.skip_expr_trivia(context);
+        if self.depth == MAX_DEPTH && !self.is_eof() {
+            return Err(ParseError {
+                message: String::from("expression nested too deeply"),
+                span: self.current_span(),
+            });
+        }
+        self.depth += 1;
+        let result = self.parse_expr_inner(min_prec, context);
+        self.depth -= 1;
+        result
+    }
+
+    fn parse_expr_inner(
+        &mut self,
+        min_prec: Prec,
+        context: ExprContext,
+    ) -> Result<NodeId, ParseError> {
+        let mut lhs = self.parse_prefix(context)?;
 
         loop {
-            if ignore_newlines {
-                self.skip_newlines_and_comments();
-            } else {
-                self.skip_comments();
-            }
+            self.skip_expr_trivia(context);
 
-            // Postfix calls and indexing bind tighter than binary ops (except `::`/`:::`, `$`/`@`).
-            match self.peek_kind() {
-                TokKind::LParen => {
-                    lhs = self.parse_call(lhs)?;
-                    continue;
+            if min_prec <= ops::prec::SUBSET {
+                match self.peek_kind() {
+                    TokKind::LParen => {
+                        lhs = self.parse_call(lhs)?;
+                        continue;
+                    }
+                    TokKind::LBracket | TokKind::LBracket2 => {
+                        lhs = self.parse_subset(lhs, self.peek_kind() == &TokKind::LBracket2)?;
+                        continue;
+                    }
+                    _ => {}
                 }
-                TokKind::LBracket => {
-                    lhs = self.parse_subset(lhs, false)?;
-                    continue;
-                }
-                TokKind::LBracket2 => {
-                    lhs = self.parse_subset(lhs, true)?;
-                    continue;
-                }
-                _ => {}
             }
 
             let Some((op_str, prec, assoc)) = self.peek_binary_op() else {
                 break;
             };
-            if prec < min_prec {
+            if prec < min_prec || (op_str == "=" && !context.allow_equals) {
                 break;
             }
 
+            if matches!(prec, ops::prec::NS | ops::prec::EXTRACT) {
+                lhs = self.parse_member(lhs, context)?;
+                continue;
+            }
+
             let op_tok = self.advance();
-            let op_text = op_str.to_owned();
-            // After any binary operator, newlines are always skipped before the RHS.
             self.skip_newlines_and_comments();
 
             let next_min = match assoc {
-                Assoc::Left => Prec(prec.0 + 1),
                 Assoc::Right => prec,
-                Assoc::NonAssoc => Prec(prec.0 + 1),
+                Assoc::Left | Assoc::NonAssoc => Prec(prec.0 + 1),
             };
-            let rhs = self.parse_expr(next_min, ignore_newlines)?;
+            let placeholder_start = self.placeholders.len();
+            let rhs = self.parse_expr(next_min, context)?;
+            if assoc == Assoc::NonAssoc
+                && self
+                    .peek_binary_op()
+                    .is_some_and(|(_, next, _)| next == prec)
+            {
+                return Err(self.unexpected());
+            }
             let span = self.ast.span(lhs).merge(self.ast.span(rhs));
 
-            lhs = match op_text.as_str() {
+            lhs = match op_str {
                 "->" => self.make_binary_call("<-", op_tok.span, rhs, lhs, span),
                 "->>" => self.make_binary_call("<<-", op_tok.span, rhs, lhs, span),
                 "**" => self.make_binary_call("^", op_tok.span, lhs, rhs, span),
-                "|>" => self.desugar_pipe(lhs, rhs, span)?,
-                _ => self.make_binary_call(&op_text, op_tok.span, lhs, rhs, span),
+                "|>" => self.desugar_pipe(lhs, rhs, span, placeholder_start)?,
+                _ => self.make_binary_call(op_str, op_tok.span, lhs, rhs, span),
             };
         }
 
         Ok(lhs)
     }
 
-    fn parse_prefix(&mut self, ignore_newlines: bool) -> Result<NodeId, ParseError> {
+    fn parse_member(&mut self, lhs: NodeId, context: ExprContext) -> Result<NodeId, ParseError> {
+        let namespace = matches!(self.peek_kind(), TokKind::NsGet | TokKind::NsGetInt);
+        if namespace
+            && !matches!(
+                self.ast.node(lhs),
+                Node::Sym(_) | Node::Const(Const::Str { .. })
+            )
+        {
+            return Err(self.unexpected());
+        }
+        if namespace && self.placeholders.last() == Some(&lhs) {
+            return Err(self.invalid_placeholder(lhs));
+        }
+        let op = self.advance();
+        if namespace {
+            self.skip_expr_trivia(context);
+        } else {
+            self.skip_newlines_and_comments();
+        }
+        if !matches!(
+            self.peek_kind(),
+            TokKind::Symbol | TokKind::Backtick | TokKind::Str { .. }
+        ) {
+            return Err(self.unexpected());
+        }
+        let rhs = self.parse_prefix(context)?;
+        let span = self.ast.span(lhs).merge(self.ast.span(rhs));
+        Ok(self.make_binary_call(self.slice(op.span), op.span, lhs, rhs, span))
+    }
+
+    fn parse_prefix(&mut self, context: ExprContext) -> Result<NodeId, ParseError> {
         let tok = self.peek().clone();
         match tok.kind {
             TokKind::Null => {
@@ -387,24 +520,31 @@ impl<'s> Parser<'s> {
             TokKind::Symbol | TokKind::Placeholder => {
                 self.advance();
                 let name: Box<str> = self.slice(tok.span).into();
-                Ok(self.ast.push_node(Node::Sym(name), tok.span))
+                let node = self.ast.push_node(Node::Sym(name), tok.span);
+                if tok.kind == TokKind::Placeholder {
+                    self.placeholders.push(node);
+                }
+                Ok(node)
             }
             TokKind::Backtick => {
                 self.advance();
-                let raw = self.slice(tok.span);
-                let inner = &raw[1..raw.len() - 1];
-                let (bytes, _) = decode_escaped(inner, tok.span)?;
-                let name = String::from_utf8_lossy(&bytes)
-                    .into_owned()
-                    .into_boxed_str();
+                let name = self.decode_symbol(&tok)?;
                 Ok(self.ast.push_node(Node::Sym(name), tok.span))
             }
             TokKind::Plus | TokKind::Minus | TokKind::Bang | TokKind::Tilde | TokKind::Question => {
                 self.advance();
                 let op_str = self.slice(tok.span);
-                let prec = ops::unary(op_str).unwrap_or(ops::prec::UNARY);
+                let mut prec = ops::unary(op_str).unwrap_or(ops::prec::UNARY);
+                if matches!(tok.kind, TokKind::Tilde | TokKind::Question) {
+                    prec.0 += 1;
+                }
+                let operand_context = if tok.kind == TokKind::Question {
+                    context.body()
+                } else {
+                    context
+                };
                 self.skip_newlines_and_comments();
-                let rhs = self.parse_expr(prec, ignore_newlines)?;
+                let rhs = self.parse_expr(prec, operand_context)?;
                 let span = tok.span.merge(self.ast.span(rhs));
                 let func = self.ast.push_node(Node::Sym(op_str.into()), tok.span);
                 let args = self.ast.push_args([Arg {
@@ -417,7 +557,7 @@ impl<'s> Parser<'s> {
             TokKind::LParen => {
                 let open = self.advance();
                 self.skip_newlines_and_comments();
-                let inner = self.parse_expr(Prec(0), true)?;
+                let inner = self.parse_expr(Prec(0), ExprContext::PAREN)?;
                 self.skip_newlines_and_comments();
                 if self.peek_kind() != &TokKind::RParen {
                     return Err(ParseError {
@@ -436,11 +576,11 @@ impl<'s> Parser<'s> {
                 Ok(self.ast.push_node(Node::Call { func, args }, span))
             }
             TokKind::LBrace => self.parse_brace_block(),
-            TokKind::Function | TokKind::Lambda => self.parse_function(ignore_newlines),
-            TokKind::If => self.parse_if(ignore_newlines),
-            TokKind::While => self.parse_while(ignore_newlines),
-            TokKind::Repeat => self.parse_repeat(ignore_newlines),
-            TokKind::For => self.parse_for(ignore_newlines),
+            TokKind::Function | TokKind::Lambda => self.parse_function(context),
+            TokKind::If => self.parse_if(context),
+            TokKind::While => self.parse_while(context),
+            TokKind::Repeat => self.parse_repeat(context),
+            TokKind::For => self.parse_for(context),
             TokKind::Break | TokKind::Next => {
                 self.advance();
                 let name = self.slice(tok.span);
@@ -448,10 +588,7 @@ impl<'s> Parser<'s> {
                 let args = self.ast.push_args([]);
                 Ok(self.ast.push_node(Node::Call { func, args }, tok.span))
             }
-            _ => Err(ParseError {
-                message: format!("unexpected '{}'", self.current_text()),
-                span: tok.span,
-            }),
+            _ => Err(self.unexpected()),
         }
     }
 
@@ -473,7 +610,7 @@ impl<'s> Parser<'s> {
                     span: self.current_span(),
                 });
             }
-            let stmt = self.parse_expr(Prec(0), false)?;
+            let stmt = self.parse_expr(Prec(0), ExprContext::BLOCK)?;
             let stmt_span = self.ast.span(stmt);
             stmts.push(Arg {
                 name: None,
@@ -492,9 +629,13 @@ impl<'s> Parser<'s> {
         }
     }
 
-    fn parse_function(&mut self, ignore_newlines: bool) -> Result<NodeId, ParseError> {
+    fn parse_function(&mut self, context: ExprContext) -> Result<NodeId, ParseError> {
         let kw = self.advance();
-        self.skip_newlines_and_comments();
+        if kw.kind == TokKind::Lambda {
+            self.skip_expr_trivia(context);
+        } else {
+            self.skip_newlines_and_comments();
+        }
         if self.peek_kind() != &TokKind::LParen {
             return Err(ParseError {
                 message: String::from("expected '(' after function"),
@@ -503,17 +644,14 @@ impl<'s> Parser<'s> {
         }
         self.advance();
         let mut formals = Vec::new();
+        let mut names = HashSet::new();
         self.skip_newlines_and_comments();
         if self.peek_kind() != &TokKind::RParen {
             loop {
                 self.skip_newlines_and_comments();
                 let name_tok = self.advance();
                 let name_str: Box<str> = match name_tok.kind {
-                    TokKind::Symbol => self.slice(name_tok.span).into(),
-                    TokKind::Backtick => {
-                        let raw = self.slice(name_tok.span);
-                        raw[1..raw.len() - 1].into()
-                    }
+                    TokKind::Symbol | TokKind::Backtick => self.decode_symbol(&name_tok)?,
                     _ => {
                         return Err(ParseError {
                             message: String::from("expected formal parameter name"),
@@ -521,11 +659,17 @@ impl<'s> Parser<'s> {
                         });
                     }
                 };
+                if !names.insert(name_str.clone()) {
+                    return Err(ParseError {
+                        message: format!("repeated formal argument '{name_str}'"),
+                        span: name_tok.span,
+                    });
+                }
                 self.skip_newlines_and_comments();
                 let default = if self.peek_kind() == &TokKind::Eq {
                     self.advance();
                     self.skip_newlines_and_comments();
-                    Some(self.parse_expr(Prec(0), true)?)
+                    Some(self.parse_expr(Prec(0), ExprContext::ARGUMENT)?)
                 } else {
                     None
                 };
@@ -539,10 +683,6 @@ impl<'s> Parser<'s> {
                 self.skip_newlines_and_comments();
                 if self.peek_kind() == &TokKind::Comma {
                     self.advance();
-                    self.skip_newlines_and_comments();
-                    if self.peek_kind() == &TokKind::RParen {
-                        break;
-                    }
                 } else {
                     break;
                 }
@@ -556,7 +696,7 @@ impl<'s> Parser<'s> {
         }
         self.advance();
         self.skip_newlines_and_comments();
-        let body = self.parse_expr(Prec(0), ignore_newlines)?;
+        let body = self.parse_expr(ops::prec::EQ_ASSIGN, context.body())?;
         let span = kw.span.merge(self.ast.span(body));
         let formals_range = self.ast.push_args(formals);
         Ok(self.ast.push_node(
@@ -569,7 +709,7 @@ impl<'s> Parser<'s> {
         ))
     }
 
-    fn parse_if(&mut self, ignore_newlines: bool) -> Result<NodeId, ParseError> {
+    fn parse_if(&mut self, context: ExprContext) -> Result<NodeId, ParseError> {
         let kw = self.advance();
         self.skip_newlines_and_comments();
         if self.peek_kind() != &TokKind::LParen {
@@ -579,7 +719,7 @@ impl<'s> Parser<'s> {
             });
         }
         self.advance();
-        let cond = self.parse_expr(Prec(0), true)?;
+        let cond = self.parse_expr(Prec(0), ExprContext::ARGUMENT)?;
         self.skip_newlines_and_comments();
         if self.peek_kind() != &TokKind::RParen {
             return Err(ParseError {
@@ -589,7 +729,7 @@ impl<'s> Parser<'s> {
         }
         self.advance();
         self.skip_newlines_and_comments();
-        let then_branch = self.parse_expr(Prec(0), ignore_newlines)?;
+        let then_branch = self.parse_expr(ops::prec::EQ_ASSIGN, context.body())?;
 
         let mut args_vec = vec![
             Arg {
@@ -605,7 +745,7 @@ impl<'s> Parser<'s> {
         ];
 
         let saved = self.cursor;
-        if ignore_newlines {
+        if context.newlines != Newlines::TopLevel {
             self.skip_newlines_and_comments();
         } else {
             self.skip_comments();
@@ -613,7 +753,7 @@ impl<'s> Parser<'s> {
         let end_span = if self.peek_kind() == &TokKind::Else {
             self.advance();
             self.skip_newlines_and_comments();
-            let else_branch = self.parse_expr(Prec(0), ignore_newlines)?;
+            let else_branch = self.parse_expr(ops::prec::EQ_ASSIGN, context.body())?;
             let es = self.ast.span(else_branch);
             args_vec.push(Arg {
                 name: None,
@@ -632,7 +772,7 @@ impl<'s> Parser<'s> {
         Ok(self.ast.push_node(Node::Call { func, args }, span))
     }
 
-    fn parse_while(&mut self, ignore_newlines: bool) -> Result<NodeId, ParseError> {
+    fn parse_while(&mut self, context: ExprContext) -> Result<NodeId, ParseError> {
         let kw = self.advance();
         self.skip_newlines_and_comments();
         if self.peek_kind() != &TokKind::LParen {
@@ -642,7 +782,7 @@ impl<'s> Parser<'s> {
             });
         }
         self.advance();
-        let cond = self.parse_expr(Prec(0), true)?;
+        let cond = self.parse_expr(Prec(0), ExprContext::ARGUMENT)?;
         self.skip_newlines_and_comments();
         if self.peek_kind() != &TokKind::RParen {
             return Err(ParseError {
@@ -652,7 +792,7 @@ impl<'s> Parser<'s> {
         }
         self.advance();
         self.skip_newlines_and_comments();
-        let body = self.parse_expr(Prec(0), ignore_newlines)?;
+        let body = self.parse_expr(ops::prec::EQ_ASSIGN, context.body())?;
         let span = kw.span.merge(self.ast.span(body));
         let func = self.ast.push_node(Node::Sym("while".into()), kw.span);
         let args = self.ast.push_args([
@@ -670,10 +810,10 @@ impl<'s> Parser<'s> {
         Ok(self.ast.push_node(Node::Call { func, args }, span))
     }
 
-    fn parse_repeat(&mut self, ignore_newlines: bool) -> Result<NodeId, ParseError> {
+    fn parse_repeat(&mut self, context: ExprContext) -> Result<NodeId, ParseError> {
         let kw = self.advance();
         self.skip_newlines_and_comments();
-        let body = self.parse_expr(Prec(0), ignore_newlines)?;
+        let body = self.parse_expr(ops::prec::EQ_ASSIGN, context.body())?;
         let span = kw.span.merge(self.ast.span(body));
         let func = self.ast.push_node(Node::Sym("repeat".into()), kw.span);
         let args = self.ast.push_args([Arg {
@@ -684,7 +824,7 @@ impl<'s> Parser<'s> {
         Ok(self.ast.push_node(Node::Call { func, args }, span))
     }
 
-    fn parse_for(&mut self, ignore_newlines: bool) -> Result<NodeId, ParseError> {
+    fn parse_for(&mut self, context: ExprContext) -> Result<NodeId, ParseError> {
         let kw = self.advance();
         self.skip_newlines_and_comments();
         if self.peek_kind() != &TokKind::LParen {
@@ -697,11 +837,7 @@ impl<'s> Parser<'s> {
         self.skip_newlines_and_comments();
         let var_tok = self.advance();
         let var_name: Box<str> = match var_tok.kind {
-            TokKind::Symbol => self.slice(var_tok.span).into(),
-            TokKind::Backtick => {
-                let raw = self.slice(var_tok.span);
-                raw[1..raw.len() - 1].into()
-            }
+            TokKind::Symbol | TokKind::Backtick => self.decode_symbol(&var_tok)?,
             _ => {
                 return Err(ParseError {
                     message: String::from("expected loop variable name"),
@@ -719,7 +855,7 @@ impl<'s> Parser<'s> {
         }
         self.advance();
         self.skip_newlines_and_comments();
-        let seq = self.parse_expr(Prec(0), true)?;
+        let seq = self.parse_expr(Prec(0), ExprContext::ARGUMENT)?;
         self.skip_newlines_and_comments();
         if self.peek_kind() != &TokKind::RParen {
             return Err(ParseError {
@@ -729,7 +865,7 @@ impl<'s> Parser<'s> {
         }
         self.advance();
         self.skip_newlines_and_comments();
-        let body = self.parse_expr(Prec(0), ignore_newlines)?;
+        let body = self.parse_expr(ops::prec::EQ_ASSIGN, context.body())?;
         let span = kw.span.merge(self.ast.span(body));
         let func = self.ast.push_node(Node::Sym("for".into()), kw.span);
         let args = self.ast.push_args([
@@ -753,9 +889,16 @@ impl<'s> Parser<'s> {
     }
 
     fn parse_call(&mut self, callee: NodeId) -> Result<NodeId, ParseError> {
-        let _open = self.advance(); // '('
+        self.advance();
+        let callee_span = self.ast.span(callee);
+        let callee = if let Node::Const(Const::Str { bytes, .. }) = self.ast.node(callee) {
+            let name = symbol_name(bytes, callee_span)?;
+            self.ast.push_node(Node::Sym(name), callee_span)
+        } else {
+            callee
+        };
         let (args_vec, close_span) = self.parse_arg_list(TokKind::RParen)?;
-        let span = self.ast.span(callee).merge(close_span);
+        let span = callee_span.merge(close_span);
         let args = self.ast.push_args(args_vec);
         Ok(self.ast.push_node(Node::Call { func: callee, args }, span))
     }
@@ -763,6 +906,13 @@ impl<'s> Parser<'s> {
     fn parse_subset(&mut self, target: NodeId, double: bool) -> Result<NodeId, ParseError> {
         let open = self.advance();
         let (mut args_vec, close_span) = self.parse_arg_list(TokKind::RBracket)?;
+        if args_vec.is_empty() {
+            args_vec.push(Arg {
+                name: None,
+                value: None,
+                span: close_span,
+            });
+        }
         let end_span = if double {
             self.skip_newlines_and_comments();
             if self.peek_kind() != &TokKind::RBracket {
@@ -823,7 +973,7 @@ impl<'s> Parser<'s> {
                 let value = if self.peek_kind() == &TokKind::Comma || self.peek_kind() == &closing {
                     None
                 } else {
-                    Some(self.parse_expr(Prec(0), true)?)
+                    Some(self.parse_expr(Prec(0), ExprContext::ARGUMENT)?)
                 };
                 let span = value.map_or(name_span, |v| name_span.merge(self.ast.span(v)));
                 args.push(Arg {
@@ -832,7 +982,7 @@ impl<'s> Parser<'s> {
                     span,
                 });
             } else {
-                let expr = self.parse_expr(Prec(0), true)?;
+                let expr = self.parse_expr(Prec(0), ExprContext::ARGUMENT)?;
                 args.push(Arg {
                     name: None,
                     value: Some(expr),
@@ -858,33 +1008,38 @@ impl<'s> Parser<'s> {
     fn try_parse_arg_name(&mut self) -> Result<Option<(ArgName, Span)>, ParseError> {
         let saved = self.cursor;
         let first = self.peek().clone();
-        let candidate = match first.kind {
-            TokKind::Symbol => Some(ArgName::Sym(self.slice(first.span).into())),
-            TokKind::Backtick => {
-                let raw = self.slice(first.span);
-                Some(ArgName::Sym(raw[1..raw.len() - 1].into()))
-            }
-            TokKind::Null => Some(ArgName::Null),
+        if !matches!(
+            first.kind,
+            TokKind::Symbol | TokKind::Backtick | TokKind::Null | TokKind::Str { .. }
+        ) {
+            return Ok(None);
+        }
+        self.advance();
+        self.skip_newlines_and_comments();
+        if self.peek_kind() != &TokKind::Eq {
+            self.cursor = saved;
+            return Ok(None);
+        }
+        let name = match first.kind {
+            TokKind::Null => ArgName::Null,
             TokKind::Str { raw } => {
                 let (bytes, _) = decode_string(self.slice(first.span), raw, first.span)?;
-                Some(ArgName::Str(
-                    String::from_utf8_lossy(&bytes)
-                        .into_owned()
-                        .into_boxed_str(),
-                ))
+                ArgName::Str(symbol_name(&bytes, first.span)?)
             }
-            _ => None,
+            _ => ArgName::Sym(self.decode_symbol(&first)?),
         };
-        if let Some(name) = candidate {
-            self.advance();
-            self.skip_newlines_and_comments();
-            if self.peek_kind() == &TokKind::Eq {
-                self.advance();
-                return Ok(Some((name, first.span)));
-            }
+        self.advance();
+        Ok(Some((name, first.span)))
+    }
+
+    fn decode_symbol(&self, token: &Token) -> Result<Box<str>, ParseError> {
+        let raw = self.slice(token.span);
+        if token.kind == TokKind::Backtick {
+            let (bytes, _) = decode_escaped(&raw[1..raw.len() - 1], token.span, true)?;
+            symbol_name(&bytes, token.span)
+        } else {
+            Ok(raw.into())
         }
-        self.cursor = saved;
-        Ok(None)
     }
 
     fn peek_binary_op(&self) -> Option<(&'s str, Prec, Assoc)> {
@@ -950,369 +1105,218 @@ impl<'s> Parser<'s> {
         self.ast.push_node(Node::Call { func, args }, span)
     }
 
-    fn desugar_pipe(&mut self, lhs: NodeId, rhs: NodeId, span: Span) -> Result<NodeId, ParseError> {
-        match self.ast.node(rhs).clone() {
-            Node::Call { func, args } => {
-                let mut existing: Vec<Arg> = self.ast.args(args).to_vec();
-                let mut placeholder_idx = None;
-                for (i, arg) in existing.iter().enumerate() {
-                    if let Some(val) = arg.value
-                        && matches!(self.ast.node(val), Node::Sym(s) if s.as_ref() == "_")
-                    {
-                        if arg.name.is_none() {
-                            return Err(ParseError {
-                                message: String::from(
-                                    "pipe placeholder may only be used as a named argument",
-                                ),
-                                span: arg.span,
-                            });
-                        }
-                        if placeholder_idx.is_some() {
-                            return Err(ParseError {
-                                message: String::from(
-                                    "pipe placeholder may only appear once in RHS",
-                                ),
-                                span: arg.span,
-                            });
-                        }
-                        placeholder_idx = Some(i);
-                    }
-                }
-                if let Some(idx) = placeholder_idx {
-                    existing[idx].value = Some(lhs);
-                } else {
-                    existing.insert(
-                        0,
-                        Arg {
-                            name: None,
-                            value: Some(lhs),
-                            span: self.ast.span(lhs),
-                        },
-                    );
-                }
-                let new_args = self.ast.push_args(existing);
-                Ok(self.ast.push_node(
-                    Node::Call {
-                        func,
-                        args: new_args,
-                    },
-                    span,
-                ))
-            }
-            _ => Err(ParseError {
-                message: String::from("pipe operator requires a function call as RHS"),
-                span,
-            }),
+    fn invalid_placeholder(&self, placeholder: NodeId) -> ParseError {
+        ParseError {
+            message: String::from("invalid use of pipe placeholder"),
+            span: self.ast.span(placeholder),
         }
     }
-}
 
-fn parse_r_double(s: &str) -> Option<f64> {
-    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-        return parse_hex_float(hex);
-    }
-    s.parse::<f64>().ok()
-}
-
-fn parse_hex_float(hex: &str) -> Option<f64> {
-    let (mantissa, exp) = match hex.find(['p', 'P']) {
-        Some(idx) => {
-            let e = hex[idx + 1..].parse::<i32>().ok()?;
-            (&hex[..idx], e)
-        }
-        None => (hex, 0),
-    };
-    let (int_part, frac_part) = match mantissa.find('.') {
-        Some(idx) => (&mantissa[..idx], &mantissa[idx + 1..]),
-        None => (mantissa, ""),
-    };
-    let mut val = 0.0f64;
-    for b in int_part.bytes() {
-        let d = hex_digit(b)?;
-        val = val * 16.0 + f64::from(d);
-    }
-    let mut scale = 1.0f64 / 16.0;
-    for b in frac_part.bytes() {
-        let d = hex_digit(b)?;
-        val += f64::from(d) * scale;
-        scale /= 16.0;
-    }
-    Some(val * 2.0f64.powi(exp))
-}
-
-fn hex_digit(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
-}
-
-fn parse_r_int(
-    num_str: &str,
-    span: Span,
-    warnings: &mut Vec<ParseWarning>,
-) -> Result<Node, ParseError> {
-    if let Some(hex) = num_str
-        .strip_prefix("0x")
-        .or_else(|| num_str.strip_prefix("0X"))
-    {
-        if !hex.contains('.')
-            && !hex.contains(['p', 'P'])
-            && let Ok(v) = i64::from_str_radix(hex, 16)
-            && v <= i64::from(i32::MAX)
+    fn desugar_pipe(
+        &mut self,
+        lhs: NodeId,
+        rhs: NodeId,
+        span: Span,
+        placeholder_start: usize,
+    ) -> Result<NodeId, ParseError> {
+        let rhs_span = self.ast.span(rhs);
+        if self.placeholders.get(placeholder_start) == Some(&rhs)
+            || !matches!(
+                self.ast.node(rhs),
+                Node::Call { .. } | Node::Function { .. }
+            )
         {
-            return Ok(Node::Const(Const::Int(v as i32)));
-        }
-    } else if let Ok(v) = num_str.parse::<i64>()
-        && v <= i64::from(i32::MAX)
-    {
-        return Ok(Node::Const(Const::Int(v as i32)));
-    }
-
-    let f = parse_r_double(num_str).ok_or_else(|| ParseError {
-        message: format!("invalid integer literal '{num_str}L'"),
-        span,
-    })?;
-    if f.fract() == 0.0 && f >= f64::from(-i32::MAX) && f <= f64::from(i32::MAX) {
-        Ok(Node::Const(Const::Int(f as i32)))
-    } else {
-        warnings.push(ParseWarning {
-            message: format!("non-integer value {num_str} qualified with L; using numeric value"),
-            span,
-        });
-        Ok(Node::Const(Const::Real(f.to_bits())))
-    }
-}
-
-fn decode_string(
-    raw_token: &str,
-    is_raw: bool,
-    span: Span,
-) -> Result<(Box<[u8]>, StrEncoding), ParseError> {
-    if is_raw {
-        // Strip r/R, quote, dashes, opening delim ... closing delim, dashes, quote.
-        let inner = &raw_token[2..raw_token.len() - 1];
-        let dashes = inner.bytes().take_while(|&b| b == b'-').count();
-        let body = &inner[dashes + 1..inner.len() - dashes - 1];
-        let enc = if body.is_ascii() {
-            StrEncoding::Native
-        } else {
-            StrEncoding::Utf8
-        };
-        return Ok((body.as_bytes().into(), enc));
-    }
-    let inner = &raw_token[1..raw_token.len() - 1];
-    decode_escaped(inner, span)
-}
-
-fn decode_escaped(inner: &str, span: Span) -> Result<(Box<[u8]>, StrEncoding), ParseError> {
-    let mut out = Vec::with_capacity(inner.len());
-    let mut has_unicode_escape = false;
-    let mut has_high_hex = false;
-    let bytes = inner.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] != b'\\' {
-            out.push(bytes[i]);
-            i += 1;
-            continue;
-        }
-        i += 1;
-        if i >= bytes.len() {
             return Err(ParseError {
-                message: String::from("unterminated escape sequence"),
-                span,
+                message: String::from("The pipe operator requires a function call as RHS"),
+                span: rhs_span,
             });
         }
-        match bytes[i] {
-            b'n' => {
-                out.push(b'\n');
-                i += 1;
+        let Node::Call { func, args } = self.ast.node(rhs).clone() else {
+            return Err(ParseError {
+                message: String::from("function 'function' not supported in RHS call of a pipe"),
+                span: rhs_span,
+            });
+        };
+        let pending = &self.placeholders[placeholder_start..];
+        let func_span = self.ast.span(func);
+        if pending.iter().any(|&id| {
+            let placeholder = self.ast.span(id);
+            func_span.lo <= placeholder.lo && placeholder.hi <= func_span.hi
+        }) {
+            return Err(ParseError {
+                message: String::from("pipe placeholder cannot be used in the RHS function"),
+                span: func_span,
+            });
+        }
+        if pending.len() > 1 {
+            return Err(ParseError {
+                message: String::from("pipe placeholder may only appear once"),
+                span: self.ast.span(pending[1]),
+            });
+        }
+
+        let mut arguments = self.ast.args(args).to_vec();
+        if let Some(&placeholder) = pending.first() {
+            if self.replace_extraction_root(rhs, lhs, placeholder) {
+                self.ast.set_span(rhs, span);
+                self.placeholders.truncate(placeholder_start);
+                return Ok(rhs);
             }
-            b'r' => {
-                out.push(b'\r');
-                i += 1;
-            }
-            b't' => {
-                out.push(b'\t');
-                i += 1;
-            }
-            b'b' => {
-                out.push(0x08);
-                i += 1;
-            }
-            b'a' => {
-                out.push(0x07);
-                i += 1;
-            }
-            b'f' => {
-                out.push(0x0C);
-                i += 1;
-            }
-            b'v' => {
-                out.push(0x0B);
-                i += 1;
-            }
-            b'\\' => {
-                out.push(b'\\');
-                i += 1;
-            }
-            b'"' => {
-                out.push(b'"');
-                i += 1;
-            }
-            b'\'' => {
-                out.push(b'\'');
-                i += 1;
-            }
-            b'`' => {
-                out.push(b'`');
-                i += 1;
-            }
-            b' ' => {
-                out.push(b' ');
-                i += 1;
-            }
-            b'x' => {
-                i += 1;
-                let mut val = 0u8;
-                let mut count = 0;
-                while count < 2 && i < bytes.len() {
-                    if let Some(d) = hex_digit(bytes[i]) {
-                        val = val * 16 + d;
-                        i += 1;
-                        count += 1;
-                    } else {
-                        break;
-                    }
-                }
-                if count == 0 {
-                    return Err(ParseError {
-                        message: String::from("\\x used without hex digits"),
-                        span,
-                    });
-                }
-                if val == 0 {
-                    return Err(ParseError {
-                        message: String::from("nul character not allowed"),
-                        span,
-                    });
-                }
-                if val >= 0x80 {
-                    has_high_hex = true;
-                }
-                out.push(val);
-            }
-            b'u' | b'U' => {
-                let max_digits = if bytes[i] == b'u' { 4 } else { 8 };
-                i += 1;
-                let braced = i < bytes.len() && bytes[i] == b'{';
-                if braced {
-                    i += 1;
-                }
-                let mut cp = 0u32;
-                let mut count = 0;
-                while count < max_digits && i < bytes.len() {
-                    if let Some(d) = hex_digit(bytes[i]) {
-                        cp = cp * 16 + u32::from(d);
-                        i += 1;
-                        count += 1;
-                    } else {
-                        break;
-                    }
-                }
-                if braced {
-                    if i >= bytes.len() || bytes[i] != b'}' {
-                        return Err(ParseError {
-                            message: String::from("unterminated unicode escape"),
-                            span,
-                        });
-                    }
-                    i += 1;
-                }
-                if count == 0 || cp == 0 {
-                    return Err(ParseError {
-                        message: String::from("invalid unicode escape"),
-                        span,
-                    });
-                }
-                let ch = char::from_u32(cp).ok_or_else(|| ParseError {
-                    message: String::from("invalid unicode scalar value"),
-                    span,
-                })?;
-                let mut buf = [0u8; 4];
-                out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
-                has_unicode_escape = true;
-            }
-            b'0'..=b'7' => {
-                let mut val = 0u32;
-                let mut count = 0;
-                while count < 3 && i < bytes.len() && (b'0'..=b'7').contains(&bytes[i]) {
-                    val = val * 8 + u32::from(bytes[i] - b'0');
-                    i += 1;
-                    count += 1;
-                }
-                if val == 0 {
-                    return Err(ParseError {
-                        message: String::from("nul character not allowed"),
-                        span,
-                    });
-                }
-                if val >= 0x80 {
-                    has_high_hex = true;
-                }
-                out.push((val & 0xFF) as u8);
-            }
-            other => {
+            let Some(arg) = arguments
+                .iter_mut()
+                .find(|arg| arg.value == Some(placeholder))
+            else {
+                return Err(self.invalid_placeholder(placeholder));
+            };
+            if arg.name.is_none() {
                 return Err(ParseError {
-                    message: format!("'\\{}' is an unrecognized escape", other as char),
-                    span,
+                    message: String::from("pipe placeholder may only be used as a named argument"),
+                    span: arg.span,
                 });
             }
+            arg.value = Some(lhs);
+            self.placeholders.truncate(placeholder_start);
+        } else {
+            if let Node::Sym(name) = self.ast.node(func)
+                && pipe_forbids_insertion(name)
+            {
+                return Err(ParseError {
+                    message: format!("function '{name}' not supported in RHS call of a pipe"),
+                    span: rhs_span,
+                });
+            }
+            arguments.insert(
+                0,
+                Arg {
+                    name: None,
+                    value: Some(lhs),
+                    span: self.ast.span(lhs),
+                },
+            );
         }
+        let args = self.ast.push_args(arguments);
+        Ok(self.ast.push_node(Node::Call { func, args }, span))
     }
-    if has_unicode_escape && has_high_hex {
-        return Err(ParseError {
-            message: String::from(
-                "mixing Unicode and octal/hex escapes in a string is not allowed",
-            ),
-            span,
-        });
+
+    fn replace_extraction_root(&mut self, rhs: NodeId, lhs: NodeId, placeholder: NodeId) -> bool {
+        let mut node = rhs;
+        let mut chain = Vec::new();
+        while let Node::Call { func, args } = self.ast.node(node) {
+            if !matches!(self.ast.node(*func), Node::Sym(name) if matches!(name.as_ref(), "$" | "@" | "[" | "[["))
+            {
+                break;
+            }
+            let Some(target) = self
+                .ast
+                .args(args.clone())
+                .first()
+                .and_then(|arg| arg.value)
+            else {
+                break;
+            };
+            chain.push(node);
+            if target == placeholder {
+                self.ast.replace_arg(args.start, lhs);
+                let lhs_span = self.ast.span(lhs);
+                for extraction in chain {
+                    self.ast
+                        .set_span(extraction, lhs_span.merge(self.ast.span(extraction)));
+                }
+                return true;
+            }
+            node = target;
+        }
+        false
     }
-    let enc = if has_high_hex {
-        StrEncoding::Bytes
-    } else if has_unicode_escape || !out.is_ascii() {
-        StrEncoding::Utf8
-    } else {
-        StrEncoding::Native
-    };
-    Ok((out.into_boxed_slice(), enc))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+fn pipe_forbids_insertion(name: &str) -> bool {
+    matches!(
+        name,
+        "if" | "while"
+            | "for"
+            | "repeat"
+            | "function"
+            | "break"
+            | "next"
+            | "return"
+            | "{"
+            | "("
+            | "["
+            | "[["
+            | "$"
+            | "@"
+            | "::"
+            | ":::"
+            | "+"
+            | "-"
+            | "*"
+            | "/"
+            | "^"
+            | ":"
+            | "~"
+            | "?"
+            | "!"
+            | "&"
+            | "&&"
+            | "|"
+            | "||"
+            | "<"
+            | "<="
+            | ">"
+            | ">="
+            | "=="
+            | "!="
+            | "<-"
+            | "<<-"
+            | "="
+            | "|>"
+            | "%%"
+            | "%/%"
+            | "%*%"
+    )
+}
 
-    #[test]
-    fn parses_unary_minus_and_right_assoc_pow() {
-        let mut p = Parser::new("-2 ^ 3 ^ 2", SrcFileId(0));
-        let exprs = p.parse_all().unwrap();
-        assert_eq!(exprs.len(), 1);
-        let ast = p.into_ast();
-        // Top-level node must be unary `-` applied to `2 ^ (3 ^ 2)`.
-        let Node::Call { func, args } = ast.node(exprs[0]) else {
-            panic!("expected call");
+fn collect_line_directives(src: &str, tokens: &[Token]) -> Vec<LineDirective> {
+    let mut directives = Vec::new();
+    let mut physical_line = 1u32;
+    let mut previous = 0;
+    for token in tokens.iter().filter(|token| token.kind == TokKind::Comment) {
+        let lo = token.span.lo as usize;
+        let hi = token.span.hi as usize;
+        if lo != 0 && src.as_bytes()[lo - 1] != b'\n' {
+            continue;
+        }
+        let Some(text) = src[lo..hi].strip_prefix("#line") else {
+            continue;
         };
-        assert!(matches!(ast.node(*func), Node::Sym(s) if s.as_ref() == "-"));
-        assert_eq!(ast.args(args.clone()).len(), 1);
+        let text = text.trim_start_matches([' ', '\t']);
+        let digits = text.bytes().take_while(u8::is_ascii_digit).count();
+        let Ok(logical_line) = text[..digits].parse::<u32>() else {
+            continue;
+        };
+        let physical_lines = src.as_bytes()[previous..lo]
+            .iter()
+            .filter(|&&b| b == b'\n')
+            .count();
+        physical_line += physical_lines as u32;
+        previous = lo;
+        let filename =
+            directive_filename(text[digits..].trim_start_matches([' ', '\t']), token.span);
+        directives.push(LineDirective {
+            physical_line,
+            logical_line,
+            filename,
+        });
     }
+    directives
+}
 
-    #[test]
-    fn parses_raw_strings_and_pipe() {
-        let mut p = Parser::new(r#"R"--[a\nb]--" |> f(y = _)"#, SrcFileId(0));
-        let exprs = p.parse_all().unwrap();
-        assert_eq!(exprs.len(), 1);
+fn directive_filename(text: &str, span: Span) -> Option<String> {
+    if !text.starts_with('"') {
+        return None;
     }
+    let token = Lexer::new(text, span.file).next_token().ok()?;
+    let (bytes, _) = decode_string(&text[..token.span.hi as usize], false, span).ok()?;
+    String::from_utf8(bytes.into_vec()).ok()
 }
