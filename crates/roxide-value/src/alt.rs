@@ -4,11 +4,11 @@ use std::collections::HashMap;
 use std::fmt;
 use std::rc::Rc;
 
-use roxide_gc::{SexpId, Trace, Tracer};
+use roxide_gc::{HeapError, SexpId, Trace, Tracer};
 
-use crate::api::ValueError;
-use crate::na::{Elem, RComplex, RLogical};
-use crate::object::{CharId, RVec, SexpType};
+use crate::api::{ValueApi, ValueError};
+use crate::na::{Elem, NA_INTEGER, RComplex, RLogical};
+use crate::object::{Body, CharId, RObject, RVec, SexpType};
 use crate::session::{RHeap, RSession};
 
 /// Known sortedness metadata exposed by ALTREP vectors.
@@ -89,11 +89,20 @@ pub trait AltVector<T: Elem>: AltClass {
     /// Materialize the full vector into an owned boxed slice.
     fn materialize(&self, heap: &RHeap) -> Result<Box<[T]>, ValueError> {
         let len = self.length(heap);
-        let mut out = Vec::with_capacity(len);
+        let mut out = Vec::new();
+        out.try_reserve_exact(len)
+            .map_err(|_| HeapError::OutOfMemory {
+                requested: len.saturating_mul(size_of::<T>()),
+            })?;
         for i in 0..len {
             out.push(self.elt(heap, i));
         }
         Ok(out.into_boxed_slice())
+    }
+
+    /// Return the endpoints of a known unit-step sequence with at least two elements.
+    fn unit_sequence_bounds(&self, _heap: &RHeap) -> Option<(T, T)> {
+        None
     }
 
     /// Known sortedness metadata.
@@ -155,7 +164,16 @@ impl AltClass for CompactIntSeq {
 impl AltVector<i32> for CompactIntSeq {
     #[inline]
     fn elt(&self, _heap: &RHeap, i: usize) -> i32 {
-        (i64::from(self.start) + (i as i64) * i64::from(self.incr)) as i32
+        let value = i128::from(self.start) + (i as i128) * i128::from(self.incr);
+        i32::try_from(value).unwrap_or(NA_INTEGER)
+    }
+
+    fn unit_sequence_bounds(&self, heap: &RHeap) -> Option<(i32, i32)> {
+        if self.len < 2 || !matches!(self.incr, -1 | 1) {
+            return None;
+        }
+        let last = self.elt(heap, self.len - 1);
+        (self.start != NA_INTEGER && last != NA_INTEGER).then_some((self.start, last))
     }
 
     fn is_sorted(&self, _heap: &RHeap) -> Sortedness {
@@ -203,7 +221,11 @@ impl AltClass for CompactRealSeq {
 impl AltVector<f64> for CompactRealSeq {
     #[inline]
     fn elt(&self, _heap: &RHeap, i: usize) -> f64 {
-        self.start + (i as f64) * self.incr
+        if i == 0 {
+            self.start
+        } else {
+            self.start + (i as f64) * self.incr
+        }
     }
 
     fn is_sorted(&self, _heap: &RHeap) -> Sortedness {
@@ -233,7 +255,7 @@ pub(crate) enum AltKind {
 
 /// Materialized backing storage for an [`AltObj`].
 #[allow(dead_code)]
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) enum AltMaterialized {
     Lgl(RVec<RLogical>),
     Int(RVec<i32>),
@@ -244,7 +266,7 @@ pub(crate) enum AltMaterialized {
 }
 
 /// Heap body for an ALTREP vector.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct AltObj {
     pub(crate) kind: AltKind,
     pub(crate) materialized: Option<AltMaterialized>,
@@ -291,6 +313,18 @@ impl AltObj {
             AltKind::Cplx(c) => c.length(heap),
             AltKind::Raw(c) => c.length(heap),
             AltKind::Str(c) => c.length(heap),
+        }
+    }
+
+    pub(crate) fn buffer_bytes(&self) -> usize {
+        match &self.materialized {
+            Some(AltMaterialized::Lgl(v)) => std::mem::size_of_val(&*v.buf),
+            Some(AltMaterialized::Int(v)) => std::mem::size_of_val(&*v.buf),
+            Some(AltMaterialized::Real(v)) => std::mem::size_of_val(&*v.buf),
+            Some(AltMaterialized::Cplx(v)) => std::mem::size_of_val(&*v.buf),
+            Some(AltMaterialized::Raw(v)) => v.buf.len(),
+            Some(AltMaterialized::Str(v)) => std::mem::size_of_val(&*v.buf),
+            None => 0,
         }
     }
 
@@ -344,5 +378,256 @@ impl AltRegistry {
         self.entries
             .get(&(class.to_owned(), package.to_owned()))
             .copied()
+    }
+}
+
+/// ALTREP metadata wrapper for an atomic vector.
+#[derive(Clone, Debug)]
+pub struct AltWrapper {
+    target: SexpId,
+    len: usize,
+}
+
+impl AltWrapper {
+    /// Get the handle of the wrapped vector.
+    #[must_use]
+    pub const fn target(&self) -> SexpId {
+        self.target
+    }
+
+    /// Allocate a wrapper for an atomic vector.
+    pub fn alloc(session: &mut RSession, target: SexpId) -> Result<SexpId, ValueError> {
+        let wrapper = Rc::new(Self {
+            target,
+            len: session.xlength(target)?,
+        });
+        let (kind, materialized) = match session.type_of(target)? {
+            SexpType::Lgl => (AltKind::Lgl(wrapper), None),
+            SexpType::Int => (AltKind::Int(wrapper), None),
+            SexpType::Real => (AltKind::Real(wrapper), None),
+            SexpType::Cplx => (AltKind::Cplx(wrapper), None),
+            SexpType::Raw => (AltKind::Raw(wrapper), None),
+            SexpType::Str => {
+                let data = RVec::from_vec(session.str_slice(target)?.to_vec());
+                (AltKind::Str(wrapper), Some(AltMaterialized::Str(data)))
+            }
+            actual => {
+                return Err(ValueError::TypeMismatch {
+                    expected: "atomic vector",
+                    actual: actual.type_name(false),
+                });
+            }
+        };
+        let id = session.alloc_alt(kind, materialized)?;
+        session.heap.inc_ref(target);
+        Ok(id)
+    }
+}
+
+impl Trace for AltWrapper {
+    fn trace(&self, t: &mut Tracer<'_>) {
+        t.edge(self.target);
+    }
+}
+
+impl AltClass for AltWrapper {
+    fn class_name(&self) -> &'static str {
+        "wrap"
+    }
+
+    fn package_name(&self) -> &'static str {
+        "base"
+    }
+
+    fn length(&self, _heap: &RHeap) -> usize {
+        self.len
+    }
+
+    fn wrapped_target(&self) -> Option<SexpId> {
+        Some(self.target)
+    }
+}
+
+impl AltString for AltWrapper {
+    fn elt(&self, session: &mut RSession, i: usize) -> Result<CharId, ValueError> {
+        let values = session.str_slice(self.target)?;
+        values.get(i).copied().ok_or(ValueError::IndexOutOfBounds {
+            index: i,
+            len: values.len(),
+        })
+    }
+
+    fn set_elt(&self, _session: &mut RSession, _i: usize, _val: CharId) -> Result<(), ValueError> {
+        Err(ValueError::Shared(self.target))
+    }
+}
+
+macro_rules! atomic_dataptr {
+    ($ty:ty, $default:expr, $variant:ident, $prepare:ident, $read:ident, $write:ident) => {
+        impl AltVector<$ty> for AltWrapper {
+            fn elt(&self, heap: &RHeap, i: usize) -> $ty {
+                let mut target = self.target;
+                while let Ok(obj) = heap.get(target) {
+                    match &obj.body {
+                        Body::$variant(v) => {
+                            return v.as_slice().get(i).copied().unwrap_or($default);
+                        }
+                        Body::Alt(alt) => match (&alt.materialized, &alt.kind) {
+                            (Some(AltMaterialized::$variant(v)), _) => {
+                                return v.as_slice().get(i).copied().unwrap_or($default);
+                            }
+                            (None, AltKind::$variant(class)) => {
+                                if let Some(inner) = class.wrapped_target() {
+                                    target = inner;
+                                } else {
+                                    return class.elt(heap, i);
+                                }
+                            }
+                            _ => break,
+                        },
+                        _ => break,
+                    }
+                }
+                $default
+            }
+        }
+
+        impl RSession {
+            fn $prepare(&mut self, x: SexpId) -> Result<&mut RVec<$ty>, ValueError> {
+                let obj = self.heap.get(x)?;
+                let mismatch = ValueError::TypeMismatch {
+                    expected: <$ty as Elem>::TYPE.type_name(false),
+                    actual: obj.sexp_type().type_name(obj.flags.s4),
+                };
+                if let Body::Alt(alt) = &obj.body
+                    && alt.materialized.is_none()
+                {
+                    let AltKind::$variant(class) = &alt.kind else {
+                        return Err(mismatch);
+                    };
+                    // A wrapper gets its own buffer before either pointer access.
+                    let buf = class.materialize(&self.heap)?;
+                    let len = buf.len();
+                    if let Body::Alt(alt) = &mut self.heap.get_mut(x)?.body {
+                        alt.materialized = Some(AltMaterialized::$variant(RVec { buf, len }));
+                    }
+                    self.heap.update_size(x)?;
+                }
+                match &mut self.heap.get_mut(x)?.body {
+                    Body::$variant(v) => Ok(v),
+                    Body::Alt(alt) => match &mut alt.materialized {
+                        Some(AltMaterialized::$variant(v)) => Ok(v),
+                        _ => Err(mismatch),
+                    },
+                    _ => Err(mismatch),
+                }
+            }
+
+            /// Get a contiguous read-only slice. Materialize a private buffer for ALTREP.
+            pub fn $read(&mut self, x: SexpId) -> Result<&[$ty], ValueError> {
+                Ok(self.$prepare(x)?.as_slice())
+            }
+
+            /// Get a contiguous writable slice from an unshared vector.
+            pub fn $write(&mut self, x: SexpId) -> Result<&mut [$ty], ValueError> {
+                if self.heap.maybe_shared(x) {
+                    return Err(ValueError::Shared(x));
+                }
+                Ok(self.$prepare(x)?.as_mut_slice())
+            }
+        }
+    };
+}
+
+atomic_dataptr!(
+    RLogical,
+    RLogical::NA,
+    Lgl,
+    prepare_lgl,
+    lgl_dataptr_ro,
+    lgl_dataptr_mut
+);
+atomic_dataptr!(
+    i32,
+    NA_INTEGER,
+    Int,
+    prepare_int,
+    int_dataptr_ro,
+    int_dataptr_mut
+);
+atomic_dataptr!(
+    f64,
+    crate::na::NA_REAL,
+    Real,
+    prepare_real,
+    real_dataptr_ro,
+    real_dataptr_mut
+);
+atomic_dataptr!(
+    RComplex,
+    RComplex::NA,
+    Cplx,
+    prepare_cplx,
+    cplx_dataptr_ro,
+    cplx_dataptr_mut
+);
+atomic_dataptr!(u8, 0, Raw, prepare_raw, raw_dataptr_ro, raw_dataptr_mut);
+
+impl RSession {
+    /// Allocate an ALTREP wrapper for an atomic vector.
+    pub fn alloc_alt_wrapper(&mut self, target: SexpId) -> Result<SexpId, ValueError> {
+        AltWrapper::alloc(self, target)
+    }
+
+    /// Allocate a compact integer sequence with a step of 1 or -1.
+    pub fn alloc_compact_intseq(
+        &mut self,
+        start: i32,
+        len: usize,
+        incr: i8,
+    ) -> Result<SexpId, ValueError> {
+        let end = i128::from(start) + (len.saturating_sub(1) as i128) * i128::from(incr);
+        if !matches!(incr, 1 | -1)
+            || (len > 0
+                && (start == NA_INTEGER
+                    || !(-i128::from(i32::MAX)..=i128::from(i32::MAX)).contains(&end)))
+        {
+            return Err(ValueError::InvalidAttribute(
+                "invalid compact integer sequence".into(),
+            ));
+        }
+        self.alloc_alt(
+            AltKind::Int(Rc::new(CompactIntSeq { start, len, incr })),
+            None,
+        )
+    }
+
+    /// Allocate a compact double sequence with a finite start and a step of 1 or -1.
+    pub fn alloc_compact_realseq(
+        &mut self,
+        start: f64,
+        len: usize,
+        incr: f64,
+    ) -> Result<SexpId, ValueError> {
+        if !start.is_finite() || incr.abs() != 1.0 {
+            return Err(ValueError::InvalidAttribute(
+                "invalid compact double sequence".into(),
+            ));
+        }
+        self.alloc_alt(
+            AltKind::Real(Rc::new(CompactRealSeq { start, len, incr })),
+            None,
+        )
+    }
+
+    fn alloc_alt(
+        &mut self,
+        kind: AltKind,
+        materialized: Option<AltMaterialized>,
+    ) -> Result<SexpId, ValueError> {
+        Ok(self.heap.alloc(RObject::new(Body::Alt(Box::new(AltObj {
+            kind,
+            materialized,
+        }))))?)
     }
 }

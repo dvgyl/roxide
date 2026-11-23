@@ -534,7 +534,7 @@ impl HeapSize for RObject {
             Body::Raw(v) => v.buf.len(),
             Body::Vec(v) | Body::Expr(v) => std::mem::size_of_val(&*v.buf),
             Body::Env(e) => e.entries.len() * 48 + 64,
-            Body::Alt(_) => 128,
+            Body::Alt(alt) => 128 + alt.buffer_bytes(),
             _ => 0,
         };
         base + attr_bytes + body_bytes

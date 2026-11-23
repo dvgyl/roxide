@@ -138,7 +138,12 @@ impl RSession {
 
     /// Look up the print name of a [`Sym`].
     pub fn sym_name(&self, sym: Sym) -> Result<&str, ValueError> {
-        let obj = self.heap.get(sym.as_sexp())?;
+        self.sym_name_of(sym.as_sexp())
+    }
+
+    /// Get the print name of a symbol directly from its handle.
+    pub fn sym_name_of(&self, id: SexpId) -> Result<&str, ValueError> {
+        let obj = self.heap.get(id)?;
         let Body::Sym { name } = obj.body else {
             return Err(ValueError::TypeMismatch {
                 expected: "symbol",

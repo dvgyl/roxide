@@ -4,8 +4,8 @@ use std::fmt;
 
 use roxide_gc::{HeapError, SexpId};
 
-use crate::alt::{AltKind, AltMaterialized, AltObj, AltVector};
-use crate::na::{Elem, NA_INTEGER, NA_REAL, RComplex, RLogical};
+use crate::alt::{AltKind, AltMaterialized, AltVector};
+use crate::na::{Elem, RComplex, RLogical};
 use crate::object::{
     Attrs, Binding, Body, CharId, Cons, EnvData, PrimId, PromiseState, RObject, RVec, SexpType, Sym,
 };
@@ -131,7 +131,7 @@ impl<'h, T: Elem> VecView<'h, T> {
     }
 
     /// Iterate over all elements.
-    pub fn iter(&self) -> impl Iterator<Item = T> + '_ {
+    pub fn iter(&self) -> impl Iterator<Item = T> + Clone + '_ {
         (0..self.len()).map(|i| self.get(i))
     }
 
@@ -486,215 +486,22 @@ impl ValueApi for RSession {
     }
 
     fn real_mut(&mut self, x: SexpId) -> Result<&mut [f64], ValueError> {
-        if self.heap.maybe_shared(x) {
-            return Err(ValueError::Shared(x));
-        }
-        // Materialize ALTREP if needed (with R 4.6.2 wrapper duplication check).
-        let needs_mat = matches!(
-            &self.heap.get(x)?.body,
-            Body::Alt(alt) if alt.materialized.is_none()
-        );
-        if needs_mat {
-            let data = {
-                let obj = self.heap.get(x)?;
-                let Body::Alt(alt) = &obj.body else {
-                    unreachable!();
-                };
-                let AltKind::Real(ref c) = alt.kind else {
-                    return Err(ValueError::TypeMismatch {
-                        expected: "double",
-                        actual: obj.sexp_type().type_name(obj.flags.s4),
-                    });
-                };
-                c.materialize(&self.heap)?
-            };
-            let len = data.len();
-            if let Body::Alt(alt) = &mut self.heap.get_mut(x)?.body {
-                alt.materialized = Some(AltMaterialized::Real(RVec { buf: data, len }));
-            }
-            self.heap.update_size(x)?;
-        }
-        let obj = self.heap.get_mut(x)?;
-        let ty = obj.sexp_type().type_name(obj.flags.s4);
-        match &mut obj.body {
-            Body::Real(v) => Ok(v.as_mut_slice()),
-            Body::Alt(alt) => match &mut alt.materialized {
-                Some(AltMaterialized::Real(v)) => Ok(v.as_mut_slice()),
-                _ => Err(ValueError::TypeMismatch {
-                    expected: "double",
-                    actual: ty,
-                }),
-            },
-            _ => Err(ValueError::TypeMismatch {
-                expected: "double",
-                actual: ty,
-            }),
-        }
+        self.real_dataptr_mut(x)
     }
 
     fn int_mut(&mut self, x: SexpId) -> Result<&mut [i32], ValueError> {
-        if self.heap.maybe_shared(x) {
-            return Err(ValueError::Shared(x));
-        }
-        let needs_mat = matches!(
-            &self.heap.get(x)?.body,
-            Body::Alt(alt) if alt.materialized.is_none()
-        );
-        if needs_mat {
-            let data = {
-                let obj = self.heap.get(x)?;
-                let Body::Alt(alt) = &obj.body else {
-                    unreachable!();
-                };
-                let AltKind::Int(ref c) = alt.kind else {
-                    return Err(ValueError::TypeMismatch {
-                        expected: "integer",
-                        actual: obj.sexp_type().type_name(obj.flags.s4),
-                    });
-                };
-                c.materialize(&self.heap)?
-            };
-            let len = data.len();
-            if let Body::Alt(alt) = &mut self.heap.get_mut(x)?.body {
-                alt.materialized = Some(AltMaterialized::Int(RVec { buf: data, len }));
-            }
-            self.heap.update_size(x)?;
-        }
-        let obj = self.heap.get_mut(x)?;
-        let ty = obj.sexp_type().type_name(obj.flags.s4);
-        match &mut obj.body {
-            Body::Int(v) => Ok(v.as_mut_slice()),
-            Body::Alt(alt) => match &mut alt.materialized {
-                Some(AltMaterialized::Int(v)) => Ok(v.as_mut_slice()),
-                _ => Err(ValueError::TypeMismatch {
-                    expected: "integer",
-                    actual: ty,
-                }),
-            },
-            _ => Err(ValueError::TypeMismatch {
-                expected: "integer",
-                actual: ty,
-            }),
-        }
+        self.int_dataptr_mut(x)
     }
 
     fn lgl_mut(&mut self, x: SexpId) -> Result<&mut [RLogical], ValueError> {
-        if self.heap.maybe_shared(x) {
-            return Err(ValueError::Shared(x));
-        }
-        let obj = self.heap.get_mut(x)?;
-        let ty = obj.sexp_type().type_name(obj.flags.s4);
-        match &mut obj.body {
-            Body::Lgl(v) => Ok(v.as_mut_slice()),
-            _ => Err(ValueError::TypeMismatch {
-                expected: "logical",
-                actual: ty,
-            }),
-        }
+        self.lgl_dataptr_mut(x)
     }
 
     fn unshare(&mut self, x: SexpId) -> Result<SexpId, ValueError> {
-        let wrapper_shared = match &self.heap.get(x)?.body {
-            Body::Alt(alt) => alt
-                .wrapped_target()
-                .is_some_and(|t| self.heap.maybe_shared(t)),
-            _ => false,
-        };
-        if !self.heap.maybe_shared(x) && !wrapper_shared {
-            return Ok(x);
+        if self.heap.maybe_shared(x) {
+            return self.shallow_duplicate(x);
         }
-        let (gp, flags, attrs_clone, cloned_body, child_refs) = {
-            let obj = self.heap.get(x)?;
-            let attrs_clone = obj.attrs.clone();
-            let mut child_refs: Vec<SexpId> = attrs_clone.iter().map(|(_, v)| v).collect();
-            let body = match &obj.body {
-                Body::Nil
-                | Body::Env(_)
-                | Body::Sym { .. }
-                | Body::Builtin(_)
-                | Body::Special(_) => {
-                    return Ok(x);
-                }
-                Body::Lgl(v) => Body::Lgl(v.clone()),
-                Body::Int(v) => Body::Int(v.clone()),
-                Body::Real(v) => Body::Real(v.clone()),
-                Body::Cplx(v) => Body::Cplx(v.clone()),
-                Body::Str(v) => Body::Str(v.clone()),
-                Body::Raw(v) => Body::Raw(v.clone()),
-                Body::Vec(v) => {
-                    child_refs.extend_from_slice(v.as_slice());
-                    Body::Vec(v.clone())
-                }
-                Body::Expr(v) => {
-                    child_refs.extend_from_slice(v.as_slice());
-                    Body::Expr(v.clone())
-                }
-                Body::Alt(alt) => match &alt.kind {
-                    AltKind::Int(c) => {
-                        let buf = c.materialize(&self.heap)?;
-                        let len = buf.len();
-                        Body::Int(RVec { buf, len })
-                    }
-                    AltKind::Real(c) => {
-                        let buf = c.materialize(&self.heap)?;
-                        let len = buf.len();
-                        Body::Real(RVec { buf, len })
-                    }
-                    AltKind::Lgl(c) => {
-                        let buf = c.materialize(&self.heap)?;
-                        let len = buf.len();
-                        Body::Lgl(RVec { buf, len })
-                    }
-                    AltKind::Cplx(c) => {
-                        let buf = c.materialize(&self.heap)?;
-                        let len = buf.len();
-                        Body::Cplx(RVec { buf, len })
-                    }
-                    AltKind::Raw(c) => {
-                        let buf = c.materialize(&self.heap)?;
-                        let len = buf.len();
-                        Body::Raw(RVec { buf, len })
-                    }
-                    AltKind::Str(_) => match &alt.materialized {
-                        Some(AltMaterialized::Str(v)) => Body::Str(v.clone()),
-                        _ => Body::Alt(Box::new(AltObj {
-                            kind: alt.kind.clone(),
-                            materialized: None,
-                        })),
-                    },
-                },
-                Body::List(c) => {
-                    child_refs.push(c.car);
-                    child_refs.push(c.cdr);
-                    child_refs.push(c.tag);
-                    Body::List(*c)
-                }
-                Body::Lang(c) => {
-                    child_refs.push(c.car);
-                    child_refs.push(c.cdr);
-                    child_refs.push(c.tag);
-                    Body::Lang(*c)
-                }
-                Body::Dots(c) => {
-                    child_refs.push(c.car);
-                    child_refs.push(c.cdr);
-                    child_refs.push(c.tag);
-                    Body::Dots(*c)
-                }
-                _ => return Ok(x),
-            };
-            (obj.gp, obj.flags, attrs_clone, body, child_refs)
-        };
-        for child in child_refs {
-            self.heap.inc_ref(child);
-        }
-        let dup = self.heap.alloc(RObject {
-            gp,
-            flags,
-            attrs: attrs_clone,
-            body: cloned_body,
-        })?;
-        Ok(dup)
+        Ok(x)
     }
 
     fn alloc_lgl_from(&mut self, vals: &[RLogical]) -> Result<SexpId, ValueError> {
@@ -734,9 +541,16 @@ impl ValueApi for RSession {
     }
 
     fn alloc_list(&mut self, n: usize) -> Result<SexpId, ValueError> {
+        let mut values = Vec::new();
+        values
+            .try_reserve_exact(n)
+            .map_err(|_| HeapError::OutOfMemory {
+                requested: n.saturating_mul(size_of::<SexpId>()),
+            })?;
+        values.resize(n, SEXP_NIL);
         Ok(self
             .heap
-            .alloc(RObject::new(Body::Vec(RVec::from_vec(vec![SEXP_NIL; n]))))?)
+            .alloc(RObject::new(Body::Vec(RVec::from_vec(values))))?)
     }
 
     fn alloc_expr_from(&mut self, vals: &[SexpId]) -> Result<SexpId, ValueError> {
@@ -1050,7 +864,14 @@ impl ValueApi for RSession {
     }
 
     fn set_attrib(&mut self, x: SexpId, sym: Sym, val: SexpId) -> Result<(), ValueError> {
-        let class_sym = self.intern("class")?;
+        let name = self.sym_name(sym)?;
+        let is_class = name == "class";
+        let val = if name == "names" && val != SEXP_NIL {
+            self.normalize_names(x, val)?
+        } else {
+            self.heap.get(val)?;
+            val
+        };
         let old_val = {
             let obj = self.heap.get_mut(x)?;
             let mut entries: Vec<(Sym, SexpId)> = obj.attrs.iter().collect();
@@ -1065,7 +886,7 @@ impl ValueApi for RSession {
             } else {
                 entries.push((sym, val));
             }
-            if sym == class_sym {
+            if is_class {
                 obj.flags.object = val != SEXP_NIL;
             }
             obj.attrs = if entries.is_empty() {
@@ -1075,6 +896,7 @@ impl ValueApi for RSession {
             };
             old
         };
+        self.heap.update_size(x)?;
         if val != SEXP_NIL {
             self.heap.inc_ref(val);
         }
@@ -1085,54 +907,6 @@ impl ValueApi for RSession {
     }
 
     fn coerce(&mut self, x: SexpId, to: SexpType) -> Result<(SexpId, CoerceWarn), ValueError> {
-        let from = self.type_of(x)?;
-        if from == to {
-            return Ok((x, CoerceWarn::default()));
-        }
-        let warn = CoerceWarn::default();
-        match (from, to) {
-            (SexpType::Lgl, SexpType::Int) => {
-                let vals: Vec<i32> = self
-                    .lgl(x)?
-                    .iter()
-                    .map(|b| match b.get() {
-                        Some(true) => 1,
-                        Some(false) => 0,
-                        None => NA_INTEGER,
-                    })
-                    .collect();
-                Ok((self.alloc_int_from(&vals)?, warn))
-            }
-            (SexpType::Lgl, SexpType::Real) => {
-                let vals: Vec<f64> = self
-                    .lgl(x)?
-                    .iter()
-                    .map(|b| match b.get() {
-                        Some(true) => 1.0,
-                        Some(false) => 0.0,
-                        None => NA_REAL,
-                    })
-                    .collect();
-                Ok((self.alloc_real_from(&vals)?, warn))
-            }
-            (SexpType::Int, SexpType::Real) => {
-                let vals: Vec<f64> = self
-                    .int(x)?
-                    .iter()
-                    .map(|n| {
-                        if n == NA_INTEGER {
-                            NA_REAL
-                        } else {
-                            f64::from(n)
-                        }
-                    })
-                    .collect();
-                Ok((self.alloc_real_from(&vals)?, warn))
-            }
-            _ => Err(ValueError::TypeMismatch {
-                expected: to.type_name(false),
-                actual: from.type_name(false),
-            }),
-        }
+        crate::coerce::coerce(self, x, to)
     }
 }
