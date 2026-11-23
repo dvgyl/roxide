@@ -2,10 +2,14 @@
 
 //! Check I/O behavior against GNU R 4.6.2 on both host implementations.
 
+use std::sync::Mutex;
+
 use roxide_eval::Ctx;
 use roxide_gc::GcPolicy;
 use roxide_host::{Host, Limits, NativeHost, PureHost};
 use roxide_value::GLOBAL_ENV;
+
+static NATIVE_TEST: Mutex<()> = Mutex::new(());
 
 fn run(ctx: &mut Ctx, script: &str) {
     ctx.run_script("<io-os-parity>", script, GLOBAL_ENV, false)
@@ -146,6 +150,9 @@ close(con)
 
 #[test]
 fn native_host_roundtrips_and_limits_decompression() {
+    let _guard = NATIVE_TEST
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     let mut ctx = context(Box::new(NativeHost::with_limits(Limits {
         max_decompress_bytes: 64,
         ..Limits::default()
@@ -168,6 +175,108 @@ fn native_host_roundtrips_and_limits_decompression() {
     stopifnot(identical(message, "input exceeds the byte limit"))
 })()
 stopifnot(identical(system2("printf", c("'%s\n'", "'one two'"), stdout = TRUE), "one two"))
+"#,
+    );
+}
+
+#[test]
+fn connection_errors_preserve_open_state_and_local_environment() {
+    let mut ctx = context(Box::new(PureHost::new()));
+    run(
+        &mut ctx,
+        r#"
+con <- (function() textConnection("saved", "w", local = TRUE))()
+open_in_handler <- FALSE
+message <- tryCatch(
+    withCallingHandlers(readBin(con, "raw"), error = function(e) {
+        open_in_handler <<- isOpen(con)
+    }),
+    error = conditionMessage
+)
+stopifnot(open_in_handler, identical(message, "can only read from a binary connection"))
+"#,
+    );
+    ctx.safepoint();
+    run(
+        &mut ctx,
+        r#"
+writeLines("after error", con)
+stopifnot(identical(textConnectionValue(con), "after error"))
+close(con)
+"#,
+    );
+}
+
+#[test]
+fn rejects_oversized_io_buffers_before_writing() {
+    let _guard = NATIVE_TEST
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let mut ctx = context(Box::new(NativeHost::with_limits(Limits {
+        max_vector_bytes: 256,
+        ..Limits::default()
+    })));
+    run(
+        &mut ctx,
+        r#"
+con <- textConnection("saved", "w")
+large <- "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+message <- tryCatch(writeLines(rep(large, 3L), con), error = conditionMessage)
+stopifnot(identical(message, "I/O result exceeds the vector size limit"))
+open_in_handler <- FALSE
+message <- tryCatch(
+    withCallingHandlers(writeLines("\n\n\n\n\n\n\n\n\n\n\n", con, sep = ""),
+                        error = function(e) open_in_handler <<- isOpen(con)),
+    error = conditionMessage
+)
+stopifnot(identical(message, "I/O result exceeds the vector size limit"))
+stopifnot(open_in_handler, isOpen(con), identical(textConnectionValue(con), character()))
+close(con)
+"#,
+    );
+}
+
+#[test]
+fn connection_capacity_encoding_and_environment_match_gnu_r() {
+    let mut ctx = context(Box::new(PureHost::new()));
+    run(
+        &mut ctx,
+        r#"
+p <- tempfile()
+connections <- rep(list(NULL), 125L)
+for (i in 1:125) connections[[i]] <- file(p)
+message <- tryCatch(file(p), error = conditionMessage)
+stopifnot(identical(message, "all 128 connections are in use"))
+close(connections[[1L]])
+con <- file(p)
+stopifnot(!isOpen(con))
+close(con)
+for (i in 2:125) close(connections[[i]])
+
+x <- rawToChar(as.raw(233L))
+Encoding(x) <- "latin1"
+stopifnot(identical(writeBin(x, raw()), as.raw(c(195L, 169L, 0L))),
+          identical(writeBin(x, raw(), useBytes = TRUE), as.raw(c(233L, 0L))))
+writeLines(x, p)
+stopifnot(identical(readBin(p, "raw", 3L), as.raw(c(195L, 169L, 10L))))
+writeLines(x, p, useBytes = TRUE)
+stopifnot(identical(readBin(p, "raw", 2L), as.raw(c(233L, 10L))))
+for (enc in c("bytes", "UTF-8")) {
+    con <- textConnection(x, encoding = enc)
+    expected <- if (enc == "bytes") as.raw(233L) else as.raw(c(195L, 169L))
+    stopifnot(identical(charToRaw(readLines(con)), expected))
+    close(con)
+}
+
+stopifnot(Sys.setenv("NA" = "literal"))
+stopifnot(identical(Sys.getenv(NA_character_, unset = NA_character_), "literal"))
+stopifnot(Sys.unsetenv(NA_character_))
+stopifnot(identical(Sys.getenv(NA_character_, unset = NA_character_), NA_character_))
+stopifnot(Sys.setenv(WAVE_EXISTING = "before"))
+message <- tryCatch(Sys.setenv(WAVE_EXISTING = "after", WAVE_INVALID = c(1L, 2L)),
+                    error = conditionMessage)
+stopifnot(identical(message, "'names' and 'val' are of different lengths"))
+stopifnot(identical(Sys.getenv("WAVE_EXISTING"), "before"))
 "#,
     );
 }

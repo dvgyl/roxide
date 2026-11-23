@@ -6,8 +6,8 @@ mod files;
 mod read;
 mod write;
 
-use std::fmt;
 use std::path::{Path, PathBuf};
+use std::{fmt, io};
 
 use roxide_eval::{
     ArgEval, Args, Arity, Call, Ctx, Dispatch, EvalResult, Module, PrimDef, PrimFn, PrimKind,
@@ -18,6 +18,8 @@ use roxide_host::Limits;
 use roxide_value::{
     CharId, RLogical, SEXP_MISSING, SEXP_NIL, SEXP_UNBOUND, SexpType, ValueApi, ValueError,
 };
+
+use crate::io_os::connection::{self, Serialization};
 
 use files::Compression;
 
@@ -70,7 +72,7 @@ pub const MODULE: Module = Module {
     prims: &[
         internal("rox_serialize", serialize, 6, Visibility::On),
         internal("rox_unserialize", unserialize, 2, Visibility::On),
-        internal("rox_save_rds", save_rds, 6, Visibility::Off),
+        internal("rox_save_rds", save_rds, 7, Visibility::Off),
         internal("rox_read_rds", read_rds, 2, Visibility::On),
         internal("rox_save", save, 7, Visibility::Off),
         internal("rox_load", load, 3, Visibility::Off),
@@ -81,14 +83,17 @@ serialize <- function(object, connection, ascii = FALSE, xdr = TRUE, version = N
 unserialize <- function(connection, refhook = NULL)
     .Internal(rox_unserialize(connection, refhook))
 saveRDS <- function(object, file = "", ascii = FALSE, version = NULL, compress = TRUE, refhook = NULL)
-    .Internal(rox_save_rds(object, file, ascii, version, compress, refhook))
+    .Internal(rox_save_rds(object, file, ascii, version,
+                          if (inherits(file, "connection")) NULL else compress,
+                          refhook, !missing(compress)))
 readRDS <- function(file, refhook = NULL)
     .Internal(rox_read_rds(file, refhook))
 save <- function(..., list = character(), file = stop("'file' must be specified"),
                  ascii = FALSE, version = NULL, envir = parent.frame(), compress = !ascii,
                  compression_level = NULL, eval.promises = TRUE, precheck = TRUE)
     .Internal(rox_save(substitute(list(...)), list, file, ascii, version, envir,
-                       list(compress, compression_level, eval.promises)))
+                       if (inherits(file, "connection")) list(NULL, NULL, eval.promises)
+                       else list(compress, compression_level, eval.promises)))
 load <- function(file, envir = parent.frame(), verbose = FALSE)
     .Internal(rox_load(file, envir, verbose))
 "#,
@@ -218,16 +223,22 @@ fn serialize(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
             "native binary serialization is unavailable",
         ));
     }
-    if args.get(1) != SEXP_NIL {
-        return Err(ctx.stop(call.err_call(), "serialize() requires a NULL connection"));
-    }
+    let dest = args.get(1);
     let version = version(ctx, call, args.get(4))?;
     let bytes = encode(ctx, call, args.get(0), version, false)?;
-    Ok(ctx.session_mut().alloc_raw_from(&bytes)?)
+    if dest == SEXP_NIL {
+        return Ok(ctx.session_mut().alloc_raw_from(&bytes)?);
+    }
+    connection::write_serialized(ctx, call, dest, Serialization::Stream, &bytes)?;
+    Ok(SEXP_NIL)
 }
 
 fn unserialize(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     validate_hook(ctx, call, args.get(1))?;
+    let source = args.get(0);
+    if connection::is_connection(ctx, source)? {
+        return read_connection(ctx, call, source, Serialization::Stream);
+    }
     let limits = limits(ctx);
     let raw = ctx.session().raw(args.get(0));
     let bytes = match raw.as_ref().ok().and_then(|view| view.as_slice()) {
@@ -246,25 +257,71 @@ fn read_file(ctx: &mut Ctx, call: &Call, path: &Path, workspace: bool) -> EvalRe
     decode(ctx, call, &bytes, workspace)
 }
 
+fn read_connection(
+    ctx: &mut Ctx,
+    call: &Call,
+    source: SexpId,
+    serialization: Serialization,
+) -> EvalResult {
+    let limits = limits(ctx);
+    connection::read_serialized(ctx, call, source, serialization, |session, input| {
+        read::decode_stream(
+            session,
+            input,
+            serialization == Serialization::Workspace,
+            &limits,
+        )
+        .map_err(|error| io::Error::other(error.0))
+    })
+}
+
 fn save_rds(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     validate_format(ctx, call, args.get(2), args.get(5))?;
-    let path = path(ctx, call, args.get(1))?;
+    let dest = args.get(1);
     let version = version(ctx, call, args.get(3))?;
-    let compress = compression(ctx, call, args.get(4))?;
-    let bytes = encode(ctx, call, args.get(0), version, false)?;
-    let result = files::write(ctx.host(), &path, &bytes, compress, None);
-    checked(ctx, call, result)?;
+    if connection::is_connection(ctx, dest)? {
+        if flag(ctx, call, args.get(6))? {
+            ctx.warn(
+                call.err_call(),
+                "'compress' is ignored unless 'file' is a file name",
+            );
+        }
+        let bytes = encode(ctx, call, args.get(0), version, false)?;
+        connection::write_serialized(ctx, call, dest, Serialization::Rds, &bytes)?;
+    } else {
+        let path = path(ctx, call, dest)?;
+        let compress = compression(ctx, call, args.get(4))?;
+        let bytes = encode(ctx, call, args.get(0), version, false)?;
+        let result = files::write(ctx.host(), &path, &bytes, compress, None);
+        checked(ctx, call, result)?;
+    }
     Ok(SEXP_NIL)
 }
 
 fn read_rds(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     validate_hook(ctx, call, args.get(1))?;
-    let path = path(ctx, call, args.get(0))?;
+    let source = args.get(0);
+    if connection::is_connection(ctx, source)? {
+        return read_connection(ctx, call, source, Serialization::Rds);
+    }
+    let path = path(ctx, call, source)?;
     read_file(ctx, call, &path, false)
 }
 
+fn compression_level(ctx: &mut Ctx, call: &Call, level: SexpId) -> EvalResult<Option<u32>> {
+    if level == SEXP_NIL {
+        return Ok(None);
+    }
+    let (x, _) = ctx.session_mut().coerce(level, SexpType::Int)?;
+    let view = ctx.session().int(x)?;
+    match (view.len() == 1).then(|| view.get(0)) {
+        Some(n @ 0..=9) => Ok(Some(n as u32)),
+        _ => Err(ctx.stop(call.err_call(), "invalid compression level")),
+    }
+}
+
 fn save(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
-    let path = path(ctx, call, args.get(2))?;
+    let dest = args.get(2);
     validate_format(ctx, call, args.get(3), SEXP_NIL)?;
     let version = version(ctx, call, args.get(4))?;
     let env = args.get(5);
@@ -272,18 +329,15 @@ fn save(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
         return Err(ctx.stop(call.err_call(), "invalid 'envir' argument"));
     }
     let options = args.get(6);
-    let compress = ctx.session().list_get(options, 0)?;
-    let compress = compression(ctx, call, compress)?;
-    let level = ctx.session().list_get(options, 1)?;
-    let level = if level == SEXP_NIL {
+    let file = if connection::is_connection(ctx, dest)? {
         None
     } else {
-        let (x, _) = ctx.session_mut().coerce(level, SexpType::Int)?;
-        let view = ctx.session().int(x)?;
-        match (view.len() == 1).then(|| view.get(0)) {
-            Some(n @ 0..=9) => Some(n as u32),
-            _ => return Err(ctx.stop(call.err_call(), "invalid compression level")),
-        }
+        let path = path(ctx, call, dest)?;
+        let compress = ctx.session().list_get(options, 0)?;
+        let compress = compression(ctx, call, compress)?;
+        let level = ctx.session().list_get(options, 1)?;
+        let level = compression_level(ctx, call, level)?;
+        Some((path, compress, level))
     };
     let force = ctx.session().list_get(options, 2)?;
     let force = flag(ctx, call, force)?;
@@ -293,7 +347,7 @@ fn save(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     let mut values = Vec::with_capacity(names.len());
     for name in names {
         let mut current = env;
-        let value = loop {
+        let binding = loop {
             if current == SEXP_NIL {
                 let name = ctx.session().sym_name(name)?.to_owned();
                 return Err(ctx.stop(call.err_call(), format!("object '{name}' not found")));
@@ -301,14 +355,16 @@ fn save(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
             if let Some(binding) = ctx.session().env_get(current, name)
                 && binding.value != SEXP_UNBOUND
             {
-                break binding.value;
+                break binding;
             }
             current = ctx.session().env_enclos(current)?;
         };
-        let value = if force && ctx.session().type_of(value)? == SexpType::Prom {
-            ctx.force(value)?
+        let value = if binding.active {
+            ctx.apply(binding.value, &[], call.err_call(), current)?
+        } else if force && ctx.session().type_of(binding.value)? == SexpType::Prom {
+            ctx.force(binding.value)?
         } else {
-            value
+            binding.value
         };
         ctx.protect(value);
         values.push((name, value));
@@ -318,8 +374,12 @@ fn save(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
         frame = ctx.session_mut().cons(value, frame, name.as_sexp())?;
     }
     let bytes = encode(ctx, call, frame, version, true)?;
-    let result = files::write(ctx.host(), &path, &bytes, compress, level);
-    checked(ctx, call, result)?;
+    if let Some((path, compress, level)) = file {
+        let result = files::write(ctx.host(), &path, &bytes, compress, level);
+        checked(ctx, call, result)?;
+    } else {
+        connection::write_serialized(ctx, call, dest, Serialization::Workspace, &bytes)?;
+    }
     Ok(SEXP_NIL)
 }
 
@@ -366,13 +426,18 @@ fn save_names(
 }
 
 fn load(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
-    let path = path(ctx, call, args.get(0))?;
+    let source = args.get(0);
     let env = args.get(1);
     if ctx.session().type_of(env)? != SexpType::Env {
         return Err(ctx.stop(call.err_call(), "invalid 'envir' argument"));
     }
     let verbose = flag(ctx, call, args.get(2))?;
-    let mut frame = read_file(ctx, call, &path, true)?;
+    let mut frame = if connection::is_connection(ctx, source)? {
+        read_connection(ctx, call, source, Serialization::Workspace)?
+    } else {
+        let path = path(ctx, call, source)?;
+        read_file(ctx, call, &path, true)?
+    };
     ctx.protect(frame);
     let mut bindings = Vec::new();
     while frame != SEXP_NIL {

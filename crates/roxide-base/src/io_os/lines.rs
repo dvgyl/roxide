@@ -4,7 +4,10 @@ use roxide_eval::{Args, Call, Ctx, EvalResult};
 use roxide_value::{Encoding, NA_INTEGER, SEXP_NIL, SexpType, ValueApi};
 
 use super::connection::Access;
-use super::{bytes, check_limit, connection, flag, integer, integers, strings, text};
+use super::{
+    ByteEncoding, bytes, check_limit, connection, flag, integer, integers, strings, text,
+    translated_bytes,
+};
 
 pub(super) fn read_lines(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     let source = args.get(0);
@@ -102,9 +105,23 @@ fn read_line(input: &mut dyn BufRead, limit: usize) -> io::Result<Option<(Vec<u8
 }
 
 pub(super) fn write_lines(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
-    let values = bytes(ctx, args.get(0))
-        .map_err(|_| ctx.stop(call.err_call(), "invalid 'text' argument"))?;
-    let sep = text(ctx, call, args.get(2), "sep")?;
+    let use_bytes = flag(ctx, call, args.get(3), "useBytes")?;
+    let encoding = if use_bytes {
+        ByteEncoding::Bytes
+    } else {
+        ByteEncoding::native(ctx)
+    };
+    if ctx.session().type_of(args.get(0))? != SexpType::Str {
+        return Err(ctx.stop(call.err_call(), "invalid 'text' argument"));
+    }
+    let values = translated_bytes(ctx, call, args.get(0), encoding)?;
+    if ctx.session().type_of(args.get(2))? != SexpType::Str {
+        return Err(ctx.stop(call.err_call(), "invalid 'sep' argument"));
+    }
+    let separator = translated_bytes(ctx, call, args.get(2), encoding)?;
+    let [Some(sep)] = separator.as_slice() else {
+        return Err(ctx.stop(call.err_call(), "invalid 'sep' argument"));
+    };
     let mut buffer = Vec::new();
     for value in values {
         let value = value.as_deref().unwrap_or(b"NA");
@@ -117,7 +134,7 @@ pub(super) fn write_lines(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalRe
                 .saturating_add(sep.len()),
         )?;
         buffer.extend_from_slice(value);
-        buffer.extend_from_slice(sep.as_bytes());
+        buffer.extend_from_slice(sep);
     }
     connection::write(ctx, call, args.get(1), Access::Lines, &buffer)?;
     Ok(SEXP_NIL)
@@ -198,8 +215,10 @@ fn utf8_width(first: u8) -> usize {
 }
 
 pub(super) fn write_char(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
-    let values = bytes(ctx, args.get(0))
-        .map_err(|_| ctx.stop(call.err_call(), "invalid 'object' argument"))?;
+    if ctx.session().type_of(args.get(0))? != SexpType::Str {
+        return Err(ctx.stop(call.err_call(), "invalid 'object' argument"));
+    }
+    let values = bytes(ctx, call, args.get(0))?;
     let widths = if args.get(2) == SEXP_NIL {
         None
     } else {

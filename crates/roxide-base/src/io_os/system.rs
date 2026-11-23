@@ -8,7 +8,10 @@ use super::{attr, bytes, check_limit, flag, logical, string, strings, text, text
 
 pub(super) fn getenv(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     let keys = args.get(0);
-    let unset = text(ctx, call, args.get(1), "unset")?;
+    let unset = texts(ctx, call, args.get(1), "unset")?;
+    let [unset] = unset.as_slice() else {
+        return Err(ctx.stop(call.err_call(), "invalid 'unset' argument"));
+    };
     let named = logical(ctx, args.get(2))?;
     if keys == SEXP_NIL || ctx.session().xlength(keys)? == 0 {
         let mut entries = ctx.host().env_vars();
@@ -35,11 +38,9 @@ pub(super) fn getenv(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult 
     let values: Vec<_> = names
         .iter()
         .map(|name| {
-            Some(
-                name.as_ref()
-                    .and_then(|name| ctx.host().env_var(name))
-                    .unwrap_or_else(|| unset.as_bytes().to_vec()),
-            )
+            ctx.host()
+                .env_var(name.as_deref().unwrap_or("NA"))
+                .or_else(|| unset.as_ref().map(|value| value.as_bytes().to_vec()))
         })
         .collect();
     let result = strings(ctx, values, Encoding::Native)?;
@@ -65,13 +66,20 @@ pub(super) fn setenv(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult 
     {
         return Err(ctx.stop(call.err_call(), "all arguments must be named"));
     }
-    let mut result = Vec::with_capacity(names.len());
+    let mut pending = Vec::with_capacity(names.len());
     for (name, value) in names.into_iter().flatten().zip(values) {
         let (value, _) = ctx.session_mut().coerce(value, SexpType::Str)?;
-        let value = bytes(ctx, value)?
-            .into_iter()
-            .next()
-            .ok_or_else(|| ctx.stop(call.err_call(), "wrong length for argument"))?;
+        if ctx.session().xlength(value)? != 1 {
+            return Err(ctx.stop(
+                call.err_call(),
+                "'names' and 'val' are of different lengths",
+            ));
+        }
+        let mut value = bytes(ctx, call, value)?;
+        pending.push((name, value.pop().flatten()));
+    }
+    let mut result = Vec::with_capacity(pending.len());
+    for (name, value) in pending {
         let value = value.as_deref().unwrap_or(b"NA");
         let ok = valid_key(&name) && ctx.host().set_env_var(&name, Some(value)).is_ok();
         result.push(RLogical::from_option(Some(ok)));
@@ -83,8 +91,8 @@ pub(super) fn unsetenv(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResul
     let names = texts(ctx, call, args.get(0), "x")?;
     let mut result = Vec::with_capacity(names.len());
     for name in names {
-        let ok = name
-            .is_some_and(|name| valid_key(&name) && ctx.host().set_env_var(&name, None).is_ok());
+        let name = name.as_deref().unwrap_or("NA");
+        let ok = valid_key(name) && ctx.host().set_env_var(name, None).is_ok();
         result.push(RLogical::from_option(Some(ok)));
     }
     Ok(ctx.session_mut().alloc_lgl_from(&result)?)
@@ -168,7 +176,7 @@ pub(super) fn system2(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult
     }
     let input = if input != SEXP_NIL {
         let mut data = Vec::new();
-        for line in bytes(ctx, input)? {
+        for line in bytes(ctx, call, input)? {
             let line = line.as_deref().unwrap_or(b"NA");
             check_limit(
                 ctx,

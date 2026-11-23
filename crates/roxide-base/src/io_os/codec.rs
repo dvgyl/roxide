@@ -1,4 +1,6 @@
-use std::io::{self, Read, Write};
+use std::io::{self, BufReader, Read, Write};
+
+use roxide_host::HostFile;
 
 use bzip2::{read::MultiBzDecoder, write::BzEncoder};
 use flate2::{read::MultiGzDecoder, write::GzEncoder};
@@ -6,7 +8,7 @@ use lzma_rust2::{XzOptions, XzReader, XzWriter};
 
 /// Compression formats shared by connections and serialized objects.
 #[derive(Clone, Copy)]
-pub(crate) enum Compression {
+pub(super) enum Compression {
     /// Gzip stream.
     Gzip,
     /// Bzip2 stream.
@@ -19,7 +21,7 @@ pub(crate) enum Compression {
 
 impl Compression {
     /// Identify a compression format from the first bytes of a stream.
-    pub(crate) fn detect(bytes: &[u8]) -> Option<Self> {
+    pub(super) fn detect(bytes: &[u8]) -> Option<Self> {
         if bytes.starts_with(b"\x1f\x8b") {
             Some(Self::Gzip)
         } else if bytes.starts_with(b"BZh") {
@@ -34,53 +36,109 @@ impl Compression {
     }
 }
 
-/// Encode bytes as a complete compressed stream.
-pub(crate) fn compress(format: Compression, bytes: &[u8], level: u32) -> io::Result<Vec<u8>> {
-    match format {
-        Compression::Gzip => {
-            let mut writer = GzEncoder::new(Vec::new(), flate2::Compression::new(level.min(9)));
-            writer.write_all(bytes)?;
-            writer.finish()
+pub(super) enum Writer {
+    Gzip(GzEncoder<Box<dyn HostFile>>),
+    Bzip2(BzEncoder<Box<dyn HostFile>>),
+    Xz(Box<XzWriter<Box<dyn HostFile>>>),
+    Zstd(zstd::stream::write::Encoder<'static, Box<dyn HostFile>>),
+}
+
+impl Writer {
+    pub(super) fn new(
+        format: Compression,
+        file: Box<dyn HostFile>,
+        level: u32,
+    ) -> io::Result<Self> {
+        Ok(match format {
+            Compression::Gzip => {
+                Self::Gzip(GzEncoder::new(file, flate2::Compression::new(level.min(9))))
+            }
+            Compression::Bzip2 => Self::Bzip2(BzEncoder::new(
+                file,
+                bzip2::Compression::new(level.clamp(1, 9)),
+            )),
+            Compression::Xz => Self::Xz(Box::new(XzWriter::new(
+                file,
+                XzOptions::with_preset(level.min(9)),
+            )?)),
+            Compression::Zstd => Self::Zstd(zstd::stream::write::Encoder::new(
+                file,
+                level.min(22) as i32,
+            )?),
+        })
+    }
+
+    pub(super) fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
+        match self {
+            Self::Gzip(writer) => writer.write_all(bytes),
+            Self::Bzip2(writer) => writer.write_all(bytes),
+            Self::Xz(writer) => writer.write_all(bytes),
+            Self::Zstd(writer) => writer.write_all(bytes),
         }
-        Compression::Bzip2 => {
-            let mut writer = BzEncoder::new(Vec::new(), bzip2::Compression::new(level.clamp(1, 9)));
-            writer.write_all(bytes)?;
-            writer.finish()
-        }
-        Compression::Xz => {
-            let mut writer = XzWriter::new(Vec::new(), XzOptions::with_preset(level.min(9)))?;
-            writer.write_all(bytes)?;
-            writer.finish()
-        }
-        Compression::Zstd => zstd::stream::encode_all(bytes, level.min(22) as i32),
+    }
+
+    pub(super) fn finish(self) -> io::Result<()> {
+        let mut file = match self {
+            Self::Gzip(writer) => writer.finish()?,
+            Self::Bzip2(writer) => writer.finish()?,
+            Self::Xz(writer) => writer.finish()?,
+            Self::Zstd(writer) => writer.finish()?,
+        };
+        file.flush()
     }
 }
 
-/// Decode a compressed stream up to the specified output limit in bytes.
-pub(crate) fn decompress(
+pub(super) fn reader(
     format: Compression,
-    reader: impl Read,
+    file: impl Read + 'static,
     limit: usize,
-) -> io::Result<Vec<u8>> {
-    match format {
-        Compression::Gzip => read_limited(MultiGzDecoder::new(reader), limit),
-        Compression::Bzip2 => read_limited(MultiBzDecoder::new(reader), limit),
-        Compression::Xz => read_limited(XzReader::new_mem_limit(reader, true, 128 * 1024), limit),
+) -> io::Result<BufReader<LimitedReader>> {
+    let input: Box<dyn Read> = match format {
+        Compression::Gzip => Box::new(MultiGzDecoder::new(file)),
+        Compression::Bzip2 => Box::new(MultiBzDecoder::new(file)),
+        Compression::Xz => Box::new(XzReader::new_mem_limit(file, true, 128 * 1024)),
         Compression::Zstd => {
-            let mut reader = zstd::stream::read::Decoder::new(reader)?;
+            let mut reader = zstd::stream::read::Decoder::new(file)?;
             reader.window_log_max(27)?;
-            read_limited(reader, limit)
+            Box::new(reader)
         }
-    }
+    };
+    Ok(limited(input, limit))
 }
 
-pub(super) fn read_limited(reader: impl Read, limit: usize) -> io::Result<Vec<u8>> {
-    let mut bytes = Vec::new();
-    reader
-        .take((limit as u64).saturating_add(1))
-        .read_to_end(&mut bytes)?;
-    if bytes.len() > limit {
-        return Err(io::Error::other("input exceeds the byte limit"));
+pub(super) fn gzip_reader(file: impl Read + 'static, limit: usize) -> BufReader<LimitedReader> {
+    limited(Box::new(MultiGzDecoder::new(file)), limit)
+}
+
+fn limited(input: Box<dyn Read>, limit: usize) -> BufReader<LimitedReader> {
+    BufReader::new(LimitedReader {
+        input,
+        remaining: limit,
+        exceeded: false,
+    })
+}
+
+pub(super) struct LimitedReader {
+    input: Box<dyn Read>,
+    remaining: usize,
+    exceeded: bool,
+}
+
+impl Read for LimitedReader {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        if self.remaining == 0 {
+            if self.exceeded || self.input.read(&mut [0])? != 0 {
+                self.exceeded = true;
+                return Err(io::Error::other("input exceeds the byte limit"));
+            }
+            return Ok(0);
+        }
+        let width = self.remaining.min(buffer.len());
+        let count = self.input.read(&mut buffer[..width])?;
+        self.remaining -= count;
+        Ok(count)
     }
-    Ok(bytes)
 }

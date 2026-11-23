@@ -352,3 +352,155 @@ fn xdr_body(words: &[u32]) -> Vec<u8> {
     bytes.extend(words.iter().flat_map(|n| n.to_be_bytes()));
     bytes
 }
+
+#[test]
+fn binary_connections_keep_object_boundaries_and_open_state() {
+    let script = r#"
+    out <- rawConnection(raw(), "w")
+    serialize(11L, out)
+    saveRDS("second", out)
+    stopifnot(isOpen(out))
+    input <- rawConnection(rawConnectionValue(out))
+    close(out)
+    stopifnot(identical(unserialize(input), 11L),
+              identical(readRDS(input), "second"), isOpen(input))
+    close(input)
+
+    p <- tempfile()
+    for (open_file in list(file, gzfile, bzfile, xzfile, zstdfile)) {
+        out <- open_file(p, "wb")
+        serialize(11L, out)
+        saveRDS("second", out)
+        stopifnot(isOpen(out))
+        close(out)
+        input <- open_file(p, "rb")
+        stopifnot(identical(unserialize(input), 11L),
+                  identical(readRDS(input), "second"), isOpen(input))
+        close(input)
+
+        out <- open_file(p)
+        stopifnot(identical(tryCatch(serialize(11L, out), error = conditionMessage),
+                            "connection is not open"), !isOpen(out))
+        saveRDS(42L, out)
+        stopifnot(!isOpen(out))
+        stopifnot(identical(tryCatch(unserialize(out), error = conditionMessage),
+                            "connection is not open"), !isOpen(out))
+        stopifnot(identical(readRDS(out), 42L), !isOpen(out))
+        close(out)
+
+        e1 <- new.env()
+        e2 <- new.env()
+        e1$x <- 42L
+        out <- open_file(p)
+        save(x, envir = e1, file = out)
+        stopifnot(!isOpen(out))
+        stopifnot(identical(load(out, envir = e2), "x"), identical(e2$x, 42L), !isOpen(out))
+        close(out)
+    }
+    save(x, envir = e1, file = p)
+    input <- file(p, "rb")
+    stopifnot(identical(load(input, envir = e2), "x"), isOpen(input))
+    close(input)
+    unlink(p)
+"#;
+    if let Some(executable) = env::var_os("ROXIDE_ORACLE_RSCRIPT") {
+        oracle(Path::new(&executable), script);
+    }
+    run(
+        &mut context(Box::new(PureHost::new())),
+        "serialized connections",
+        script,
+    );
+}
+
+#[test]
+fn save_invokes_active_bindings_even_without_forcing_promises() {
+    let mut ctx = context(Box::new(PureHost::new()));
+    run(
+        &mut ctx,
+        "active binding setup",
+        "reader <- function() 42L\ne <- new.env()",
+    );
+    let session = ctx.session_mut();
+    let reader = session.intern("reader").unwrap();
+    let reader = session.env_get(GLOBAL_ENV, reader).unwrap().value;
+    let env = session.intern("e").unwrap();
+    let env = session.env_get(GLOBAL_ENV, env).unwrap().value;
+    let x = session.intern("x").unwrap();
+    session
+        .env_define_binding(
+            env,
+            x,
+            roxide_value::Binding {
+                value: reader,
+                active: true,
+                locked: false,
+                missing: 0,
+            },
+        )
+        .unwrap();
+    run(
+        &mut ctx,
+        "save active binding",
+        r#"
+p <- tempfile()
+save(x, envir = e, file = p, eval.promises = FALSE)
+target <- new.env()
+stopifnot(identical(load(p, envir = target), "x"), identical(target$x, 42L))
+unlink(p)
+"#,
+    );
+}
+
+#[test]
+fn decodes_long_parent_chains_and_large_attribute_lists() {
+    let mut ctx = context(Box::new(PureHost::new()));
+    let session = ctx.session_mut();
+    let mut words = vec![19, 500];
+    for i in 0..500 {
+        let parent = if i == 0 { 242 } else { (i << 8) | 255 };
+        words.extend([4, 0, parent, 254, 254, 254]);
+    }
+    let wire = session.alloc_raw_from(&xdr_body(&words)).unwrap();
+    let parents = session.intern("parents").unwrap();
+    session.env_define(GLOBAL_ENV, parents, wire).unwrap();
+
+    let mut bytes = xdr_body(&[13 | (1 << 9), 1, 42]);
+    for i in 0..1000 {
+        let name = format!("attr{i}");
+        bytes.extend(
+            [2u32 | (1 << 10), 1, 9, name.len() as u32]
+                .into_iter()
+                .flat_map(u32::to_be_bytes),
+        );
+        bytes.extend(name.bytes());
+        bytes.extend([13u32, 1, i].into_iter().flat_map(u32::to_be_bytes));
+    }
+    bytes.extend(254u32.to_be_bytes());
+    let wire = session.alloc_raw_from(&bytes).unwrap();
+    let attrs = session.intern("attrs").unwrap();
+    session.env_define(GLOBAL_ENV, attrs, wire).unwrap();
+    run(
+        &mut ctx,
+        "large XDR objects",
+        "parents <- unserialize(parents)\nattrs <- unserialize(attrs)",
+    );
+    let session = ctx.session();
+    let root = session.env_get(GLOBAL_ENV, parents).unwrap().value;
+    let mut env = session.list_get(root, 499).unwrap();
+    for i in (0..500).rev() {
+        assert_eq!(env, session.list_get(root, i).unwrap());
+        env = session.env_enclos(env).unwrap();
+    }
+    assert_eq!(env, roxide_value::EMPTY_ENV);
+    let value = session.env_get(GLOBAL_ENV, attrs).unwrap().value;
+    let attrs = session.attrs(value).unwrap();
+    assert_eq!(attrs.len(), 1000);
+    for (i, (key, value)) in attrs.into_iter().enumerate() {
+        assert_eq!(session.sym_name(key).unwrap(), format!("attr{i}"));
+        assert_eq!(session.int(value).unwrap().get(0), i as i32);
+    }
+
+    let two_environment_cycle = [4, 0, 4, 0, 0x1ff, 254, 254, 254, 254, 254, 254];
+    rejects_raw(&mut ctx, &xdr_body(&two_environment_cycle));
+}

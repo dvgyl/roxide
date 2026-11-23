@@ -74,9 +74,7 @@ impl Host for NativeHost {
     }
 
     fn read_line(&mut self, buf: &mut Vec<u8>) -> HostResult<usize> {
-        let stdin = io::stdin();
-        let mut locked = stdin.lock();
-        locked.read_until(b'\n', buf).map_err(HostError::from_io)
+        read_line_bounded(io::stdin().lock(), buf, self.limits.max_vector_bytes)
     }
 
     fn is_tty(&self, stream: StdStream) -> bool {
@@ -331,5 +329,38 @@ impl Host for NativeHost {
 
     fn limits(&self) -> &Limits {
         &self.limits
+    }
+}
+
+fn read_line_bounded(input: impl BufRead, buf: &mut Vec<u8>, limit: usize) -> HostResult<usize> {
+    let start = buf.len();
+    let count = input
+        .take((limit as u64).saturating_add(1))
+        .read_until(b'\n', buf)
+        .map_err(HostError::from_io)?;
+    if count > limit {
+        buf.truncate(start);
+        return Err(HostError::new(
+            HostErrorKind::InvalidInput,
+            "I/O result exceeds the vector size limit",
+        ));
+    }
+    Ok(count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_line_rejects_input_after_one_byte_past_the_limit() {
+        let mut input = &b"abcdefgh\n"[..];
+        let mut buf = Vec::new();
+        let error = read_line_bounded(&mut input, &mut buf, 4).unwrap_err();
+        assert_eq!(error.kind, HostErrorKind::InvalidInput);
+        assert!(buf.is_empty());
+        assert_eq!(input, b"fgh\n");
+        assert_eq!(read_line_bounded(input, &mut buf, 4).unwrap(), 4);
+        assert_eq!(buf, b"fgh\n");
     }
 }

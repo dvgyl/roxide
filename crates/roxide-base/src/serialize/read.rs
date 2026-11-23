@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io::BufRead;
 
 use roxide_gc::SexpId;
 use roxide_host::Limits;
@@ -14,65 +15,120 @@ use super::{
 
 pub(super) fn decode(
     session: &mut RSession,
-    mut bytes: &[u8],
+    bytes: &[u8],
     workspace: bool,
     limits: &Limits,
 ) -> WireResult<SexpId> {
     if bytes.len() > limits.max_decompress_bytes {
         return Err(invalid("serialized input exceeds the decompression limit"));
     }
-    let workspace_version = if workspace {
-        if let Some(rest) = bytes.strip_prefix(b"RDX2\n") {
-            bytes = rest;
-            Some(2)
-        } else if let Some(rest) = bytes.strip_prefix(b"RDX3\n") {
-            bytes = rest;
-            Some(3)
-        } else {
-            return Err(invalid("invalid R workspace header"));
-        }
-    } else {
-        None
+    decode_from(session, Input::Slice(bytes), workspace, limits)
+}
+
+pub(super) fn decode_stream(
+    session: &mut RSession,
+    input: &mut dyn BufRead,
+    workspace: bool,
+    limits: &Limits,
+) -> WireResult<SexpId> {
+    decode_from(session, Input::Stream(input), workspace, limits)
+}
+
+fn decode_from(
+    session: &mut RSession,
+    input: Input<'_>,
+    workspace: bool,
+    limits: &Limits,
+) -> WireResult<SexpId> {
+    let remaining = match &input {
+        Input::Slice(bytes) => bytes.len(),
+        Input::Stream(_) => limits.max_decompress_bytes,
     };
-    let bytes = bytes
-        .strip_prefix(b"X\n")
-        .ok_or_else(|| invalid("invalid XDR stream header"))?;
     let mut reader = Reader {
-        bytes,
+        input,
+        remaining,
+        scratch: Vec::new(),
         refs: Vec::new(),
         binding_flags: HashMap::new(),
+        env_parents: HashMap::new(),
         version: 0,
         heap_start: session.heap.live_bytes(),
         limits,
     };
+    let workspace_version = if workspace {
+        match reader.take(5)? {
+            b"RDX2\n" => Some(2),
+            b"RDX3\n" => Some(3),
+            _ => return Err(invalid("invalid R workspace header")),
+        }
+    } else {
+        None
+    };
+    if reader.take(2)? != b"X\n" {
+        return Err(invalid("invalid XDR stream header"));
+    }
     reader.version = reader.word()?;
     if !matches!(reader.version, 2 | 3) || workspace_version.is_some_and(|v| v != reader.version) {
         return Err(invalid("unsupported serialization version"));
     }
     reader.take(8)?;
     if reader.version == 3 {
-        let len = reader.length()?;
+        let len = reader.vector_len::<u8>(1)?;
         reader.take(len)?;
     }
     let value = reader.item(session, 0)?;
     reader.check_heap(session)?;
+    validate_parents(reader.env_parents)?;
     Ok(value)
 }
 
-struct Reader<'a> {
-    bytes: &'a [u8],
-    refs: Vec<SexpId>,
-    binding_flags: HashMap<SexpId, u32>,
-    version: u32,
-    heap_start: usize,
-    limits: &'a Limits,
+enum Input<'a> {
+    Slice(&'a [u8]),
+    Stream(&'a mut dyn BufRead),
 }
 
-impl<'a> Reader<'a> {
-    fn take(&mut self, n: usize) -> WireResult<&'a [u8]> {
-        let (head, rest) = self.bytes.split_at_checked(n).ok_or_else(truncated)?;
-        self.bytes = rest;
-        Ok(head)
+struct Reader<'a, 'limits> {
+    input: Input<'a>,
+    remaining: usize,
+    scratch: Vec<u8>,
+    refs: Vec<SexpId>,
+    binding_flags: HashMap<SexpId, u32>,
+    env_parents: HashMap<SexpId, (SexpId, Option<SexpId>)>,
+    version: u32,
+    heap_start: usize,
+    limits: &'limits Limits,
+}
+
+impl Reader<'_, '_> {
+    fn take(&mut self, n: usize) -> WireResult<&[u8]> {
+        self.remaining = self
+            .remaining
+            .checked_sub(n)
+            .ok_or_else(|| match self.input {
+                Input::Slice(_) => truncated(),
+                Input::Stream(_) => invalid("serialized input exceeds the decompression limit"),
+            })?;
+        match &mut self.input {
+            Input::Slice(bytes) => {
+                let (head, rest) = bytes.split_at_checked(n).ok_or_else(truncated)?;
+                *bytes = rest;
+                Ok(head)
+            }
+            Input::Stream(input) => {
+                self.scratch.clear();
+                while self.scratch.len() < n {
+                    let available = input.fill_buf()?;
+                    if available.is_empty() {
+                        return Err(truncated());
+                    }
+                    let count = available.len().min(n - self.scratch.len());
+                    self.scratch.try_reserve(count).map_err(invalid)?;
+                    self.scratch.extend_from_slice(&available[..count]);
+                    input.consume(count);
+                }
+                Ok(&self.scratch)
+            }
+        }
     }
 
     fn word(&mut self) -> WireResult<u32> {
@@ -103,8 +159,11 @@ impl<'a> Reader<'a> {
         if len > self.limits.max_vector_bytes / size_of::<T>() {
             return Err(invalid("serialized vector exceeds the allocation limit"));
         }
-        if len > self.bytes.len() / width {
-            return Err(truncated());
+        if len > self.remaining / width {
+            return Err(match self.input {
+                Input::Slice(_) => truncated(),
+                Input::Stream(_) => invalid("serialized input exceeds the decompression limit"),
+            });
         }
         Ok(())
     }
@@ -122,11 +181,20 @@ impl<'a> Reader<'a> {
     ) -> WireResult<Vec<T>> {
         let len = self.vector_len::<T>(width)?;
         let mut values = Vec::new();
-        values.try_reserve_exact(len).map_err(invalid)?;
+        self.reserve_vector(&mut values, len)?;
         for _ in 0..len {
-            values.push(get(self)?);
+            let value = get(self)?;
+            values.try_reserve(1).map_err(invalid)?;
+            values.push(value);
         }
         Ok(values)
+    }
+
+    fn reserve_vector<T>(&self, values: &mut Vec<T>, len: usize) -> WireResult<()> {
+        if matches!(self.input, Input::Slice(_)) {
+            values.try_reserve_exact(len).map_err(invalid)?;
+        }
+        Ok(())
     }
 
     fn reference(&mut self, id: SexpId) -> WireResult<()> {
@@ -216,27 +284,37 @@ impl<'a> Reader<'a> {
             16 => {
                 let len = self.vector_len::<CharId>(8)?;
                 let mut chars = Vec::new();
-                chars.try_reserve_exact(len).map_err(invalid)?;
+                self.reserve_vector(&mut chars, len)?;
                 for _ in 0..len {
-                    chars.push(self.read_char(session, depth)?);
+                    let ch = self.read_char(session, depth)?;
+                    chars.try_reserve(1).map_err(invalid)?;
+                    chars.push(ch);
                 }
                 session.alloc_str_from(&chars)?
             }
             19 => {
                 let len = self.vector_len::<SexpId>(4)?;
+                let mut values = Vec::new();
+                self.reserve_vector(&mut values, len)?;
+                for _ in 0..len {
+                    let value = self.item(session, depth)?;
+                    values.try_reserve(1).map_err(invalid)?;
+                    values.push(value);
+                }
                 let list = session.alloc_list(len)?;
-                for i in 0..len {
-                    let elt = self.item(session, depth)?;
-                    session.list_set(list, i, elt)?;
+                for (i, value) in values.into_iter().enumerate() {
+                    session.list_set(list, i, value)?;
                 }
                 list
             }
             20 => {
                 let len = self.vector_len::<SexpId>(4)?;
                 let mut exprs = Vec::new();
-                exprs.try_reserve_exact(len).map_err(invalid)?;
+                self.reserve_vector(&mut exprs, len)?;
                 for _ in 0..len {
-                    exprs.push(self.item(session, depth)?);
+                    let value = self.item(session, depth)?;
+                    exprs.try_reserve(1).map_err(invalid)?;
+                    exprs.push(value);
                 }
                 session.alloc_expr_from(&exprs)?
             }
@@ -391,15 +469,9 @@ impl<'a> Reader<'a> {
             SEXP_NIL => BASE_ENV,
             parent => parent,
         };
-        // Cycles through bindings are valid. A cycle in the parent chain prevents lookup from ending.
-        let mut parent = enclos;
-        while parent != SEXP_NIL {
-            if parent == env {
-                return Err(invalid("cyclic serialized environment parent chain"));
-            }
-            parent = session.env_enclos(parent)?;
-        }
         session.env_set_enclos(env, enclos)?;
+        self.env_parents.try_reserve(1).map_err(invalid)?;
+        self.env_parents.insert(env, (enclos, None));
         let frame = self.item(session, depth)?;
         let table = self.item(session, depth)?;
         let attrs = self.item(session, depth)?;
@@ -636,6 +708,27 @@ impl<'a> Reader<'a> {
     }
 }
 
+fn validate_parents(mut parents: HashMap<SexpId, (SexpId, Option<SexpId>)>) -> WireResult<()> {
+    // Only environments from this stream can point back into it.
+    let starts: Vec<_> = parents.keys().copied().collect();
+    for start in starts {
+        let mut env = start;
+        while let Some((parent, visited_from)) = parents.get_mut(&env) {
+            match *visited_from {
+                Some(previous) if previous == start => {
+                    return Err(invalid("cyclic serialized environment parent chain"));
+                }
+                Some(_) => break,
+                None => {
+                    *visited_from = Some(start);
+                    env = *parent;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn char_text(session: &RSession, ch: CharId) -> WireResult<String> {
     if ch == CharId::NA {
         return Err(invalid("missing serialized symbol name"));
@@ -667,6 +760,7 @@ fn apply_attributes(
     mut attrs: SexpId,
     flags: u32,
 ) -> WireResult<()> {
+    let mut entries = Vec::new();
     while attrs != SEXP_NIL {
         if session.type_of(attrs)? != SexpType::List {
             return Err(invalid("invalid serialized attribute list"));
@@ -679,8 +773,12 @@ fn apply_attributes(
         {
             return Err(invalid("invalid serialized names attribute length"));
         }
-        session.set_attrib(id, name, value)?;
+        entries.try_reserve(1).map_err(invalid)?;
+        entries.push((name, value));
         attrs = next;
+    }
+    if !entries.is_empty() {
+        session.replace_attributes(id, entries)?;
     }
     if flags & S4 != 0 {
         session.set_s4_flag(id, true)?;

@@ -7,7 +7,7 @@ use roxide_value::{
 };
 
 use super::connection::{self, Access};
-use super::{bytes, check_limit, flag, integer, strings, text};
+use super::{ByteEncoding, check_limit, flag, integer, strings, text, translated_bytes};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
@@ -295,7 +295,13 @@ pub(super) fn write_bin(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResu
             }
         }
         Kind::Character => {
-            for value in bytes(ctx, value)? {
+            let use_bytes = flag(ctx, call, args.get(4), "useBytes")?;
+            let encoding = if use_bytes {
+                ByteEncoding::Bytes
+            } else {
+                ByteEncoding::native(ctx)
+            };
+            for value in translated_bytes(ctx, call, value, encoding)? {
                 let value = value.as_deref().unwrap_or(b"NA");
                 check_limit(
                     ctx,

@@ -4,12 +4,10 @@
 
 mod binary;
 mod codec;
-mod connection;
+pub(crate) mod connection;
 mod filesystem;
 mod lines;
 mod system;
-
-pub(crate) use codec::{Compression, compress, decompress};
 
 use roxide_eval::{
     ArgEval, Arity, Call, Ctx, Dispatch, EvalResult, Module, PrimDef, PrimFn, PrimKind, Visibility,
@@ -22,6 +20,8 @@ pub const MODULE: Module = Module {
     prims: &[
         internal("rox_io_file", connection::file, 6, Visibility::On),
         internal("rox_io_text", connection::text, 4, Visibility::On),
+        internal("rox_io_raw", connection::raw, 2, Visibility::On),
+        internal("rox_io_raw_value", connection::raw_value, 1, Visibility::On),
         internal(
             "rox_io_text_value",
             connection::text_value,
@@ -32,7 +32,7 @@ pub const MODULE: Module = Module {
         internal("rox_io_is_open", connection::is_open, 2, Visibility::On),
         internal("rox_io_std", connection::standard, 1, Visibility::On),
         internal("rox_io_read_lines", lines::read_lines, 6, Visibility::On),
-        internal("rox_io_write_lines", lines::write_lines, 3, Visibility::Off),
+        internal("rox_io_write_lines", lines::write_lines, 4, Visibility::Off),
         internal("rox_io_read_char", lines::read_char, 3, Visibility::On),
         internal(
             "rox_io_write_char",
@@ -44,7 +44,7 @@ pub const MODULE: Module = Module {
         internal(
             "rox_io_write_bin",
             binary::write_bin,
-            4,
+            5,
             Visibility::SetByFn,
         ),
         internal("rox_io_tempfile", filesystem::tempfile, 3, Visibility::On),
@@ -97,7 +97,12 @@ bzfile <- function(description, open = "", encoding = getOption("encoding"), com
     .Internal(rox_io_file(description, open, "bzfile", compression, FALSE, encoding))
 xzfile <- function(description, open = "", encoding = getOption("encoding"), compression = 6)
     .Internal(rox_io_file(description, open, "xzfile", compression, FALSE, encoding))
-textConnection <- function(object, open = "r", local = FALSE, encoding = c("", "bytes", "UTF-8"))
+zstdfile <- function(description, open = "", encoding = getOption("encoding"), compression = 9)
+    .Internal(rox_io_file(description, open, "zstdfile", compression, FALSE, encoding))
+rawConnection <- function(object, open = "r") .Internal(rox_io_raw(object, open))
+rawConnectionValue <- function(con) .Internal(rox_io_raw_value(con))
+textConnection <- function(object, open = "r", local = FALSE, name = deparse1(substitute(object)),
+                           encoding = c("", "bytes", "UTF-8"))
     .Internal(rox_io_text(object, open, if (local) parent.frame() else globalenv(), encoding))
 textConnectionValue <- function(con) .Internal(rox_io_text_value(con))
 close <- function(con, ...) UseMethod("close")
@@ -110,11 +115,11 @@ readLines <- function(con = stdin(), n = -1L, ok = TRUE, warn = TRUE, encoding =
                       skipNul = FALSE)
     .Internal(rox_io_read_lines(con, n, ok, warn, encoding, skipNul))
 writeLines <- function(text, con = stdout(), sep = "\n", useBytes = FALSE)
-    .Internal(rox_io_write_lines(text, con, sep))
+    .Internal(rox_io_write_lines(text, con, sep, useBytes))
 readBin <- function(con, what, n = 1L, size = NA_integer_, signed = TRUE, endian = "platform")
     .Internal(rox_io_read_bin(con, what, n, size, signed, endian))
 writeBin <- function(object, con, size = NA_integer_, endian = "platform", useBytes = FALSE)
-    .Internal(rox_io_write_bin(object, con, size, endian))
+    .Internal(rox_io_write_bin(object, con, size, endian, useBytes))
 readChar <- function(con, nchars, useBytes = FALSE)
     .Internal(rox_io_read_char(con, nchars, useBytes))
 writeChar <- function(object, con, nchars = NULL, eos = "", useBytes = FALSE)
@@ -201,29 +206,132 @@ fn string(ctx: &mut Ctx, value: impl AsRef<[u8]>) -> EvalResult {
     strings(ctx, [Some(value)], Encoding::Native)
 }
 
-fn bytes(ctx: &Ctx, value: SexpId) -> EvalResult<Vec<Option<Vec<u8>>>> {
-    ctx.session()
+#[derive(Clone, Copy)]
+enum ByteEncoding {
+    Bytes,
+    Utf8,
+    Ascii,
+}
+
+impl ByteEncoding {
+    fn native(ctx: &mut Ctx) -> Self {
+        if ctx.host().locale().utf8 {
+            Self::Utf8
+        } else {
+            Self::Ascii
+        }
+    }
+}
+
+fn bytes(ctx: &mut Ctx, call: &Call, value: SexpId) -> EvalResult<Vec<Option<Vec<u8>>>> {
+    translated_bytes(ctx, call, value, ByteEncoding::Bytes)
+}
+
+fn translated_bytes(
+    ctx: &mut Ctx,
+    call: &Call,
+    value: SexpId,
+    encoding: ByteEncoding,
+) -> EvalResult<Vec<Option<Vec<u8>>>> {
+    let ids = ctx.session().str_slice(value)?;
+    let mut size = ids.len().saturating_mul(size_of::<Option<Vec<u8>>>());
+    for &id in ids {
+        if id != CharId::NA {
+            let data = ctx.session().char_bytes(id)?;
+            let mark = ctx.session().char_encoding(id)?;
+            let len = match (encoding, mark) {
+                (ByteEncoding::Utf8, Encoding::Latin1) => data
+                    .len()
+                    .saturating_add(data.iter().filter(|b| !b.is_ascii()).count()),
+                (ByteEncoding::Ascii, Encoding::Latin1) => data.len().saturating_add(
+                    data.iter()
+                        .filter(|b| !b.is_ascii())
+                        .count()
+                        .saturating_mul(3),
+                ),
+                (ByteEncoding::Ascii, Encoding::Utf8) => std::str::from_utf8(data)
+                    .map_or(data.len(), |s| s.chars().map(ascii_width).sum()),
+                _ => data.len(),
+            };
+            size = size.saturating_add(len);
+        }
+    }
+    check_limit(ctx, call, size)?;
+    ids_to_bytes(ctx, value, encoding)
+}
+
+fn ascii_width(ch: char) -> usize {
+    match u32::from(ch) {
+        0..=0x7f => 1,
+        0x80..=0xffff => 8,
+        _ => 12,
+    }
+}
+
+fn ids_to_bytes(
+    ctx: &Ctx,
+    value: SexpId,
+    encoding: ByteEncoding,
+) -> EvalResult<Vec<Option<Vec<u8>>>> {
+    let session = ctx.session();
+    session
         .str_slice(value)?
         .iter()
         .map(|&id| {
             if id == CharId::NA {
-                Ok(None)
-            } else {
-                Ok(Some(ctx.session().char_bytes(id)?.to_vec()))
+                return Ok(None);
             }
+            let data = session.char_bytes(id)?;
+            let value = match (encoding, session.char_encoding(id)?) {
+                (ByteEncoding::Utf8, Encoding::Latin1) => data
+                    .iter()
+                    .map(|&b| char::from(b))
+                    .collect::<String>()
+                    .into_bytes(),
+                (ByteEncoding::Ascii, Encoding::Latin1) => {
+                    let mut result = Vec::new();
+                    for &byte in data {
+                        if byte.is_ascii() {
+                            result.push(byte);
+                        } else {
+                            result.extend_from_slice(format!("<{byte:02x}>").as_bytes());
+                        }
+                    }
+                    result
+                }
+                (ByteEncoding::Ascii, Encoding::Utf8) => match std::str::from_utf8(data) {
+                    Ok(text) => {
+                        let mut result = Vec::new();
+                        for ch in text.chars() {
+                            match ascii_width(ch) {
+                                1 => result.push(ch as u8),
+                                8 => result
+                                    .extend_from_slice(format!("<U+{:04X}>", ch as u32).as_bytes()),
+                                _ => result
+                                    .extend_from_slice(format!("<U+{:08X}>", ch as u32).as_bytes()),
+                            }
+                        }
+                        result
+                    }
+                    Err(_) => data.to_vec(),
+                },
+                _ => data.to_vec(),
+            };
+            Ok(Some(value))
         })
         .collect()
 }
 
 fn texts(ctx: &mut Ctx, call: &Call, value: SexpId, arg: &str) -> EvalResult<Vec<Option<String>>> {
-    bytes(ctx, value)
-        .map(|values| {
-            values
-                .into_iter()
-                .map(|s| s.map(|s| String::from_utf8_lossy(&s).into_owned()))
-                .collect()
-        })
-        .map_err(|_| ctx.stop(call.err_call(), format!("invalid '{arg}' argument")))
+    if ctx.session().type_of(value)? != SexpType::Str {
+        return Err(ctx.stop(call.err_call(), format!("invalid '{arg}' argument")));
+    }
+    bytes(ctx, call, value).map(|values| {
+        values
+            .into_iter()
+            .map(|s| s.map(|s| String::from_utf8_lossy(&s).into_owned()))
+            .collect()
+    })
 }
 
 fn text(ctx: &mut Ctx, call: &Call, value: SexpId, arg: &str) -> EvalResult<String> {

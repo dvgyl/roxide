@@ -5,10 +5,11 @@ use std::path::PathBuf;
 use roxide_eval::{Args, Call, Ctx, CtxExt, EvalResult};
 use roxide_gc::{SexpId, Trace, Tracer};
 use roxide_host::{HostFile, OpenMode};
-use roxide_value::{Encoding, SEXP_NIL, SexpType, Sym, ValueApi};
+use roxide_value::{Encoding, RSession, SEXP_NIL, SexpType, Sym, ValueApi};
 
+use super::codec::{self, Compression};
 use super::{
-    Compression, attr, bytes, check_limit, compress, decompress, flag, integer, io_result, strings,
+    ByteEncoding, attr, bytes, check_limit, flag, integer, io_result, strings, translated_bytes,
 };
 
 #[derive(Default)]
@@ -36,6 +37,7 @@ struct Connection {
     stream: Option<Stream>,
 }
 
+#[derive(Clone)]
 struct FilePath {
     name: PathBuf,
     format: Option<Compression>,
@@ -101,12 +103,9 @@ impl Mode {
 enum Stream {
     File(BufReader<Box<dyn HostFile>>, Option<u64>),
     ReadMemory(Cursor<Vec<u8>>),
-    CompressedWrite {
-        file: Box<dyn HostFile>,
-        format: Compression,
-        level: u32,
-        buffer: Vec<u8>,
-    },
+    Raw(Cursor<Vec<u8>>),
+    CompressedRead(BufReader<codec::LimitedReader>),
+    CompressedWrite(Box<codec::Writer>),
     TextWrite(TextOutput),
 }
 
@@ -116,25 +115,41 @@ struct TextOutput {
     lines: Vec<Option<Vec<u8>>>,
     partial: Vec<u8>,
     size: usize,
+    encoding: Encoding,
 }
 
 impl TextOutput {
     fn value(&self, ctx: &mut Ctx) -> EvalResult {
-        strings(
+        strings(ctx, self.lines.iter().map(Option::as_deref), self.encoding)
+    }
+
+    fn update(&self, ctx: &mut Ctx) -> io::Result<()> {
+        let value = self
+            .value(ctx)
+            .map_err(|error| io::Error::other(format!("{error:?}")))?;
+        ctx.session_mut()
+            .env_define(self.env, self.symbol, value)
+            .map_err(io::Error::other)
+    }
+
+    fn write(&mut self, ctx: &mut Ctx, data: &[u8]) -> io::Result<()> {
+        let completed = data.iter().filter(|&&byte| byte == b'\n').count();
+        let payload = self.size.saturating_add(data.len() - completed);
+        let partial = if let Some(&last) = data.last() {
+            last != b'\n'
+        } else {
+            !self.partial.is_empty()
+        };
+        let count = self
+            .lines
+            .len()
+            .saturating_add(completed)
+            .saturating_add(usize::from(partial));
+        check_buffer(
             ctx,
-            self.lines.iter().map(Option::as_deref),
-            Encoding::Native,
-        )
-    }
-
-    fn update(&self, ctx: &mut Ctx) -> EvalResult<()> {
-        let value = self.value(ctx)?;
-        ctx.assign(self.symbol, value, self.env)
-    }
-
-    fn write(&mut self, ctx: &mut Ctx, call: &Call, data: &[u8]) -> EvalResult<()> {
-        check_limit(ctx, call, self.size.saturating_add(data.len()))?;
-        self.size += data.len();
+            payload.saturating_add(count.saturating_mul(size_of::<Option<Vec<u8>>>())),
+        )?;
+        self.size = payload;
         for part in data.split_inclusive(|&b| b == b'\n') {
             if let Some(line) = part.strip_suffix(b"\n") {
                 self.partial.extend_from_slice(line);
@@ -163,12 +178,8 @@ impl FilePath {
         if let Some(format) = self.format
             && mode.flags.write
         {
-            return Ok(Stream::CompressedWrite {
-                file,
-                format,
-                level: self.level,
-                buffer: Vec::new(),
-            });
+            let writer = io_result(ctx, call, codec::Writer::new(format, file, self.level))?;
+            return Ok(Stream::CompressedWrite(Box::new(writer)));
         }
         let mut file = BufReader::new(file);
         if mode.flags.read
@@ -179,11 +190,8 @@ impl FilePath {
             let header = io_result(ctx, call, header)?;
             if let Some(format) = Compression::detect(header) {
                 let limit = ctx.host().limits().max_decompress_bytes;
-                return Ok(Stream::ReadMemory(Cursor::new(io_result(
-                    ctx,
-                    call,
-                    decompress(format, file, limit),
-                )?)));
+                let reader = io_result(ctx, call, codec::reader(format, file, limit))?;
+                return Ok(Stream::CompressedRead(reader));
             }
         }
         let write_position = (mode.flags.read && mode.flags.write).then_some(0);
@@ -202,11 +210,17 @@ fn handle(ctx: &mut Ctx, kind: &str, id: i32) -> EvalResult {
     Ok(value)
 }
 
-fn register(ctx: &mut Ctx, call: &Call, kind: &str, connection: Connection) -> EvalResult {
-    let next = ctx.ext::<ConnTable>().last_id.max(2).saturating_add(1);
-    if next == i32::MAX {
-        return Err(ctx.stop(call.err_call(), "all connections are in use"));
+fn check_slot(ctx: &mut Ctx, call: &Call) -> EvalResult<()> {
+    let table = ctx.ext::<ConnTable>();
+    if table.entries.len() >= 125 || table.last_id == i32::MAX {
+        return Err(ctx.stop(call.err_call(), "all 128 connections are in use"));
     }
+    Ok(())
+}
+
+fn register(ctx: &mut Ctx, call: &Call, kind: &str, connection: Connection) -> EvalResult {
+    check_slot(ctx, call)?;
+    let next = ctx.ext::<ConnTable>().last_id.max(2) + 1;
     let value = handle(ctx, kind, next)?;
     let table = ctx.ext::<ConnTable>();
     table.last_id = next;
@@ -214,30 +228,39 @@ fn register(ctx: &mut Ctx, call: &Call, kind: &str, connection: Connection) -> E
     Ok(value)
 }
 
-fn id(ctx: &mut Ctx, call: &Call, value: SexpId) -> EvalResult<i32> {
+pub(crate) fn is_connection(ctx: &mut Ctx, value: SexpId) -> EvalResult<bool> {
     let key = ctx.session_mut().intern("class")?;
     let class = ctx.session().attr(value, key);
-    let is_connection = ctx.session().str_slice(class).is_ok_and(|ids| {
+    Ok(ctx.session().str_slice(class).is_ok_and(|ids| {
         ids.iter().any(|&id| {
             ctx.session()
                 .char_bytes(id)
                 .is_ok_and(|b| b == b"connection")
         })
-    });
-    if !is_connection {
+    }))
+}
+
+fn id(ctx: &mut Ctx, call: &Call, value: SexpId) -> EvalResult<i32> {
+    if !is_connection(ctx, value)? {
         return Err(ctx.stop(call.err_call(), "'con' is not a connection"));
     }
     Ok(ctx.session().int(value)?.iter().next().unwrap_or(-1))
 }
 
 fn take(ctx: &mut Ctx, call: &Call, id: i32) -> EvalResult<Connection> {
-    ctx.ext::<ConnTable>()
+    let connection = ctx
+        .ext::<ConnTable>()
         .entries
         .remove(&id)
-        .ok_or_else(|| ctx.stop(call.err_call(), "invalid connection"))
+        .ok_or_else(|| ctx.stop(call.err_call(), "invalid connection"))?;
+    if let Some(Stream::TextWrite(out)) = &connection.stream {
+        ctx.protect(out.env);
+    }
+    Ok(connection)
 }
 
 pub(super) fn file(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    check_slot(ctx, call)?;
     let mut name = super::text(ctx, call, args.get(0), "description")?;
     let open = super::text(ctx, call, args.get(1), "open")?;
     let kind = super::text(ctx, call, args.get(2), "kind")?;
@@ -247,6 +270,7 @@ pub(super) fn file(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
         "gzfile" => Some(Compression::Gzip),
         "bzfile" => Some(Compression::Bzip2),
         "xzfile" => Some(Compression::Xz),
+        "zstdfile" => Some(Compression::Zstd),
         _ => None,
     };
     let temporary = name.is_empty() && kind == "file";
@@ -287,15 +311,92 @@ pub(super) fn file(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     )
 }
 
+pub(super) fn raw(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    check_slot(ctx, call)?;
+    let object = args.get(0);
+    if ctx.session().type_of(object)? != SexpType::Raw {
+        return Err(ctx.stop(call.err_call(), "'object' must be a raw vector"));
+    }
+    let open = super::text(ctx, call, args.get(1), "open")?;
+    let first = open.as_bytes().first();
+    if open.as_bytes().get(1) == Some(&b't') {
+        return Err(ctx.stop(call.err_call(), "invalid 'open' argument"));
+    }
+    let append = first == Some(&b'a');
+    let plus = open.as_bytes().get(1) == Some(&b'+');
+    let mode = Mode {
+        binary: true,
+        flags: OpenMode {
+            read: first == Some(&b'r') || (plus && matches!(first, Some(b'w' | b'a'))),
+            write: matches!(first, Some(b'w' | b'a')) || (plus && first == Some(&b'r')),
+            append,
+            create: false,
+            truncate: false,
+        },
+    };
+    check_limit(ctx, call, ctx.session().xlength(object)?)?;
+    let mut buffer = Cursor::new(ctx.session().raw(object)?.iter().collect::<Vec<_>>());
+    if append {
+        buffer.set_position(buffer.get_ref().len() as u64);
+    }
+    register(
+        ctx,
+        call,
+        "rawConnection",
+        Connection {
+            path: None,
+            mode,
+            stream: Some(Stream::Raw(buffer)),
+        },
+    )
+}
+
+pub(super) fn raw_value(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    let id = id(ctx, call, args.get(0))?;
+    let table = ctx.ext::<ConnTable>();
+    let Some(Connection {
+        stream: Some(Stream::Raw(buffer)),
+        mode,
+        ..
+    }) = table.entries.get(&id)
+    else {
+        return Err(ctx.stop(call.err_call(), "'con' is not an output rawConnection"));
+    };
+    if !mode.flags.write {
+        return Err(ctx.stop(call.err_call(), "'con' is not an output rawConnection"));
+    }
+    let bytes = buffer.get_ref().clone();
+    Ok(ctx.session_mut().alloc_raw_from(&bytes)?)
+}
+
 pub(super) fn text(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    check_slot(ctx, call)?;
     let object = args.get(0);
     let open = super::text(ctx, call, args.get(1), "open")?;
+    let encoding = args.get(3);
+    let encoding = if encoding == SEXP_NIL {
+        ByteEncoding::native(ctx)
+    } else {
+        let enc = super::texts(ctx, call, encoding, "encoding")?;
+        match enc.as_slice() {
+            [Some(a), Some(b), Some(c)] if a.is_empty() && b == "bytes" && c == "UTF-8" => {
+                ByteEncoding::native(ctx)
+            }
+            [Some(enc)] if !enc.is_empty() && "bytes".starts_with(enc.as_str()) => {
+                ByteEncoding::Bytes
+            }
+            [Some(enc)] if !enc.is_empty() && "UTF-8".starts_with(enc.as_str()) => {
+                ByteEncoding::Utf8
+            }
+            _ => return Err(ctx.stop(call.err_call(), "'arg' should be one of “bytes”, “UTF-8”")),
+        }
+    };
     let mode = Mode::parse(&open)
         .filter(|_| matches!(open.as_str(), "r" | "w" | "a"))
         .ok_or_else(|| ctx.stop(call.err_call(), "invalid 'open' argument"))?;
     let stream = if mode.flags.read {
         let mut input = Vec::new();
-        for line in bytes(ctx, object)? {
+        for line in translated_bytes(ctx, call, object, encoding)? {
             let line = line.as_deref().unwrap_or(b"NA");
             check_limit(
                 ctx,
@@ -318,7 +419,10 @@ pub(super) fn text(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
             } else {
                 binding.value
             };
-            bytes(ctx, value).map_err(|_| ctx.stop(call.err_call(), "invalid 'text' argument"))?
+            if ctx.session().type_of(value)? != SexpType::Str {
+                return Err(ctx.stop(call.err_call(), "invalid 'text' argument"));
+            }
+            bytes(ctx, call, value)?
         } else {
             if mode.flags.append {
                 ctx.warn(
@@ -335,8 +439,14 @@ pub(super) fn text(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
             lines,
             partial: Vec::new(),
             size,
+            encoding: if ctx.host().locale().utf8 {
+                Encoding::Utf8
+            } else {
+                Encoding::Native
+            },
         };
-        out.update(ctx)?;
+        let result = out.update(ctx);
+        io_result(ctx, call, result)?;
         Stream::TextWrite(out)
     };
     register(
@@ -355,29 +465,17 @@ pub(super) fn text_value(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalRes
     let id = id(ctx, call, args.get(0))?;
     let connection = take(ctx, call, id)?;
     let result = match &connection.stream {
-        Some(Stream::TextWrite(out)) => out.value(ctx),
-        _ => Err(ctx.stop(call.err_call(), "'con' is not an output textConnection")),
+        Some(Stream::TextWrite(out)) => Some(out.value(ctx)),
+        _ => None,
     };
     ctx.ext::<ConnTable>().entries.insert(id, connection);
-    result
+    result.ok_or_else(|| ctx.stop(call.err_call(), "'con' is not an output textConnection"))?
 }
 
-fn finish(ctx: &mut Ctx, call: &Call, stream: Stream) -> EvalResult<()> {
+fn finish(ctx: &mut Ctx, stream: Stream) -> io::Result<()> {
     match stream {
-        Stream::CompressedWrite {
-            mut file,
-            format,
-            level,
-            buffer,
-        } => {
-            let compressed = io_result(ctx, call, compress(format, &buffer, level))?;
-            io_result(
-                ctx,
-                call,
-                file.write_all(&compressed).and_then(|()| file.flush()),
-            )
-        }
-        Stream::File(mut file, _) => io_result(ctx, call, file.get_mut().flush()),
+        Stream::CompressedWrite(writer) => writer.finish(),
+        Stream::File(mut file, _) => file.get_mut().flush(),
         Stream::TextWrite(mut out) if !out.partial.is_empty() => {
             out.lines.push(Some(std::mem::take(&mut out.partial)));
             out.update(ctx)
@@ -394,11 +492,11 @@ pub(super) fn close(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     let connection = take(ctx, call, id)?;
     let result = connection
         .stream
-        .map_or(Ok(()), |stream| finish(ctx, call, stream));
+        .map_or(Ok(()), |stream| finish(ctx, stream));
     if let Some(path) = connection.path.filter(|path| path.temporary) {
         let _ = ctx.host().remove(&path.name, false);
     }
-    result?;
+    io_result(ctx, call, result)?;
     Ok(SEXP_NIL)
 }
 
@@ -471,11 +569,36 @@ pub(super) enum Access {
     Lines,
     Binary,
     Characters,
+    Serialized(Serialization),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Serialization {
+    Stream,
+    Rds,
+    Workspace,
 }
 
 impl Access {
     fn binary(self) -> bool {
         self != Self::Lines
+    }
+
+    fn text_error(self, read: bool) -> Option<&'static str> {
+        match (self, read) {
+            (Self::Binary, true) => Some("can only read from a binary connection"),
+            (Self::Binary, false) => Some("can only write to a binary connection"),
+            (Self::Serialized(Serialization::Stream | Serialization::Rds), true) => {
+                Some("input format does not match specified format")
+            }
+            (Self::Serialized(Serialization::Rds), false) => {
+                Some("binary-mode connection required for ascii=false")
+            }
+            (Self::Serialized(Serialization::Workspace), false) => {
+                Some("can only save to a binary connection")
+            }
+            _ => None,
+        }
     }
 }
 
@@ -490,6 +613,7 @@ pub(super) fn read<T>(
     let limit = ctx.host().limits().max_vector_bytes;
     match ctx.session().type_of(source)? {
         SexpType::Raw if binary => {
+            check_limit(ctx, call, ctx.session().xlength(source)?)?;
             let data: Vec<_> = ctx.session().raw(source)?.iter().collect();
             io_result(ctx, call, read(&mut Cursor::new(data), limit))
         }
@@ -503,7 +627,8 @@ pub(super) fn read<T>(
                 temporary: false,
             };
             let mut stream = path.open(ctx, call, Mode::read(binary))?;
-            read_from(ctx, call, &mut stream, read, limit)
+            let result = read_from(&mut stream, |input| read(input, limit));
+            io_result(ctx, call, result)
         }
         _ => {
             let id = id(ctx, call, source)?;
@@ -524,26 +649,97 @@ pub(super) fn read<T>(
                     },
                 ));
             }
-            operate(ctx, call, id, Mode::read(binary), access, |ctx, stream| {
-                read_from(ctx, call, stream, read, limit)
+            operate(ctx, call, id, Mode::read(binary), access, |_, stream| {
+                read_from(stream, |input| read(input, limit))
             })
         }
     }
 }
 
 fn read_from<T>(
+    stream: &mut Stream,
+    read: impl FnOnce(&mut dyn BufRead) -> io::Result<T>,
+) -> io::Result<T> {
+    match stream {
+        Stream::File(file, _) => read(file),
+        Stream::CompressedRead(file) => read(file),
+        Stream::Raw(buffer) | Stream::ReadMemory(buffer) => read(buffer),
+        _ => Err(io::Error::other("cannot read from this connection")),
+    }
+}
+
+pub(crate) fn read_serialized<T>(
     ctx: &mut Ctx,
     call: &Call,
-    stream: &mut Stream,
-    read: impl FnOnce(&mut dyn BufRead, usize) -> io::Result<T>,
-    limit: usize,
+    source: SexpId,
+    serialization: Serialization,
+    read: impl FnOnce(&mut RSession, &mut dyn BufRead) -> io::Result<T>,
 ) -> EvalResult<T> {
-    let result = match stream {
-        Stream::File(file, _) => read(file, limit),
-        Stream::ReadMemory(buffer) => read(buffer, limit),
-        _ => return Err(ctx.stop(call.err_call(), "cannot read from this connection")),
+    let id = id(ctx, call, source)?;
+    let caller_opened = ctx
+        .ext::<ConnTable>()
+        .entries
+        .get(&id)
+        .is_some_and(|connection| connection.stream.is_some());
+    operate(
+        ctx,
+        call,
+        id,
+        Mode::read(true),
+        Access::Serialized(serialization),
+        |ctx, stream| {
+            if serialization == Serialization::Workspace {
+                prepare_workspace(
+                    stream,
+                    caller_opened,
+                    ctx.host().limits().max_decompress_bytes,
+                )?;
+            }
+            read_from(stream, |input| read(ctx.session_mut(), input))
+        },
+    )
+}
+
+fn prepare_workspace(stream: &mut Stream, open: bool, limit: usize) -> io::Result<()> {
+    let Stream::File(file, _) = stream else {
+        return Ok(());
     };
-    io_result(ctx, call, result)
+    let Some(format) = Compression::detect(file.fill_buf()?) else {
+        return Ok(());
+    };
+    if !open {
+        return Err(io::Error::other(
+            "can only use read- or write- binary connections",
+        ));
+    }
+    if !matches!(format, Compression::Gzip) {
+        return Err(io::Error::other(
+            "the input does not start with a magic number compatible with loading from a connection",
+        ));
+    }
+    let original = std::mem::replace(stream, Stream::ReadMemory(Cursor::default()));
+    if let Stream::File(file, _) = original {
+        *stream = Stream::CompressedRead(codec::gzip_reader(file, limit));
+    }
+    Ok(())
+}
+
+pub(crate) fn write_serialized(
+    ctx: &mut Ctx,
+    call: &Call,
+    dest: SexpId,
+    serialization: Serialization,
+    data: &[u8],
+) -> EvalResult<()> {
+    let id = id(ctx, call, dest)?;
+    operate(
+        ctx,
+        call,
+        id,
+        Mode::write(true),
+        Access::Serialized(serialization),
+        |ctx, stream| write_to(ctx, stream, data),
+    )
 }
 
 pub(super) fn write(
@@ -564,8 +760,8 @@ pub(super) fn write(
             temporary: false,
         };
         let mut stream = path.open(ctx, call, Mode::write(binary))?;
-        write_to(ctx, call, &mut stream, data)?;
-        return finish(ctx, call, stream);
+        let result = write_to(ctx, &mut stream, data).and_then(|()| finish(ctx, stream));
+        return io_result(ctx, call, result);
     }
     let id = id(ctx, call, dest)?;
     if (0..=2).contains(&id) {
@@ -577,37 +773,42 @@ pub(super) fn write(
         return result.map_err(|e| ctx.stop(call.err_call(), e.to_string()));
     }
     operate(ctx, call, id, Mode::write(binary), access, |ctx, stream| {
-        write_to(ctx, call, stream, data)
+        write_to(ctx, stream, data)
     })
 }
 
-fn write_to(ctx: &mut Ctx, call: &Call, stream: &mut Stream, data: &[u8]) -> EvalResult<()> {
+fn check_buffer(ctx: &mut Ctx, size: usize) -> io::Result<()> {
+    if size > ctx.host().limits().max_vector_bytes {
+        return Err(io::Error::other("I/O result exceeds the vector size limit"));
+    }
+    Ok(())
+}
+
+fn write_to(ctx: &mut Ctx, stream: &mut Stream, data: &[u8]) -> io::Result<()> {
     match stream {
         Stream::File(file, write_position) => {
             if let Some(write_position) = write_position {
-                let read_position = io_result(ctx, call, file.stream_position())?;
-                io_result(
-                    ctx,
-                    call,
-                    file.seek(std::io::SeekFrom::Start(*write_position)),
-                )?;
+                let read_position = file.stream_position()?;
+                file.seek(io::SeekFrom::Start(*write_position))?;
                 let result = file.get_mut().write_all(data);
                 let position = file.get_mut().stream_position();
-                let restored = file.seek(std::io::SeekFrom::Start(read_position));
-                *write_position = io_result(ctx, call, position)?;
-                io_result(ctx, call, restored)?;
-                io_result(ctx, call, result)
+                let restored = file.seek(io::SeekFrom::Start(read_position));
+                *write_position = position?;
+                restored?;
+                result
             } else {
-                io_result(ctx, call, file.get_mut().write_all(data))
+                file.get_mut().write_all(data)
             }
         }
-        Stream::CompressedWrite { buffer, .. } => {
-            check_limit(ctx, call, buffer.len().saturating_add(data.len()))?;
-            buffer.extend_from_slice(data);
-            Ok(())
+        Stream::CompressedWrite(writer) => writer.write_all(data),
+        Stream::Raw(buffer) => {
+            check_buffer(ctx, (buffer.position() as usize).saturating_add(data.len()))?;
+            buffer.write_all(data)
         }
-        Stream::TextWrite(out) => out.write(ctx, call, data),
-        Stream::ReadMemory(_) => Err(ctx.stop(call.err_call(), "cannot write to this connection")),
+        Stream::TextWrite(out) => out.write(ctx, data),
+        Stream::CompressedRead(_) | Stream::ReadMemory(_) => {
+            Err(io::Error::other("cannot write to this connection"))
+        }
     }
 }
 
@@ -617,51 +818,55 @@ fn operate<T>(
     id: i32,
     mode: Mode,
     access: Access,
-    operation: impl FnOnce(&mut Ctx, &mut Stream) -> EvalResult<T>,
+    operation: impl FnOnce(&mut Ctx, &mut Stream) -> io::Result<T>,
 ) -> EvalResult<T> {
-    let mut connection = take(ctx, call, id)?;
-    let result = match &mut connection.stream {
-        Some(_) if access == Access::Binary && !connection.mode.binary => Err(ctx.stop(
-            call.err_call(),
-            if mode.flags.read {
-                "can only read from a binary connection"
-            } else {
-                "can only write to a binary connection"
-            },
-        )),
-        Some(_) if mode.flags.read && !connection.mode.flags.read => {
-            Err(ctx.stop(call.err_call(), "cannot read from this connection"))
-        }
-        Some(_) if mode.flags.write && !connection.mode.flags.write => {
-            Err(ctx.stop(call.err_call(), "cannot write to this connection"))
-        }
-        Some(stream) => {
-            if access == Access::Characters && !connection.mode.binary {
-                let name = if mode.flags.read {
-                    "readChar"
-                } else {
-                    "writeChar"
-                };
-                ctx.warn(
-                    call.err_call(),
-                    format!("text connection used with {name}(), results may be incorrect"),
-                );
-            }
-            operation(ctx, stream)
-        }
-        None => (|| {
-            let path = connection
-                .path
-                .as_ref()
-                .ok_or_else(|| ctx.stop(call.err_call(), "invalid connection"))?;
-            let mut stream = path.open(ctx, call, mode)?;
-            let result = operation(ctx, &mut stream);
-            let closed = finish(ctx, call, stream);
-            result.and_then(|value| closed.map(|()| value))
-        })(),
+    let table = ctx.ext::<ConnTable>();
+    let Some(connection) = table.entries.get(&id) else {
+        return Err(ctx.stop(call.err_call(), "invalid connection"));
     };
+    if connection.stream.is_none() {
+        if access == Access::Serialized(Serialization::Stream) {
+            return Err(ctx.stop(call.err_call(), "connection is not open"));
+        }
+        let Some(path) = connection.path.clone() else {
+            return Err(ctx.stop(call.err_call(), "invalid connection"));
+        };
+        let mut stream = path.open(ctx, call, mode)?;
+        let result = operation(ctx, &mut stream);
+        let closed = finish(ctx, stream);
+        return io_result(ctx, call, result.and_then(|value| closed.map(|()| value)));
+    }
+
+    if !connection.mode.binary
+        && let Some(message) = access.text_error(mode.flags.read)
+    {
+        return Err(ctx.stop(call.err_call(), message));
+    }
+    if mode.flags.read && !connection.mode.flags.read {
+        return Err(ctx.stop(call.err_call(), "cannot read from this connection"));
+    }
+    if mode.flags.write && !connection.mode.flags.write {
+        return Err(ctx.stop(call.err_call(), "cannot write to this connection"));
+    }
+    if access == Access::Characters && !connection.mode.binary {
+        let name = if mode.flags.read {
+            "readChar"
+        } else {
+            "writeChar"
+        };
+        ctx.warn(
+            call.err_call(),
+            format!("text connection used with {name}(), results may be incorrect"),
+        );
+    }
+    // Stream operations return I/O errors. Restore the entry before an R calling handler can run.
+    let mut connection = take(ctx, call, id)?;
+    let result = connection.stream.as_mut().map_or_else(
+        || Err(io::Error::other("invalid connection")),
+        |stream| operation(ctx, stream),
+    );
     ctx.ext::<ConnTable>().entries.insert(id, connection);
-    result
+    io_result(ctx, call, result)
 }
 
 pub(super) fn label(ctx: &mut Ctx, call: &Call, value: SexpId) -> EvalResult<String> {
