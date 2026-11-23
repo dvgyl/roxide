@@ -103,6 +103,10 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    if let Err(err) = roxide_base::register_all(&mut ctx) {
+        let _ = writeln!(io::stderr().lock(), "Error: {err}");
+        return ExitCode::FAILURE;
+    }
 
     if !opts.exprs.is_empty() {
         for expr in &opts.exprs {

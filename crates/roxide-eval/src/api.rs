@@ -220,6 +220,10 @@ pub struct OptionsCache {
     pub expressions: usize,
     /// `options(width)`, default 80.
     pub width: usize,
+    /// `options(warnPartialMatchDollar)`, default false.
+    pub warn_partial_match_dollar: bool,
+    /// `options(warnPartialMatchArgs)`, default false.
+    pub warn_partial_match_args: bool,
 }
 
 impl Default for OptionsCache {
@@ -230,6 +234,8 @@ impl Default for OptionsCache {
             warn: 0,
             expressions: 5000,
             width: 80,
+            warn_partial_match_dollar: false,
+            warn_partial_match_args: false,
         }
     }
 }

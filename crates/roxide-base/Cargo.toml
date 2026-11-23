@@ -1,0 +1,17 @@
+[package]
+name = "roxide-base"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Clean-room GNU R 4.6.2 base package primitives and R-level wrappers split into disjoint submodules"
+
+[dependencies]
+roxide-diag = { workspace = true }
+roxide-gc = { workspace = true }
+roxide-host = { workspace = true }
+roxide-syntax = { workspace = true }
+roxide-value = { workspace = true }
+roxide-eval = { workspace = true }
+
+[lints]
+workspace = true

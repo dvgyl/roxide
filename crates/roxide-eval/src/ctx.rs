@@ -232,6 +232,36 @@ impl Ctx {
         &self.opts
     }
 
+    /// Mutably borrow cached options.
+    #[inline]
+    #[must_use]
+    pub fn opts_mut(&mut self) -> &mut OptionsCache {
+        &mut self.opts
+    }
+
+    /// Emit a diagnostic message (signaling `simpleMessage` when handlers are installed).
+    pub fn message(&mut self, _call: SexpId, text: impl Into<String>) -> EvalResult<()> {
+        let s = text.into();
+        let _ = self.host.write_err(s.as_bytes());
+        Ok(())
+    }
+
+    /// Emit a warning that participates in calling/exiting condition handlers (`muffleWarning`).
+    pub fn warn_now(&mut self, call: SexpId, msg: impl Into<String>) -> EvalResult<()> {
+        self.warn(call, msg);
+        Ok(())
+    }
+
+    /// Print a value using Roxide's core default vector printer.
+    pub fn print_value_default(&mut self, val: SexpId, digits: usize) -> EvalResult<()> {
+        builtins::print_value(self, val, digits)
+    }
+
+    /// Return the default `dput` / `deparse` line output for a value.
+    pub fn deparse_lines(&self, val: SexpId, opts: DeparseOpts) -> EvalResult<Vec<String>> {
+        Ok(deparse(&self.session, val, opts)?)
+    }
+
     /// Set visibility flag for the current evaluation result.
     #[inline]
     pub fn set_visible(&mut self, visible: bool) {

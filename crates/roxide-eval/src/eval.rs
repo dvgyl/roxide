@@ -160,6 +160,76 @@ impl Ctx {
         Ok(())
     }
 
+    /// Super-assign (`<<-`) `val` to `sym` in the first enclosing environment binding `sym`,
+    /// or `.GlobalEnv` if unbound in all enclosing frames.
+    pub fn assign_super(&mut self, sym: Sym, val: SexpId, env: SexpId) -> EvalResult<()> {
+        let mut cur = self.session.env_enclos(env)?;
+        while cur != SEXP_NIL && cur != roxide_value::EMPTY_ENV {
+            if self.session.env_get(cur, sym).is_some() {
+                self.session.env_define(cur, sym, val)?;
+                return Ok(());
+            }
+            cur = self.session.env_enclos(cur)?;
+        }
+        self.session
+            .env_define(roxide_value::GLOBAL_ENV, sym, val)?;
+        Ok(())
+    }
+
+    /// Apply a callable `fun` to already-evaluated `(Option<Sym>, SexpId)` arguments.
+    pub fn apply(
+        &mut self,
+        fun: SexpId,
+        args: &[(Option<Sym>, SexpId)],
+        call_expr: SexpId,
+        env: SexpId,
+    ) -> EvalResult {
+        self.safepoint();
+        let fun_ty = self.session.type_of(fun)?;
+        match fun_ty {
+            SexpType::Builtin | SexpType::Special => {
+                let (prim_id, _) = self.session.prim_parts(fun)?;
+                let def = self.prims[prim_id.0 as usize];
+                let mut arg_bundle = Args::from_pairs(args.to_vec());
+                let call = Call {
+                    expr: call_expr,
+                    env,
+                    prim: prim_id,
+                    user_call: call_expr,
+                };
+                let res = self.scoped(|ctx| {
+                    for &v in arg_bundle.values() {
+                        ctx.protect(v);
+                    }
+                    (def.fun)(ctx, &call, &mut arg_bundle)
+                })?;
+                match def.visibility {
+                    Visibility::On => self.visible = true,
+                    Visibility::Off => self.visible = false,
+                    Visibility::SetByFn => {}
+                }
+                Ok(res)
+            }
+            SexpType::Clo => Err(self.stop(
+                call_expr,
+                "closure evaluation will be enabled in Milestone 1 Wave 2A",
+            )),
+            _ => Err(self.stop(call_expr, msg::NOT_A_FUNCTION)),
+        }
+    }
+
+    /// Look up function `name` in `env` and apply it to evaluated arguments.
+    pub fn call_function(
+        &mut self,
+        name: &str,
+        args: &[(Option<Sym>, SexpId)],
+        env: SexpId,
+    ) -> EvalResult {
+        let sym = self.session.intern(name)?;
+        let fun = self.find_fun(sym, env)?;
+        self.apply(fun, args, SEXP_NIL, env)
+    }
+
     fn eval_call(&mut self, call_expr: SexpId, env: SexpId) -> EvalResult {
         let (head, arg_list, _) = self.session.cons_parts(call_expr)?;
         let fun = if self.session.type_of(head)? == SexpType::Sym {

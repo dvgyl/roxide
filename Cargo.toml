@@ -7,6 +7,7 @@ members = [
     "crates/roxide-syntax",
     "crates/roxide-value",
     "crates/roxide-eval",
+    "crates/roxide-base",
     "crates/roxide-cli",
     "crates/roxide-harness",
 ]
@@ -24,6 +25,7 @@ roxide-gc = { path = "crates/roxide-gc" }
 roxide-syntax = { path = "crates/roxide-syntax" }
 roxide-value = { path = "crates/roxide-value" }
 roxide-eval = { path = "crates/roxide-eval" }
+roxide-base = { path = "crates/roxide-base" }
 
 [workspace.lints.rust]
 missing_docs = "deny"

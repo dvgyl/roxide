@@ -3,9 +3,22 @@
 version = 4
 
 [[package]]
+name = "roxide-base"
+version = "0.1.0"
+dependencies = [
+ "roxide-diag",
+ "roxide-eval",
+ "roxide-gc",
+ "roxide-host",
+ "roxide-syntax",
+ "roxide-value",
+]
+
+[[package]]
 name = "roxide-cli"
 version = "0.1.0"
 dependencies = [
+ "roxide-base",
  "roxide-eval",
  "roxide-gc",
  "roxide-host",
