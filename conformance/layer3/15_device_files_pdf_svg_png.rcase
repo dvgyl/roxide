@@ -1,0 +1,22 @@
+=== case: pdf_opens_numbered_file_and_returns_invisible_null ===
+#@ tags: layer3,devices
+#@ compare: exact
+path <- file.path(tempdir(), "m%02d.pdf")
+result <- withVisible(pdf(path, width = 4, height = 3, onefile = FALSE))
+dput(is.null(result$value))
+dput(result$visible)
+dput(file.exists(file.path(tempdir(), "m01.pdf")))
+
+=== case: png_constructor_returns_invisible_null ===
+#@ tags: layer3,devices
+#@ compare: exact
+path <- file.path(tempdir(), "p%02d.png")
+result <- withVisible(png(path, width = 300, height = 240))
+dput(is.null(result$value))
+dput(result$visible)
+
+=== case: svg_constructor_export ===
+#@ tags: layer3,devices
+#@ compare: exact
+dput(is.function(grDevices::svg))
+dput(identical(grDevices::svg, svg))

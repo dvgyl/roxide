@@ -1,20 +1,45 @@
-//! Headless PDF 1.4, SVG 1.1, and PNG graphics devices + font metrics (owned by M3 Builder D).
-//!
-//! The R-level `pdf()`, `svg()`, and `png()` functions live in this module (`devices::MODULE`).
+//! Headless PDF, SVG, and PNG devices and their R constructors.
 
-use roxide_eval::Module;
+mod metrics;
+mod output;
+mod pdf;
+mod raster;
+mod svg;
+
+use roxide_eval::{
+    ArgEval, Args, Arity, Call, Ctx, Dispatch, EvalResult, Module, PrimDef, PrimFn, PrimKind,
+    Visibility,
+};
+use roxide_gc::SexpId;
 use roxide_host::Host;
+use roxide_value::{CharId, Encoding, SEXP_NIL, SexpType, ValueApi};
 
-use crate::engine::{Device, DeviceSpec, RecordingDevice};
+use crate::engine::{Device, DeviceSpec, GraphicsExt, MAX_DEVICES, RecordingDevice, Rgba};
 
-/// Device constructor primitives (`pdf`, `svg`, `png`; owned by M3 Builder D).
+/// Device constructors for the `grDevices` package.
 pub const MODULE: Module = Module {
-    prims: &[],
-    prelude: "",
+    prims: &[
+        constructor("rox_gr_pdf", 11, pdf),
+        constructor("rox_gr_svg", 7, svg),
+        constructor("rox_gr_png", 8, png),
+    ],
+    prelude: include_str!("prelude.R"),
 };
 
-/// Construct a concrete graphics [`Device`] from `spec` (Builder D replaces the stub branches in W1-D).
-pub fn open_device(_host: &mut dyn Host, spec: &DeviceSpec) -> Result<Box<dyn Device>, String> {
+const fn constructor(name: &'static str, count: usize, fun: PrimFn) -> PrimDef {
+    PrimDef {
+        name,
+        kind: PrimKind::Internal,
+        args: ArgEval::Eval,
+        arity: Arity::Exact(count),
+        dispatch: Dispatch::None,
+        visibility: Visibility::Off,
+        fun,
+    }
+}
+
+/// Open the backend selected by the device specification.
+pub fn open_device(host: &mut dyn Host, spec: &DeviceSpec) -> Result<Box<dyn Device>, String> {
     match spec {
         DeviceSpec::Recording {
             name,
@@ -25,25 +50,195 @@ pub fn open_device(_host: &mut dyn Host, spec: &DeviceSpec) -> Result<Box<dyn De
             *width,
             *height,
         ))),
-        DeviceSpec::Pdf { width, height, .. } => {
-            Ok(Box::new(RecordingDevice::new("pdf", *width, *height)))
-        }
-        DeviceSpec::Svg { width, height, .. } => {
-            Ok(Box::new(RecordingDevice::new("svg", *width, *height)))
-        }
-        DeviceSpec::Png {
-            width_px,
-            height_px,
-            res,
-            device_name,
-            ..
-        } => {
-            let ppi = if *res > 0.0 { *res } else { 72.0 };
-            Ok(Box::new(RecordingDevice::new(
-                device_name.clone(),
-                f64::from(*width_px) / ppi,
-                f64::from(*height_px) / ppi,
-            )))
-        }
+        DeviceSpec::Pdf { .. } => Ok(Box::new(pdf::PdfDevice::open(
+            host,
+            spec,
+            pdf::Settings::default(),
+        )?)),
+        DeviceSpec::Svg { .. } => Ok(Box::new(svg::SvgDevice::open(spec, "sans".into())?)),
+        DeviceSpec::Png { .. } => Ok(Box::new(raster::PngDevice::open(host, spec)?)),
     }
+}
+
+fn install(
+    ctx: &mut Ctx,
+    call: &Call,
+    open: impl FnOnce(&mut dyn Host) -> Result<Box<dyn Device>, String>,
+) -> EvalResult {
+    if ctx.ext::<GraphicsExt>().open_ids().len() >= MAX_DEVICES - 1 {
+        return Err(ctx.stop(call.err_call(), "too many open devices"));
+    }
+    let device = open(ctx.host()).map_err(|message| ctx.stop(call.err_call(), message))?;
+    ctx.ext::<GraphicsExt>()
+        .open_slot(device)
+        .ok_or_else(|| ctx.stop(call.err_call(), "too many open devices"))?;
+    Ok(SEXP_NIL)
+}
+
+fn pdf(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    let spec = DeviceSpec::Pdf {
+        file: text(ctx, call, args.get(0), "file")?,
+        width: number(ctx, call, args.get(1), "width")?,
+        height: number(ctx, call, args.get(2), "height")?,
+        onefile: flag(ctx, call, args.get(3), "onefile")?,
+        compress: flag(ctx, call, args.get(4), "compress")?,
+        bg: background(ctx, call, args.get(5))?,
+        pointsize: number(ctx, call, args.get(6), "pointsize")?,
+    };
+    let settings = pdf::Settings {
+        title: text(ctx, call, args.get(7), "title")?,
+        kerning: flag(ctx, call, args.get(8), "useKerning")?,
+        odd_even: flag(ctx, call, args.get(9), "fillOddEven")?,
+    };
+    let family = text(ctx, call, args.get(10), "family")?;
+    if !matches!(family.as_str(), "Helvetica" | "sans" | "") {
+        return Err(ctx.stop(call.err_call(), format!("unknown family '{family}'")));
+    }
+    install(ctx, call, |host| {
+        Ok(Box::new(pdf::PdfDevice::open(host, &spec, settings)?))
+    })
+}
+
+fn svg(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    let spec = DeviceSpec::Svg {
+        filename: text(ctx, call, args.get(0), "filename")?,
+        width: number(ctx, call, args.get(1), "width")?,
+        height: number(ctx, call, args.get(2), "height")?,
+        pointsize: number(ctx, call, args.get(3), "pointsize")?,
+        onefile: flag(ctx, call, args.get(4), "onefile")?,
+        bg: background(ctx, call, args.get(5))?,
+    };
+    let family = text(ctx, call, args.get(6), "family")?;
+    install(ctx, call, |_| {
+        Ok(Box::new(svg::SvgDevice::open(&spec, family)?))
+    })
+}
+
+fn png(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    let units = text(ctx, call, args.get(3), "units")?;
+    let kind = if args.get(7) == SEXP_NIL {
+        let info = ctx.host().sys_info();
+        let default = if matches!(info.sysname.as_str(), "macos" | "Darwin") {
+            "quartz"
+        } else {
+            "cairo"
+        };
+        default.to_owned()
+    } else {
+        text(ctx, call, args.get(7), "type")?
+    };
+    let mut res = number(ctx, call, args.get(6), "res")?;
+    if res.is_nan() {
+        if units != "px" {
+            return Err(ctx.stop(
+                call.err_call(),
+                "'res' must be specified unless 'units = \"px\"'",
+            ));
+        }
+        res = 72.0;
+    }
+    let factor = match units.as_str() {
+        "px" => 1.0,
+        "in" => res,
+        "cm" => res / 2.54,
+        "mm" => res / 25.4,
+        _ => return Err(ctx.stop(call.err_call(), "invalid 'units' argument")),
+    };
+    let dimension = |ctx: &mut Ctx, index, name| -> EvalResult<u32> {
+        let pixels = (number(ctx, call, args.get(index), name)? * factor).trunc();
+        if !(1.0..=f64::from(i32::MAX)).contains(&pixels) {
+            return Err(ctx.stop(call.err_call(), format!("invalid '{name}' argument")));
+        }
+        Ok(pixels as u32)
+    };
+    let device_name = match kind.as_str() {
+        "quartz" => "quartz_off_screen",
+        "cairo" | "cairo-png" | "Xlib" => "png",
+        _ => return Err(ctx.stop(call.err_call(), "invalid 'type' argument")),
+    };
+    let spec = DeviceSpec::Png {
+        filename: text(ctx, call, args.get(0), "filename")?,
+        width_px: dimension(ctx, 1, "width")?,
+        height_px: dimension(ctx, 2, "height")?,
+        pointsize: number(ctx, call, args.get(4), "pointsize")?,
+        bg: background(ctx, call, args.get(5))?,
+        res,
+        device_name: device_name.into(),
+    };
+    install(ctx, call, |host| open_device(host, &spec))
+}
+
+fn number(ctx: &mut Ctx, call: &Call, value: SexpId, name: &str) -> EvalResult<f64> {
+    let (value, _) = ctx.session_mut().coerce(value, SexpType::Real)?;
+    let values = ctx.session().real(value)?;
+    if let Some(number) = values.iter().next() {
+        Ok(number)
+    } else {
+        Err(ctx.stop(call.err_call(), format!("invalid '{name}' argument")))
+    }
+}
+
+fn flag(ctx: &mut Ctx, call: &Call, value: SexpId, name: &str) -> EvalResult<bool> {
+    let (value, _) = ctx.session_mut().coerce(value, SexpType::Lgl)?;
+    let first = ctx
+        .session()
+        .lgl(value)?
+        .iter()
+        .next()
+        .and_then(|v| v.get());
+    first.ok_or_else(|| ctx.stop(call.err_call(), format!("invalid '{name}' argument")))
+}
+
+fn text(ctx: &mut Ctx, call: &Call, value: SexpId, name: &str) -> EvalResult<String> {
+    if ctx.session().type_of(value)? == SexpType::Str
+        && let Some(&id) = ctx.session().str_slice(value)?.first()
+        && id != CharId::NA
+    {
+        let data = ctx.session().char_bytes(id)?;
+        return Ok(if ctx.session().char_encoding(id)? == Encoding::Latin1 {
+            data.iter().copied().map(char::from).collect()
+        } else {
+            String::from_utf8_lossy(data).into_owned()
+        });
+    }
+    Err(ctx.stop(call.err_call(), format!("invalid '{name}' argument")))
+}
+
+fn background(ctx: &mut Ctx, call: &Call, value: SexpId) -> EvalResult<Rgba> {
+    let color = text(ctx, call, value, "bg")?.to_ascii_lowercase();
+    if let Some(hex) = color.strip_prefix('#')
+        && matches!(hex.len(), 6 | 8)
+        && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && let Ok(mut rgba) = u32::from_str_radix(hex, 16)
+    {
+        if hex.len() == 6 {
+            rgba = (rgba << 8) | 255;
+        }
+        let [r, g, b, a] = rgba.to_be_bytes();
+        return Ok(Rgba::new(r, g, b, a));
+    }
+    if let Some(level) = color
+        .strip_prefix("gray")
+        .or_else(|| color.strip_prefix("grey"))
+        && let Ok(level) = level.parse::<u16>()
+        && level <= 100
+    {
+        // Match the 8-bit gray levels used by R.
+        let gray = (f64::from(level) * 2.55).round() as u8;
+        return Ok(Rgba::new(gray, gray, gray, 255));
+    }
+    let [r, g, b] = match color.as_str() {
+        "transparent" => return Ok(Rgba::TRANSPARENT),
+        "black" => [0, 0, 0],
+        "white" => [255, 255, 255],
+        "red" => [255, 0, 0],
+        "green" => [0, 255, 0],
+        "blue" => [0, 0, 255],
+        "yellow" => [255, 255, 0],
+        "cyan" => [0, 255, 255],
+        "magenta" => [255, 0, 255],
+        "gray" | "grey" => [190, 190, 190],
+        _ => return Err(ctx.stop(call.err_call(), format!("invalid color name '{color}'"))),
+    };
+    Ok(Rgba::new(r, g, b, 255))
 }
