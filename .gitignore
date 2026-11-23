@@ -1,0 +1,20 @@
+# Build artifacts & local environment
+/target/
+/env/
+*.rs.bk
+
+# macOS & exFAT junk
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+
+# Python caches
+__pycache__/
+*.py[cod]
+
+# Temporary test outputs
+*.tmp
+*.log
+*.rds
+*.RData
