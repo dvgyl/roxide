@@ -126,3 +126,45 @@ stopifnot(identical(draws,expected), identical(after,.Random.seed))
 stopifnot(max(abs(points - c(1,-2.2803941187835086,-2.2537997494889117,-4.4497457184630891))) < 1e-13)
 "#, GLOBAL_ENV, false).unwrap();
 }
+
+#[test]
+fn infinite_oscillatory_integration_converges() {
+    let mut ctx = Ctx::new(Box::new(PureHost::new()), GcPolicy::Torture).expect("Create session");
+    roxide_base::register_all(&mut ctx).expect("Register base");
+    roxide_stats::register(&mut ctx).expect("Register stats");
+    ctx.run_script(
+        "Oscillatory integration",
+        r#"
+fit <- integrate(function(x) sin(x)^2/x^2, 0, Inf, subdivisions=200, stop.on.error=FALSE)
+stopifnot(identical(fit$message, "OK"), abs(fit$value - 1.5707963267948966) < 2e-4)
+fit <- integrate(function(x) abs(x - .231)^(-.7), 0, 1)
+stopifnot(identical(fit$message, "OK"), abs(fit$value - 5.22821910133857) < 1e-10)
+"#,
+        GLOBAL_ENV,
+        false,
+    )
+    .expect("Run the integration checks");
+}
+
+#[test]
+fn bfgs_and_cg_reject_an_infinite_gradient() {
+    let mut ctx = Ctx::new(Box::new(PureHost::new()), GcPolicy::Torture).expect("Create session");
+    roxide_base::register_all(&mut ctx).expect("Register base");
+    roxide_stats::register(&mut ctx).expect("Register stats");
+    ctx.run_script(
+        "Nonfinite gradient",
+        r#"
+for (method in c("BFGS", "CG")) {
+    for (grad in c(Inf, -Inf)) {
+        msg <- tryCatch(optim(1, function(x) x*x, function(x) grad, method=method), error=conditionMessage)
+        stopifnot(identical(msg, "non-finite value supplied by optim"))
+    }
+    fit <- optim(1, function(x) x*x, function(x) NaN, method=method)
+    stopifnot(identical(fit$convergence, 0L))
+}
+"#,
+        GLOBAL_ENV,
+        false,
+    )
+    .expect("Run gradient checks");
+}

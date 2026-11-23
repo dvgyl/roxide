@@ -13,13 +13,13 @@ use roxide_eval::{
 };
 use roxide_gc::SexpId;
 use roxide_value::{BASE_ENV, CharId, Encoding, NA_REAL, RLogical, SEXP_NIL, SexpType, ValueApi};
-use std::path::Path;
+use std::{borrow::Cow, path::Path};
 
 /// Register Rd and file path operations in the tools namespace.
 pub const MODULE: Module = Module {
     prims: &[
         internal("rox_rd_parse", 8, parse_rd),
-        internal("rox_rd_text", 6, render::rd_to_text),
+        internal("rox_rd_text", 7, render::rd_to_text),
         internal("rox_rd_character", 1, tree::as_character),
         internal("rox_tools_ext", 3, paths::extensions),
         internal("rox_tools_non_ascii", 1, paths::non_ascii),
@@ -64,7 +64,15 @@ Rd2txt <- function(Rd, out = "", package = "", defines = "unix", stages = "rende
     for (key in names(options)) defaults[key] <- options[key]
     options <- defaults
     if (!inherits(Rd, "Rd")) Rd <- parse_Rd(Rd, fragment = fragment, ...)
-    lines <- .Internal(rox_rd_text(Rd, fragment, options, defines, stages, outputEncoding))
+    env <- new.env(parent = globalenv())
+    evaluate <- function(code, results) {
+        expression <- parse(text = code)
+        if (results == "verbatim") return(paste(capture.output(eval(expression, env)), collapse = "\n"))
+        value <- eval(expression, env)
+        if (results == "hide") return("")
+        paste(as.character(value), collapse = " ")
+    }
+    lines <- .Internal(rox_rd_text(Rd, fragment, options, defines, stages, outputEncoding, evaluate))
     encoded <- outputEncoding == "latin1" || outputEncoding == "ISO-8859-1" || outputEncoding == "ASCII"
     if (is.character(out)) {
         if (identical(out, "")) {
@@ -74,7 +82,10 @@ Rd2txt <- function(Rd, out = "", package = "", defines = "unix", stages = "rende
             on.exit(close(con))
             writeLines(lines, con, useBytes = encoded)
         }
-    } else writeLines(lines, out, useBytes = encoded)
+    } else {
+        writeLines(lines, out, useBytes = encoded)
+        out <- .Internal(rox_io_description(out))
+    }
     invisible(out)
 }
 file_ext <- function(x) .Internal(rox_tools_ext(as.character(x), FALSE, TRUE))
@@ -141,16 +152,16 @@ fn set_str(ctx: &mut Ctx, value: SexpId, key: &str, text: &str) -> EvalResult<()
     set_attr(ctx, value, key, text)
 }
 
-fn char_text(ctx: &Ctx, id: CharId) -> EvalResult<Option<String>> {
+fn char_text(ctx: &Ctx, id: CharId) -> EvalResult<Option<Cow<'_, str>>> {
     if id == CharId::NA {
         return Ok(None);
     }
     let s = ctx.session();
     let bytes = s.char_bytes(id)?;
     Ok(Some(if s.char_encoding(id)? == Encoding::Latin1 {
-        bytes.iter().copied().map(char::from).collect()
+        Cow::Owned(bytes.iter().copied().map(char::from).collect())
     } else {
-        String::from_utf8_lossy(bytes).into_owned()
+        String::from_utf8_lossy(bytes)
     }))
 }
 
@@ -158,13 +169,13 @@ fn strings(ctx: &Ctx, value: SexpId) -> EvalResult<Vec<Option<String>>> {
     ctx.session()
         .str_slice(value)?
         .iter()
-        .map(|&id| char_text(ctx, id))
+        .map(|&id| char_text(ctx, id).map(|text| text.map(Cow::into_owned)))
         .collect()
 }
 
 fn first_text(ctx: &Ctx, value: SexpId) -> EvalResult<Option<String>> {
     match ctx.session().str_slice(value)?.first() {
-        Some(&id) => char_text(ctx, id),
+        Some(&id) => char_text(ctx, id).map(|text| text.map(Cow::into_owned)),
         None => Ok(None),
     }
 }

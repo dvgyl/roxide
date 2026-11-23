@@ -117,7 +117,15 @@ pub(super) fn next_length(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalRe
             roxide_value::NA_REAL
         } else {
             match nextn(x as u64, &factors) {
-                Ok(Some(value)) => value as f64,
+                Ok(Some(value)) => {
+                    if value > 1 << 53 {
+                        ctx.warn_now(
+                            call.err_call(),
+                            format!(r#"nextn() = {value} > 2^53 may not be exactly representable in R (as "double")"#),
+                        )?;
+                    }
+                    value as f64
+                }
                 Ok(None) => {
                     no_result = true;
                     0.0

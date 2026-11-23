@@ -672,3 +672,23 @@ fn invalid_continuous_boundaries_set_warning_flags() {
         assert!(flags.has(Flags::NAN_PRODUCED));
     }
 }
+
+#[test]
+fn large_noncentral_chi_square_tails_and_quantiles() {
+    let mut flags = Flags::default();
+    let lower = pnchisq(2e12, 2.0, 1e12, LOWER, &mut flags).exp();
+    let upper = pnchisq(2e12, 2.0, 1e12, UPPER, &mut flags).exp();
+    assert_eq!(lower + upper, 1.0);
+    let noncentralities = [100_000.0, 500_000.0, 999_999.0, 1_000_000.0];
+    let quantiles = noncentralities.map(|ncp| qnchisq(0.5, 2.0, ncp, Tail::default(), &mut flags));
+    for (quantile, ncp) in quantiles.into_iter().zip(noncentralities) {
+        assert!((quantile - (ncp + 1.0)).abs() < 0.001);
+    }
+    let quantiles = quantiles.map(|q| format!("{q:.17}")).join(",");
+    if let Some(cdf) = oracle(&format!(
+        "cat(sprintf('%.17g', pchisq(c({quantiles}), 2, ncp=c(1e5,5e5,999999,1e6))))"
+    )) {
+        assert_eq!(cdf.len(), noncentralities.len());
+        assert!(cdf.iter().all(|p| (p - 0.5).abs() < 1e-8));
+    }
+}

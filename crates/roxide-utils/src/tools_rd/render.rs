@@ -2,7 +2,7 @@ use roxide_eval::{Args, Call, Ctx, EvalResult};
 use roxide_gc::SexpId;
 use roxide_value::{BASE_ENV, SEXP_NIL, SexpType, ValueApi};
 
-use super::parser::Node;
+use super::parser::{Body, Node};
 use super::{attr, chars, first_text, flag, strings, tree};
 
 struct Options {
@@ -83,11 +83,71 @@ fn number(ctx: &mut Ctx, value: SexpId) -> EvalResult<usize> {
         .clamp(0, 10_000) as usize)
 }
 
+fn sexpr_option<'a>(options: &'a str, key: &str, default: &'a str) -> &'a str {
+    options
+        .split(',')
+        .filter_map(|field| field.split_once('='))
+        .find(|(name, _)| name.trim() == key)
+        .map_or(default, |(_, value)| value.trim().trim_matches(['"', '\'']))
+}
+
+fn evaluate_stage(
+    ctx: &mut Ctx,
+    call: &Call,
+    node: &mut Node,
+    stage: &str,
+    evaluate: SexpId,
+    remaining: &mut usize,
+) -> EvalResult<()> {
+    if node.tag == "\\Sexpr" {
+        let options = node.option.as_deref().map_or("", Node::text);
+        if sexpr_option(options, "stage", "install") == stage {
+            let value = if sexpr_option(options, "eval", "TRUE") == "FALSE" {
+                String::new()
+            } else {
+                ctx.scoped(|ctx| {
+                    let code: String = node.children().iter().map(Node::text).collect();
+                    let code = ctx.session_mut().scalar_str(&code)?;
+                    ctx.protect(code);
+                    let results = ctx
+                        .session_mut()
+                        .scalar_str(sexpr_option(options, "results", "text"))?;
+                    let result = ctx.apply(
+                        evaluate,
+                        &[(None, code), (None, results)],
+                        call.err_call(),
+                        call.env,
+                    )?;
+                    first_text(ctx, result).map(Option::unwrap_or_default)
+                })?
+            };
+            tree::charge(ctx, call, remaining, value.len())?;
+            node.tag = "TEXT".to_owned();
+            node.body = Body::Text(value);
+        }
+    } else if let Body::Children(children) = &mut node.body {
+        for child in children {
+            evaluate_stage(ctx, call, child, stage, evaluate, remaining)?;
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn rd_to_text(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     let fragment = flag(ctx, call, args.get(1))?;
     let options = Options::read(ctx, call, args.get(2), args.get(3))?;
     let encoding = first_text(ctx, args.get(5))?.unwrap_or_default();
-    let root = tree::decode(ctx, call, args.get(0))?;
+    let mut root = tree::decode(ctx, call, args.get(0))?;
+    if !fragment {
+        let selected = strings(ctx, args.get(4))?;
+        let evaluate = args.get(6);
+        let mut remaining = ctx.host().limits().max_vector_bytes;
+        for stage in ["build", "install", "render"] {
+            if selected.iter().flatten().any(|name| name == stage) {
+                evaluate_stage(ctx, call, &mut root, stage, evaluate, &mut remaining)?;
+            }
+        }
+    }
     let remaining = ctx.host().limits().max_vector_bytes;
     let mut render = Renderer {
         ctx,
@@ -386,6 +446,7 @@ impl Renderer<'_> {
         match node.tag.as_str() {
             "\\deqn" => {
                 let equation = self.inline(argument(node, usize::from(node.children().len() > 1)));
+                let equation = math_text(&equation);
                 let width = self.options.width * 9 / 10;
                 for line in equation.trim().lines() {
                     let space = width.saturating_sub(line.chars().count());
@@ -501,6 +562,13 @@ impl Renderer<'_> {
             rows.push(row);
         }
         let columns = layout.chars().collect::<Vec<_>>();
+        if rows.iter().any(|row| row.len() > columns.len()) {
+            let line = node.span.map_or(1, |span| span.integers()[0]);
+            return Err(self.ctx.stop(
+                self.call.err_call(),
+                format!("Rd:{line}: too many columns for format '{layout}'"),
+            ));
+        }
         let mut widths = vec![0usize; columns.len()];
         for row in &rows {
             for (cell, width) in row.iter().zip(&mut widths) {
@@ -649,7 +717,7 @@ fn append_node(node: &Node, options: &Options, out: &mut String) {
                 options,
                 &mut content,
             );
-            out.push_str(content.trim());
+            out.push_str(math_text(content.trim()).as_str());
         }
         "\\verb" => {
             let mut text = String::new();
@@ -696,6 +764,32 @@ fn append_node(node: &Node, options: &Options, out: &mut String) {
         }
         _ => append_inline(children, options, out),
     }
+}
+
+fn math_text(text: &str) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some((prefix, suffix)) = rest.split_once('\\') {
+        out.push_str(prefix);
+        let length = suffix.bytes().take_while(u8::is_ascii_alphabetic).count();
+        let command = &suffix[..length];
+        match command {
+            "alpha" | "beta" | "gamma" | "delta" | "epsilon" | "zeta" | "eta" | "theta"
+            | "iota" | "kappa" | "lambda" | "mu" | "nu" | "xi" | "omicron" | "pi" | "rho"
+            | "sigma" | "tau" | "upsilon" | "phi" | "chi" | "psi" | "omega" | "Gamma" | "Delta"
+            | "Theta" | "Lambda" | "Xi" | "Pi" | "Sigma" | "Upsilon" | "Phi" | "Psi" | "Omega"
+            | "sqrt" => out.push_str(command),
+            "infty" => out.push_str("Inf"),
+            "left" | "right" => {}
+            _ => {
+                out.push('\\');
+                out.push_str(command);
+            }
+        }
+        rest = &suffix[length..];
+    }
+    out.push_str(rest);
+    out
 }
 
 fn surrounded(nodes: &[Node], options: &Options, out: &mut String, left: char, right: char) {

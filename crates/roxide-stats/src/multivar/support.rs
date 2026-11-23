@@ -18,6 +18,9 @@ pub(super) fn size(ctx: &mut Ctx, call: &Call, d: SexpId) -> EvalResult<usize> {
         return Err(ctx.stop(call.err_call(), "missing value where TRUE/FALSE needed"));
     }
     let size = number(ctx, call, size)?;
+    if size < 0.0 {
+        return Err(ctx.stop(call.err_call(), "invalid 'nrow' value (< 0)"));
+    }
     if !size.is_finite() || size > 65536.0 {
         return Err(ctx.stop(call.err_call(), "size cannot be NA nor exceed 65536"));
     }

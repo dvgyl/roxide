@@ -77,3 +77,44 @@ stopifnot(hatvalues(m)[2L] == 0, is.na(cooks.distance(m)[2L]))
 "#,
     );
 }
+
+#[test]
+fn multivariate_model_comparisons_and_influence() {
+    check(
+        r#"
+x <- 1:6
+y <- c(2,4,5,4,9,8)
+z <- c(1,4,2,8,2,11)
+m <- lm(cbind(y,z) ~ x)
+a <- anova(m)
+b <- anova(lm(cbind(y,z) ~ 1), m)
+stopifnot(identical(rownames(a), c("(Intercept)", "x", "Residuals")))
+stopifnot(identical(names(b), c("Res.Df", "Df", "Gen.var.", "Pillai", "approx F", "num Df", "den Df", "Pr(>F)")))
+stopifnot(abs(a$Pillai[1] - .990987975157466) < 1e-11, abs(b$Pillai[2] - .953703424347564) < 1e-11)
+stopifnot(abs(b$Gen.var.[2] - 2.70317273904996) < 1e-11)
+ci <- confint(m)
+stopifnot(identical(rownames(ci), c("y:(Intercept)", "y:x", "z:(Intercept)", "z:x")))
+stopifnot(max(abs(ci[,1] - c(-2.64728485594513, .33772498287657, -8.8687206188474, -.763113699316563))) < 1e-10)
+fit <- lm(z ~ x)
+for (f in list(rstandard, rstudent, cooks.distance)) {
+    stopifnot(max(abs(f(m)[, 2] - f(fit))) < 1e-10)
+}
+stopifnot(all(lm(y ~ 0, offset=z)$fitted.values == z), df.residual(lm(cbind(y,z) ~ 0)) == 6L)
+fit <- lm.wfit(matrix(numeric(),6,0), cbind(y,z), c(1,0,1,1,1,1), offset=z)
+stopifnot(identical(dim(fit$residuals), c(5L,2L)), all(fit$weights == 1))
+msg <- function(expr) tryCatch(expr, error=conditionMessage)
+stopifnot(identical(msg(vcov(lm(cbind(y,z) ~ x, weights=x))), "'mlm' objects with weights are not supported"))
+stopifnot(identical(msg(printCoefmat(matrix(1:6,3), P.values=TRUE)), "'P.values' is TRUE, but 'has.Pvalue' is not"))
+print(summary(lm(y ~ x), correlation=TRUE, symbolic.cor=TRUE))
+y[3] <- NA
+m <- lm(y ~ x, weights=c(1,0,1,2,1,1), na.action=na.exclude)
+d <- cooks.distance(m)
+stopifnot(identical(names(d), c("1", NA, "4", "5", "6")))
+stopifnot(is.na(d[2]), max(abs(d[-2] - c(1.63446995823876, 0, .2732292178974, .00254781843046891))) < 1e-10)
+m <- lm(cbind(y,z) ~ x, weights=c(1,0,1,2,1,1), na.action=na.exclude)
+stopifnot(max(abs(sigma(m) - c(2.14261903439006, 4.44409720865779))) < 1e-10)
+stopifnot(max(abs(rstandard(m)[1,] - c(.790510306630321, -.283817474855534))) < 1e-10)
+stopifnot(max(abs(cooks.distance(m)[1,] - c(1.63446995823876, .200777831793875))) < 1e-10)
+"#,
+    );
+}

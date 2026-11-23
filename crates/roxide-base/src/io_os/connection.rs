@@ -32,6 +32,7 @@ impl Trace for ConnTable {
 impl CtxExt for ConnTable {}
 
 struct Connection {
+    description: String,
     path: Option<FilePath>,
     mode: Mode,
     stream: Option<Stream>,
@@ -304,6 +305,7 @@ pub(super) fn file(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
         call,
         &kind,
         Connection {
+            description: name,
             path: Some(path),
             mode,
             stream,
@@ -339,11 +341,13 @@ pub(super) fn raw(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     if append {
         buffer.set_position(buffer.get_ref().len() as u64);
     }
+    let description = super::text(ctx, call, args.get(2), "description")?;
     register(
         ctx,
         call,
         "rawConnection",
         Connection {
+            description,
             path: None,
             mode,
             stream: Some(Stream::Raw(buffer)),
@@ -394,7 +398,9 @@ pub(super) fn text(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     let mode = Mode::parse(&open)
         .filter(|_| matches!(open.as_str(), "r" | "w" | "a"))
         .ok_or_else(|| ctx.stop(call.err_call(), "invalid 'open' argument"))?;
+    let description;
     let stream = if mode.flags.read {
+        description = super::text(ctx, call, args.get(4), "description")?;
         let mut input = Vec::new();
         for line in translated_bytes(ctx, call, object, encoding)? {
             let line = line.as_deref().unwrap_or(b"NA");
@@ -408,8 +414,8 @@ pub(super) fn text(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
         }
         Stream::ReadMemory(Cursor::new(input))
     } else {
-        let name = super::text(ctx, call, object, "text")?;
-        let symbol = ctx.session_mut().intern(&name)?;
+        description = super::text(ctx, call, object, "text")?;
+        let symbol = ctx.session_mut().intern(&description)?;
         let env = args.get(2);
         let lines = if mode.flags.append
             && let Some(binding) = ctx.session().env_get(env, symbol)
@@ -454,6 +460,7 @@ pub(super) fn text(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
         call,
         "textConnection",
         Connection {
+            description,
             path: None,
             mode,
             stream: Some(stream),
@@ -524,6 +531,22 @@ pub(super) fn is_open(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult
     Ok(ctx
         .session_mut()
         .alloc_lgl_from(&[roxide_value::RLogical::from_option(Some(result))])?)
+}
+
+pub(super) fn description(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    let id = id(ctx, call, args.get(0))?;
+    let description = match id {
+        0 => "stdin".to_owned(),
+        1 => "stdout".to_owned(),
+        2 => "stderr".to_owned(),
+        _ => {
+            let Some(connection) = ctx.ext::<ConnTable>().entries.get(&id) else {
+                return Err(ctx.stop(call.err_call(), "invalid connection"));
+            };
+            connection.description.clone()
+        }
+    };
+    Ok(ctx.session_mut().scalar_str(&description)?)
 }
 
 pub(super) fn standard(ctx: &mut Ctx, _: &Call, args: &mut Args) -> EvalResult {

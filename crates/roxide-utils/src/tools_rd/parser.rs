@@ -61,16 +61,16 @@ impl Position {
 
     fn after(&mut self, ch: char) {
         if ch == '\n' {
-            self.line += 1;
+            self.line = self.line.saturating_add(1);
             self.byte = 1;
             self.column = 1;
         } else {
-            self.byte += ch.len_utf8() as i32;
-            self.column += if ch == '\t' {
+            self.byte = self.byte.saturating_add(ch.len_utf8() as i32);
+            self.column = self.column.saturating_add(if ch == '\t' {
                 8 - (self.column - 1) % 8
             } else {
                 1
-            };
+            });
         }
     }
 }
@@ -599,7 +599,7 @@ impl<'a> Cursor<'a> {
         let ch = self.peek()?;
         self.offset += ch.len_utf8();
         self.last = self.pos;
-        self.last.byte += ch.len_utf8() as i32 - 1;
+        self.last.byte = self.last.byte.saturating_add(ch.len_utf8() as i32 - 1);
         self.pos.after(ch);
         Some(ch)
     }
@@ -822,5 +822,26 @@ impl Spec {
             option: matches!(tag, "\\link" | "\\linkS4class" | "\\Sexpr"),
             optional_last: matches!(tag, "\\eqn" | "\\deqn"),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Position;
+
+    #[test]
+    fn source_positions_saturate_at_the_integer_limit() {
+        let mut position = Position {
+            line: i32::MAX,
+            byte: i32::MAX - 1,
+            column: i32::MAX - 1,
+        };
+        position.after('é');
+        position.after('\t');
+        assert_eq!(position.byte, i32::MAX);
+        assert_eq!(position.column, i32::MAX);
+        position.after('\n');
+        assert_eq!(position.line, i32::MAX);
+        assert_eq!(position.column, 1);
     }
 }

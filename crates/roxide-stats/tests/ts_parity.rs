@@ -57,3 +57,27 @@ stopifnot(identical(message(acf(matrix(1:40,5),4,plot=FALSE)),limit))
 "#,
     );
 }
+
+#[test]
+fn fft_nonfinite_components_and_time_series_tolerances() {
+    run(
+        Box::new(PureHost::new()),
+        r#"
+z <- fft(c(1e308, rep(0,6)))
+stopifnot(all(Re(z) == 1e308), all(Im(z) == 0))
+for (a in c(NA_real_, Inf)) {
+    z <- fft(c(a, rep(0,6)))
+    stopifnot(all(Im(z) == 0), identical(Re(z), rep(a, 7)))
+}
+stopifnot(identical(tsp(ts(1:3, start=1, end=3.005, ts.eps=.01)), c(1,3.005,1)))
+msg <- tryCatch(ccf(ts(1:5), ts(2:6, start=1.5), plot=FALSE), error=conditionMessage)
+stopifnot(identical(msg, "not all series have the same phase"))
+warning <- ""
+n <- withCallingHandlers(nextn(2^54), warning=function(w) {
+    warning <<- conditionMessage(w)
+    invokeRestart("muffleWarning")
+})
+stopifnot(n == 2^54, grepl("> 2^53", warning, fixed=TRUE))
+"#,
+    );
+}

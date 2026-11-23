@@ -3,7 +3,9 @@ use crate::{
     linalg::spectral::{svd, symmetric_eigen},
 };
 
-use super::{ONE, Reflector, ZERO, adjoint, area, lift, scaled_matrix};
+use super::{
+    ONE, Reflector, ZERO, adjoint, area, basis, check_matrix, diagonal, lift, scaled_matrix,
+};
 
 /// Complex singular values and vectors.
 pub struct ComplexSvd {
@@ -25,8 +27,29 @@ pub fn complex_svd(
     nu: usize,
     nv: usize,
 ) -> Result<ComplexSvd, MathError> {
-    let (a, scale) = scaled_matrix(data, rows, cols)?;
+    check_matrix(data, rows, cols)?;
     let (nu, nv) = (nu.min(rows), nv.min(cols));
+    if diagonal(data, rows) {
+        let mut order: Vec<_> = (0..rows.min(cols)).collect();
+        order.sort_by(|&i, &j| {
+            data[j * (rows + 1)]
+                .modulus()
+                .total_cmp(&data[i * (rows + 1)].modulus())
+        });
+        let mut u = basis(rows, nu, &order)?;
+        for (j, &i) in order.iter().take(nu).enumerate() {
+            u[j * rows + i] = data[i * (rows + 1)].phase();
+        }
+        return Ok(ComplexSvd {
+            d: order
+                .iter()
+                .map(|&i| data[i * (rows + 1)].modulus())
+                .collect(),
+            u,
+            vt: adjoint(&basis(cols, nv, &order)?, cols, nv),
+        });
+    }
+    let (a, scale) = scaled_matrix(data, rows, cols)?;
     let (mut d, u, v) = if rows >= cols {
         tall(a, rows, cols, nu, nv)?
     } else {
@@ -102,13 +125,30 @@ pub fn hermitian_eigen(
     n: usize,
     only_values: bool,
 ) -> Result<HermitianEigen, MathError> {
-    let (mut a, scale) = scaled_matrix(data, n, n)?;
+    if n == 0 || data.len() != area(n, n)? {
+        return Err(MathError::Dim);
+    }
+    let mut triangle = data.to_vec();
     for j in 0..n {
-        a[j * n + j].im = 0.0;
+        triangle[j * n + j].im = 0.0;
         for i in j + 1..n {
-            a[i * n + j] = a[j * n + i].conjugate();
+            triangle[i * n + j] = triangle[j * n + i].conjugate();
         }
     }
+    check_matrix(&triangle, n, n)?;
+    if diagonal(&triangle, n) {
+        let mut order: Vec<_> = (0..n).collect();
+        order.sort_by(|&i, &j| {
+            triangle[j * (n + 1)]
+                .re
+                .total_cmp(&triangle[i * (n + 1)].re)
+        });
+        return Ok(HermitianEigen {
+            values: order.iter().map(|&i| triangle[i * (n + 1)].re).collect(),
+            vectors: basis(n, if only_values { 0 } else { n }, &order)?,
+        });
+    }
+    let (mut a, scale) = scaled_matrix(&triangle, n, n)?;
     let mut reflectors = Vec::new();
     for k in 0..n.saturating_sub(2) {
         if let Some(h) = Reflector::new(k + 1, a[k * n + k + 1..(k + 1) * n].to_vec()) {

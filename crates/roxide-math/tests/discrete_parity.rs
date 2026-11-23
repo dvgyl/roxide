@@ -626,3 +626,18 @@ fn extreme_discrete_tails_and_endpoints() {
     assert!(pbinom(1.0, 2.4, 0.5, Tail::default(), &mut flags).is_nan());
     assert!(flags.has(Flags::NONINT_X));
 }
+
+#[test]
+fn tiny_negative_binomial_upper_tail_stays_in_log_space() {
+    let tail = Tail {
+        lower: false,
+        log: true,
+    };
+    let actual = pnbinom_mu(0.0, 1e-310, 1e-300, tail, &mut Flags::default());
+    assert!((actual - (-710.664761289908)).abs() < 1e-12);
+    if let Some(expected) =
+        oracle("cat(sprintf('%.17g', pnbinom(0,1e-310,mu=1e-300,lower.tail=FALSE,log.p=TRUE)))")
+    {
+        assert!((actual - expected[0]).abs() < 1e-12);
+    }
+}

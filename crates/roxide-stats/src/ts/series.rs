@@ -64,7 +64,16 @@ pub(super) fn set_tsp(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult
             "invalid time series parameters specified (0)",
         ));
     }
-    if ((end - start) * frequency - (rows - 1) as f64).abs() > 1e-5 {
+    let tolerance = ctx.scoped(|ctx| {
+        let key = ctx.session_mut().scalar_str("ts.eps")?;
+        let tolerance = ctx.call_function("getOption", &[(None, key)], roxide_value::BASE_ENV)?;
+        if tolerance == SEXP_NIL {
+            Ok(1e-5)
+        } else {
+            number(ctx, call, tolerance)
+        }
+    })?;
+    if ((end - start) * frequency - (rows - 1) as f64).abs() > tolerance {
         return Err(ctx.stop(
             call.err_call(),
             "invalid time series parameters specified (1)",

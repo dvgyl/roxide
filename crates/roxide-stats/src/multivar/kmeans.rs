@@ -135,12 +135,12 @@ impl Fit<'_> {
 
     fn removal_gain(&self, i: usize, group: usize) -> f64 {
         let size = self.sizes[group] as f64;
-        self.distance(i, group) * size / (size - 1.0)
+        self.distance(i, group) * (size / (size - 1.0))
     }
 
-    fn addition_cost(&self, i: usize, group: usize) -> f64 {
+    fn addition_factor(&self, group: usize) -> f64 {
         let size = self.sizes[group] as f64;
-        self.distance(i, group) * size / (size + 1.0)
+        size / (size + 1.0)
     }
 
     fn hartigan_wong(
@@ -152,28 +152,42 @@ impl Fit<'_> {
         let n = self.x.rows;
         let k = self.centers.rows;
         let quick_limit = n.saturating_mul(50);
+        let mut live = vec![n; k];
+        let mut changed_at = vec![None; k];
+        let mut gain = vec![0.0; n];
         let mut unchanged = 0;
         for iter in 1..=limit {
-            // The optimal-transfer pass checks every prospective destination.
             for (i, alternative) in other.iter_mut().enumerate() {
                 let from = self.cluster[i];
                 unchanged += 1;
                 if self.sizes[from] > 1 {
+                    if iter == 1 || changed_at[from].is_some() {
+                        gain[i] = self.removal_gain(i, from);
+                    }
                     let mut to = *alternative;
-                    let mut cost = self.addition_cost(i, to);
+                    let mut cost = self.distance(i, to) * self.addition_factor(to);
                     for group in 0..k {
-                        if group != from {
-                            let candidate = self.addition_cost(i, group);
-                            if candidate < cost {
-                                to = group;
-                                cost = candidate;
-                            }
+                        if group == from
+                            || group == *alternative
+                            || (i >= live[from] && i >= live[group])
+                        {
+                            continue;
+                        }
+                        let factor = self.addition_factor(group);
+                        let distance = self.distance(i, group);
+                        if distance < cost / factor {
+                            to = group;
+                            cost = distance * factor;
                         }
                     }
-                    if cost < self.removal_gain(i, from) {
+                    if cost < gain[i] {
                         self.transfer(i, to);
                         *alternative = from;
                         unchanged = 0;
+                        for group in [from, to] {
+                            changed_at[group] = Some(i + 1);
+                            live[group] = n + i + 1;
+                        }
                     } else {
                         *alternative = to;
                     }
@@ -184,31 +198,45 @@ impl Fit<'_> {
                 }
             }
             trace(iter, unchanged);
+            for until in &mut live {
+                *until = until.saturating_sub(n);
+            }
 
-            // The quick-transfer pass revisits each point's alternate cluster.
-            // Stop when one pass makes no transfers or the step limit is reached.
             let mut still = 0;
-            for step in 0..quick_limit {
-                let i = step % n;
+            for step in 1..=quick_limit {
+                let i = (step - 1) % n;
                 let from = self.cluster[i];
                 let to = other[i];
                 still += 1;
-                if self.sizes[from] > 1 && self.addition_cost(i, to) < self.removal_gain(i, from) {
-                    self.transfer(i, to);
-                    other[i] = from;
-                    still = 0;
-                    unchanged = 0;
+                if self.sizes[from] > 1 {
+                    if changed_at[from].is_none_or(|last| step <= last) {
+                        gain[i] = self.removal_gain(i, from);
+                    }
+                    let active = |group: usize| changed_at[group].is_some_and(|last| step < last);
+                    if (active(from) || active(to))
+                        && self.distance(i, to) < gain[i] / self.addition_factor(to)
+                    {
+                        self.transfer(i, to);
+                        other[i] = from;
+                        still = 0;
+                        unchanged = 0;
+                        for group in [from, to] {
+                            changed_at[group] = Some(step.saturating_add(n));
+                            live[group] = n;
+                        }
+                    }
                 }
                 if still == n {
                     break;
                 }
-                if step + 1 == quick_limit {
+                if step == quick_limit {
                     return (iter, 4);
                 }
             }
             if k == 2 {
                 return (iter, 0);
             }
+            changed_at.fill(None);
         }
         (limit + 1, 2)
     }

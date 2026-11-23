@@ -186,3 +186,48 @@ fn general_eigenvectors_have_unit_norm_and_a_real_pivot() {
         assert!(only.vectors.is_empty());
     }
 }
+
+#[test]
+fn extreme_fft_and_complex_decompositions() {
+    let mut data = [Cplx::default(); 7];
+    data[0].re = 1e308;
+    fft(&mut data, false, 64).expect("FFT");
+    assert_eq!(data, [Cplx::new(1e308, 0.0); 7]);
+    let mut data = [Cplx::default(); 7];
+    data[1].re = 1e308;
+    fft(&mut data, false, 64).expect("FFT");
+    assert!(
+        data.iter()
+            .all(|z| (z.re.hypot(z.im) / 1e308 - 1.0).abs() < 1e-14)
+    );
+
+    let mut a = [
+        Cplx::new(1e200, 0.0),
+        Cplx::default(),
+        Cplx::default(),
+        Cplx::new(1e-200, 0.0),
+    ];
+    assert_eq!(complex_svd(&a, 2, 2, 2, 2).expect("SVD").d, [1e200, 1e-200]);
+    assert_eq!(
+        hermitian_eigen(&a, 2, false)
+            .expect("Hermitian eigen")
+            .values,
+        [1e200, 1e-200]
+    );
+    assert_eq!(
+        complex_general_eigen(&a, 2, false)
+            .expect("general eigen")
+            .values[1],
+        a[3]
+    );
+
+    a = [
+        Cplx::default(),
+        Cplx::new(1e-200, 1e-200),
+        Cplx::new(1e308, 0.0),
+        Cplx::default(),
+    ];
+    let e = hermitian_eigen(&a, 2, false).expect("lower triangle");
+    assert!((e.values[0] / 1e-200 - 2.0_f64.sqrt()).abs() < 1e-14);
+    assert!((e.values[1] / 1e-200 + 2.0_f64.sqrt()).abs() < 1e-14);
+}

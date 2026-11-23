@@ -117,6 +117,7 @@ printCoefmat <- function(x, digits = max(3L, getOption("digits", 7L) - 2L),
     if (!nc || !nrow(x)) return(invisible(x))
     k <- max(0L, nc - if (has.Pvalue) 2L else 1L)
     if (is.null(P.values)) P.values <- has.Pvalue
+    if (P.values && !has.Pvalue) stop("'P.values' is TRUE, but 'has.Pvalue' is not")
     cs.ind <- cs.ind[cs.ind > 0L & cs.ind <= nc]
     tst.ind <- tst.ind[tst.ind > 0L & tst.ind <= nc]
     cs <- x[, cs.ind, drop = FALSE]
@@ -202,7 +203,23 @@ print.summary.lm <- function(x, digits = max(3L, getOption("digits", 7L) - 3L),
     }
     if (!is.null(x$correlation) && nrow(x$correlation) > 1L) {
         cat("\nCorrelation of Coefficients:\n")
-        print(round(x$correlation, 2L))
+        if (identical(symbolic.cor, TRUE)) {
+            corr <- abs(x$correlation)
+            cuts <- c(.3, .6, .8, .9, .95, 1)
+            symbols <- c(" ", ".", ",", "+", "*", "B", "1")
+            marks <- symbols[1L + vapply(as.double(corr), function(value) {
+                if (is.na(value)) NA_integer_ else if (value >= 1) 6L else sum(value > cuts)
+            }, 0L)]
+            marks[is.na(marks)] <- "?"
+            marks <- matrix(marks, nrow(corr), ncol(corr), dimnames = dimnames(corr))
+            columns <- lapply(seq_len(ncol(marks)), function(i) {
+                column <- marks[, i]
+                column[seq_len(i - 1L)] <- " "
+                column
+            })
+            .lm_print_columns(columns, rep("", ncol(marks)), rownames(marks), right = FALSE)
+            cat("attr(,\"legend\")\n[1] 0 ‘ ’ 0.3 ‘.’ 0.6 ‘,’ 0.8 ‘+’ 0.9 ‘*’ 0.95 ‘B’ 1\n")
+        } else print(round(x$correlation, 2L))
     }
     cat("\n")
     invisible(x)

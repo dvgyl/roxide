@@ -66,17 +66,35 @@ fn area(rows: usize, cols: usize) -> Result<usize, MathError> {
         .ok_or(MathError::TooLarge)
 }
 
-fn scaled_matrix(data: &[Cplx], rows: usize, cols: usize) -> Result<(Vec<Cplx>, f64), MathError> {
+fn check_matrix(data: &[Cplx], rows: usize, cols: usize) -> Result<(), MathError> {
     if rows == 0 || cols == 0 || data.len() != area(rows, cols)? {
         return Err(MathError::Dim);
     }
-    let mut max = 0.0_f64;
-    for z in data {
-        if !z.re.is_finite() || !z.im.is_finite() {
-            return Err(MathError::NoConvergence { info: 1 });
-        }
-        max = max.max(z.re.abs()).max(z.im.abs());
+    if data.iter().any(|z| !z.re.is_finite() || !z.im.is_finite()) {
+        return Err(MathError::NoConvergence { info: 1 });
     }
+    Ok(())
+}
+
+fn diagonal(data: &[Cplx], rows: usize) -> bool {
+    data.chunks_exact(rows)
+        .enumerate()
+        .all(|(j, col)| col.iter().enumerate().all(|(i, &z)| i == j || z == ZERO))
+}
+
+fn basis(rows: usize, count: usize, order: &[usize]) -> Result<Vec<Cplx>, MathError> {
+    let mut out = vec![ZERO; area(rows, count)?];
+    for (j, col) in out.chunks_exact_mut(rows).enumerate() {
+        col[order.get(j).copied().unwrap_or(j)] = ONE;
+    }
+    Ok(out)
+}
+
+fn scaled_matrix(data: &[Cplx], rows: usize, cols: usize) -> Result<(Vec<Cplx>, f64), MathError> {
+    check_matrix(data, rows, cols)?;
+    let max = data
+        .iter()
+        .fold(0.0_f64, |max, z| max.max(z.re.abs()).max(z.im.abs()));
     let exponent = ((max.to_bits() >> 52) & 0x7ff) as i32 - 1023;
     let factor = if max == 0.0 {
         1.0

@@ -73,3 +73,30 @@ stopifnot(length(eigen(A,symmetric=FALSE,only.values=TRUE)$values)==80)
     )
     .expect("check spectral vector limits");
 }
+
+#[test]
+fn fractional_svd_columns_and_norm_nan_order() {
+    let mut ctx = Ctx::new(Box::new(PureHost::new()), GcPolicy::Torture).expect("Create evaluator");
+    roxide_base::register_all(&mut ctx).expect("Register base");
+    ctx.run_script(
+        "Spectral edge cases",
+        r#"
+for (a in list(diag(2), diag(c(1+0i, 2+0i)))) {
+    s <- svd(a, nu=.5, nv=.5)
+    stopifnot(identical(dim(s$u), c(2L,0L)), identical(dim(s$v), c(2L,0L)))
+}
+stopifnot(is.nan(norm(matrix(c(1,NaN,NA,1),2), "I")))
+a <- matrix(0,4,4)
+a[1,1] <- 1e200
+a[2,3] <- a[3,4] <- a[4,2] <- 1e-200
+values <- eigen(a)$values
+stopifnot(Re(values[1]) == 1e200, max(abs(Mod(values[-1]) / 1e-200 - 1)) < 1e-12)
+stopifnot(max(Im(values) / 1e-200) > .86)
+a <- matrix(c(1,0,100,2),2)
+stopifnot(abs(kappa(a, method="direct", triangular=TRUE, uplo="upper") - 5/3) < 1e-12)
+"#,
+        GLOBAL_ENV,
+        false,
+    )
+    .expect("Run spectral edge cases");
+}

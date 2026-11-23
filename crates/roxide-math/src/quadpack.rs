@@ -349,7 +349,14 @@ fn adaptive<F: VecFn>(
                     sequence.remove(0);
                 }
                 sequence.push(value);
-                let start = (sequence.len() + 1) % 2;
+                let infinite = matches!(domain, Domain::Infinite { .. });
+                // The dominant tail interval changes as the infinite domain
+                // is subdivided. Use the latest three estimates for that tail.
+                let start = if infinite {
+                    sequence.len().saturating_sub(3)
+                } else {
+                    (sequence.len() + 1) % 2
+                };
                 if let Some(extrapolated) = epsilon(&sequence[start..]) {
                     if history.len() >= 3 {
                         let history_error = history
@@ -359,9 +366,12 @@ fn adaptive<F: VecFn>(
                         // Higher-order estimates can agree while retaining the same bias.
                         // Compare with the extrapolation of the latest three subdivisions.
                         let local = epsilon(&sequence[sequence.len() - 3..]).unwrap_or(value);
-                        let estimate = history_error
-                            .max((extrapolated - local).abs())
-                            .max(5.0 * f64::EPSILON * extrapolated.abs());
+                        let estimate = if infinite {
+                            history_error
+                        } else {
+                            history_error.max((extrapolated - local).abs())
+                        }
+                        .max(5.0 * f64::EPSILON * extrapolated.abs());
                         if best.is_none_or(|(_, error)| estimate < error) {
                             best = Some((extrapolated, estimate));
                         }

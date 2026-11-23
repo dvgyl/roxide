@@ -44,7 +44,7 @@ pub(in crate::linalg) fn kappa(ctx: &mut Ctx, call: &Call, args: &mut Args) -> E
         let kind = norm_name(ctx, call, norm)?;
         if direct && a.rows == a.cols {
             if triangular {
-                let upper = string(ctx.session(), uplo).as_deref() != Some("L");
+                let upper = string(ctx.session(), uplo).as_deref() == Some("U");
                 triangular_kappa(ctx, call, a.view(), &kind, upper, true)?
             } else {
                 direct_kappa(ctx, call, a, &kind)?

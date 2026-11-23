@@ -34,7 +34,7 @@ stopifnot(isOpen(input), identical(as.character(on_disk), as.character(from_conn
 close(input)
 output <- textConnection("result", "w")
 returned <- withVisible(tools::Rd2txt(on_disk, output, options = list(underline_titles = FALSE)))
-stopifnot(!returned$visible, identical(returned$value, output))
+stopifnot(!returned$visible, identical(returned$value, "result"))
 stopifnot(identical(result, c("Test title", "", "Description:", "", "     First.", "", "     Second.", "")))
 close(output)
 destination <- tempfile()
@@ -96,6 +96,38 @@ stopifnot(identical(tools::analyze_license("GPL (>= 9)")$spdx, NA_character_))
 stopifnot(identical(tools::analyze_license("CC BY-NC 4.0")$restricts_use, TRUE))
 stopifnot(identical(tools::file_ext(c(NA, ".profile", "x.tar.gz")), c("", "", "gz")))
 stopifnot(identical(tools::file_path_sans_ext("x.tar.gz", compression = TRUE), "x"))
+"#,
+    );
+}
+
+#[test]
+fn rd_stages_and_path_extensions() {
+    run(
+        PureHost::new(),
+        r#"
+options <- list(underline_titles = FALSE)
+rd <- paste0("\\name{x}\\title{X}\\description{",
+             '\\Sexpr[stage=build]{2 + 2} \\Sexpr[stage=render]{3 + 2}}')
+render <- function(stages) {
+    input <- textConnection(rd)
+    out <- textConnection("lines", "w", local=TRUE)
+    on.exit({close(input); close(out)})
+    result <- withVisible(tools::Rd2txt(input, out, stages=stages, options=options))
+    stopifnot(!result$visible, identical(result$value, "lines"))
+    lines
+}
+stopifnot(any(grepl("4 5", render(c("build", "render")), fixed=TRUE)))
+stopifnot(any(grepl('\\Sexpr[stage=build]', render("render"), fixed=TRUE)))
+stopifnot(any(grepl('\\Sexpr[stage=render]', render("build"), fixed=TRUE)))
+stopifnot(identical(capture.output(tools::Rd2txt(textConnection(r"(\eqn{\alpha + x})"),fragment=TRUE)), "alpha + x"))
+bad <- textConnection(r"(\tabular{l}{Left\tab Right\cr})")
+message <- tryCatch(tools::Rd2txt(bad,fragment=TRUE), error=conditionMessage)
+stopifnot(grepl("too many columns for format 'l'", message, fixed=TRUE))
+close(bad)
+long <- paste(rep("a", 65536), collapse="")
+stopifnot(identical(tools::file_ext(c(paste0(long,".zip"), "a.²", "a.١", "a.é", "a.β", "a.四")), c("zip", "", "١", "é", "β", "四")))
+license <- tools::analyze_license("Mozilla Public License 2.0 | GNU General Public License")
+stopifnot(license$is_canonical, identical(license$spdx, "MPL-2.0 OR GPL-2.0-only OR GPL-3.0-only"))
 "#,
     );
 }

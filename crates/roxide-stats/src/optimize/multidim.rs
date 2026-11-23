@@ -209,6 +209,13 @@ impl Objective for RObjective<'_> {
             for ((out, value), &scale) in g.iter_mut().zip(gradient).zip(&self.parscale) {
                 *out = value * scale / self.fnscale;
             }
+            if matches!(self.method, Method::Bfgs | Method::Cg)
+                && g.iter().any(|value| value.is_infinite())
+            {
+                return Err(self
+                    .ctx
+                    .stop(self.call.err_call(), "non-finite value supplied by optim"));
+            }
             return Ok(());
         }
         let mut point = x.to_vec();

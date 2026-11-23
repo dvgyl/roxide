@@ -169,10 +169,16 @@ impl Parameters {
             return ppois(q, self.mean, tail, flags);
         }
         if q == 0.0 && tail.log && !tail.lower && self.prob <= 0.5 {
-            // Evaluate the beta power with its normalization before taking the complement.
+            let log_mass = self.size * self.prob.ln();
             let log_size = self.size.ln();
-            let lp = (self.size * self.prob.ln() + log_size) - log_size;
-            return from_log(lp, true, tail);
+            // Keep the beta-power rounding at ordinary jump points. Near zero,
+            // adding the normalization before the complement can lose the mass.
+            let mass = if log_mass.abs() < f64::EPSILON.sqrt() * log_size.abs() {
+                log_mass
+            } else {
+                (log_mass + log_size) - log_size
+            };
+            return from_log(mass, true, tail);
         }
         pbeta_raw(self.prob, self.failure, self.size, q + 1.0, tail, flags)
     }

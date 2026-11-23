@@ -307,3 +307,34 @@ fn spectral_scaling_retains_mixed_magnitude_diagonals() {
         [1e200, 1e-200]
     );
 }
+
+#[test]
+fn qr_scales_the_active_block_and_resolves_close_roots() {
+    let mut data = [0.0; 16];
+    data[0] = 1e200;
+    data[9] = 1e-200;
+    data[14] = 1e-200;
+    data[7] = 1e-200;
+    let e = general_eigen(MatRef::new(&data, 4, 4).expect("matrix"), false).expect("eigen");
+    assert_eq!(e.values[0].re, 1e200);
+    for z in &e.values[1..] {
+        close(z.re.hypot(z.im) / 1e-200, 1.0, 1e-12);
+    }
+    assert!(
+        e.values[1..]
+            .iter()
+            .any(|z| (z.re / 1e-200 - 1.0).abs() < 1e-12)
+    );
+    assert!(
+        e.values[1..]
+            .iter()
+            .any(|z| (z.im / 1e-200 - 3.0_f64.sqrt() / 2.0).abs() < 1e-12)
+    );
+
+    let data = [1.0, -(1.0 - 2.0_f64.powi(-53)), 1.0, -1.0];
+    let e = general_eigen(MatRef::new(&data, 2, 2).expect("matrix"), false).expect("eigen");
+    for z in e.values {
+        assert_eq!(z.im, 0.0);
+        assert!((z.re.abs() - 1.05367121277235e-8).abs() < 1e-16);
+    }
+}

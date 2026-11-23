@@ -78,3 +78,19 @@ stopifnot(identical(.Random.seed, actual_seed))
 "#,
     );
 }
+
+#[test]
+fn live_transfers_and_additive_scaling() {
+    check(
+        Box::new(PureHost::new()),
+        r#"
+x <- rbind(c(1,-1),c(2,-3),c(2,-2),c(-2,-1),c(3,-3),c(1,-2),c(0,2),c(0,2),c(-2,0),c(1,1))
+fit <- kmeans(x, rbind(c(3,-3),c(2,-3),c(2,-2)))
+stopifnot(abs(fit$tot.withinss - 7.43333333333333) < 1e-12, fit$iter == 3L)
+d <- as.dist(rbind(c(0,1,1),c(1,0,3),c(1,3,0)))
+stopifnot(identical(dim(cmdscale(d, add=TRUE)$points), c(3L,2L)))
+d <- structure(numeric(), class="dist", Size=-1L)
+stopifnot(identical(tryCatch(cmdscale(d), error=conditionMessage), "invalid 'nrow' value (< 0)"))
+"#,
+    );
+}

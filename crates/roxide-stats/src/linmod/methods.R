@@ -207,31 +207,39 @@ vcov.lm <- function(object, complete = TRUE, ...) vcov.summary.lm(summary.lm(obj
 vcov.summary.lm <- function(object, complete = TRUE, ...) {
     .lm_complete_cov(object$cov.unscaled * object$sigma^2, object$aliased, complete)
 }
+.mlm_coefficient_names <- function(terms, responses, count) {
+    if (!length(terms)) return(character())
+    if (is.null(responses)) responses <- as.character(seq_len(count))
+    paste(rep(responses, each = length(terms)), rep(terms, times = length(responses)), sep = ":")
+}
 vcov.mlm <- function(object, complete = TRUE, ...) {
     r <- object$residuals
     w <- weights(object)
-    if (!is.null(w)) r <- r * sqrt(w)
+    if (!is.null(w)) stop("'mlm' objects with weights are not supported")
+    if (!length(object$coefficients)) return(matrix(numeric(), 0L, 0L))
     b <- object$coefficients[, 1L]
     cov <- .lm_complete_cov(.lm_unscaled(object), is.na(b), complete)
     out <- kronecker(crossprod(r) / df.residual(object), cov)
-    labels <- as.character(colnames(r))
-    if (!length(labels)) labels <- as.character(seq_len(ncol(r)))
-    names <- character()
-    for (label in labels) names <- c(names, paste(label, rownames(cov), sep = ":"))
-    dimnames(out) <- list(names, names)
+    labels <- .mlm_coefficient_names(rownames(cov), colnames(r), ncol(r))
+    dimnames(out) <- list(labels, labels)
     out
 }
 
 confint <- function(object, parm, level = 0.95, ...) UseMethod("confint")
 .lm_confint <- function(object, parm, level, critical, ...) {
     b <- coef(object)
+    covariance <- vcov(object, ...)
+    if (is.matrix(b)) {
+        labels <- .mlm_coefficient_names(rownames(b), colnames(b), ncol(b))
+        b <- setNames(as.double(b), labels)
+    }
     labels <- names(b)
     if (missing(parm)) parm <- labels
     if (is.numeric(parm)) parm <- labels[parm]
     endpoints <- c((1 - level) / 2, (1 + level) / 2)
     ci <- matrix(NA_real_, length(parm), 2L, dimnames =
                  list(parm, paste(sprintf("%.3g", 100 * endpoints), "%")))
-    s <- sqrt(diag(vcov(object, ...)))[parm]
+    s <- sqrt(diag(covariance))[parm]
     ci[, 1L] <- b[parm] + s * critical(endpoints[[1L]])
     ci[, 2L] <- b[parm] + s * critical(endpoints[[2L]])
     ci
@@ -308,13 +316,16 @@ hatvalues.lm <- function(model, infl = NULL, ...) {
     }
     naresid(model[["na.action"]], r)
 }
+.lm_column_values <- function(x, values) {
+    if (is.matrix(x)) rep(values, each = nrow(x)) else values
+}
 rstandard <- function(model, ...) UseMethod("rstandard")
 rstandard.lm <- function(model, infl = NULL, sd = sigma(model),
                          type = c("sd.1", "predictive"), ...) {
     type <- .lm_choice(type, c("sd.1", "predictive"))
     r <- if (is.null(infl)) .lm_influence_residuals(model) else infl$wt.res
     h <- hatvalues(model, infl = infl)
-    value <- if (type == "predictive") r / (1 - h) else r / (sd * sqrt(1 - h))
+    value <- if (type == "predictive") r / (1 - h) else (r / sqrt(1 - h)) / .lm_column_values(r, sd)
     value[is.infinite(value)] <- NaN
     value
 }
@@ -322,7 +333,7 @@ rstudent <- function(model, ...) UseMethod("rstudent")
 rstudent.lm <- function(model, infl = NULL, ...) {
     r <- if (is.null(infl)) .lm_influence_residuals(model) else infl$wt.res
     h <- hatvalues(model, infl = infl)
-    sd <- if (is.null(infl)) sqrt((deviance(model) - r^2 / (1 - h)) / (df.residual(model) - 1L)) else infl$sigma
+    sd <- if (is.null(infl)) sqrt((.lm_column_values(r, deviance(model)) - r^2 / (1 - h)) / (df.residual(model) - 1L)) else infl$sigma
     value <- r / (sd * sqrt(1 - h))
     value[is.infinite(value) | is.infinite(sd)] <- NaN
     value[is.infinite(sd)] <- 0
@@ -330,9 +341,37 @@ rstudent.lm <- function(model, infl = NULL, ...) {
 }
 cooks.distance <- function(model, ...) UseMethod("cooks.distance")
 cooks.distance.lm <- function(model, infl = NULL, res = NULL,
-                              sd = sigma(model), hat = hatvalues(model, infl = infl), ...) {
+                              sd = sqrt(deviance(model) / df.residual(model)),
+                              hat = hatvalues(model, infl = infl), ...) {
     if (is.null(res)) res <- if (is.null(infl)) .lm_influence_residuals(model) else infl$wt.res
-    result <- (res / (sd * (1 - hat)))^2 * hat / model$rank
-    result[hat == 1 & !is.na(hat)] <- NaN
+    result <- ((res / (1 - hat)) / .lm_column_values(res, sd))^2 * hat / model$rank
+    at.one <- .lm_which(hat == 1)
+    if (is.matrix(result)) result[at.one, ] <- NaN else result[at.one] <- NaN
+    action <- model[["na.action"]]
+    if (inherits(action, "exclude") && length(action)) {
+        missing <- as.integer(action)
+        w <- weights(model)
+        omitted <- missing
+        if (!is.null(w)) {
+            zero <- naresid(action, w) == 0
+            zero[is.na(zero)] <- FALSE
+            omitted <- missing - cumsum(zero)[missing]
+        }
+        labels <- if (is.matrix(res)) rownames(res) else names(res)
+        if (!is.null(labels)) {
+            retained <- labels[-missing]
+            labels[] <- NA_character_
+            labels[-omitted] <- retained
+        }
+        if (is.matrix(result)) {
+            result[missing, ] <- 0
+            result[omitted, ] <- NA_real_
+            dimnames(result) <- list(labels, colnames(result))
+        } else {
+            result[missing] <- 0
+            result[omitted] <- NA_real_
+            names(result) <- labels
+        }
+    }
     result
 }

@@ -31,7 +31,10 @@ pub fn general_eigen(a: MatRef<'_>, only_values: bool) -> Result<GeneralEigen, M
     }
     let mut h = a.data.to_vec();
     let balance = Balance::new(&mut h, n)?;
-    let factor = scale(h.iter().copied())?;
+    let mut factor = scale(h.iter().copied())?;
+    if h.iter().any(|&x| x != 0.0 && x / factor == 0.0) {
+        factor = 1.0;
+    }
     for x in &mut h {
         *x /= factor;
     }
@@ -253,15 +256,20 @@ fn schur(
                     info: i32::try_from(end).unwrap_or(i32::MAX),
                 });
             }
-            let trailing = pair(h, n, last - 1);
+            let magnitude = (lo..=last)
+                .flat_map(|j| &h[j * n + lo..j * n + end])
+                .map(|x| x.abs())
+                .fold(0.0, f64::max);
+            let entry = |r, c| h[c * n + r] / magnitude;
+            let trailing = pair(h, n, last - 1).scaled_by(magnitude);
             let (top, bottom, product) = if iteration % 16 == 0 {
-                let delta = h[(last - 1) * n + last].abs() + h[(last - 2) * n + last - 1].abs();
+                let delta = entry(last, last - 1).abs() + entry(last - 1, last - 2).abs();
                 let shift = trailing.d + 0.75 * delta;
                 (shift, shift, -0.4375 * delta * delta)
             } else {
                 (trailing.a, trailing.d, trailing.b * trailing.c)
             };
-            francis(h, q, n, lo, last, [top, bottom, product]);
+            francis(h, q, n, lo, last, [top, bottom, product], magnitude);
         }
     }
     Ok(())
@@ -280,18 +288,26 @@ fn negligible(h: &[f64], n: usize, i: usize) -> bool {
     let ba = b.abs().min(c.abs());
     let aa = d.abs().max((a - d).abs());
     let bb = d.abs().min((a - d).abs());
-    let scale = aa + ab;
-    scale > 0.0 && ba * (ab / scale) <= (f64::EPSILON * bb * (aa / scale)).max(f64::MIN_POSITIVE)
+    let scale = aa.max(ab);
+    scale > 0.0 && (ba / scale) * (ab / scale) <= f64::EPSILON * (bb / scale) * (aa / scale)
 }
 
-fn francis(h: &mut [f64], q: &mut [f64], n: usize, lo: usize, last: usize, shifts: [f64; 3]) {
+fn francis(
+    h: &mut [f64],
+    q: &mut [f64],
+    n: usize,
+    lo: usize,
+    last: usize,
+    shifts: [f64; 3],
+    scale: f64,
+) {
     let [a, d, product] = shifts;
-    let h00 = h[lo * (n + 1)];
-    let h10 = h[lo * n + lo + 1];
+    let h00 = h[lo * (n + 1)] / scale;
+    let h10 = h[lo * n + lo + 1] / scale;
     let mut v = [
-        (h00 - a) * (h00 - d) + h[(lo + 1) * n + lo] * h10 - product,
-        h10 * ((h00 - a) + (h[(lo + 1) * (n + 1)] - d)),
-        h10 * h[(lo + 1) * n + lo + 2],
+        (h00 - a) * (h00 - d) + (h[(lo + 1) * n + lo] / scale) * h10 - product,
+        h10 * ((h00 - a) + (h[(lo + 1) * (n + 1)] / scale - d)),
+        h10 * (h[(lo + 1) * n + lo + 2] / scale),
     ];
     for k in lo..last {
         let width = 3.min(last - k + 1);
@@ -330,6 +346,15 @@ fn pair(h: &[f64], n: usize, i: usize) -> Block {
 }
 
 impl Block {
+    fn scaled_by(self, scale: f64) -> Self {
+        Self {
+            a: self.a / scale,
+            b: self.b / scale,
+            c: self.c / scale,
+            d: self.d / scale,
+        }
+    }
+
     fn values(self) -> [Cplx; 2] {
         let Self { a, b, c, d } = self;
         let delta = (a - d) / 2.0;
@@ -338,14 +363,24 @@ impl Block {
         if largest == 0.0 {
             return [Cplx::new(a, 0.0), Cplx::new(d, 0.0)];
         }
-        let x = delta / largest;
-        let y = cross / largest;
-        let discriminant = if b.is_sign_negative() == c.is_sign_negative() {
-            x * x + y * y
+        // Use a power of two so scaling preserves the bits that distinguish
+        // nearly repeated roots. Multiply b and c before rounding the sum.
+        let exponent = ((largest.to_bits() >> 52) & 0x7ff) as i32 - 1023;
+        let scale = 2.0_f64.powi(exponent.max(-1022));
+        let x = delta / scale;
+        let (b_scaled, c_scaled) = (b / scale, c / scale);
+        let product = b_scaled * c_scaled;
+        let discriminant = if product.is_finite() && (product != 0.0 || cross == 0.0) {
+            x.mul_add(x, product) + b_scaled.mul_add(c_scaled, -product)
         } else {
-            (x.abs() - y) * (x.abs() + y)
+            let y = (cross / scale).copysign(if b.is_sign_negative() == c.is_sign_negative() {
+                1.0
+            } else {
+                -1.0
+            });
+            x.mul_add(x, y * y.abs())
         };
-        let root = largest * discriminant.abs().sqrt();
+        let root = scale * discriminant.abs().sqrt();
         if discriminant < 0.0 {
             let mid = (a + d) / 2.0;
             [Cplx::new(mid, root), Cplx::new(mid, -root)]

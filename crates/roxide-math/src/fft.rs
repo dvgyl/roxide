@@ -253,18 +253,42 @@ impl Step {
                 spectrum,
                 work,
             } => {
+                let mut lane = input[offset..].iter().step_by(stride).take(output.len());
+                let first = input[offset];
+                if lane.clone().skip(1).all(|&z| z == Cplx::default()) {
+                    output.fill(first);
+                    return;
+                }
+                let (scale, nonfinite) =
+                    lane.clone()
+                        .fold((0.0_f64, false), |(scale, nonfinite), z| {
+                            (
+                                scale.max(z.re.abs()).max(z.im.abs()),
+                                nonfinite || !z.re.is_finite() || !z.im.is_finite(),
+                            )
+                        });
+                let scale = if scale.is_finite() && scale > 0.0 {
+                    scale
+                } else {
+                    1.0
+                };
+                let dc = nonfinite.then(|| lane.clone().copied().fold(Cplx::default(), sum));
                 work.fill(Cplx::default());
-                for (j, (&p, z)) in phase.iter().zip(work.iter_mut()).enumerate() {
-                    *z = product(input[offset + stride * j], p);
+                for ((&p, z), v) in phase.iter().zip(work.iter_mut()).zip(&mut lane) {
+                    *z = times_root(Cplx::new(v.re / scale, v.im / scale), p);
                 }
                 radix_two(work, false);
                 for (a, &b) in work.iter_mut().zip(spectrum.iter()) {
                     *a = product(*a, b);
                 }
                 radix_two(work, true);
-                let scale = 1.0 / work.len() as f64;
+                let length = work.len() as f64;
                 for ((z, &p), v) in output.iter_mut().zip(phase.iter()).zip(work) {
-                    *z = product(Cplx::new(v.re * scale, v.im * scale), p);
+                    let w = times_root(Cplx::new(v.re / length, v.im / length), p);
+                    *z = Cplx::new(w.re * scale, w.im * scale);
+                }
+                if let Some(dc) = dc {
+                    output[0] = dc;
                 }
             }
         }

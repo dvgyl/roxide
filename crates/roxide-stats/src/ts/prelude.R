@@ -96,7 +96,8 @@ ts <- function(data = NA, start = 1, end = numeric(), frequency = 1,
         if (is.null(names) && !is.null(class)) names <- paste("Series", seq_len(nseries))
         dimnames(data) <- list(NULL, names)
     }
-    tsp(data) <- c(start, end, frequency)
+    if (frequency <= 0) stop("invalid time series parameters specified (0)")
+    attr(data, "tsp") <- c(start, end, frequency)
     class(data) <- class
     data
 }
@@ -342,6 +343,8 @@ ccf <- function(x, y, lag.max = NULL, type = c("correlation", "covariance"),
     px <- tsp(x)
     py <- tsp(y)
     if (abs(px[3L] - py[3L]) > .ts_eps()) stop("not all series have the same frequency")
+    phase <- (px[1L] - py[1L]) * px[3L]
+    if (abs(phase - round(phase)) > .ts_eps()) stop("not all series have the same phase")
     first <- max(px[1L], py[1L])
     last <- min(px[2L], py[2L])
     if (last < first) stop("no time series intersection")

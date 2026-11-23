@@ -173,6 +173,16 @@ fn file_pointer(spec: &str) -> Option<&'static str> {
 }
 
 fn versions(spec: &str) -> Option<(String, Vec<License>)> {
+    let original = spec;
+    let alias;
+    let spec = if spec == "GNU General Public License" {
+        "GPL"
+    } else if let Some(version) = spec.strip_prefix("Mozilla Public License ") {
+        alias = format!("MPL-{version}");
+        &alias
+    } else {
+        spec
+    };
     for (family, releases, separator, long_form) in [
         ("LGPL", LGPL, "-", false),
         ("GPL", GPL, "-", false),
@@ -186,7 +196,7 @@ fn versions(spec: &str) -> Option<(String, Vec<License>)> {
         };
         if suffix.is_empty() {
             return Some((
-                spec.to_owned(),
+                original.to_owned(),
                 releases.iter().map(|&(_, lic)| lic).collect(),
             ));
         }
@@ -215,7 +225,7 @@ fn versions(spec: &str) -> Option<(String, Vec<License>)> {
             .iter()
             .find(|(v, lic)| version == Some(*v) || (long_form && lic.expanded == spec))
         {
-            return Some((spec.to_owned(), vec![*license]));
+            return Some((original.to_owned(), vec![*license]));
         }
     }
     None

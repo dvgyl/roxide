@@ -12,6 +12,48 @@ use super::*;
 
 const INF: f64 = f64::INFINITY;
 const MAX_QUANTILE_COMPONENTS: usize = 500_000;
+const LARGE_NONCENTRALITY: f64 = 100_000.0;
+
+// Use the signed likelihood root of the chi-square cumulant generating function.
+// Near the mean its correction has a removable singularity. Use the
+// skewness and kurtosis corrections to the normal probability there.
+fn large_chisq_normal_score(x: f64, df: f64, ncp: f64) -> f64 {
+    let scale = df.max(ncp);
+    let (d, n) = (df / scale, ncp / scale);
+    let y = x / scale;
+    let variance = 2.0 * (d + 2.0 * n);
+    let difference = ((x - ncp) - df) / scale;
+    let z = difference * scale.sqrt() / variance.sqrt();
+    if z.abs() <= 0.5 {
+        let skewness = 8.0 * (d + 3.0 * n) / (variance * variance.sqrt() * scale.sqrt());
+        let kurtosis = (48.0 * (d + 4.0 * n) / (variance * variance)) / scale;
+        let squared = z * z;
+        let first = skewness * (1.0 - squared) / 6.0;
+        let second = -kurtosis * z * (squared - 3.0) / 24.0
+            - skewness * skewness * z * (squared * (squared - 10.0) + 15.0) / 72.0;
+        return z + first + second + 0.5 * z * first * first;
+    }
+
+    // At the saddlepoint, x = df * t + ncp * t².
+    let t = 2.0 * (y.sqrt() / (d / y.sqrt() + (d / y.sqrt()).hypot(2.0 * n.sqrt())));
+    if t <= 0.0 || !t.is_finite() {
+        return z;
+    }
+    let delta = difference / (d + n * (t + 1.0));
+    let log_remainder = if delta.abs() < 1e-3 {
+        0.5 + delta * (-1.0 / 3.0 + delta * (0.25 - delta / 5.0))
+    } else {
+        (delta - t.ln()) / (delta * delta)
+    };
+    let root_scale = (d * log_remainder + n).sqrt();
+    let root = delta * scale.sqrt() * root_scale;
+    let ratio = (0.5 * d + n * t).sqrt() / root_scale;
+    if root.is_finite() && ratio > 0.0 && ratio.is_finite() {
+        root + ratio.ln() / root
+    } else {
+        root
+    }
+}
 
 fn poisson_log_mass(k: f64, mean: f64) -> f64 {
     if k == 0.0 {
@@ -199,6 +241,9 @@ fn pnchisq_budget(
             step(false, tail)
         };
     }
+    if ncp >= LARGE_NONCENTRALITY {
+        return pnorm(large_chisq_normal_score(x, df, ncp), 0.0, 1.0, tail, flags);
+    }
     let log_tail = Tail { log: true, ..tail };
     let mean = 0.5 * ncp;
     let component = |k, flags: &mut Flags| pgamma(x, 0.5 * df + k, 2.0, log_tail, flags);
@@ -233,6 +278,19 @@ pub fn qnchisq(p: f64, df: f64, ncp: f64, tail: Tail, flags: &mut Flags) -> f64 
     }
     let lower = lp <= lq;
     let log_tail = Tail { lower, log: true };
+    if ncp >= LARGE_NONCENTRALITY {
+        let target = qnorm(lp.min(lq), 0.0, 1.0, log_tail, flags);
+        return positive_quantile(target, true, (df + ncp).min(f64::MAX), |x| {
+            let score = if x == 0.0 {
+                f64::NEG_INFINITY
+            } else if x.is_infinite() {
+                f64::INFINITY
+            } else {
+                large_chisq_normal_score(x, df, ncp)
+            };
+            (score, f64::NAN)
+        });
+    }
     let mut budget = MAX_QUANTILE_COMPONENTS;
     let value = positive_quantile(lp.min(lq), lower, (df + ncp).min(f64::MAX), |x| {
         (

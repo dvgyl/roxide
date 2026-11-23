@@ -13,7 +13,7 @@ use roxide_math::{
         spectral::{MatrixNorm, general_eigen, matrix_norm, svd as decompose, symmetric_eigen},
     },
 };
-use roxide_value::{NA_REAL, RComplex, RLogical, SEXP_NIL, SexpType, ValueApi, is_na_real};
+use roxide_value::{NA_REAL, RComplex, RLogical, SEXP_NIL, SexpType, ValueApi};
 
 use crate::ops::common::{ch, error, flag, list, number, set, set_names, string, vector_limit};
 
@@ -37,19 +37,19 @@ pub(super) fn svd(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
         return Err(error(ctx, call, "a dimension is zero"));
     }
     finite(ctx, call, &a)?;
-    let nu = columns(ctx, call, nu, a.rows)?;
-    let nv = columns(ctx, call, nv, a.cols)?;
+    let (nu, keep_u) = columns(ctx, call, nu, a.rows)?;
+    let (nv, keep_v) = columns(ctx, call, nv, a.cols)?;
     size(ctx, call, a.rows, nu, size_of::<f64>())?;
     size(ctx, call, a.cols, nv, size_of::<f64>())?;
     let factors = decompose(a.view(), nu, nv).map_err(|e| math_error(ctx, call, e))?;
     let d = ctx.session_mut().alloc_real_from(&factors.d)?;
     ctx.protect(d);
     let mut items = vec![("d", d)];
-    if nu != 0 {
+    if keep_u {
         let u = ctx.session_mut().alloc_real_from(&factors.u)?;
         items.push(("u", matrix(ctx, u, a.rows, nu)?));
     }
-    if nv != 0 {
+    if keep_v {
         if transposed {
             let vt: Vec<_> = (0..a.cols)
                 .flat_map(|i| {
@@ -82,19 +82,19 @@ fn svd_complex(
         return Err(error(ctx, call, "a dimension is zero"));
     }
     finite_complex(ctx, call, &a)?;
-    let nu = columns(ctx, call, nu, m)?;
-    let nv = columns(ctx, call, nv, n)?;
+    let (nu, keep_u) = columns(ctx, call, nu, m)?;
+    let (nv, keep_v) = columns(ctx, call, nv, n)?;
     size(ctx, call, m, nu, size_of::<Cplx>())?;
     size(ctx, call, n, nv, size_of::<Cplx>())?;
     let s = complex_svd(&a, m, n, nu, nv).map_err(|e| math_error(ctx, call, e))?;
     let d = ctx.session_mut().alloc_real_from(&s.d)?;
     ctx.protect(d);
     let mut fields = vec![("d", d)];
-    if nu != 0 {
+    if keep_u {
         let u = eigen_vector(ctx, &s.u, true)?;
         fields.push(("u", matrix(ctx, u, m, nu)?));
     }
-    if nv != 0 {
+    if keep_v {
         if transposed {
             let vt = eigen_vector(ctx, &s.vt, true)?;
             fields.push(("vt", matrix(ctx, vt, nv, n)?));
@@ -120,7 +120,7 @@ fn complex_input(ctx: &mut Ctx, call: &Call, x: SexpId) -> EvalResult<((usize, u
     Ok((shape, complex(ctx, call, x)?))
 }
 
-fn columns(ctx: &mut Ctx, call: &Call, x: SexpId, cap: usize) -> EvalResult<usize> {
+fn columns(ctx: &mut Ctx, call: &Call, x: SexpId, cap: usize) -> EvalResult<(usize, bool)> {
     let s = ctx.session();
     let ty = s.type_of(x)?;
     if ty == SexpType::Cplx {
@@ -148,7 +148,7 @@ fn columns(ctx: &mut Ctx, call: &Call, x: SexpId, cap: usize) -> EvalResult<usiz
             "argument must be coercible to non-negative integer",
         ));
     }
-    Ok((n as usize).min(cap))
+    Ok(((n as usize).min(cap), n != 0.0))
 }
 
 pub(super) fn eigen(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
@@ -168,7 +168,16 @@ pub(super) fn eigen(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     }
     finite(ctx, call, &a)?;
     let symmetric = if flag(ctx, detect, false)? {
-        symmetry::real(&a.values, n, symmetry::TOLERANCE, symmetry::TOLERANCE * 8.0)
+        // A small asymmetric block can have its own eigenvalues. Compare
+        // opposing entries on their own scale before using one triangle.
+        (0..n).all(|j| {
+            (j + 1..n).all(|i| {
+                let lower = a.values[j * n + i];
+                let upper = a.values[i * n + j];
+                let scale = lower.abs().max(upper.abs());
+                lower == upper || (lower - upper).abs() / scale <= symmetry::TOLERANCE
+            })
+        })
     } else {
         flag(ctx, symmetric, false)?
     };
@@ -467,7 +476,12 @@ fn real_norm(ctx: &mut Ctx, call: &Call, a: MatRef<'_>, kind: MatrixNorm) -> Eva
     let nan = match kind {
         MatrixNorm::Spectral if a.data.iter().any(|v| v.is_nan()) => Some(NA_REAL),
         MatrixNorm::One | MatrixNorm::Maximum => a.data.iter().rfind(|v| v.is_nan()).copied(),
-        MatrixNorm::Infinity => a.data.iter().find(|v| is_na_real(**v)).copied(),
+        MatrixNorm::Infinity => (0..a.nrow).rev().find_map(|row| {
+            (0..a.ncol)
+                .rev()
+                .map(|col| a.data[col * a.nrow + row])
+                .find(|v| v.is_nan())
+        }),
         _ => None,
     };
     if let Some(nan) = nan {

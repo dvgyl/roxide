@@ -26,6 +26,12 @@ fn center(values: &mut [f64], n: usize) {
 }
 
 fn additive_constant(ctx: &mut Ctx, call: &Call, d: &[f64], n: usize) -> EvalResult<f64> {
+    if n == 3 && (0..n).all(|j| (0..j).all(|i| d[j * n + i] == d[i * n + j])) {
+        // With three points, the triangle inequalities determine the offset.
+        let mut edges = [d[1], d[2], d[5]];
+        edges.sort_by(f64::total_cmp);
+        return Ok(((edges[2] - edges[1]) - edges[0]).max(0.0));
+    }
     let side = area::<f64>(ctx, call, 2, n)?;
     let len = area::<f64>(ctx, call, side, side)?;
     let mut linear = d.to_vec();
@@ -117,15 +123,7 @@ pub(super) fn cmdscale(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResul
     };
     let result =
         symmetric_eigen(view, false).map_err(|e| ctx.stop(call.err_call(), e.to_string()))?;
-    let mut cols = result.values[..k].iter().take_while(|&&v| v > 0.0).count();
-    // Centering makes the constant vector a null direction. Roundoff can make
-    // its eigenvalue positive when the configuration is rank deficient.
-    if add && cols == k {
-        let scale = result.values[0].abs() * f64::EPSILON * n as f64;
-        while cols > 0 && result.values[cols - 1] <= scale {
-            cols -= 1;
-        }
-    }
+    let cols = result.values[..k].iter().take_while(|&&v| v > 0.0).count();
     if cols < k {
         ctx.warn_now(
             call.err_call(),

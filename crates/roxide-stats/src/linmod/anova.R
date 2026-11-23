@@ -77,3 +77,69 @@ anova.lm <- function(object, ..., scale = 0, test = "F") {
     heading <- paste0("Model ", seq_len(n), ": ", formulae, collapse = "\n")
     .lm_anova_table(out, as.character(seq_len(n)), c("Analysis of Variance Table\n", heading))
 }
+
+.mlm_pillai <- function(h, e, df, residual) {
+    if (!df) return(c(0, NaN, 0, 0, NA_real_))
+    responses <- nrow(e)
+    s <- min(df, responses)
+    trace <- sum(diag(solve(e + h, h)))
+    num <- s * max(df, responses)
+    den <- s * (residual - responses + s)
+    f <- (den / num) * trace / (s - trace)
+    c(trace, f, num, den, pf(f, num, den, lower.tail = FALSE))
+}
+
+anova.mlm <- function(object, ..., test = "Pillai") {
+    .lm_choice(test, "Pillai")
+    models <- c(list(object), list(...))
+    n <- length(models)
+    rss <- function(model) {
+        r <- model$residuals
+        w <- weights(model)
+        crossprod(if (is.null(w)) r else sqrt(w) * r)
+    }
+    rdf <- vapply(models, function(model) as.double(df.residual(model)), 0)
+    errors <- lapply(models, rss)
+    largest <- .lm_which(rdf == min(rdf))[[1L]]
+    residual <- rdf[[largest]]
+    e <- errors[[largest]]
+    heading <- "Analysis of Variance Table\n"
+    if (n == 1L) {
+        if (!object$rank) stop("object 'ss' not found")
+        active <- seq_len(object$rank)
+        group <- object[["assign"]][.lm_qr(object)$pivot[active]]
+        labels <- c("(Intercept)", attr(terms(object), "term.labels"))
+        groups <- seq_along(labels) - 1L
+        counts <- vapply(groups, function(term) as.integer(sum(group == term)), 0L)
+        keep <- counts > 0L
+        tests <- lapply(groups[keep], function(term) {
+            effect <- object$effects[active[group == term], , drop = FALSE]
+            .mlm_pillai(crossprod(effect), e, nrow(effect), residual)
+        })
+        tests <- c(tests, list(rep(NA_real_, 5L)))
+        out <- list(Df = as.integer(c(counts[keep], residual)))
+        rows <- c(labels[keep], "Residuals")
+    } else {
+        if (any(!vapply(models, inherits, FALSE, "mlm"))) stop("all models must be 'mlm' objects")
+        sizes <- vapply(models, function(model) nrow(model$residuals), 0L)
+        if (any(sizes != sizes[[1L]])) stop("models were not all fitted to the same size of dataset")
+        d <- diff(rdf)
+        tests <- lapply(seq_along(d), function(i) {
+            h <- (errors[[i + 1L]] - errors[[i]]) * sign(d[[i]])
+            .mlm_pillai(h, e, abs(d[[i]]), residual)
+        })
+        tests <- c(list(rep(NA_real_, 5L)), tests)
+        generalized <- vapply(seq_len(n), function(i) det(errors[[i]] / rdf[[i]])^(1 / nrow(e)), 0)
+        out <- list(Res.Df = rdf, Df = c(NA_real_, d), Gen.var. = generalized)
+        formulae <- vapply(models, function(model) {
+            f <- formula(model)
+            attributes(f) <- NULL
+            deparse1(f)
+        }, "")
+        heading <- c(heading, paste0("Model ", seq_len(n), ": ", formulae, collapse = "\n"))
+        rows <- as.character(seq_len(n))
+    }
+    columns <- lapply(seq_len(5L), function(j) vapply(tests, function(value) value[[j]], 0))
+    names(columns) <- c("Pillai", "approx F", "num Df", "den Df", "Pr(>F)")
+    .lm_anova_table(c(out, columns), rows, heading)
+}

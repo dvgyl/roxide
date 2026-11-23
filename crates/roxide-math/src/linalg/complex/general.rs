@@ -1,6 +1,6 @@
 use crate::{Cplx, MathError};
 
-use super::{ONE, Reflector, ZERO, euclidean, scaled_matrix};
+use super::{ONE, Reflector, ZERO, basis, check_matrix, diagonal, euclidean, scaled_matrix};
 
 /// Eigenvalues and right eigenvectors of a general complex matrix.
 pub struct ComplexEigen {
@@ -17,6 +17,19 @@ pub fn complex_general_eigen(
     n: usize,
     only_values: bool,
 ) -> Result<ComplexEigen, MathError> {
+    check_matrix(data, n, n)?;
+    if diagonal(data, n) {
+        let mut order: Vec<_> = (0..n).collect();
+        order.sort_by(|&i, &j| {
+            data[j * (n + 1)]
+                .modulus()
+                .total_cmp(&data[i * (n + 1)].modulus())
+        });
+        return Ok(ComplexEigen {
+            values: order.iter().map(|&i| data[i * (n + 1)]).collect(),
+            vectors: basis(n, if only_values { 0 } else { n }, &order)?,
+        });
+    }
     let (mut a, scale) = scaled_matrix(data, n, n)?;
     let balance = balance(&mut a, n);
     let mut q = if only_values {

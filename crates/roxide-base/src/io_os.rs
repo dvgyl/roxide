@@ -19,8 +19,8 @@ use roxide_value::{CharId, Encoding, NA_INTEGER, SexpType, ValueApi};
 pub const MODULE: Module = Module {
     prims: &[
         internal("rox_io_file", connection::file, 6, Visibility::On),
-        internal("rox_io_text", connection::text, 4, Visibility::On),
-        internal("rox_io_raw", connection::raw, 2, Visibility::On),
+        internal("rox_io_text", connection::text, 5, Visibility::On),
+        internal("rox_io_raw", connection::raw, 3, Visibility::On),
         internal("rox_io_raw_value", connection::raw_value, 1, Visibility::On),
         internal(
             "rox_io_text_value",
@@ -31,6 +31,12 @@ pub const MODULE: Module = Module {
         internal("rox_io_close", connection::close, 1, Visibility::Off),
         internal("rox_io_is_open", connection::is_open, 2, Visibility::On),
         internal("rox_io_std", connection::standard, 1, Visibility::On),
+        internal(
+            "rox_io_description",
+            connection::description,
+            1,
+            Visibility::On,
+        ),
         internal("rox_io_read_lines", lines::read_lines, 6, Visibility::On),
         internal("rox_io_write_lines", lines::write_lines, 4, Visibility::Off),
         internal("rox_io_read_char", lines::read_char, 3, Visibility::On),
@@ -99,11 +105,12 @@ xzfile <- function(description, open = "", encoding = getOption("encoding"), com
     .Internal(rox_io_file(description, open, "xzfile", compression, FALSE, encoding))
 zstdfile <- function(description, open = "", encoding = getOption("encoding"), compression = 9)
     .Internal(rox_io_file(description, open, "zstdfile", compression, FALSE, encoding))
-rawConnection <- function(object, open = "r") .Internal(rox_io_raw(object, open))
+rawConnection <- function(object, open = "r")
+    .Internal(rox_io_raw(object, open, deparse1(substitute(object))))
 rawConnectionValue <- function(con) .Internal(rox_io_raw_value(con))
 textConnection <- function(object, open = "r", local = FALSE, name = deparse1(substitute(object)),
                            encoding = c("", "bytes", "UTF-8"))
-    .Internal(rox_io_text(object, open, if (local) parent.frame() else globalenv(), encoding))
+    .Internal(rox_io_text(object, open, if (local) parent.frame() else globalenv(), encoding, name))
 textConnectionValue <- function(con) .Internal(rox_io_text_value(con))
 close <- function(con, ...) UseMethod("close")
 close.connection <- function(con, ...) .Internal(rox_io_close(con))

@@ -38,6 +38,11 @@ lm.wfit <- function(x, y, w, offset = NULL, method = "qr", tol = 1e-7, singular.
     if (multi && !ncol(y)) stop("incorrect number of subscripts on matrix")
     if (weighted && !is.null(offset)) y <- y - offset
     if (!p) {
+        if (weighted && any(w == 0)) {
+            keep <- .lm_which(w != 0)
+            y <- if (multi) y[keep, , drop = FALSE] else y[keep]
+            w <- w[keep]
+        }
         fit <- y
         fit[] <- 0
         result <- list(coefficients = numeric(), residuals = y, fitted.values = fit)
@@ -211,10 +216,11 @@ lm <- function(formula, data, subset, weights, na.action, method = "qr",
     if (!length(attr(tt, "term.labels")) && !attr(tt, "intercept")) {
         r <- if (is.null(off)) response else response - off
         fit <- response
-        fit[] <- 0
-        empty <- if (multi) matrix(numeric(), 0L, ncol(response)) else numeric()
+        fit[] <- if (is.null(off)) 0 else off
+        empty <- if (multi) matrix(numeric(), 0L, ncol(response),
+                                    dimnames = list(NULL, colnames(response))) else numeric()
         z <- list(coefficients = empty, residuals = r, fitted.values = fit,
-                  weights = w, rank = 0L, df.residual = length(response))
+                  weights = w, rank = 0L, df.residual = .model_rows(response))
     } else {
         design <- model.matrix(tt, frame, contrasts)
         z <- if (is.null(w)) lm.fit(design, response, offset = off, singular.ok = singular.ok, ...)

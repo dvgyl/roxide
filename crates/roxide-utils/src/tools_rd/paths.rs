@@ -1,10 +1,11 @@
 use roxide_eval::{Args, Call, Ctx, EvalResult};
-use roxide_value::{CharId, RLogical, ValueApi};
+use roxide_value::{BASE_ENV, CharId, Encoding, RLogical, ValueApi};
+use std::borrow::Cow;
 use std::fmt::Write;
 
 use super::tree;
 
-use super::{flag, strings};
+use super::{char_text, flag};
 
 fn extension(path: &str) -> Option<usize> {
     let base = path.rsplit('/').next()?;
@@ -13,39 +14,89 @@ fn extension(path: &str) -> Option<usize> {
         .then_some(path.len() - ext.len() - 1)
 }
 
+fn decimal_extension(ctx: &mut Ctx, ext: &str) -> EvalResult<bool> {
+    if ext
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c.is_alphabetic())
+    {
+        return Ok(true);
+    }
+    ctx.scoped(|ctx| {
+        let pattern = ctx.session_mut().scalar_str(r"^[\p{L}\p{Nd}]+$")?;
+        ctx.protect(pattern);
+        let value = ctx.session_mut().scalar_str(ext)?;
+        ctx.protect(value);
+        let name = ctx.session_mut().intern("perl")?;
+        let perl = ctx.session_mut().scalar_lgl(RLogical::TRUE)?;
+        let matched = ctx.call_function(
+            "grepl",
+            &[(None, pattern), (None, value), (Some(name), perl)],
+            BASE_ENV,
+        )?;
+        Ok(ctx.session().lgl(matched)?.iter().next() == Some(RLogical::TRUE))
+    })
+}
+
 pub(super) fn extensions(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
-    let paths = strings(ctx, args.get(0))?;
+    let input = args.get(0);
     let compression = flag(ctx, call, args.get(1))?;
     let ext_only = flag(ctx, call, args.get(2))?;
-    let mut result = Vec::with_capacity(paths.len());
-    for path in &paths {
-        let output = match path {
-            Some(path) if ext_only => {
-                if extension(path.trim_end_matches('/')).is_none() {
-                    Some("")
-                } else {
-                    Some(extension(path).map_or(path.as_str(), |dot| &path[dot + 1..]))
-                }
-            }
-            Some(path) => {
-                let mut stem = path.as_str();
-                if compression
-                    && let Some(dot) = extension(stem)
-                    && matches!(&stem[dot + 1..], "gz" | "bz2" | "xz")
-                {
-                    stem = &stem[..dot];
-                }
-                Some(extension(stem).map_or(stem, |dot| &stem[..dot]))
-            }
-            None if ext_only => Some(""),
-            None => None,
+    let count = ctx.session().str_slice(input)?.len();
+    let mut result = Vec::with_capacity(count);
+    let mut output = String::new();
+    for i in 0..count {
+        let id = ctx.session().str_slice(input)?[i];
+        if id == CharId::NA && !ext_only {
+            result.push(id);
+            continue;
+        }
+        let path = char_text(ctx, id)?.unwrap_or(Cow::Borrowed(""));
+        let full = path.len();
+        let trimmed = if ext_only {
+            path.trim_end_matches('/')
+        } else {
+            &path
         };
-        result.push(match output {
-            Some(value) => ctx
-                .session_mut()
-                .mk_char(value.as_bytes(), roxide_value::Encoding::Utf8)?,
-            None => CharId::NA,
-        });
+        let stem = if compression {
+            extension(trimmed)
+                .filter(|&dot| matches!(&trimmed[dot + 1..], "gz" | "bz2" | "xz"))
+                .map_or(trimmed, |dot| &trimmed[..dot])
+        } else {
+            trimmed
+        };
+        let stem_len = stem.len();
+        let dot = extension(stem);
+        let mut special = String::new();
+        if let Some(dot) = dot {
+            let ext = &stem[dot + 1..];
+            if ext
+                .chars()
+                .any(|c| !c.is_ascii() && c.is_numeric() && !c.is_alphabetic())
+            {
+                special.push_str(ext);
+            }
+        }
+        let valid = special.is_empty() || decimal_extension(ctx, &special)?;
+        let path = char_text(ctx, id)?.unwrap_or(Cow::Borrowed(""));
+        let output_slice = if ext_only {
+            match dot.filter(|_| valid) {
+                Some(_) if path.ends_with('/') => &*path,
+                Some(dot) => &path[dot + 1..],
+                None => "",
+            }
+        } else {
+            &path[..dot.filter(|_| valid).unwrap_or(stem_len)]
+        };
+        if id != CharId::NA && output_slice.len() == full {
+            result.push(id);
+        } else {
+            output.clear();
+            output.push_str(output_slice);
+            result.push(
+                ctx.session_mut()
+                    .mk_char(output.as_bytes(), Encoding::Utf8)?,
+            );
+        }
     }
     Ok(ctx.session_mut().alloc_str_from(&result)?)
 }
