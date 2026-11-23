@@ -1,0 +1,193 @@
+=== case: optim_simplex ===
+#@ tags: layer2,optim
+#@ compare: rel=1e-6,abs=1e-7
+f <- function(x) sum((x - c(1, -2))^2)
+fit <- optim(c(x = 0, y = 0), f, method = "Nelder-Mead")
+stopifnot(identical(unname(fit$counts), c(69L, NA_integer_)), identical(fit$convergence, 0L))
+cat(fit$par, fit$value, "\n")
+
+=== case: optim_bfgs ===
+#@ tags: layer2,optim
+#@ compare: rel=1e-6,abs=1e-7
+f <- function(x) sum((x - c(1, -2))^2)
+fit <- optim(c(x = 0, y = 0), f, method = "BFGS")
+stopifnot(identical(unname(fit$counts), c(9L, 3L)), identical(fit$convergence, 0L))
+cat(fit$par, fit$value, "\n")
+
+=== case: optim_cg ===
+#@ tags: layer2,optim
+#@ compare: rel=1e-6,abs=1e-7
+f <- function(x) sum((x - c(1, -2))^2)
+fit <- optim(c(x = 0, y = 0), f, method = "CG")
+stopifnot(identical(unname(fit$counts), c(26L, 11L)), identical(fit$convergence, 0L))
+cat(fit$par, fit$value, "\n")
+
+=== case: optim_bounded ===
+#@ tags: layer2,optim
+#@ compare: rel=1e-6,abs=1e-7
+f <- function(x) sum((x - c(1, -2))^2)
+fit <- optim(c(x = 0, y = 0), f, method = "L-BFGS-B")
+stopifnot(identical(unname(fit$counts), c(4L, 4L)), identical(fit$convergence, 0L))
+stopifnot(identical(fit$message, "CONVERGENCE: REL_REDUCTION_OF_F <= FACTR*EPSMCH"))
+cat(fit$par, fit$value, "\n")
+
+=== case: optim_scaling_hessian_and_box ===
+#@ tags: layer2,optim
+#@ compare: rel=1e-6,abs=1e-7
+f <- function(x) sum((x - c(1, -2))^2)
+g <- function(x) 2 * (x - c(1, -2))
+fit <- optim(c(x = 0, y = 0), f, g, method = "L-BFGS-B", lower = -.5, upper = .5)
+cat(fit$par, fit$value, "\n")
+fit <- optim(c(x = 0, y = 0), f, g, method = "BFGS", hessian = TRUE)
+cat(fit$par, fit$value, fit$hessian, "\n")
+fit <- optim(c(x = 0, y = 0), function(x) -f(x), function(x) -g(x),
+             method = "BFGS", control = list(fnscale = -1, parscale = c(2, 3)))
+cat(fit$par, fit$value, "\n")
+cat(optimHess(c(1, 2), function(x) sum(x^4),
+              control = list(parscale = c(2, 3), ndeps = c(.1, .2), fnscale = -3)), "\n")
+
+=== case: optim_names_and_box_constraints ===
+#@ tags: layer2,optim
+#@ compare: exact
+f <- function(x) sum((x - c(1, -2))^2)
+g <- function(x) 2 * (x - c(1, -2))
+fit <- optim(c(x = 0, y = 0), f, g, method = "BFGS", hessian = TRUE)
+dput(names(fit))
+dput(names(fit$par))
+dput(dimnames(fit$hessian))
+fit <- optim(c(0, 0), f, g, method = "L-BFGS-B", lower = -.5, upper = .5)
+dput(fit$counts)
+cat(fit$convergence, fit$message, "\n")
+
+=== case: optim_failures_and_iteration_limits ===
+#@ tags: layer2,optim
+#@ compare: exact
+f <- function(x) sum((x - c(1, -2))^2)
+g <- function(x) 2 * (x - c(1, -2))
+
+for (method in c("Nelder-Mead", "BFGS", "CG", "L-BFGS-B")) {
+    short <- optim(c(0, 0), f, g, method = method, control = list(maxit = 1))
+    cat(short$convergence, short$message, "\n")
+}
+fit <- optim(c(0, 0), f, method = "L-BFGS-B", lower = 1, upper = 0)
+cat(fit$convergence, fit$message, "\n")
+fit <- optim(c(0, 0), f, method = "L-BFGS-B", control = list(lmm = 0))
+cat(fit$convergence, fit$message, "\n")
+fit <- optim(c(0, 0), function(x) 0, function(x) c(2, 1), method = "L-BFGS-B")
+cat(fit$counts, fit$convergence, fit$message, "\n")
+fit <- optim(c(0, 0), function(x) if (all(x == 0)) 0 else 1,
+             control = list(beta = 1, maxit = 35, reltol = 0))
+cat(fit$counts, fit$convergence, "\n")
+
+=== case: sann_seeded_and_brent ===
+#@ tags: layer2,optim
+#@ compare: rel=1e-6,abs=1e-7
+set.seed(42)
+fit <- optim(c(0, 0), function(x) sum((x - c(1, -2))^2), method = "SANN", control = list(maxit = 25L))
+cat(fit$par, fit$value, fit$counts, fit$convergence, "\n")
+fit <- optim(0, function(x) (x - 1)^2, method = "Brent", lower = -4, upper = 4)
+cat(fit$par, fit$value, fit$counts, fit$convergence, "\n")
+
+=== case: optimization_bounds_and_callback_errors ===
+#@ tags: layer2,optim
+#@ compare: exact
+err <- function(e) cat(conditionMessage(e), "\n")
+warn <- function(w) {
+    cat(conditionMessage(w), "\n")
+    invokeRestart("muffleWarning")
+}
+f <- function(x) sum(x^2)
+tryCatch(optim(c(0, 0), f, method = "Brent"), error = err)
+tryCatch(optim(0, f, method = "Brent"), error = err)
+z <- withCallingHandlers(optim(c(0, 0), f, method = "BFGS", lower = c(1, 1)), warning = warn)
+cat(z$convergence, z$message, "\n")
+tryCatch(optim(c(0, 0), function(x) c(1, 2)), error = err)
+tryCatch(optimize(f, c(1, 1)), error = err)
+tryCatch(optimize(function(x) stop("from objective"), c(0, 2)), error = err)
+
+=== case: scalar_minimum_and_maximum ===
+#@ tags: layer2,optim
+#@ compare: rel=1e-6,abs=1e-7
+f <- function(x, shift) (x - shift)^2
+a <- optimize(f, c(-4, 4), shift = 1)
+b <- optimise(function(x) -f(x, 1), c(4, -4), maximum = TRUE)
+cat(names(a), a$minimum, a$objective, "\n")
+cat(names(b), b$maximum, b$objective, "\n")
+
+=== case: uniroot_bracket_and_extension ===
+#@ tags: layer2,optim
+#@ compare: rel=1e-6,abs=1e-7
+for (x in list(uniroot(function(x) x*x - 2, c(0, 2)),
+               uniroot(function(x) x, c(0, 2)),
+               uniroot(function(x) x - 3, c(0, 2), extendInt = "upX"))) {
+    cat(names(x), x$root, x$f.root, x$iter, x$init.it, x$estim.prec, "\n")
+}
+
+=== case: uniroot_diagnostics ===
+#@ tags: layer2,optim
+#@ compare: exact
+err <- function(e) cat(conditionMessage(e), "\n")
+warn <- function(w) {
+    cat(conditionMessage(w), "\n")
+    invokeRestart("muffleWarning")
+}
+f <- function(x) x*x - 2
+tryCatch(uniroot(f, c(2, 3)), error = err)
+x <- withCallingHandlers(uniroot(f, c(0, 2), maxiter = 1), warning = warn)
+dput(x$iter)
+tryCatch(uniroot(f, c(0, 2), maxiter = 1, check.conv = TRUE), error = err)
+
+=== case: integrate_estimates ===
+#@ tags: layer2,optim
+#@ compare: rel=1e-6,abs=1e-7
+for (x in list(integrate(function(x) x^2, 0, 1),
+               integrate(dnorm, -Inf, Inf),
+               integrate(function(x) 1/sqrt(x), 0, 1),
+               integrate(function(x) 1/x, 0, 1, subdivisions = 2, stop.on.error = FALSE))) {
+    cat(x$value, x$abs.error, x$subdivisions, x$message, "\n")
+}
+
+=== case: integrate_print_and_diagnostics ===
+#@ tags: layer2,optim
+#@ compare: exact
+x <- integrate(function(x) x^2, 0, 1)
+dput(names(x))
+dput(class(x))
+print(x)
+print(integrate(dnorm, -Inf, Inf))
+print(integrate(function(x) 1/sqrt(x), 0, 1))
+print(integrate(function(x) 1/x, 0, 1, subdivisions = 2, stop.on.error = FALSE))
+err <- function(e) cat(conditionMessage(e), "\n")
+tryCatch(integrate(function(x) 1/x, 0, 1, subdivisions = 2), error = err)
+tryCatch(integrate(function(x) 1, 0, 1), error = err)
+tryCatch(integrate(function(x) x/0, 0, 1, stop.on.error = FALSE), error = err)
+
+=== case: integrate_vector_callbacks_and_matched_call ===
+#@ tags: layer2,optim
+#@ compare: exact
+sizes <- integer()
+f <- function(x, scale) {
+    sizes <<- c(sizes, length(x))
+    scale * x^2
+}
+out <- integrate(f, 0, 1, scale = 3)
+dput(sizes)
+dput(names(as.list(out$call)))
+
+=== case: optim_reporting_interval ===
+#@ tags: layer2,optim
+#@ compare: exact
+f <- function(x) sum((x - c(1, -2))^2)
+g <- function(x) 2 * (x - c(1, -2))
+invisible(optim(c(0, 0), f, g, method = "BFGS", control = list(trace = 1L, REPORT = 2L)))
+invisible(optim(c(0, 0), f, g, method = "L-BFGS-B", control = list(trace = 1L, REPORT = 2L)))
+
+=== case: integrate_divergent_extrapolation ===
+#@ tags: layer2,optim
+#@ compare: exact
+x <- integrate(function(x) 1/x^2, 0, 1, stop.on.error = FALSE)
+cat(x$message, "\n")
+dput(x$subdivisions)
+x <- integrate(function(x) x^2, 0, 1, rel.tol = 1e-20, abs.tol = 1e-20, stop.on.error = FALSE)
+cat(x$message, "\n")
+dput(x$subdivisions)
