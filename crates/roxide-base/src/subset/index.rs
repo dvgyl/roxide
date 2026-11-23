@@ -142,6 +142,20 @@ fn argument_indices(ctx: &Ctx, args: &Args, skip: &[&str]) -> Vec<SexpId> {
         .collect()
 }
 
+pub(super) fn index_labels(s: &mut roxide_value::RSession, x: SexpId) -> EvalResult<Vec<CharId>> {
+    if matches!(s.type_of(x)?, SexpType::Lang | SexpType::List) {
+        let tags: Vec<_> = s.pairlist_iter(x).map(|(tag, _)| tag).collect();
+        return tags
+            .into_iter()
+            .map(|sym| {
+                let key = tag(s, sym).unwrap_or("").to_owned();
+                Ok(ch(s, &key)?)
+            })
+            .collect();
+    }
+    Ok(names(s, x).to_vec())
+}
+
 pub(super) fn subset(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     let x = args.get(0);
     if x == SEXP_NIL {
@@ -182,7 +196,6 @@ pub(super) fn subset(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult 
         }
     }
     let s = ctx.session();
-    let labels = names(s, x).to_vec();
     let n = s.xlength(x)?;
     let is_function = matches!(
         s.type_of(x)?,
@@ -196,6 +209,7 @@ pub(super) fn subset(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult 
             format!("object of type '{name}' is not subsettable"),
         ));
     }
+    let labels = index_labels(ctx.session_mut(), x)?;
     let index = indices(ctx, call, sub, n, &labels, false, false)?;
     let pos: Vec<_> = index.iter().map(|i| i.pos).collect();
     selected(ctx, x, &pos)
@@ -214,6 +228,7 @@ pub(super) fn selected(ctx: &mut Ctx, x: SexpId, pos: &[Option<usize>]) -> EvalR
     }
     if has_class(s, x, "factor") {
         copy_attrs(s, x, out, |n| matches!(n, "levels" | "class"))?;
+        s.set_s4_flag(out, false)?;
     }
     Ok(out)
 }
@@ -640,25 +655,24 @@ pub(super) fn extract(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult
         let s = ctx.session();
         let n = s.xlength(x)?;
         let ty = s.type_of(x)?;
-        let labels = if ty == SexpType::List {
-            let keys: Vec<_> = s
-                .pairlist_iter(x)
-                .map(|(n, _)| tag(s, n).unwrap_or("").to_owned())
-                .collect();
-            keys.iter()
-                .map(|key| ch(ctx.session_mut(), key))
-                .collect::<Result<_, _>>()?
-        } else {
-            names(s, x).to_vec()
-        };
+        let labels = index_labels(ctx.session_mut(), x)?;
         let pos = single(ctx, call, sub, i, exact, &labels, n)?;
         let Some(pos) = pos else {
-            if matches!(ty, SexpType::Vec | SexpType::List | SexpType::Expr) && i + 1 == len {
+            if matches!(
+                ty,
+                SexpType::Vec | SexpType::List | SexpType::Lang | SexpType::Expr
+            ) && i + 1 == len
+            {
                 return Ok(SEXP_NIL);
             }
             return Err(error(ctx, call, "subscript out of bounds"));
         };
-        if i + 1 < len && !matches!(ty, SexpType::Vec | SexpType::List | SexpType::Expr) {
+        if i + 1 < len
+            && !matches!(
+                ty,
+                SexpType::Vec | SexpType::List | SexpType::Lang | SexpType::Expr
+            )
+        {
             return Err(error(
                 ctx,
                 call,
@@ -690,20 +704,9 @@ pub(super) fn dollar(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult 
     match s.type_of(x)? {
         SexpType::Nil => Ok(SEXP_NIL),
         SexpType::Env => env_lookup(ctx, x, &key),
-        SexpType::Vec | SexpType::List => {
-            let (pos, matched) = if s.type_of(x)? == SexpType::List {
-                let entries: Vec<_> = s
-                    .pairlist_iter(x)
-                    .map(|(n, _)| tag(s, n).unwrap_or("").to_owned())
-                    .collect();
-                let labels = entries
-                    .iter()
-                    .map(|n| ch(ctx.session_mut(), n))
-                    .collect::<Result<Vec<_>, _>>()?;
-                lookup(ctx.session(), &labels, &key, true)
-            } else {
-                lookup(s, names(s, x), &key, true)
-            };
+        SexpType::Vec | SexpType::List | SexpType::Lang => {
+            let labels = index_labels(ctx.session_mut(), x)?;
+            let (pos, matched) = lookup(ctx.session(), &labels, &key, true);
             if let Some(matched) = matched
                 && ctx.opts().warn_partial_match_dollar
             {

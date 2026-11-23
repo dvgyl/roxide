@@ -205,9 +205,14 @@ pub(crate) fn gather(
                 SexpType::List | SexpType::Lang => {
                     let tags: Vec<_> = s.pairlist_iter(x).map(|(tag, _)| tag).collect();
                     let mut result = SEXP_NIL;
-                    for (&value, i) in out.iter().zip(indices).rev() {
-                        let tag = i.and_then(|j| tags.get(j)).copied().flatten();
-                        result = s.cons(value, result, tag.map_or(SEXP_NIL, Sym::as_sexp))?;
+                    for (i, (&value, pos)) in out.iter().zip(indices).enumerate().rev() {
+                        let tag = pos.and_then(|j| tags.get(j)).copied().flatten();
+                        let tag = tag.map_or(SEXP_NIL, Sym::as_sexp);
+                        result = if i == 0 && ty == SexpType::Lang {
+                            s.lcons(value, result, tag)?
+                        } else {
+                            s.cons(value, result, tag)?
+                        };
                     }
                     Ok(result)
                 }
@@ -269,8 +274,13 @@ pub(crate) fn copy_attrs(
     keep: impl Fn(&str) -> bool,
 ) -> Result<(), ValueError> {
     for (sym, value) in s.attrs(src)? {
-        if keep(s.sym_name(sym)?) && s.attr(out, sym) == SEXP_NIL {
+        let name = s.sym_name(sym)?;
+        if keep(name) && s.attr(out, sym) == SEXP_NIL {
+            let is_s4_class = name == "class" && s.is_s4(src)?;
             s.set_attrib(out, sym, value)?;
+            if is_s4_class {
+                s.set_s4_flag(out, true)?;
+            }
         }
     }
     Ok(())

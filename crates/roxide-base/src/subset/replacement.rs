@@ -9,7 +9,7 @@ use crate::ops::common::{
 };
 
 use super::index::{
-    Index, array_indices, coordinates, dollar_name, indices, lookup, selected, single,
+    Index, array_indices, coordinates, dollar_name, index_labels, indices, lookup, selected, single,
 };
 
 fn replace_one_index(
@@ -28,7 +28,8 @@ fn replace_one_index(
             pos: if id == CharId::NA {
                 None
             } else {
-                lookup(s, names(s, x), &key, false).0
+                let labels = index_labels(ctx.session_mut(), x)?;
+                lookup(ctx.session(), &labels, &key, false).0
             },
             name: (id != CharId::NA).then_some(id),
         });
@@ -38,7 +39,7 @@ fn replace_one_index(
     if v >= 1.0 && v.is_finite() && v < usize::MAX as f64 {
         return Ok(Index::position(Some(v as usize - 1)));
     }
-    let labels = names(ctx.session(), x).to_vec();
+    let labels = index_labels(ctx.session_mut(), x)?;
     Ok(Index::position(single(
         ctx,
         call,
@@ -59,8 +60,8 @@ pub(super) fn replace(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult
     }
     let s = ctx.session();
     let n = s.xlength(x)?;
-    let labels = names(s, x).to_vec();
     let matrix = attr(s, x, "dim") != SEXP_NIL;
+    let labels = index_labels(ctx.session_mut(), x)?;
     let ix = if subs.len() > 1 {
         if !matrix {
             return Err(error(ctx, call, "incorrect number of subscripts"));
@@ -197,7 +198,8 @@ pub(super) fn replace_dollar(ctx: &mut Ctx, call: &Call, args: &mut Args) -> Eva
     };
     let s = ctx.session_mut();
     let id = ch(s, &key)?;
-    let pos = lookup(s, names(s, x), &key, false).0;
+    let labels = index_labels(s, x)?;
+    let pos = lookup(s, &labels, &key, false).0;
     replace_single_column_or_item(
         ctx,
         call,
@@ -374,11 +376,14 @@ fn assign(
         if tx == SexpType::Nil {
             return Ok(x);
         }
-        if matches!(tx, SexpType::Vec | SexpType::List) {
+        if matches!(tx, SexpType::Vec | SexpType::List | SexpType::Lang) {
             let removed: std::collections::HashSet<_> = ix.iter().filter_map(|i| i.pos).collect();
             let keep: Vec<_> = (0..n).filter(|i| !removed.contains(i)).map(Some).collect();
             let out = selected(ctx, x, &keep)?;
             let s = ctx.session_mut();
+            if out == SEXP_NIL {
+                return Ok(out);
+            }
             copy_attrs(s, x, out, |name| {
                 !matches!(name, "names" | "dim" | "dimnames")
             })?;
@@ -386,8 +391,10 @@ fn assign(
         }
     }
     let value_len = if one
-        && (matches!(tx, SexpType::Vec | SexpType::List | SexpType::Expr)
-            || !atomic(tv) && tv != SexpType::Nil)
+        && (matches!(
+            tx,
+            SexpType::Vec | SexpType::List | SexpType::Lang | SexpType::Expr
+        ) || !atomic(tv) && tv != SexpType::Nil)
     {
         1
     } else {
@@ -463,9 +470,8 @@ fn assign(
     {
         return Ok(out);
     }
-    let labels = names(s, x);
-    let named = attr(s, x, "names") != SEXP_NIL || !added.is_empty();
-    let mut labels = if named { labels.to_vec() } else { vec![] };
+    let named = tx == SexpType::Lang || attr(s, x, "names") != SEXP_NIL || !added.is_empty();
+    let mut labels = if named { index_labels(s, x)? } else { vec![] };
     if named {
         labels.resize(end, CharId::BLANK);
     }
@@ -499,6 +505,24 @@ fn assign(
                     element(s, value, i % value_len)?
                 };
             }
+        }
+        if tx == SexpType::Lang {
+            let mut tail = SEXP_NIL;
+            for (i, (&value, &label)) in values.iter().zip(&labels).enumerate().rev() {
+                let tag = if label == CharId::BLANK || label == CharId::NA {
+                    SEXP_NIL
+                } else {
+                    let label = text(s, label);
+                    s.intern(&label)?.as_sexp()
+                };
+                tail = if i == 0 {
+                    s.lcons(value, tail, tag)?
+                } else {
+                    s.cons(value, tail, tag)?
+                };
+            }
+            copy_attrs(s, x, tail, |n| n != "names")?;
+            return Ok(tail);
         }
         concatenate(s, &values, ty)?
     };

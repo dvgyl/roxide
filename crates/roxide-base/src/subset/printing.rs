@@ -4,16 +4,23 @@ use roxide_eval::{Args, Call, Ctx, EvalResult};
 use roxide_gc::SexpId;
 use roxide_value::{
     CharId, FormatOpts, RSession, SEXP_MISSING, SEXP_NIL, SexpType, ValueApi, encode_string,
-    format_int_vec, format_lgl_vec, format_real_vec,
+    format_int_vec, format_lgl_vec,
 };
 
+use crate::numbers::{complex_fields, real_fields};
 use crate::ops::attributes::{has_class, row_count};
-use crate::ops::common::{attr, chars, element, error, formals, gather, names, number, text};
+use crate::ops::common::{
+    atomic, attr, chars, element, error, flag, formals, gather, names, number, text, vector_limit,
+};
 
 use super::containers::{factor_values, matrix_dims, named_element};
 
 pub(super) fn print(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
-    let [x] = formals(ctx.session(), args, ["x"]);
+    let [x, digits, quote, _na_print, gap, right] = formals(
+        ctx.session(),
+        args,
+        ["x", "digits", "quote", "na.print", "print.gap", "right"],
+    );
     if x == SEXP_MISSING {
         return Err(error(
             ctx,
@@ -24,31 +31,215 @@ pub(super) fn print(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     if ctx.session().is_s4(x)? && ctx.show_s4(x, call.env)? {
         return Ok(x);
     }
-    let digits = args.named(ctx.session(), "digits");
-    let digits = if let Some(v) = digits {
-        number(ctx.session_mut(), v)?.clamp(1.0, 22.0) as usize
-    } else {
+    let digits = if matches!(digits, SEXP_MISSING | SEXP_NIL) {
         ctx.opts().digits
-    };
-    let fmt = FormatOpts {
-        digits,
-        scipen: ctx.opts().scipen,
-    };
-    let s = ctx.session_mut();
-    let output = if has_class(s, x, "rle") {
-        print_rle(s, x, fmt)?
-    } else if has_class(s, x, "data.frame") {
-        print_frame(s, x, fmt)?
-    } else if has_class(s, x, "factor") {
-        print_factor(s, x, fmt)?
-    } else if let Some((nr, nc)) = matrix_dims(s, x)? {
-        print_matrix(s, x, nr, nc, fmt)?
     } else {
-        ctx.print_value_default(x, digits)?;
-        return Ok(x);
+        number(ctx.session_mut(), digits)?.clamp(1.0, 22.0) as usize
     };
-    let _ = ctx.host().write_out(output.as_bytes());
+    let gap = if matches!(gap, SEXP_MISSING | SEXP_NIL) {
+        1
+    } else {
+        let gap = number(ctx.session_mut(), gap)?;
+        if !(0.0..=1024.0).contains(&gap) {
+            return Err(error(ctx, call, "invalid 'print.gap' argument"));
+        }
+        gap as usize
+    };
+    let quote = flag(ctx, quote, true)?;
+    let right = flag(ctx, right, false)?;
+    let settings = PrintSettings {
+        fmt: FormatOpts {
+            digits,
+            scipen: ctx.opts().scipen,
+        },
+        width: ctx.opts().width,
+        quote,
+        right,
+        gap,
+    };
+    print_default(ctx, call, x, &settings, "", 0)?;
     Ok(x)
+}
+
+struct PrintSettings {
+    fmt: FormatOpts,
+    width: usize,
+    quote: bool,
+    right: bool,
+    gap: usize,
+}
+
+fn print_default(
+    ctx: &mut Ctx,
+    call: &Call,
+    x: SexpId,
+    settings: &PrintSettings,
+    prefix: &str,
+    depth: usize,
+) -> EvalResult<()> {
+    if depth >= ctx.opts().expressions.min(128) {
+        return Err(error(ctx, call, "evaluation nested too deeply"));
+    }
+    let s = ctx.session_mut();
+    let ty = s.type_of(x)?;
+    let output = if has_class(s, x, "rle") {
+        Some(print_rle(s, x, settings.fmt)?)
+    } else if has_class(s, x, "data.frame") {
+        Some(print_frame(s, x, settings.fmt)?)
+    } else if has_class(s, x, "factor") {
+        Some(print_factor(s, x, settings.fmt)?)
+    } else if let Some((nr, nc)) = matrix_dims(s, x)? {
+        Some(print_matrix(s, x, nr, nc, settings)?)
+    } else if ty == SexpType::Vec {
+        print_list(ctx, call, x, settings, prefix, depth)?;
+        None
+    } else if atomic(ty) {
+        vector_limit(ctx, call, ctx.session().xlength(x)?, size_of::<String>())?;
+        Some(print_vector(ctx.session_mut(), x, settings)?)
+    } else {
+        ctx.print_value_default(x, settings.fmt.digits)?;
+        None
+    };
+    if let Some(output) = output {
+        write_out(ctx, call, &output)?;
+    }
+    if ["rle", "factor", "data.frame"]
+        .iter()
+        .any(|class| has_class(ctx.session(), x, class))
+    {
+        return Ok(());
+    }
+    for (sym, value) in ctx.session().attrs(x)? {
+        let name = ctx.session().sym_name(sym)?;
+        if matches!(name, "names" | "dim" | "dimnames" | "class" | "tsp") {
+            continue;
+        }
+        let label = format!("attr(,{})", encode_string(name.as_bytes()));
+        write_out(ctx, call, &format!("{label}\n"))?;
+        print_element(ctx, call, value, settings, &label, depth + 1)?;
+    }
+    Ok(())
+}
+
+fn write_out(ctx: &mut Ctx, call: &Call, output: &str) -> EvalResult<()> {
+    ctx.host()
+        .write_out(output.as_bytes())
+        .map_err(|err| error(ctx, call, err.to_string()))
+}
+
+fn print_list(
+    ctx: &mut Ctx,
+    call: &Call,
+    x: SexpId,
+    settings: &PrintSettings,
+    prefix: &str,
+    depth: usize,
+) -> EvalResult<()> {
+    let values = ctx.session().list_slice(x)?.to_vec();
+    let labels = names(ctx.session(), x).to_vec();
+    if values.is_empty() {
+        let named = attr(ctx.session(), x, "names") != SEXP_NIL;
+        return write_out(ctx, call, if named { "named list()\n" } else { "list()\n" });
+    }
+    for (i, x) in values.into_iter().enumerate() {
+        let suffix = match labels.get(i) {
+            None | Some(&CharId::BLANK) => format!("[[{}]]", i + 1),
+            Some(&CharId::NA) => "$<NA>".to_owned(),
+            Some(&label) => {
+                let label = text(ctx.session(), label);
+                let sym = ctx.session_mut().intern(&label)?;
+                let escaped =
+                    roxide_value::deparse(ctx.session(), sym.as_sexp(), Default::default())?
+                        .join("");
+                format!("${escaped}")
+            }
+        };
+        let label = format!("{prefix}{suffix}");
+        write_out(ctx, call, &format!("{label}\n"))?;
+        print_element(ctx, call, x, settings, &label, depth + 1)?;
+        write_out(ctx, call, "\n")?;
+    }
+    Ok(())
+}
+
+fn print_element(
+    ctx: &mut Ctx,
+    call: &Call,
+    x: SexpId,
+    settings: &PrintSettings,
+    prefix: &str,
+    depth: usize,
+) -> EvalResult<()> {
+    if ctx.session().is_s4(x)? && ctx.show_s4(x, call.env)? {
+        return Ok(());
+    }
+    if attr(ctx.session(), x, "class") != SEXP_NIL {
+        ctx.call_function("print", &[(None, x)], call.env)?;
+        return Ok(());
+    }
+    print_default(ctx, call, x, settings, prefix, depth)
+}
+
+fn print_vector(s: &mut RSession, x: SexpId, settings: &PrintSettings) -> EvalResult<String> {
+    let ty = s.type_of(x)?;
+    let values = display(s, x, settings.fmt, settings.quote)?;
+    let named = attr(s, x, "names") != SEXP_NIL;
+    if values.is_empty() {
+        let kind = if ty == SexpType::Real {
+            "numeric"
+        } else {
+            ty.type_name(false)
+        };
+        return Ok(format!("{}{kind}(0)\n", if named { "named " } else { "" }));
+    }
+    let labels: Vec<_> = names(s, x)
+        .iter()
+        .map(|&id| {
+            if id == CharId::NA {
+                "<NA>".to_owned()
+            } else {
+                text(s, id)
+            }
+        })
+        .collect();
+    let width = values
+        .iter()
+        .chain(&labels)
+        .map(|v| v.chars().count())
+        .max()
+        .unwrap_or(0);
+    let gap = " ".repeat(settings.gap);
+    let mut out = String::new();
+    if named {
+        let across = (settings.width / (width + settings.gap).max(1)).max(1);
+        for (row, values) in values.chunks(across).enumerate() {
+            for label in labels.iter().skip(row * across).take(values.len()) {
+                let _ = write!(out, "{label:>width$}{gap}");
+            }
+            out.push('\n');
+            for value in values {
+                let _ = write!(out, "{value:>width$}{gap}");
+            }
+            out.push('\n');
+        }
+    } else {
+        let index_width = values.len().to_string().len() + 2;
+        let across =
+            ((settings.width.saturating_sub(index_width)) / (width + settings.gap).max(1)).max(1);
+        for (i, row) in values.chunks(across).enumerate() {
+            let label = format!("[{}]", i * across + 1);
+            let _ = write!(out, "{label:>index_width$}");
+            for value in row {
+                if ty == SexpType::Str && !settings.right {
+                    let _ = write!(out, "{gap}{value:<width$}");
+                } else {
+                    let _ = write!(out, "{gap}{value:>width$}");
+                }
+            }
+            out.push('\n');
+        }
+    }
+    Ok(out)
 }
 
 fn display(s: &mut RSession, x: SexpId, fmt: FormatOpts, quote: bool) -> EvalResult<Vec<String>> {
@@ -57,7 +248,8 @@ fn display(s: &mut RSession, x: SexpId, fmt: FormatOpts, quote: bool) -> EvalRes
     Ok(match s.type_of(x)? {
         SexpType::Lgl => format_lgl_vec(&s.lgl(x)?.to_vec()),
         SexpType::Int => format_int_vec(&s.int(x)?.to_vec()),
-        SexpType::Real => format_real_vec(&s.real(x)?.to_vec(), fmt),
+        SexpType::Real => real_fields(&s.real(x)?.to_vec(), fmt, 0),
+        SexpType::Cplx => complex_fields(&s.cplx(x)?.to_vec(), fmt, 0, false),
         SexpType::Raw => s.raw(x)?.iter().map(|v| format!("{v:02x}")).collect(),
         SexpType::Str => s
             .str_slice(x)?
@@ -69,7 +261,8 @@ fn display(s: &mut RSession, x: SexpId, fmt: FormatOpts, quote: bool) -> EvalRes
                 if quote {
                     encode_string(s.char_bytes(v).unwrap_or_default())
                 } else {
-                    text(s, v)
+                    let encoded = encode_string(s.char_bytes(v).unwrap_or_default());
+                    encoded[1..encoded.len() - 1].replace("\\\"", "\"")
                 }
             })
             .collect(),
@@ -191,7 +384,7 @@ fn print_matrix(
     x: SexpId,
     nr: usize,
     nc: usize,
-    fmt: FormatOpts,
+    settings: &PrintSettings,
 ) -> EvalResult<String> {
     let axis = attr(s, x, "dimnames");
     let labels = |i, n| -> Vec<String> {
@@ -212,11 +405,14 @@ fn print_matrix(
     };
     let rows = labels(0, nr);
     let columns = labels(1, nc);
-    let values = display(s, x, fmt, true)?;
-    let cols: Vec<_> = (0..nc)
-        .map(|i| values[i * nr..(i + 1) * nr].to_vec())
-        .collect();
-    let left = s.type_of(x)? == SexpType::Str;
+    let cols = (0..nc)
+        .map(|i| {
+            let pos: Vec<_> = (i * nr..(i + 1) * nr).map(Some).collect();
+            let col = gather(s, x, &pos)?;
+            display(s, col, settings.fmt, settings.quote)
+        })
+        .collect::<EvalResult<Vec<_>>>()?;
+    let left = s.type_of(x)? == SexpType::Str && !settings.right;
     if nr == 0 && nc == 0 {
         return Ok("<0 x 0 matrix>\n".into());
     }

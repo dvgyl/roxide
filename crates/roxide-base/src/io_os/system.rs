@@ -8,7 +8,8 @@ use super::{attr, bytes, check_limit, flag, logical, string, strings, text, text
 
 pub(super) fn getenv(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     let keys = args.get(0);
-    let unset = texts(ctx, call, args.get(1), "unset")?;
+    let (unset, _) = ctx.session_mut().coerce(args.get(1), SexpType::Str)?;
+    let unset = texts(ctx, call, unset, "unset")?;
     let [unset] = unset.as_slice() else {
         return Err(ctx.stop(call.err_call(), "invalid 'unset' argument"));
     };
@@ -16,7 +17,7 @@ pub(super) fn getenv(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult 
     if keys == SEXP_NIL || ctx.session().xlength(keys)? == 0 {
         let mut entries = ctx.host().env_vars();
         entries.sort();
-        if named == Some(false) {
+        if !named.unwrap_or(keys == SEXP_NIL) {
             return strings(
                 ctx,
                 entries.into_iter().map(|(mut k, v)| {
@@ -27,10 +28,14 @@ pub(super) fn getenv(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult 
                 Encoding::Native,
             );
         }
-        let (keys, values): (Vec<_>, Vec<_>) = entries.into_iter().unzip();
+        let (labels, values): (Vec<_>, Vec<_>) = entries.into_iter().unzip();
         let result = strings(ctx, values.into_iter().map(Some), Encoding::Native)?;
-        let names = strings(ctx, keys.into_iter().map(Some), Encoding::Native)?;
+        let names = strings(ctx, labels.into_iter().map(Some), Encoding::Native)?;
         attr(ctx, result, "names", names)?;
+        if keys == SEXP_NIL {
+            let class = string(ctx, "Dlist")?;
+            attr(ctx, result, "class", class)?;
+        }
         return Ok(result);
     }
 

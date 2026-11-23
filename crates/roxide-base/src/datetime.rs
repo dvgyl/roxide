@@ -30,6 +30,7 @@ const STANDARD: &str = "character string is not in a standard unambiguous format
 /// Base date-time functions and their S3 methods.
 pub const MODULE: Module = Module {
     prims: &[
+        internal("rox_format_default", crate::default_format::format, 12),
         internal("rox_date", date, 5),
         internal("rox_ct", posix::clock, 6),
         internal("rox_lt", posix::calendar, 6),
@@ -88,7 +89,12 @@ strptime <- function(x, format, tz = "") .Internal(rox_strptime(x, format, tz))
 strftime <- function(x, format = "", tz = "", usetz = FALSE, ...)
     .Internal(rox_strftime(x, format, tz, usetz, getOption("digits.secs", 0L)))
 format <- function(x, ...) UseMethod("format")
-format.default <- function(x, ...) as.character(x)
+format.default <- function(x, trim = FALSE, digits = NULL, nsmall = 0L, justify = "left",
+                           width = NULL, na.encode = TRUE, scientific = NA,
+                           big.mark = "", big.interval = 3L, decimal.mark = getOption("OutDec", "."),
+                           drop0trailing = FALSE, ...)
+    .Internal(rox_format_default(x, trim, digits, nsmall, justify, width, na.encode, scientific,
+                                 big.mark, big.interval, decimal.mark, drop0trailing))
 format.Date <- function(x, format = "%Y-%m-%d", ...)
     .Internal(rox_datetime_format(x, format, "UTC", FALSE, 0L))
 format.POSIXct <- function(x, format = "", tz = "", usetz = FALSE, ...)

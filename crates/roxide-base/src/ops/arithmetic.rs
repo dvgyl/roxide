@@ -189,15 +189,20 @@ fn binary_attributes(
 ) -> EvalResult<()> {
     let s = ctx.session_mut();
     let (first, second) = if nx >= ny { (x, y) } else { (y, x) };
-    if arithmetic && len != 0 {
-        if nx == ny {
+    if arithmetic {
+        if nx == ny || len == 0 {
             copy_attrs(s, second, out, |n| {
                 !matches!(n, "names" | "dim" | "dimnames")
             })?;
         }
         for (sym, val) in s.attrs(first)? {
-            if !matches!(s.sym_name(sym)?, "names" | "dim" | "dimnames") {
+            let name = s.sym_name(sym)?;
+            if !matches!(name, "names" | "dim" | "dimnames") {
+                let class_s4 = (name == "class").then(|| s.is_s4(first)).transpose()?;
                 s.set_attrib(out, sym, val)?;
+                if let Some(s4) = class_s4 {
+                    s.set_s4_flag(out, s4)?;
+                }
             }
         }
     }

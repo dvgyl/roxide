@@ -1,0 +1,145 @@
+=== case: print_default_vectors_lists_and_attributes ===
+#@ tags: layer3,base,print
+#@ compare: exact
+print.default(c(a = 1, many = 10, z = NA_real_))
+print.default(c("long", "x", NA_character_))
+print.default(c("long", "x", NA_character_), quote = FALSE)
+print.default(list(a = list(b = 1L), c = character(), 2L))
+print.default(structure("metadata", package = "waves"))
+print.default(matrix(c(1, 1e5, 1.3, 1.24), 2L))
+options(width = 20L)
+print.default(1:18)
+
+=== case: subset_and_replace_call_arguments ===
+#@ tags: layer3,base,language
+#@ compare: exact
+x <- quote(f(x = 1L, y = 2L))
+dput(typeof(x[-1L]))
+dput(x[-1L])
+dput(x[c("y", "missing")])
+dput(x$y)
+copy <- x
+x[[1L]] <- as.name("g")
+x["x"] <- list(4L)
+x$z <- 7L
+x[["y"]] <- NULL
+dput(x)
+dput(copy)
+
+=== case: s4_flag_on_math_and_arithmetic ===
+#@ tags: layer3,base,s4
+#@ compare: exact
+invisible(setClass("WaveNumeric", contains = "numeric"))
+x <- new("WaveNumeric", c(1, 4, 9))
+dput(vapply(list(x + 1, 1 + x, -x, sqrt(x), abs(x), round(x), log(x),
+                 x == 1, !x, cumsum(x), sum(x), x[1L], rev(x)), isS4, FALSE))
+
+=== case: base_constants_and_default_format ===
+#@ tags: layer3,base,format
+#@ compare: exact
+dput(list(T, F, LETTERS[24:26], month.name[1L], month.abb[12L]))
+dput(.Machine[c("double.digits", "integer.max", "sizeof.pointer")])
+dput(.Machine$double.eps == 2^-52)
+dput(format(c(1, NA, 1.25), nsmall = 3L))
+dput(format(c(1e5, 1), scientific = TRUE))
+dput(format(c(NA, TRUE, FALSE)))
+dput(format(c(a = "x", b = NA_character_), width = 4L, justify = "centre", na.encode = FALSE))
+dput(format(c(123456, 1), big.mark = ","))
+dput(format(list(a = c(1, 2), b = c("a", "b"))))
+dput(format(NULL))
+
+=== case: matching_sets_and_unlist_names ===
+#@ tags: layer3,base,apply
+#@ compare: exact
+dput(match(c(NA, NaN, 2, 0), c(NaN, 2, NA, -0)))
+dput(duplicated(c("a", "a", "b", "a"), fromLast = TRUE))
+dput(anyDuplicated(c("a", "b", "a")))
+dput(setdiff(c("b", "a", "b"), "a"))
+dput(unlist(list(a = 1:2, b = list(c = 3, 4), 5)))
+dput(unlist(list(a = list(b = list(1L, 2L), 3L, 4L))))
+=== case: multivariate_and_array_callbacks ===
+#@ tags: layer3,base,apply
+#@ compare: exact
+dput(Map(paste0, c("a", "b"), 1:2))
+dput(which(c(a = NA, b = TRUE, c = FALSE)))
+dput(apply(matrix(1:6, 2L), 2L, sum))
+=== case: grouped_and_recursive_callbacks ===
+#@ tags: layer3,base,apply
+#@ compare: exact
+groups <- tapply(1:5, c("x", "y", "x", "y", NA), sum)
+dput(as.vector(groups))
+dput(dimnames(groups))
+dput(rapply(list(1L, list(a = 2L, "skip")), function(x) x + 1L, classes = "integer"))
+dput(pmax(c(NA, 2), c(5, NA), na.rm = TRUE))
+
+=== case: string_replacements_and_encodings ===
+#@ tags: layer3,base,strings
+#@ compare: exact
+dput(make.unique(c("a", "a", "a.1", "a")))
+dput(utf8ToInt("Rö"))
+dput(intToUtf8(c(65L, 0L, 233L), multiple = TRUE))
+dput(iconv(c("résumé", "R"), to = "ASCII", sub = "?"))
+dput(strtoi(c("0xff", "010", "-9", "8x")))
+dput(encodeString(c("r", "test", NA), width = 5L, quote = "'", justify = "right"))
+dput(strtrim(c("test", "éxo", NA), c(2L, 2L, 1L)))
+dput(regexec("(a)?(b)", c("ab", "b", NA)))
+x <- c("abcd", "ABCD")
+substr(x, 2L, 4L) <- "q"
+regmatches(x, regexpr("[a-z]+", x)) <- "R"
+dput(x)
+
+=== case: host_files_environment_and_source ===
+#@ tags: layer3,base,io
+#@ compare: exact
+Sys.unsetenv("ROXIDE_W3_PROBE")
+dput(Sys.getenv("ROXIDE_W3_PROBE", unset = NA))
+dput(class(Sys.getenv()))
+dput(class(Sys.getenv(names = FALSE)))
+path <- tempfile()
+dir.create(path)
+from <- file.path(path, "input.R")
+to <- file.path(path, "copy.R")
+writeLines("value <- 42L", from)
+dput(file.copy(from, to))
+dput(file.size(to))
+dput(file.append(to, from))
+dput(readLines(to))
+env <- new.env()
+sys.source(to, envir = env)
+dput(env$value)
+dput(file.remove(from, to))
+unlink(path, recursive = TRUE)
+dput(interactive())
+dput(readline())
+dput(class(system.time(1 + 1)))
+dput(names(proc.time()))
+
+=== case: utils_package_metadata_and_combinations ===
+#@ tags: layer3,utils,packages
+#@ compare: exact
+invisible(globalVariables(c("waveA", "waveB")))
+dput(globalVariables("waveC"))
+dput(as.character(packageVersion("utils")))
+dput(packageDescription("utils", fields = "Version"))
+dput(compareVersion("1.2", "1.10"))
+dput(modifyList(list(x = list(a = 1L, b = 2L), y = 3L),
+                list(x = list(a = NULL, c = 4L))))
+dput(format(person("Ada", "Lovelace", email = "ada@example.org", role = "aut")))
+dput(format(as.person("Ada Lovelace <ada@example.org> [aut]")))
+dput(URLencode(c("a b/%20", "é"), reserved = TRUE))
+dput(glob2rx(c("a*.R", "a?.R", "x[ab]")))
+dput(combn(4L, 2L))
+
+=== case: nested_print_dispatches_to_object_methods ===
+#@ tags: layer3,base,print,s4
+#@ compare: exact
+print.WaveReport <- function(x, ...) {
+    cat("S3 report\n")
+    invisible(x)
+}
+invisible(setClass("WaveDisplay", slots = c(value = "numeric")))
+invisible(setMethod("show", "WaveDisplay", function(object) {
+    cat("S4 display", object@value, "\n", sep = " ")
+}))
+print.default(list(report = structure(7, class = "WaveReport"),
+                   display = new("WaveDisplay", value = 2)))
