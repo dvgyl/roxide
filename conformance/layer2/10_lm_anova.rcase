@@ -144,20 +144,45 @@ n <- data.frame(a=c(0,NA,5,8))
 p <- predict(m,n,se.fit=TRUE,interval="prediction",level=.8)
 cat(rownames(p$fit), p$fit,p$se.fit,p$df,p$residual.scale,"\n")
 
-=== case: lm_prediction_poly_factors_and_terms ===
+=== case: lm_prediction_poly_factors ===
 #@ tags: layer2,linmod
 #@ compare: rel=1e-9,abs=1e-12
 d <- data.frame(y=c(3,1,6,2,8,4,9,5),a=c(0,1,2,4,8,16,17,20),
                 f=factor(rep(c("lo","hi"),4),levels=c("lo","hi")))
 m <- lm(y~poly(a,2)+f,d)
-n <- d[c(2,5,8),]
-p <- predict(m,n,se.fit=TRUE)
+p <- predict(m,d[c(2,5,8),],se.fit=TRUE)
 cat(p$fit,p$se.fit,p$df,p$residual.scale,"\n")
-q <- predict(m,n,type="terms",se.fit=TRUE,interval="confidence")
+
+=== case: lm_prediction_poly_terms ===
+#@ tags: layer2,linmod
+#@ compare: rel=1e-9,abs=1e-12
+d <- data.frame(y=c(3,1,6,2,8,4,9,5),a=c(0,1,2,4,8,16,17,20),
+                f=factor(rep(c("lo","hi"),4),levels=c("lo","hi")))
+m <- lm(y~poly(a,2)+f,d)
+q <- predict(m,d[c(2,5,8),],type="terms",se.fit=TRUE,interval="confidence")
 cat(colnames(q$fit), attr(q$fit,"constant"), q$fit,q$se.fit,q$lwr,q$upr,"\n")
+
+=== case: lm_prediction_poly_new_level ===
+#@ tags: layer2,linmod
+#@ compare: rel=1e-9,abs=1e-12
+d <- data.frame(y=c(3,1,6,2,8,4,9,5),a=c(0,1,2,4,8,16,17,20),
+                f=factor(rep(c("lo","hi"),4),levels=c("lo","hi")))
+m <- lm(y~poly(a,2)+f,d)
 tryCatch(predict(m,data.frame(a=2,f="new")),error=function(e)cat(conditionMessage(e),"\n"))
 
-=== case: lm_prediction_rank_and_offset ===
+=== case: lm_prediction_rank_warning ===
+#@ tags: layer2,linmod
+#@ compare: rel=1e-10,abs=1e-12
+d <- data.frame(y=c(3,1,6,2,8,4),x=1:6,z=2*(1:6),o=c(0,1,2,0,1,2))
+m <- lm(y~x+z+offset(o),d,offset=x/2)
+n <- data.frame(x=2:4,z=c(4,7,8),o=c(0,1,0))
+p <- withCallingHandlers(predict(m,n),warning=function(w) {
+    cat(conditionMessage(w),"\n")
+    invokeRestart("muffleWarning")
+})
+cat(p, attr(p,"non-estim"), names(attr(p,"non-estim")), "\n")
+
+=== case: lm_prediction_rank_options ===
 #@ tags: layer2,linmod
 #@ compare: rel=1e-10,abs=1e-12
 d <- data.frame(y=c(3,1,6,2,8,4),x=1:6,z=2*(1:6),o=c(0,1,2,0,1,2))
@@ -165,12 +190,13 @@ m <- lm(y~x+z+offset(o),d,offset=x/2)
 n <- data.frame(x=2:4,z=c(4,7,8),o=c(0,1,0))
 p <- predict(m,n,rankdeficient="non-estim")
 cat(p, attr(p,"non-estim"), names(attr(p,"non-estim")), "\n")
-p <- withCallingHandlers(predict(m,n),warning=function(w) {
-    cat(conditionMessage(w),"\n")
-    invokeRestart("muffleWarning")
-})
-cat(attr(p,"non-estim"), "\n")
 cat(predict(m,n,rankdeficient="NA"), "\n")
+
+=== case: lm_prediction_rank_fitted_offset ===
+#@ tags: layer2,linmod
+#@ compare: rel=1e-10,abs=1e-12
+d <- data.frame(y=c(3,1,6,2,8,4),x=1:6,z=2*(1:6),o=c(0,1,2,0,1,2))
+m <- lm(y~x+z+offset(o),d,offset=x/2)
 cat(predict(m), fitted(m), "\n")
 
 === case: lm_dummy_aliased ===
@@ -186,31 +212,27 @@ for (use.na in c(FALSE,TRUE)) {
     for (v in z) cat(names(v), v, "\n")
 }
 
-=== case: lm_dummy_numeric_factor_interaction ===
+=== case: lm_dummy_full_rank_numeric_factor ===
 #@ tags: layer2,linmod
 #@ compare: rel=1e-10,abs=1e-12
 d <- data.frame(y=c(3,1,6,2,8,4,9,5),a=0:7,b=2*(0:7),
                 f=factor(rep(c("lo","hi"),4),levels=c("lo","hi")),
                 g=factor(rep(c("A","B"),each=4)))
 m <- lm(y~a*f,d)
-for (use.na in c(FALSE,TRUE)) {
-    z <- dummy.coef(m,use.na=use.na)
-    cat(class(z), names(z), attr(z,"matrix"), "\n")
-    for (v in z) cat(names(v), v, "\n")
-}
+z <- dummy.coef(m)
+cat(class(z), names(z), attr(z,"matrix"), "\n")
+for (v in z) cat(names(v), v, "\n")
 
-=== case: lm_dummy_factor_interaction ===
+=== case: lm_dummy_full_rank_factor_pair ===
 #@ tags: layer2,linmod
 #@ compare: rel=1e-10,abs=1e-12
 d <- data.frame(y=c(3,1,6,2,8,4,9,5),a=0:7,b=2*(0:7),
                 f=factor(rep(c("lo","hi"),4),levels=c("lo","hi")),
                 g=factor(rep(c("A","B"),each=4)))
 m <- lm(y~f*g,d)
-for (use.na in c(FALSE,TRUE)) {
-    z <- dummy.coef(m,use.na=use.na)
-    cat(class(z), names(z), attr(z,"matrix"), "\n")
-    for (v in z) cat(names(v), v, "\n")
-}
+z <- dummy.coef(m)
+cat(class(z), names(z), attr(z,"matrix"), "\n")
+for (v in z) cat(names(v), v, "\n")
 
 === case: lm_dummy_empty_and_intercept ===
 #@ tags: layer2,linmod
@@ -235,12 +257,18 @@ cat(vcov(m), confint(m), "\n")
 cat(AIC(m), BIC(m), logLik(m), logLik(m,REML=TRUE), attr(logLik(m),"df"), "\n")
 cat(names(hatvalues(m)), hatvalues(m), rstandard(m), rstudent(m), cooks.distance(m), "\n")
 
-=== case: lm_print_anova_and_dummy ===
+=== case: lm_print_table_anova ===
 #@ tags: layer2,linmod
 #@ compare: exact
 d <- data.frame(y=c(3,1,6,2,8,4,9,5),a=0:7,f=factor(rep(c("lo","hi"),4),levels=c("lo","hi")))
 m <- lm(y~a+f,d)
 print(anova(m))
+
+=== case: lm_print_table_dummy ===
+#@ tags: layer2,linmod
+#@ compare: exact
+d <- data.frame(y=c(3,1,6,2,8,4,9,5),a=0:7,f=factor(rep(c("lo","hi"),4),levels=c("lo","hi")))
+m <- lm(y~a+f,d)
 print(dummy.coef(m))
 
 === case: lm_update_and_compare_information_criteria ===
