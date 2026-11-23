@@ -1,0 +1,216 @@
+=== case: density_grid_and_metadata ===
+#@ tags: layer2,smooth
+#@ compare: rel=1e-8,abs=1e-10
+x <- c(-2, 0, 1, 4)
+d <- density(x, n = 4)
+cat(names(d), class(d), d$n, d$data.name, d$has.na, d$old.coords, "\n")
+cat(as.character(d$call[[1L]]), "\n")
+cat(d$x, d$y, d$bw, "\n")
+cat(density(x, n = 4, old.coords = TRUE)$y, "\n")
+
+=== case: density_kernels_with_weights ===
+#@ tags: layer2,smooth
+#@ compare: rel=1e-8,abs=2e-10
+for (kernel in c("gaussian", "epanechnikov", "rectangular", "triangular",
+                 "biweight", "cosine", "optcosine")) {
+    d <- density(c(-3, 0, 1.5), bw = .8, adjust = 1.2, weights = c(.1, .4, .5),
+                 kernel = kernel, n = 24, from = -3, to = 4)
+    cat(d$y, "\n")
+}
+
+=== case: density_nonfinite_and_single_point ===
+#@ tags: layer2,smooth
+#@ compare: rel=1e-8,abs=1e-10
+d <- density(c(NA, Inf, 3), bw = 1, na.rm = TRUE, n = 5, from = 1, to = 5)
+cat(d$n, d$x, d$y, "\n")
+cat(density(2, bw = 1, n = 5, from = 0, to = 4)$y, "\n")
+
+=== case: density_reference_bandwidths ===
+#@ tags: layer2,smooth
+#@ compare: rel=1e-8,abs=1e-10
+x <- c(-2, 0, 1, 4)
+cat(bw.nrd0(x), bw.nrd(x), bw.nrd0(rep(0, 4)), bw.nrd(rep(2, 4)), "\n")
+
+=== case: density_cross_validation_bandwidths ===
+#@ tags: layer2,smooth
+#@ compare: rel=1e-6,abs=1e-8
+x <- c(-2, 0, 1, 4, 4.5, 5, 13)
+options(warn = -1)
+cat(bw.ucv(x), bw.bcv(x), bw.ucv(x, nb = 25, lower = .1, upper = 8), "\n")
+
+=== case: density_sheather_jones_bandwidths ===
+#@ tags: layer2,smooth
+#@ compare: rel=1e-6,abs=1e-8
+x <- c(-2, 0, 1, 4, 4.5, 5, 13)
+cat(bw.SJ(x), bw.SJ(x, method = "dpi"), density(x, bw = "sj-dpi")$bw, "\n")
+
+=== case: interpolation_linear_and_ties ===
+#@ tags: layer2,smooth
+#@ compare: exact
+x <- c(3, 1, 2, 2, NA)
+y <- c(30, 10, 20, 24, 99)
+at <- c(0, 1, 1.5, 2, 2.5, 3, 4, NA)
+options(warn = -1)
+cat(approx(x, y, at, rule = c(2, 1))$y, "\n")
+cat(approx(x, y, at, rule = c(2, 1), ties = min)$y, "\n")
+cat(approxfun(x, y, rule = c(2, 1), ties = function(z) max(z))(at), "\n")
+
+=== case: interpolation_constant_and_missing ===
+#@ tags: layer2,smooth
+#@ compare: exact
+f <- approxfun(c(1, 2, 3), c(10, 22, 30), method = "constant", f = .25,
+               rule = c(2, 1), yright = 99)
+cat(f(c(0, 1, 1.5, 2, 2.5, 3, 4, NaN)), "\n")
+g <- approxfun(1:3, c(10, NA, 30), na.rm = FALSE)
+cat(g(c(1, 1.5, 2, 2.5, 3)), "\n")
+cat(approx(c(1, 2, 2, 3), 1:4, xout = 1:3, ties = "ordered")$y, "\n")
+
+=== case: spline_cubic_boundary_conditions ===
+#@ tags: layer2,smooth
+#@ compare: rel=1e-8,abs=1e-10
+x <- 0:4
+y <- c(0, 1, 0, 2, 0)
+at <- c(-1, .5, 2.5, 4.5, 5)
+for (m in c("fmm", "natural", "periodic")) {
+    cat(spline(x, y, xout = at, method = m)$y, "\n")
+    f <- splinefun(x, y, method = m)
+    for (i in 1:3) cat(f(at, deriv = i), "\n")
+}
+
+=== case: spline_monotone_hermite ===
+#@ tags: layer2,smooth
+#@ compare: rel=1e-8,abs=1e-10
+x <- 0:4
+y <- c(0, 1, 1.5, 3, 5)
+at <- c(-1, .5, 2.5, 4.5, 5)
+for (m in c("monoH.FC", "hyman")) {
+    f <- splinefun(x, y, method = m)
+    for (i in 0:3) cat(f(at, deriv = i), "\n")
+}
+
+=== case: empirical_distribution_attributes_and_methods ===
+#@ tags: layer2,smooth
+#@ compare: exact
+e <- ecdf(c(3, 1, 2, 2, NA))
+cat(class(e), names(attributes(e)), "\n")
+cat(knots(e), "\n")
+cat(e(c(-Inf, 0, 1, 1.5, 2, 2.99, 3, Inf, NA)), "\n")
+cat(quantile(e), names(quantile(e)), "\n")
+cat(as.numeric(summary(e)), class(summary(e)), "\n")
+
+=== case: lowess_robust_and_delta ===
+#@ tags: layer2,smooth
+#@ compare: rel=1e-8,abs=1e-10
+x <- c(4, 1, 3, 2, 5)
+y <- c(8, 2, 4, 4, 10)
+fit <- lowess(x, y, f = .8)
+cat(fit$x, fit$y, "\n")
+cat(lowess(x, y, f = .8, iter = 0)$y, "\n")
+cat(lowess(x, y, f = .8, delta = 2)$y, "\n")
+
+=== case: loess_interpolated_fit_and_standard_errors ===
+#@ tags: layer2,smooth
+#@ compare: rel=1e-6,abs=1e-8
+d <- data.frame(x = 1:12, y = c(2,3,6,7,12,18,20,30,38,42,55,63))
+l <- loess(y ~ x, data = d, control = loess.control(statistics = "exact"))
+cat(class(l), names(l), class(summary(l)), "\n")
+cat(l$fitted, l$trace.hat, l$one.delta, l$two.delta, "\n")
+cat(l$kd$a, l$kd$xi, "\n")
+cat(predict(l, data.frame(x = c(0, 1, 3.5, 7, 12, 13, NA))), "\n")
+p <- predict(l, data.frame(x = c(1, 3.5, 7)), se = TRUE)
+cat(names(p), names(p$fit), p$fit, p$se.fit, p$residual.scale, p$df, "\n")
+
+=== case: loess_degree_one_robust_direct ===
+#@ tags: layer2,smooth
+#@ compare: rel=1e-6,abs=1e-8
+d <- data.frame(x = 1:12, y = c(2,3,6,7,22,18,20,30,38,42,55,63))
+l <- loess(y ~ x, data = d, degree = 1, family = "symmetric",
+           control = loess.control(surface = "direct"))
+cat(l$fitted, "\n")
+cat(l$robust, "\n")
+cat(predict(l, c(0, 3.5, 7, 13)), "\n")
+
+=== case: loess_multivariate_linear_prediction ===
+#@ tags: layer2,smooth
+#@ compare: rel=1e-6,abs=1e-8
+d <- data.frame(x = 1:15, z = (1:15) %% 5)
+d$y <- 2 + 3 * d$x - 4 * d$z
+l <- loess(y ~ x + z, data = d, degree = 1, span = 1,
+           control = loess.control(surface = "direct"))
+cat(l$divisor, l$fitted, "\n")
+cat(predict(l, data.frame(x = c(0, 4, 10), z = c(1, 2, 3))), "\n")
+
+=== case: nlminb_box_and_callback_arguments ===
+#@ tags: layer2,smooth
+#@ compare: rel=1e-6,abs=1e-8
+f <- function(p, target) sum((p - target)^2)
+g <- function(p, target) 2 * (p - target)
+out <- nlminb(c(a = 0, b = 0), f, g, target = c(2, -1),
+              lower = c(0, 0), upper = c(1, 4))
+cat(names(out), names(out$par), names(out$evaluations), "\n")
+cat(out$par, out$objective, out$convergence, "\n")
+
+=== case: nlminb_finite_differences_and_analytic_hessian ===
+#@ tags: layer2,smooth
+#@ compare: rel=1e-6,abs=1e-8
+f <- function(p) sum((p - c(2, -1))^2)
+g <- function(p) 2 * (p - c(2, -1))
+h <- function(p) diag(2, 2)
+a <- nlminb(c(0, 0), f)
+b <- nlminb(c(0, 0), f, g, h)
+cat(a$par, a$objective, a$convergence, "\n")
+cat(b$par, b$objective, b$convergence, "\n")
+
+=== case: nlm_finite_differences_with_hessian ===
+#@ tags: layer2,smooth
+#@ compare: rel=1e-6,abs=1e-8
+f <- function(p, target) sum((p - target)^2)
+x <- nlm(f, c(a = 0, b = 0), target = c(2, -1), hessian = TRUE)
+cat(names(x), is.null(names(x$estimate)), "\n")
+cat(x$minimum, x$estimate, x$gradient, x$hessian, x$code, x$iterations, "\n")
+
+=== case: nlm_analytic_derivatives ===
+#@ tags: layer2,smooth
+#@ compare: rel=1e-6,abs=1e-8
+f <- function(p) {
+    d <- p - c(2, -1)
+    structure(sum(d^2), gradient = 2 * d, hessian = diag(2, 2))
+}
+x <- nlm(f, c(0, 0), hessian = TRUE)
+cat(x$minimum, x$estimate, x$gradient, x$hessian, x$code, x$iterations, "\n")
+
+=== case: density_and_empirical_distribution_print_methods ===
+#@ tags: layer2,smooth
+#@ compare: exact
+x <- c(-2, 0, 1, 4)
+print(density(x, n = 4))
+e <- ecdf(1:6)
+print(e)
+print(summary(e))
+
+=== case: loess_print_methods ===
+#@ tags: layer2,smooth
+#@ compare: exact
+d <- data.frame(x = 1:12, y = c(2,3,6,7,12,18,20,30,38,42,55,63))
+l <- loess(y ~ x, data = d, control = loess.control(statistics = "exact"))
+print(l)
+print(summary(l))
+
+=== case: loess_bivariate_interpolated_surface ===
+#@ tags: layer2,smooth
+#@ compare: rel=1e-6,abs=1e-8
+d <- data.frame(x = c(1,2,2,3,3,4,5,5,6,6,7,7,8,9,9),
+                z = c(3,5,2,6,1,4,8,7,2,4,5,9,6,2,8))
+d$y <- sin(d$x) + d$x*d$z + log(d$z)
+m <- loess(y ~ x + z, d, span = .85,
+           control = loess.control(statistics = "exact"))
+p <- predict(m, data.frame(x = c(1.5,3.5,4.8,5.5,6.2), z = c(3.8,4,5.4,4,6.1)),
+             se = TRUE)
+cat(m$kd$parameter, m$kd$a, m$kd$xi, "\n")
+cat(p$fit, p$se.fit, p$residual.scale, p$df, "\n")
+
+=== case: spline_monotone_derivatives_on_uneven_grid ===
+#@ tags: layer2,smooth
+#@ compare: rel=1e-6,abs=1e-8
+f <- splinefun(c(-1, 2, 3, 8, 11), c(1, 2, 5, 6, 9), "monoH.FC")
+for (i in 0:3) cat(f(c(2, 1, 6, 2, 11, -2, 4), i), "\n")
