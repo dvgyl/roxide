@@ -1,0 +1,163 @@
+=== case: real_na_and_nan_predicates ===
+#@ tags: na,values
+x <- c(NA_real_, NaN, Inf, -2)
+dput(is.na(x))
+dput(is.nan(x))
+dput(is.finite(x))
+
+=== case: real_na_and_nan_identity ===
+#@ tags: na,values
+print(identical(NA_real_, NaN))
+print(identical(NA_real_, NA_real_))
+print(identical(NaN, NaN))
+
+=== case: real_na_arithmetic_order ===
+#@ tags: na,arithmetic
+dput(NA_real_ + 1)
+dput(1 + NA_real_)
+dput(0 * NA_real_)
+
+=== case: mixed_na_nan_arithmetic_order ===
+#@ tags: na,arithmetic
+x <- c(NA_real_ + NaN, NaN + NA_real_)
+dput(x)
+dput(is.nan(x))
+
+=== case: real_na_exponent_exceptions ===
+#@ tags: na,arithmetic
+dput(NA_real_ ^ 0)
+dput(1 ^ NA_real_)
+dput(NA_real_ ^ 2)
+
+=== case: real_na_and_nan_reductions ===
+#@ tags: na,arithmetic
+x <- c(NaN, -4, NA_real_, 7)
+dput(c(min(x), max(x), sum(x)))
+dput(c(min(x, na.rm = TRUE), max(x, na.rm = TRUE), sum(x, na.rm = TRUE)))
+dput(c(min(x[-3]), max(x[-3]), sum(x[-3])))
+
+=== case: integer_na_lower_boundary ===
+#@ tags: na,arithmetic
+x <- -2147483647L
+dput(x)
+dput(NA_integer_)
+dput(x - 1L)
+
+=== case: integer_overflow_warning ===
+#@ tags: na,arithmetic,warning
+x <- 2147483647L
+dput(x + 1L)
+dput(x + 1)
+
+=== case: integer_na_in_arithmetic ===
+#@ tags: na,arithmetic
+dput(NA_integer_ + 3L)
+dput(NA_integer_ + 3)
+dput(NA_integer_ / 3L)
+
+=== case: logical_and_three_values ===
+#@ tags: na,logic
+left <- rep(c(FALSE, TRUE, NA), each = 3)
+right <- rep(c(FALSE, TRUE, NA), times = 3)
+dput(left & right)
+
+=== case: logical_or_three_values ===
+#@ tags: na,logic
+left <- rep(c(FALSE, TRUE, NA), each = 3)
+right <- rep(c(FALSE, TRUE, NA), times = 3)
+dput(left | right)
+
+=== case: logical_negation_three_values ===
+#@ tags: na,logic
+x <- c(FALSE, TRUE, NA)
+dput(!x)
+dput(!!x)
+
+=== case: scalar_and_short_circuit ===
+#@ tags: na,logic,eval
+dput(FALSE && stop("Unexpected evaluation."))
+dput(NA && FALSE)
+dput(NA && TRUE)
+dput(TRUE && NA)
+
+=== case: scalar_or_short_circuit ===
+#@ tags: na,logic,eval
+dput(TRUE || stop("Unexpected evaluation."))
+dput(NA || TRUE)
+dput(NA || FALSE)
+dput(FALSE || NA)
+
+=== case: logical_all_and_any ===
+#@ tags: na,logic
+x <- c(NA, FALSE)
+y <- c(NA, TRUE)
+dput(c(all(x), all(y), any(x), any(y)))
+dput(c(all(y, na.rm = TRUE), any(x, na.rm = TRUE)))
+dput(c(all(logical()), any(logical())))
+
+=== case: character_na_and_na_text ===
+#@ tags: na,values
+x <- c(NA_character_, "NA", "")
+dput(x)
+dput(is.na(x))
+dput(x == "NA")
+print(identical(x[1], x[2]))
+
+=== case: null_raw_and_logical_coercion ===
+#@ tags: values,coercion
+x <- as.raw(c(0, 25, 255))
+dput(c(NULL, NULL))
+dput(c(NULL, x))
+dput(c(x, FALSE, NA))
+
+=== case: logical_integer_and_double_coercion ===
+#@ tags: values,coercion
+dput(c(TRUE, FALSE, NA, 13L))
+dput(c(13L, NA_integer_, 2.25))
+dput(c(TRUE, 13L, 2.25))
+
+=== case: double_complex_and_character_coercion ===
+#@ tags: values,coercion
+dput(c(2.25, 3 - 4i))
+dput(c(2.25, NA_complex_, 3 - 4i, "blue"))
+dput(c(NA_integer_, "NA", NA_real_))
+
+=== case: character_and_list_coercion ===
+#@ tags: values,coercion
+x <- c(label = "blue", missing = NA_character_)
+dput(c(x, list(amount = 9L, empty = NULL)))
+dput(c(list(group = list(x)), x))
+
+=== case: exact_vector_recycling ===
+#@ tags: values,recycling
+x <- c(3L, 5L, 7L, 9L)
+y <- c(20L, 40L)
+dput(x + y)
+dput(x + integer())
+
+=== case: inexact_vector_recycling_warning ===
+#@ tags: values,recycling,warning
+x <- c(3L, 5L, 7L, 9L, 11L)
+y <- c(20L, 40L)
+dput(x + y)
+
+=== case: typeof_and_mode ===
+#@ tags: values,coercion
+x <- list(NULL, as.raw(4), TRUE, 8L, 8, 2i, "blue", list(2), function() 2)
+dput(vapply(x, typeof, character(1)))
+dput(vapply(x, mode, character(1)))
+
+=== case: attribute_replacement_and_removal ===
+#@ tags: values,attributes
+x <- structure(c(a = 4L, b = 8L), unit = "cm")
+dput(attributes(x))
+attr(x, "unit") <- NULL
+dput(attributes(x))
+dput(attributes(unname(x)))
+
+=== case: names_short_replacement ===
+#@ tags: values,attributes
+x <- c(4L, 8L, 12L)
+names(x) <- c("first", "")
+dput(names(x))
+dput(x)

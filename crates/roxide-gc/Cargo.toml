@@ -1,0 +1,12 @@
+[package]
+name = "roxide-gc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Cycle-safe safepoint mark-sweep GC arena, SexpId handles, ProtectStack, and copy-on-modify refcounts"
+
+[dependencies]
+roxide-diag = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,12 @@
+[package]
+name = "roxide-syntax"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Clean-room GNU R 4.6.2 lexer, Pratt parser, AST, and operator precedence table"
+
+[dependencies]
+roxide-diag = { workspace = true }
+
+[lints]
+workspace = true

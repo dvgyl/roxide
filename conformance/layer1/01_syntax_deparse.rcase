@@ -1,0 +1,161 @@
+=== case: pipe_first_argument ===
+#@ tags: syntax,pipe
+f <- function(x, y) x - y
+x <- 12
+print(x |> f(5))
+
+=== case: pipe_named_placeholder ===
+#@ tags: syntax,pipe
+f <- function(x, y) x - y
+x <- 12
+print(x |> f(5, y = _))
+
+=== case: pipe_dollar_extraction ===
+#@ tags: syntax,pipe
+x <- list(a = 17L, b = 23L)
+dput(x |> _$a)
+dput(x |> _$b)
+
+=== case: pipe_double_bracket_extraction ===
+#@ tags: syntax,pipe
+x <- list(17L, 23L)
+dput(x |> _[[1]])
+dput(x |> _[[2]])
+
+=== case: pipe_single_bracket_extraction ===
+#@ tags: syntax,pipe
+x <- c(a = 17L, b = 23L)
+dput(x |> _[1])
+dput(x |> _[2])
+
+=== case: pipe_chained_extraction ===
+#@ tags: syntax,pipe
+x <- list(a = list(c(first = 17L, second = 23L)))
+dput(x |> _$a[[1]][2] |> unname())
+dput(x |> _[["a"]][[1]] |> sum())
+
+=== case: pipe_chained_calls ===
+#@ tags: syntax,pipe
+x <- c(8, 2, 6, 1)
+print(x |> sort(decreasing = TRUE) |> head(n = 2))
+print(x |> rev() |> sum())
+
+=== case: pipe_unnamed_placeholder_error ===
+#@ tags: syntax,pipe
+#@ expect_error: true
+f <- function(x, y) x + y
+x <- 8
+print(x |> f(_, 2))
+
+=== case: lambda_default_and_override ===
+#@ tags: syntax,eval
+f <- \(x, y = 1) x + y
+print(f(9))
+print(f(9, y = 7))
+
+=== case: lambda_as_argument ===
+#@ tags: syntax,eval
+x <- c(2, 5, 8)
+apply_one <- function(f, x) f(x)
+print(apply_one(\(z) z ^ 2, x))
+
+=== case: raw_string_parentheses ===
+#@ tags: syntax,literal
+x <- r"(line\n "quoted" \path)"
+dput(x)
+print(nchar(x))
+
+=== case: raw_string_brackets_and_dashes ===
+#@ tags: syntax,literal
+x <- R"--[left ]- right\end]--"
+dput(x)
+print(x == "left ]- right\\end")
+
+=== case: hexadecimal_floats ===
+#@ tags: syntax,literal
+dput(0x1p4)
+dput(0x1.8p-2)
+print(typeof(0x1p4))
+
+=== case: hexadecimal_integer_literals ===
+#@ tags: syntax,literal
+dput(0x10L)
+dput(0X2aL + 0x01L)
+print(typeof(0x10))
+
+=== case: complex_literals ===
+#@ tags: syntax,literal
+z <- 1+2i
+dput(z)
+dput(c(Re(z), Im(z), Im(-3i)))
+
+=== case: user_infix_precedence ===
+#@ tags: syntax,precedence
+assign("%op%", function(x, y) x - y)
+print(2 * 5 %op% 3)
+print(16 %op% 4 %op% 2)
+
+=== case: null_coalescing ===
+#@ tags: syntax,eval
+dput(NULL %||% 42L)
+dput(0L %||% stop("Unexpected evaluation."))
+dput(NA %||% 42L)
+
+=== case: left_and_equals_assignment ===
+#@ tags: syntax,precedence
+x = y <- 8L
+p <- q <- 3L
+dput(c(x, y, p, q))
+
+=== case: right_assignment_precedence ===
+#@ tags: syntax,precedence
+2 + 3 -> x -> y
+z <- 4 -> w
+dput(c(x, y, z, w))
+
+=== case: superassignment_precedence ===
+#@ tags: syntax,precedence,eval
+local({
+  target <- 0L
+  f <- function() value <- target <<- 2L + 5L
+  dput(c(f(), target))
+})
+
+=== case: newline_inside_parentheses ===
+#@ tags: syntax
+value <- (4
+          + 9)
+dput(value)
+
+=== case: newline_inside_braces ===
+#@ tags: syntax
+value <- {
+  4
+  + 9
+}
+dput(value)
+
+=== case: if_else_newline ===
+#@ tags: syntax,eval
+x <- if (FALSE) 4L else 6L
+y <- {
+  if (TRUE) {
+    9L
+  }
+  else {
+    12L
+  }
+}
+dput(c(x, y))
+
+=== case: parse_and_deparse_precedence ===
+#@ tags: syntax,deparse
+expr <- parse(text = "(2 + 3) * 4 ^ 2", keep.source = FALSE)
+dput(deparse(expr[[1]]))
+print(eval(expr))
+
+=== case: parse_deparse_pipe_and_lambda ===
+#@ tags: syntax,deparse,pipe
+expr <- parse(text = "6 |> (\\(a, b = 7) a * b)()", keep.source = FALSE)
+dput(deparse(expr[[1]]))
+print(eval(expr))

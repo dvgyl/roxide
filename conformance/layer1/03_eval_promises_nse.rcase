@@ -1,0 +1,221 @@
+=== case: lexical_scope_in_closure ===
+#@ tags: eval,scope
+make_adder <- function(offset) {
+  force(offset)
+  function(value) value + offset
+}
+add <- make_adder(7L)
+offset <- 80L
+dput(local({ offset <- 90L; add(4L) }))
+
+=== case: closure_state_with_superassignment ===
+#@ tags: eval,scope
+make_counter <- function() {
+  count <- 0L
+  function(step) {
+    count <<- count + step
+    count
+  }
+}
+first <- make_counter()
+second <- make_counter()
+dput(c(first(3L), first(8L), second(5L)))
+
+=== case: unused_argument_is_lazy ===
+#@ tags: eval,promise
+choose <- function(x, unused = stop("Unexpected default evaluation.")) x
+dput(choose(17L))
+dput(choose(23L, stop("Unexpected argument evaluation.")))
+
+=== case: promise_memoization ===
+#@ tags: eval,promise
+count <- 0L
+twice <- function(x) x + x
+dput(twice({ count <- count + 1L; count + 8L }))
+dput(count)
+
+=== case: argument_and_default_environments ===
+#@ tags: eval,promise,scope
+value <- 17L
+f <- function(supplied, default = value) {
+  value <- 23L
+  c(supplied, default)
+}
+dput(f(value))
+
+=== case: recursive_default_promise_error ===
+#@ tags: eval,promise
+#@ expect_error: true
+f <- function(first = second, second = first) {
+  first
+}
+f()
+
+=== case: substitute_supplied_and_default_arguments ===
+#@ tags: eval,nse,promise
+capture <- function(x = 5L * 7L) substitute(x)
+value <- 11L
+dput(capture(value + stop("Unexpected evaluation.")))
+dput(capture())
+
+=== case: substitute_with_environment_list ===
+#@ tags: eval,nse
+template <- quote(weight * count + offset)
+bindings <- list(weight = 3L, count = quote(items), offset = 2L)
+expr <- do.call(substitute, list(template, bindings))
+dput(expr)
+dput(eval(expr, list(items = 9L)))
+
+=== case: missing_with_and_without_default ===
+#@ tags: eval,promise
+f <- function(x, y = 8L) c(missing(x), missing(y))
+dput(f())
+dput(f(NULL))
+dput(f(y = NULL))
+
+=== case: missing_through_wrapper ===
+#@ tags: eval,promise
+inner <- function(x) missing(x)
+outer <- function(value) inner(value)
+outer_default <- function(value = 8L) inner(value)
+dput(c(outer(), outer(NULL), outer_default()))
+
+=== case: force_order_and_memoization ===
+#@ tags: eval,promise
+f <- function(x, y) {
+  force(y)
+  cat("body\n")
+  dput(c(x, y, x))
+}
+f({ cat("x\n"); 4L }, { cat("y\n"); 8L })
+
+=== case: match_call_dots_expansion ===
+#@ tags: eval,nse,args
+f <- function(prefix, ..., exact = 8L) {
+  dput(match.call())
+  dput(match.call(expand.dots = FALSE))
+}
+f(pre = 3L, note = quote(item), 5L, exact = 7L)
+
+=== case: argument_matching_passes ===
+#@ tags: eval,args
+f <- function(alpha, alpine, beta, ..., after = 90L) {
+  dput(list(alpha = alpha, alpine = alpine, beta = beta,
+            dots = list(...), after = after))
+}
+f(al = 2L, 3L, 4L, note = 5L, alpha = 1L, after = 6L)
+
+=== case: argument_matching_does_not_partially_match_after_dots ===
+#@ tags: eval,args
+f <- function(first, ..., after = 99L) {
+  dput(list(first, list(...), after))
+}
+f(1L, aft = 2L)
+f(1L, after = 2L)
+
+=== case: dots_forwarding_preserves_order_and_tags ===
+#@ tags: eval,args,promise
+collect <- function(x, ...) list(x = x, ...)
+relay <- function(...) collect(...)
+dput(relay(first = 3L, 5L, first = 7L, 9L))
+
+=== case: return_from_nested_block ===
+#@ tags: eval
+f <- function(x) {
+  for (value in x) {
+    if (value > 4L) return(value)
+  }
+  -1L
+}
+dput(c(f(c(1L, 7L, 8L)), f(c(1L, 2L))))
+
+=== case: on_exit_replace_and_append ===
+#@ tags: eval,condition
+f <- function() {
+  on.exit(cat("first\n"))
+  on.exit(cat("second\n"), add = FALSE)
+  on.exit(cat("third\n"), add = TRUE, after = TRUE)
+  return(7L)
+}
+dput(f())
+
+=== case: on_exit_prepend_during_error ===
+#@ tags: eval,condition
+f <- function() {
+  on.exit(cat("last\n"))
+  on.exit(cat("first\n"), add = TRUE, after = FALSE)
+  stop("Invalid value.")
+}
+tryCatch(f(), error = function(e) cat(conditionMessage(e), "\n", sep = ""))
+
+=== case: try_catch_warning_and_finally ===
+#@ tags: eval,condition,warning
+value <- tryCatch({
+  warning("Value is low.")
+  stop("Unexpected evaluation.")
+}, warning = function(e) {
+  cat(conditionMessage(e), "\n", sep = "")
+  12L
+}, finally = cat("Cleanup.\n"))
+dput(value)
+
+=== case: calling_handlers_muffle_and_resume ===
+#@ tags: eval,condition,warning
+value <- withCallingHandlers({
+  warning("Value is low.")
+  message("Check the input.")
+  17L
+}, warning = function(e) {
+  cat("Warning: ", conditionMessage(e), "\n", sep = "")
+  invokeRestart("muffleWarning")
+}, message = function(e) {
+  cat("Message: ", conditionMessage(e), sep = "")
+  invokeRestart("muffleMessage")
+})
+dput(value)
+
+=== case: s3_dispatch_and_next_method ===
+#@ tags: eval,s3
+describe <- function(x, ...) UseMethod("describe")
+describe.primary <- function(x, ...) c("primary", NextMethod())
+describe.secondary <- function(x, label) c("secondary", label, as.character(x))
+describe.default <- function(x, ...) "default"
+dput(describe(structure(9L, class = c("primary", "secondary")), label = "blue"))
+dput(describe(9L))
+
+=== case: s3_ops_group_generic ===
+#@ tags: eval,s3
+Ops.measure <- function(e1, e2) {
+  dput(.Generic)
+  dput(.Method)
+  NextMethod()
+}
+x <- structure(8L, class = "measure")
+dput(x + 3L)
+dput(3L < x)
+
+=== case: s3_math_group_generic ===
+#@ tags: eval,s3
+Math.measure <- function(x, ...) {
+  dput(.Generic)
+  NextMethod()
+}
+x <- structure(c(-3, 4), class = "measure")
+dput(abs(x))
+dput(floor(x / 2))
+
+=== case: s3_summary_group_generic ===
+#@ tags: eval,s3,na
+Summary.measure <- function(..., na.rm = FALSE) {
+  dput(.Generic)
+  NextMethod()
+}
+x <- structure(c(3, NA_real_, 8), class = "measure")
+dput(sum(x, na.rm = TRUE))
+dput(max(x))
+
+=== case: namespace_export_resolution ===
+#@ tags: eval,namespace
+sum <- function(...) stop("Unexpected local call.")
+dput(base::sum(c(3L, 5L)))
+dput(utils::head(c(3L, 5L, 7L), n = 2L))

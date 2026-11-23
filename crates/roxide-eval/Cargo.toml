@@ -1,0 +1,16 @@
+[package]
+name = "roxide-eval"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Clean-room GNU R 4.6.2 evaluator, lazy promises, frames, conditions, S3 dispatch, and worker Ctx API"
+
+[dependencies]
+roxide-diag = { workspace = true }
+roxide-gc = { workspace = true }
+roxide-host = { workspace = true }
+roxide-syntax = { workspace = true }
+roxide-value = { workspace = true }
+
+[lints]
+workspace = true

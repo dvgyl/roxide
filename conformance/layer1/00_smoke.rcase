@@ -1,0 +1,75 @@
+=== case: basic_arithmetic ===
+#@ tags: smoke,arithmetic
+print(1 + 1)
+print(9 - 4)
+print(6 * 7)
+print(9 / 4)
+
+=== case: operator_precedence ===
+#@ tags: smoke,syntax
+print(2 + 3 * 4)
+print((2 + 3) * 4)
+print(2 ^ 3 ^ 2)
+
+=== case: unary_minus ===
+#@ tags: smoke,syntax
+print(-2 ^ 2)
+print((-2) ^ 2)
+print(-(-5))
+
+=== case: integer_literals ===
+#@ tags: smoke,arithmetic
+x <- 1L + 2L
+dput(x)
+dput(x + 0)
+
+=== case: null_value ===
+#@ tags: smoke
+print(NULL)
+print(is.null(NULL))
+print(length(NULL))
+
+=== case: logical_constants ===
+#@ tags: smoke,na
+print(TRUE)
+print(FALSE)
+dput(NA)
+
+=== case: string_output ===
+#@ tags: smoke
+print("red blue")
+dput("red\nblue")
+cat("red", "blue", sep = "\n")
+cat("\n")
+
+=== case: numeric_output ===
+#@ tags: smoke
+print(c(0, -0.125, 12.5), digits = 5)
+dput(2.5e-3)
+cat(1.25, -8.5, "\n", sep = " ")
+
+=== case: comments ===
+#@ tags: smoke,syntax
+# This line has no expression.
+x <- 7 # This comment ends at the newline.
+y <- 2
+print(x + y)
+
+=== case: multiline_expression ===
+#@ tags: smoke,syntax
+x <- 4 +
+  8 *
+  2
+print(x)
+
+=== case: assignment ===
+#@ tags: smoke,eval
+x <- 40
+x + 2
+print(x)
+
+=== case: top_level_visibility ===
+#@ tags: smoke,eval
+x <- 9
+invisible(x * 2)
+x * 3

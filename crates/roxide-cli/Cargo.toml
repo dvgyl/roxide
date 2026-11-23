@@ -1,0 +1,18 @@
+[package]
+name = "roxide-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Multi-call CLI binary for Roxide (roxide, R, Rscript, R CMD)"
+
+[[bin]]
+name = "roxide"
+path = "src/main.rs"
+
+[dependencies]
+roxide-eval = { workspace = true }
+roxide-gc = { workspace = true }
+roxide-host = { workspace = true }
+
+[lints]
+workspace = true

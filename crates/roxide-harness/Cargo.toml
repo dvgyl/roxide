@@ -1,0 +1,9 @@
+[package]
+name = "roxide-harness"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Black-box differential test runner for Roxide"
+
+[lints]
+workspace = true

@@ -1,0 +1,12 @@
+[package]
+name = "roxide-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "OS abstraction layer (Host trait, NativeHost, deterministic PureHost, resource limits)"
+
+[dependencies]
+roxide-diag = { workspace = true }
+
+[lints]
+workspace = true

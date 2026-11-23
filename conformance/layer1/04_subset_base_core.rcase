@@ -1,0 +1,180 @@
+=== case: positive_indices_with_repeats_and_zero ===
+#@ tags: subset
+x <- c(a = 10L, b = 20L, c = 30L)
+dput(x[c(3L, 0L, 1L, 3L)])
+dput(x[[2L]])
+
+=== case: negative_indices_and_zero ===
+#@ tags: subset
+x <- c(a = 10L, b = 20L, c = 30L, d = 40L)
+dput(x[c(-2L, 0L, -2L, -8L)])
+dput(x[-seq_along(x)])
+
+=== case: mixed_positive_and_negative_indices_error ===
+#@ tags: subset
+#@ expect_error: true
+x <- c(10L, 20L, 30L)
+indices <- c(1L, -2L)
+print(x[indices])
+
+=== case: logical_index_recycling_and_na ===
+#@ tags: subset,na,recycling
+x <- c(a = 10L, b = 20L, c = 30L, d = 40L, e = 50L)
+dput(x[c(TRUE, FALSE, NA)])
+dput(x[c(FALSE, TRUE)])
+dput(x[c(rep(FALSE, 5), TRUE, NA)])
+
+=== case: character_indices_and_exact_matching ===
+#@ tags: subset
+x <- c(blue = 10L, red = 20L, blue = 30L)
+dput(x[c("red", "blue", "bl", "unknown")])
+dput(x[["blue"]])
+
+=== case: empty_na_and_out_of_bounds_indices ===
+#@ tags: subset,na
+x <- c(a = 10L, b = 20L, c = 30L)
+dput(x[integer()])
+dput(x[NULL])
+dput(x[NA])
+dput(x[c(NA_integer_, 2L, 8L)])
+
+=== case: double_bracket_out_of_bounds_error ===
+#@ tags: subset
+#@ expect_error: true
+x <- c(10L, 20L, 30L)
+index <- 8L
+print(x[[index]])
+
+=== case: list_bracket_and_double_bracket ===
+#@ tags: subset,na
+x <- list(a = list(score = 10L), b = 20L)
+dput(x[1L])
+dput(x[[c("a", "score")]])
+dput(x[NA_integer_])
+dput(x[[NA_integer_]])
+dput(x[["missing"]])
+
+=== case: matrix_drop_and_dimnames ===
+#@ tags: subset,matrix
+m <- matrix(1:6, nrow = 2L, dimnames = list(c("a", "b"), c("x", "y", "z")))
+dput(m["b", , drop = TRUE])
+dput(m["b", , drop = FALSE])
+dput(m[, "z", drop = FALSE])
+
+=== case: matrix_coordinate_index ===
+#@ tags: subset,matrix,na
+m <- matrix(11:16, nrow = 2L)
+coordinates <- rbind(c(2L, 3L), c(0L, 1L), c(NA_integer_, 2L), c(1L, 2L))
+dput(m[coordinates])
+dput(m[c(6L, 3L)])
+
+=== case: dollar_partial_and_ambiguous_match ===
+#@ tags: subset,warning
+options(warnPartialMatchDollar = TRUE)
+x <- list(score = 10L, station = 20L, status = 30L)
+dput(x$score)
+dput(x$sco)
+dput(x$sta)
+dput(x[["sco", exact = TRUE]])
+dput(x[["sco", exact = FALSE]])
+
+=== case: nested_names_assignment ===
+#@ tags: subset,attributes
+x <- c(a = 10L, old = 20L)
+names(x)[2] <- "b"
+dput(names(x))
+dput(x)
+
+=== case: nested_list_assignment_preserves_shared_value ===
+#@ tags: subset,assignment
+x <- list(c(10L, 20L), c(30L, 40L))
+copy <- x
+x[[1]][2] <- 99
+dput(x)
+dput(copy)
+
+=== case: seq_and_seq_int_ranges ===
+#@ tags: base,sequence
+dput(seq(from = 3, to = -1, by = -2))
+dput(seq(from = 1, to = 3, length.out = 4))
+dput(seq.int(from = 8L, to = 2L, by = -3L))
+dput(seq.int(length.out = 0L))
+
+=== case: seq_int_along_non_vector ===
+#@ tags: base,sequence,r46
+x <- quote(weight * count)
+dput(length(x))
+dput(seq.int(along.with = x))
+dput(seq.int(from = 4L, along.with = x))
+
+=== case: rep_scalar_and_per_element_counts ===
+#@ tags: base,sequence
+x <- c(up = 4L, down = 9L)
+dput(rep(x, times = 2L, each = 2L))
+dput(rep(x, times = c(1L, 3L)))
+dput(rep(x, length.out = 5L))
+
+=== case: concatenate_list_and_atomic_values ===
+#@ tags: base,coercion
+x <- list(pair = c(left = 4L, right = 8L))
+dput(c(x, end = 12L))
+dput(c(x, end = 12L, recursive = TRUE))
+dput(c(x, end = 12L, recursive = TRUE, use.names = FALSE))
+
+=== case: cumulative_variance_unavailable ===
+#@ tags: base,r46
+#@ expect_error: true
+x <- c(a = 4, b = 10, c = 7, d = 7)
+result <- cumvar(x)
+dput(result)
+
+=== case: cumulative_sum_and_product ===
+#@ tags: base,na
+x <- c(a = 2L, b = 3L, c = NA_integer_, d = 5L)
+dput(cumsum(x))
+dput(cumprod(x))
+dput(typeof(cumprod(x)))
+
+=== case: grepv_values_and_indices ===
+#@ tags: base,regex,na
+x <- c(a = "red.wing", b = "redwing", c = NA_character_, d = "blue.wing")
+dput(grepv(".wing", x, fixed = TRUE))
+dput(grepv(".wing", x, fixed = TRUE, value = FALSE))
+dput(grepv(".wing", x, fixed = TRUE, invert = TRUE))
+
+=== case: run_length_print_arguments ===
+#@ tags: base,print,r46
+x <- rle(c(4L, 4L, 8L, 9L, 9L, NA_integer_, NA_integer_))
+print(x)
+print(x, vec.len = 2L)
+dput(inverse.rle(x))
+
+=== case: data_frame_and_factor_columns ===
+#@ tags: base,dataframe
+group <- factor(c("low", "high", NA_character_), levels = c("high", "low", "other"))
+x <- data.frame(group = group, score = c(4L, 8L, 12L))
+print(x)
+dput(x[c(2L, 1L), "group", drop = TRUE])
+dput(x[, "score", drop = FALSE])
+
+=== case: matrix_fill_order ===
+#@ tags: base,matrix
+values <- c(2L, 4L, 6L)
+dput(matrix(values, nrow = 2L, ncol = 3L))
+dput(matrix(values, nrow = 2L, ncol = 3L, byrow = TRUE))
+
+=== case: apply_list_and_simplify ===
+#@ tags: base,apply
+x <- list(small = 4L, large = 12L)
+f <- function(n, step) c(first = n, next_value = n + step)
+dput(lapply(x, f, step = 2L))
+dput(sapply(x, f, step = 2L))
+dput(vapply(x, f, c(first = 0L, next_value = 0L), step = 2L))
+
+=== case: reduce_filter_and_do_call ===
+#@ tags: base,apply
+x <- c(7L, 2L, 10L, 3L)
+dput(Filter(function(value) value > 4L, x))
+dput(Reduce(function(left, right) left - right, x, init = 20L))
+dput(Reduce(function(left, right) left - right, x, right = TRUE))
+dput(do.call("paste", list("north", "east", sep = "-")))

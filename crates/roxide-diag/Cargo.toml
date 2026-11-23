@@ -1,0 +1,9 @@
+[package]
+name = "roxide-diag"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Source locations, srcref mapping, and GNU R 4.6.2 diagnostic formatting"
+
+[lints]
+workspace = true
