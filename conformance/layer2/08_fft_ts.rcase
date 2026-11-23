@@ -1,0 +1,218 @@
+=== case: fft_named_and_inverse ===
+#@ tags: stats,fft
+#@ compare: rel=1e-13,abs=1e-13
+x <- structure(c(a=1,b=2,c=3,d=4), note="data")
+y <- fft(x)
+dput(attributes(y))
+cat(Re(y), Im(y), "\n")
+cat(Re(fft(y, TRUE)), Im(fft(y, TRUE)), "\n")
+
+=== case: fft_prime_and_mixed_radix ===
+#@ tags: stats,fft
+#@ compare: rel=1e-13,abs=1e-13
+for (n in c(60L,97L,1009L)) {
+    i <- seq_len(n)
+    x <- sin(i/17) + 1i*cos(i/31)
+    f <- fft(x)
+    j <- c(1L,2L,3L,7L,n-1L,n)
+    cat(sprintf("%.17g", Re(f[j])), sprintf("%.17g", Im(f[j])), "\n")
+    cat(max(Mod(fft(f, TRUE)/n - x)), "\n")
+}
+
+=== case: fft_dimensions ===
+#@ tags: stats,fft
+#@ compare: rel=1e-13,abs=1e-13
+x <- 1:12
+dim(x) <- c(2L,2L,3L)
+dimnames(x) <- list(c("a","b"), NULL, c("a","b","c"))
+y <- fft(x)
+dput(dimnames(y))
+cat(Re(y), Im(y), "\n")
+cat(Re(fft(y,TRUE)), "\n")
+
+=== case: mvfft_columns ===
+#@ tags: stats,fft
+#@ compare: rel=1e-13,abs=1e-13
+x <- matrix(1:6, 2L, dimnames=list(c("a","b"), c("a","b","c")))
+dput(mvfft(x))
+dput(mvfft(mvfft(x), TRUE))
+
+=== case: nextn_factor_order_and_storage ===
+#@ tags: stats,fft
+dput(nextn(36, c(4,6)))
+dput(nextn(36, c(6,4)))
+dput(nextn(c(a=-2,0,1,7,11,17,97,NA,NaN)))
+dput(nextn(c(2147483647,2147483648,1e12)))
+
+=== case: fft_convolution_modes ===
+#@ tags: stats,fft
+#@ compare: rel=1e-13,abs=1e-13
+x <- c(a=1,b=2,c=4)
+y <- c(3,5)
+for (k in c(TRUE,FALSE)) {
+    a <- convolve(x,y,conj=k,type="open")
+    b <- convolve(x,y,conj=k,type="filter")
+    dput(names(a))
+    dput(names(b))
+    cat(a,b,convolve(c(x,0),c(y,0,0),conj=k),"\n")
+}
+
+=== case: fft_complex_convolution ===
+#@ tags: stats,fft
+#@ compare: rel=1e-13,abs=1e-13
+x <- c(a=1i,b=2)
+y <- c(c=1+1i,d=3)
+for (mode in c("circular","open","filter")) {
+    for (k in c(TRUE,FALSE)) {
+        z <- convolve(x,y,conj=k,type=mode)
+        dput(names(z))
+        cat(Re(z), Im(z), "\n")
+    }
+}
+
+=== case: complex_svd_reconstruct ===
+#@ tags: base,linalg
+#@ compare: rel=1e-11,abs=1e-12
+x <- matrix(c(2+1i,1i,-2,1-1i,3,4i),3)
+for (a in list(x,t(x))) {
+    z <- svd(a)
+    w <- La.svd(a)
+    cat(z$d,w$d,"\n")
+    stopifnot(max(Mod(z$u %*% diag(z$d) %*% Conj(t(z$v)) - a)) < 1e-12)
+    stopifnot(max(Mod(w$u %*% diag(w$d) %*% w$vt - a)) < 1e-12)
+    dput(names(La.svd(a,nu=0,nv=0)))
+}
+
+=== case: complex_hermitian_eigen ===
+#@ tags: base,linalg
+#@ compare: rel=1e-11,abs=1e-12
+x <- matrix(c(4,1+2i,0,1-2i,3,2i,0,-2i,-1),3)
+z <- eigen(x)
+dput(typeof(z$values))
+cat(z$values,"\n")
+stopifnot(max(Mod(x %*% z$vectors - z$vectors %*% diag(z$values))) < 1e-12)
+dput(class(z))
+
+=== case: complex_general_eigen ===
+#@ tags: base,linalg
+#@ compare: rel=1e-11,abs=1e-12
+x <- matrix(c(2+4i,1i,3i,1-1i,3,6,3i,1,4),3)
+z <- eigen(x)
+cat(Re(z$values),Im(z$values),"\n")
+stopifnot(max(Mod(x %*% z$vectors - z$vectors %*% diag(z$values))) < 1e-12)
+stopifnot(is.null(eigen(x,only.values=TRUE)$vectors))
+
+=== case: ts_creation_and_calendar ===
+#@ tags: stats,ts
+#@ compare: rel=1e-12,abs=1e-12
+x <- ts(1:8, start=c(2000,2), frequency=4)
+dput(is.ts(x))
+dput(is.mts(x))
+dput(tsp(x))
+dput(start(x))
+dput(end(x))
+dput(frequency(x))
+dput(deltat(x))
+dput(time(x))
+dput(cycle(x))
+
+=== case: ts_matrix_and_tsp_assignment ===
+#@ tags: stats,ts
+x <- ts(matrix(1:12,6), start=2, frequency=2, names=c("a","b"))
+dput(is.mts(x))
+dput(class(x))
+dput(colnames(x))
+dput(tsp(as.ts(x)))
+saved <- x
+tsp(x) <- c(3,5.5,2)
+dput(tsp(x))
+dput(tsp(saved))
+tsp(x) <- NULL
+dput(is.ts(x))
+
+=== case: ts_window_lag_diff ===
+#@ tags: stats,ts
+x <- ts(1:8,start=c(2000,2),frequency=4)
+dput(window(x,start=c(2000,3),end=c(2001,2)))
+dput(window(x,start=1999,end=2000.5,extend=TRUE))
+dput(window(x,frequency=2))
+dput(tsp(lag(x,2)))
+dput(diff(x,lag=2,differences=2))
+
+=== case: ts_filters ===
+#@ tags: stats,ts
+#@ compare: rel=1e-12,abs=1e-12
+x <- ts(1:8,start=c(2000,2),frequency=4)
+dput(filter(x,c(1,2,3,4)))
+dput(filter(x,c(1,2),sides=1,circular=TRUE))
+z <- filter(x,c(.5,.2),method="recursive",init=c(2,3))
+cat(as.double(z), tsp(z), "\n")
+m <- ts(matrix(1:12,6), frequency=2)
+dput(filter(m,1:2))
+dput(filter(m,1:2,method="recursive",init=matrix(1:4,2)))
+
+=== case: ts_autocorrelations ===
+#@ tags: stats,ts
+#@ compare: rel=1e-12,abs=1e-12
+x <- ts(1:8,start=c(2000,2),frequency=4)
+for (z in list(acf(x,2,plot=FALSE),pacf(x,2,plot=FALSE))) {
+    dput(class(z))
+    dput(names(z))
+    cat(z$acf,z$lag,z$series,z$type,z$n.used,"\n")
+}
+
+=== case: ts_cross_correlations ===
+#@ tags: stats,ts
+#@ compare: rel=1e-12,abs=1e-12
+x <- c(1,0,0,0)
+y <- c(0,1,0,0)
+z <- ccf(x,y,lag.max=2,plot=FALSE)
+cat(z$acf,z$lag,"\n")
+dput(z$snames)
+m <- ts(cbind(c(3,2,4,8,5,0), c(4,6,5,1,2,3)),frequency=3)
+for (z in list(acf(m,2,plot=FALSE),pacf(m,2,plot=FALSE))) {
+    cat(z$acf,z$lag,"\n")
+    dput(z$snames)
+}
+
+=== case: ts_decompose_and_box_tests ===
+#@ tags: stats,ts
+#@ compare: rel=1e-12,abs=1e-12
+x <- ts(1:12 + rep(c(1,-1,-2,2),3), frequency=4)
+z <- decompose(x)
+dput(names(z))
+cat(z$figure,as.double(z$seasonal),as.double(z$trend),as.double(z$random),"\n")
+for (t in c("Box-Pierce","Ljung-Box")) {
+    z <- Box.test(x,lag=3,type=t,fitdf=1)
+    dput(class(z))
+    cat(z$statistic,z$parameter,z$p.value,z$method,z$data.name,"\n")
+}
+
+=== case: fft_convolution_time_series_and_matrix_attributes ===
+#@ tags: stats,fft,ts
+#@ compare: rel=1e-13,abs=1e-13
+a <- ts(1:4,start=2)
+b <- ts(2:5,start=3)
+z <- convolve(a,b)
+cat(as.double(z),tsp(z),"\n")
+dput(class(z))
+m <- matrix(1:4,2L,dimnames=list(c("a","b"),c("x","y")))
+z <- convolve(m,m)
+cat(z,"\n")
+dput(dimnames(z))
+
+=== case: ts_print_calendars ===
+#@ tags: stats,ts
+print(ts(c(.25,.5,1,NA), start=c(2000,3), frequency=4))
+print(ts(1:3,start=5))
+print(ts(matrix(1:8,4),start=c(2000,3),frequency=4))
+
+=== case: ts_correlation_missing_data_and_visibility ===
+#@ tags: stats,ts
+#@ compare: rel=1e-12,abs=1e-12
+x <- ts(c(NA,2,3,4,NA),start=5,frequency=2)
+y <- acf(x,1,plot=FALSE,na.action=na.omit)
+cat(y$n.used,y$acf,y$lag,"\n")
+seen <- withVisible(acf(c(1,NA,3,4),2,plot=FALSE,na.action=na.pass))
+y <- seen$value
+cat(seen$visible,y$n.used,y$acf,y$lag,"\n")

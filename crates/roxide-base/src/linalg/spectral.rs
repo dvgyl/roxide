@@ -8,7 +8,10 @@ use roxide_eval::{Args, Call, Ctx, EvalResult};
 use roxide_gc::SexpId;
 use roxide_math::{
     Cplx, MatRef,
-    linalg::spectral::{MatrixNorm, general_eigen, matrix_norm, svd as decompose, symmetric_eigen},
+    linalg::{
+        complex::{complex_general_eigen, complex_svd, hermitian_eigen},
+        spectral::{MatrixNorm, general_eigen, matrix_norm, svd as decompose, symmetric_eigen},
+    },
 };
 use roxide_value::{NA_REAL, RComplex, RLogical, SEXP_NIL, SexpType, ValueApi, is_na_real};
 
@@ -26,6 +29,9 @@ pub(super) fn svd(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
         return Err(error(ctx, call, "invalid SVD arguments"));
     };
     let transposed = flag(ctx, transposed, false)?;
+    if ctx.session().type_of(x)? == SexpType::Cplx {
+        return svd_complex(ctx, call, x, nu, nv, transposed);
+    }
     let a = input(ctx, call, x, "complex SVD is not yet implemented", true)?;
     if a.rows == 0 || a.cols == 0 {
         return Err(error(ctx, call, "a dimension is zero"));
@@ -63,6 +69,57 @@ pub(super) fn svd(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     result(ctx, &items, None)
 }
 
+fn svd_complex(
+    ctx: &mut Ctx,
+    call: &Call,
+    x: SexpId,
+    nu: SexpId,
+    nv: SexpId,
+    transposed: bool,
+) -> EvalResult {
+    let ((m, n), a) = complex_input(ctx, call, x)?;
+    if m == 0 || n == 0 {
+        return Err(error(ctx, call, "a dimension is zero"));
+    }
+    finite_complex(ctx, call, &a)?;
+    let nu = columns(ctx, call, nu, m)?;
+    let nv = columns(ctx, call, nv, n)?;
+    size(ctx, call, m, nu, size_of::<Cplx>())?;
+    size(ctx, call, n, nv, size_of::<Cplx>())?;
+    let s = complex_svd(&a, m, n, nu, nv).map_err(|e| math_error(ctx, call, e))?;
+    let d = ctx.session_mut().alloc_real_from(&s.d)?;
+    ctx.protect(d);
+    let mut fields = vec![("d", d)];
+    if nu != 0 {
+        let u = eigen_vector(ctx, &s.u, true)?;
+        fields.push(("u", matrix(ctx, u, m, nu)?));
+    }
+    if nv != 0 {
+        if transposed {
+            let vt = eigen_vector(ctx, &s.vt, true)?;
+            fields.push(("vt", matrix(ctx, vt, nv, n)?));
+        } else {
+            let mut v = Vec::with_capacity(n * nv);
+            for j in 0..nv {
+                for i in 0..n {
+                    let z = s.vt[i * nv + j];
+                    v.push(Cplx::new(z.re, -z.im));
+                }
+            }
+            let v = eigen_vector(ctx, &v, true)?;
+            fields.push(("v", matrix(ctx, v, n, nv)?));
+        }
+    }
+    result(ctx, &fields, None)
+}
+
+fn complex_input(ctx: &mut Ctx, call: &Call, x: SexpId) -> EvalResult<((usize, usize), Vec<Cplx>)> {
+    ctx.protect(x);
+    let s = ctx.session();
+    let shape = dimensions(s, x).unwrap_or((s.xlength(x)?, 1));
+    Ok((shape, complex(ctx, call, x)?))
+}
+
 fn columns(ctx: &mut Ctx, call: &Call, x: SexpId, cap: usize) -> EvalResult<usize> {
     let s = ctx.session();
     let ty = s.type_of(x)?;
@@ -98,6 +155,9 @@ pub(super) fn eigen(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     let [x, symmetric, only, detect] = *args.values() else {
         return Err(error(ctx, call, "invalid eigen arguments"));
     };
+    if ctx.session().type_of(x)? == SexpType::Cplx {
+        return eigen_complex(ctx, call, x, symmetric, only, detect);
+    }
     let a = input(ctx, call, x, "complex eigen is not yet implemented", true)?;
     let n = a.rows;
     if n != a.cols {
@@ -112,19 +172,7 @@ pub(super) fn eigen(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     } else {
         flag(ctx, symmetric, false)?
     };
-    if ctx.session().xlength(only)? > 1 {
-        return Err(error(ctx, call, "the condition has length > 1"));
-    }
-    let (only, _) = ctx.session_mut().coerce(only, SexpType::Lgl)?;
-    let Some(only) = ctx
-        .session()
-        .lgl(only)?
-        .iter()
-        .next()
-        .and_then(RLogical::get)
-    else {
-        return Err(error(ctx, call, "invalid 'only.values' argument"));
-    };
+    let only = only_values(ctx, call, only)?;
     let (values, vectors) = if symmetric {
         let e = symmetric_eigen(a.view(), only).map_err(|e| math_error(ctx, call, e))?;
         let values = ctx.session_mut().alloc_real_from(&e.values)?;
@@ -179,6 +227,85 @@ pub(super) fn eigen(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
         &[("values", values), ("vectors", vectors)],
         (!only).then_some("eigen"),
     )
+}
+
+fn only_values(ctx: &mut Ctx, call: &Call, only: SexpId) -> EvalResult<bool> {
+    if ctx.session().xlength(only)? > 1 {
+        return Err(error(ctx, call, "the condition has length > 1"));
+    }
+    let (only, _) = ctx.session_mut().coerce(only, SexpType::Lgl)?;
+    let Some(only) = ctx
+        .session()
+        .lgl(only)?
+        .iter()
+        .next()
+        .and_then(RLogical::get)
+    else {
+        return Err(error(ctx, call, "invalid 'only.values' argument"));
+    };
+    Ok(only)
+}
+
+fn eigen_complex(
+    ctx: &mut Ctx,
+    call: &Call,
+    x: SexpId,
+    symmetric: SexpId,
+    only: SexpId,
+    detect: SexpId,
+) -> EvalResult {
+    let ((n, m), a) = complex_input(ctx, call, x)?;
+    if n != m {
+        return Err(error(ctx, call, "non-square matrix in 'eigen'"));
+    }
+    if n == 0 {
+        return Err(error(ctx, call, "0 x 0 matrix"));
+    }
+    finite_complex(ctx, call, &a)?;
+    let symmetric = if flag(ctx, detect, false)? {
+        let tol = ctx.session_mut().scalar_real(symmetry::TOLERANCE)?;
+        ctx.protect(tol);
+        let tol1 = ctx.session_mut().scalar_real(8.0 * symmetry::TOLERANCE)?;
+        ctx.protect(tol1);
+        let trans = ctx.session_mut().scalar_str("C")?;
+        ctx.protect(trans);
+        let check = ctx.session_mut().scalar_lgl(RLogical::FALSE)?;
+        ctx.protect(check);
+        let mut args = Args::from_pairs([x, tol, tol1, trans, check].map(|id| (None, id)).to_vec());
+        let detected = symmetry::is_symmetric(ctx, call, &mut args)?;
+        flag(ctx, detected, false)?
+    } else {
+        flag(ctx, symmetric, false)?
+    };
+    let only = only_values(ctx, call, only)?;
+    let (values, vectors) = if symmetric {
+        let e = hermitian_eigen(&a, n, only).map_err(|e| math_error(ctx, call, e))?;
+        let values = ctx.session_mut().alloc_real_from(&e.values)?;
+        (values, e.vectors)
+    } else {
+        let e = complex_general_eigen(&a, n, only).map_err(|e| math_error(ctx, call, e))?;
+        let values = eigen_vector(ctx, &e.values, true)?;
+        (values, e.vectors)
+    };
+    ctx.protect(values);
+    let vectors = if only {
+        SEXP_NIL
+    } else {
+        let vectors = eigen_vector(ctx, &vectors, true)?;
+        matrix(ctx, vectors, n, n)?
+    };
+    result(
+        ctx,
+        &[("values", values), ("vectors", vectors)],
+        (!only).then_some("eigen"),
+    )
+}
+
+fn finite_complex(ctx: &mut Ctx, call: &Call, a: &[Cplx]) -> EvalResult<()> {
+    if a.iter().any(|z| !z.re.is_finite() || !z.im.is_finite()) {
+        return Err(error(ctx, call, NONFINITE));
+    }
+    Ok(())
 }
 
 fn eigen_vector(ctx: &mut Ctx, data: &[Cplx], complex: bool) -> EvalResult {
