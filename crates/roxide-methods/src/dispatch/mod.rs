@@ -1,7 +1,8 @@
 //! S4 generic registration and method dispatch.
 
+mod groups;
 mod invoke;
-mod metadata;
+pub(crate) mod metadata;
 mod rank;
 mod resolver;
 
@@ -68,6 +69,30 @@ pub const MODULE: Module = Module {
             metadata::show_methods,
             ArgEval::Eval,
             Visibility::Off,
+        ),
+        prim(
+            ".rx_getGroup",
+            groups::get_group,
+            ArgEval::Eval,
+            Visibility::On,
+        ),
+        prim(
+            ".rx_getGroupMembers",
+            groups::get_members,
+            ArgEval::Eval,
+            Visibility::On,
+        ),
+        prim(
+            ".rx_isGroup",
+            groups::is_group,
+            ArgEval::Eval,
+            Visibility::On,
+        ),
+        prim(
+            "callGeneric",
+            invoke::call_generic,
+            ArgEval::Unevaluated,
+            Visibility::SetByFn,
         ),
         prim(
             "callNextMethod",

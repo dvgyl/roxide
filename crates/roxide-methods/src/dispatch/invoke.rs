@@ -5,8 +5,8 @@ use roxide_value::{
 };
 
 use super::metadata::{
-    Method, attr, by_definition, formal_pairs, lookup, make_call, package_string, signature_object,
-    texts,
+    Method, attr, by_definition, dispatch_tables, formal_pairs, generic_definition, lookup,
+    make_call, merge_tables, package_string, signature_object, texts,
 };
 use super::resolver::{self, Class, Selection};
 use crate::registry::GenericInfo;
@@ -27,17 +27,36 @@ pub(super) fn primitive_formals(name: &str) -> Option<PrimitiveFormals> {
             true,
         ),
         "[[" => (&["x", "i", "j", "..."], &["x", "i", "j"], "base", true),
+        "[<-" | "[[<-" => (
+            &["x", "i", "j", "...", "value"],
+            &["x", "i", "j", "value"],
+            "base",
+            true,
+        ),
         "$" => (&["x", "name"], &["x"], "base", true),
-        "!" | "length" | "names" => (&["x"], &["x"], "base", true),
+        "$<-" => (&["x", "name", "value"], &["x", "value"], "base", true),
+        "length<-" | "names<-" | "dim<-" | "dimnames<-" | "levels<-" => {
+            (&["x", "value"], &["x", "value"], "base", true)
+        }
+        "!" | "length" | "names" | "dim" | "dimnames" | "levels" | "as.raw" => {
+            (&["x"], &["x"], "base", true)
+        }
+        "as.character" | "as.numeric" | "as.double" | "as.integer" | "as.logical"
+        | "as.complex" | "as.list" | "c" => (&["x", "..."], &["x"], "base", true),
+        "as.vector" => (&["x", "mode"], &["x", "mode"], "base", true),
         "Ops" | "Arith" | "Logic" => (&["e1", "e2"], &["e1", "e2"], "base", false),
         "Compare" => (&["e1", "e2"], &["e1", "e2"], "methods", false),
         "round" | "signif" => (&["x", "digits"], &["x", "digits"], "base", true),
+        "Math2" => (&["x", "digits"], &["x", "digits"], "methods", false),
         "Math" => (&["x"], &["x"], "base", false),
+        "Complex" => (&["z"], &["z"], "base", false),
         "Summary" => (&["x", "...", "na.rm"], &["x", "na.rm"], "base", false),
-        _ => match group(name)? {
+        _ => match super::groups::parent(name)? {
             "Arith" | "Compare" | "Logic" => (&["e1", "e2"], &["e1", "e2"], "base", true),
-            "Math" => (&["x", "..."], &["x"], "base", true),
+            "Math" if matches!(name, "log" | "trunc") => (&["x", "..."], &["x"], "base", true),
+            "Math" => (&["x"], &["x"], "base", true),
             "Summary" => (&["x", "...", "na.rm"], &["x", "na.rm"], "base", true),
+            "Complex" => (&["z"], &["z"], "base", true),
             _ => return None,
         },
     };
@@ -45,22 +64,10 @@ pub(super) fn primitive_formals(name: &str) -> Option<PrimitiveFormals> {
 }
 
 pub(super) fn primitive_active(name: &str) -> bool {
-    !matches!(name, "[[" | "length" | "names" | "!") && group(name) != Some("Summary")
-}
-
-fn group(name: &str) -> Option<&'static str> {
-    Some(match name {
-        "+" | "-" | "*" | "/" | "^" | "%%" | "%/%" => "Arith",
-        "==" | "!=" | "<" | "<=" | ">" | ">=" => "Compare",
-        "&" | "|" => "Logic",
-        "abs" | "sign" | "sqrt" | "floor" | "ceiling" | "trunc" | "exp" | "expm1" | "log"
-        | "log10" | "log2" | "log1p" | "cos" | "sin" | "tan" | "acos" | "asin" | "atan"
-        | "cosh" | "sinh" | "tanh" | "acosh" | "asinh" | "atanh" | "cospi" | "sinpi" | "tanpi"
-        | "gamma" | "lgamma" | "digamma" | "trigamma" | "cumsum" | "cumprod" | "cummax"
-        | "cummin" => "Math",
-        "all" | "any" | "min" | "max" | "sum" | "prod" | "range" => "Summary",
-        _ => return None,
-    })
+    !matches!(
+        name,
+        "[[" | "length" | "names" | "!" | "as.list" | "levels" | "levels<-"
+    ) && super::groups::parent(name) != Some("Summary")
 }
 
 #[derive(Clone)]
@@ -180,14 +187,7 @@ fn invoke(
         }
         let defined = signature_object(ctx, &invocation.info, &invocation.method.signature)?;
         let target = signature_object(ctx, &invocation.info, &invocation.target)?;
-        let generic = package_string(
-            ctx,
-            invocation
-                .primitive
-                .as_deref()
-                .unwrap_or(&invocation.info.name),
-            &invocation.info.package,
-        )?;
+        let generic = package_string(ctx, &invocation.info.name, &invocation.info.package)?;
         let marker = ctx.session_mut().alloc_env(EMPTY_ENV)?;
         let values = [
             (".Generic", generic),
@@ -242,6 +242,7 @@ fn bind_method_dots(
 }
 
 pub(super) fn standard_generic(ctx: &mut Ctx, name: Sym, frame: FrameId) -> EvalResult<SexpId> {
+    crate::meta::clear_unloaded(ctx);
     let Some((call, _, fun, caller)) = ctx.frame_info(frame) else {
         return Err(ctx.stop(
             SEXP_NIL,
@@ -251,15 +252,16 @@ pub(super) fn standard_generic(ctx: &mut Ctx, name: Sym, frame: FrameId) -> Eval
     let name = ctx.session().sym_name(name)?.to_owned();
     let package = attr(ctx, fun, "package")?;
     let package = texts(ctx, package)?.into_iter().next().unwrap_or_default();
-    let info = lookup(ctx, &name, &package, caller)?;
-    let info = match info {
+    let info = match by_definition(ctx, fun, &name)? {
         Some(info) => Some(info),
-        None => by_definition(ctx, fun, &name)?,
+        None => lookup(ctx, &name, &package, caller)?,
     };
     let Some(info) = info else {
         return Err(ctx.stop(call, format!("no generic function found for ‘{name}’")));
     };
     ctx.protect(info.table);
+    let sources = dispatch_tables(ctx, &info, caller)?;
+    let info = merge_tables(ctx, info, &sources, true)?;
     let value_class = attr(ctx, fun, "valueClass")?;
     let value_classes = texts(ctx, value_class)?;
     let matched = ctx.generic_frame_args(frame)?;
@@ -463,7 +465,7 @@ pub(super) fn call_next_method(ctx: &mut Ctx, call: &Call, args: &mut Args) -> E
         let Some((_, _, fun, _)) = ctx.frame_info(frame) else {
             return Err(ctx.stop(call.err_call(), "unknown method frame"));
         };
-        let generic = attr(ctx, invocation.info.table, "generic")?;
+        let generic = generic_definition(ctx, &invocation.info, call.env)?;
         let generic_formals = formal_pairs(ctx, generic)?;
         let method_formals = formal_pairs(ctx, fun)?;
         if generic_formals == method_formals {
@@ -477,7 +479,7 @@ pub(super) fn call_next_method(ctx: &mut Ctx, call: &Call, args: &mut Args) -> E
             match_args(ctx, &names, &args, call.err_call(), false)?
         }
     } else {
-        let generic = attr(ctx, invocation.info.table, "generic")?;
+        let generic = generic_definition(ctx, &invocation.info, call.env)?;
         let names = formal_pairs(ctx, generic)?
             .iter()
             .map(|&(sym, _)| sym)
@@ -486,7 +488,11 @@ pub(super) fn call_next_method(ctx: &mut Ctx, call: &Call, args: &mut Args) -> E
         match_args(ctx, &names, &args, call.err_call(), true)?
     };
     match next {
-        Some(method) if ctx.session().type_of(method.fun)? == SexpType::Clo => {
+        Some(method)
+            if ctx.session().type_of(method.fun)? == SexpType::Clo
+                && (invocation.primitive.is_none()
+                    || method.fun != invocation.info.default_fun) =>
+        {
             invocation.method = method;
             invoke(ctx, invocation, &matched, call.expr, call.env)
         }
@@ -503,21 +509,70 @@ pub(super) fn call_next_method(ctx: &mut Ctx, call: &Call, args: &mut Args) -> E
     }
 }
 
+pub(super) fn call_generic(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult<SexpId> {
+    let Some((invocation, frame)) = active_method(ctx)? else {
+        return Err(ctx.stop(
+            call.err_call(),
+            "no generic function found for ‘callGeneric’",
+        ));
+    };
+    let arguments = if args.is_empty() {
+        let matched = ctx.generic_frame_args(frame)?;
+        let mut arguments = flatten(ctx, &matched)?;
+        arguments.retain(|&(_, value)| value != SEXP_MISSING);
+        arguments
+    } else {
+        explicit_args(ctx, call, args)?
+    };
+    let sym = ctx.session_mut().intern(&invocation.info.name)?;
+    let fun = if invocation.primitive.is_some() {
+        ctx.find_fun(sym, BASE_ENV)?
+    } else {
+        generic_definition(ctx, &invocation.info, call.env)?
+    };
+    let expr = make_call(ctx, fun, &arguments)?;
+    ctx.eval(expr, call.env)
+}
+
+pub(super) fn primitive_sources(
+    ctx: &mut Ctx,
+    info: &GenericInfo,
+    env: SexpId,
+) -> EvalResult<Vec<GenericInfo>> {
+    let mut sources = dispatch_tables(ctx, info, env)?;
+    for group in super::groups::parents(&info.name) {
+        if let Some(info) = lookup(ctx, group, "", env)? {
+            sources.extend(dispatch_tables(ctx, &info, env)?);
+        }
+    }
+    Ok(sources)
+}
+
 pub(super) fn dispatch_primitive(
     ctx: &mut Ctx,
     generic: Sym,
     call: &Call,
     args: &Args,
 ) -> EvalResult<Option<SexpId>> {
-    let name = ctx.session().sym_name(generic)?.to_owned();
-    let Some((params, _, _, _)) = primitive_formals(&name) else {
+    crate::meta::clear_unloaded(ctx);
+    let mut name = ctx.session().sym_name(generic)?.to_owned();
+    // as.numeric and as.double share the same primitive.
+    if name == "as.double" {
+        name = "as.numeric".to_owned();
+    }
+    let Some((params, _, package, _)) = primitive_formals(&name) else {
         return Ok(None);
     };
-    let all_args = args
+    let Some(info) = lookup(ctx, &name, package, call.env)? else {
+        return Ok(None);
+    };
+    let sources = primitive_sources(ctx, &info, call.env)?;
+    let info = merge_tables(ctx, info, &sources, false)?;
+    let mut all_args = args
         .iter()
         .enumerate()
         .map(|(i, (tag, mut value))| {
-            if name == "$"
+            if matches!(name.as_str(), "$" | "$<-")
                 && i == 1
                 && let Ok(field) = ctx.session().sym_name_of(value)
             {
@@ -527,6 +582,15 @@ pub(super) fn dispatch_primitive(
             Ok((tag, forced_promise(ctx, value)?))
         })
         .collect::<EvalResult<Vec<_>>>()?;
+    if super::groups::parent(&name) == Some("Summary") {
+        let na_rm = ctx.session_mut().intern("na.rm")?;
+        if !all_args.iter().any(|&(tag, _)| tag == Some(na_rm)) {
+            all_args.push((
+                Some(na_rm),
+                forced_promise(ctx, roxide_value::FALSE_SCALAR)?,
+            ));
+        }
+    }
     let params = params
         .iter()
         .map(|param| ctx.session_mut().intern(param))
@@ -535,34 +599,24 @@ pub(super) fn dispatch_primitive(
     for &(_, value) in &matched {
         ctx.protect(value);
     }
-    let group = group(&name);
-    let ops = group
-        .filter(|group| matches!(*group, "Arith" | "Compare" | "Logic"))
-        .map(|_| "Ops");
-    for candidate in std::iter::once(name.as_str()).chain(group).chain(ops) {
-        let Some(info) = lookup(ctx, candidate, "", call.env)? else {
-            continue;
-        };
-        let target = target(ctx, &info, &matched)?;
-        let opts = Selection {
-            inherited: true,
-            next: false,
-            cache: true,
-        };
-        let Some(method) = resolver::select(ctx, &info, &target, opts, call.err_call())? else {
-            continue;
-        };
-        if ctx.session().type_of(method.fun)? != SexpType::Clo {
-            continue;
-        }
-        let invocation = Invocation {
-            info,
-            target: target_names(&target),
-            method,
-            marker: SEXP_NIL,
-            primitive: Some(name),
-        };
-        return invoke(ctx, invocation, &matched, call.expr, call.env).map(Some);
+    let target = target(ctx, &info, &matched)?;
+    let opts = Selection {
+        inherited: true,
+        next: false,
+        cache: sources.len() == 1,
+    };
+    let Some(method) = resolver::select(ctx, &info, &target, opts, call.err_call())? else {
+        return Ok(None);
+    };
+    if method.fun == info.default_fun || ctx.session().type_of(method.fun)? != SexpType::Clo {
+        return Ok(None);
     }
-    Ok(None)
+    let invocation = Invocation {
+        info,
+        target: target_names(&target),
+        method,
+        marker: SEXP_NIL,
+        primitive: Some(name),
+    };
+    invoke(ctx, invocation, &matched, call.expr, call.env).map(Some)
 }

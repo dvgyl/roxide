@@ -1,0 +1,203 @@
+=== case: s4_group_hierarchy ===
+#@ tags: layer3,s4
+dput(getGroup("+"))
+dput(getGroup(getGeneric("Compare"), recursive = TRUE))
+dput(getGroup("round"))
+dput(getGroupMembers("Ops", recursive = TRUE))
+dput(getGroupMembers("Math2", character = FALSE))
+dput(getGroupMembers(getGeneric("Complex"), character = TRUE))
+dput(c(isGroup("Ops"), isGroup("Compare"), isGroup("sum")))
+
+=== case: s4_group_dispatch_precedence ===
+#@ tags: layer3,s4
+invisible(setClass("RxA", slots = c(x = "numeric")))
+invisible(setClass("RxB", contains = "RxA"))
+setMethod("Ops", c("RxA", "RxA"), function(e1, e2) paste("Ops", .Generic))
+setMethod("Arith", c("RxA", "RxA"), function(e1, e2) paste("Arith", .Generic))
+setMethod("Compare", c("RxA", "RxA"), function(e1, e2) .Generic)
+setMethod("+", c("RxA", "RxA"), function(e1, e2) "plus")
+setMethod("Ops", c("RxB", "RxB"), function(e1, e2) "exact Ops")
+a <- new("RxA", x = 3)
+b <- new("RxB", x = 4)
+dput(a + a)
+dput(a * a)
+dput(a < a)
+dput(b + b)
+dput(is.null(getMethod("*", c("RxA", "RxA"), optional = TRUE)))
+dput(!is.null(selectMethod("*", c("RxA", "RxA"), optional = TRUE)))
+
+=== case: s4_math_summary_and_complex ===
+#@ tags: layer3,s4
+invisible(setClass("RxA", slots = c(x = "numeric")))
+a <- new("RxA", x = 4)
+setMethod("Math", "RxA", function(x) .Generic)
+setMethod("Math2", "RxA", function(x, digits) list(.Generic, missing(digits)))
+setMethod("Summary", "RxA", function(x, ..., na.rm) list(.Generic, na.rm, length(list(...))))
+setMethod("Complex", "RxA", function(z) list(.Generic, z@x))
+dput(abs(a))
+dput(log(a, 2))
+dput(round(a))
+dput(signif(a, digits = 2))
+dput(sum(a))
+dput(sum(a, 7, 8, na.rm = TRUE))
+dput(Arg(a))
+
+=== case: s4_subsetting_and_replacement ===
+#@ tags: layer3,s4
+invisible(setClass("RxA", slots = c(x = "numeric")))
+a <- new("RxA", x = 4)
+setMethod("[", "RxA", function(x, i, j, ..., drop) x@x + i)
+setMethod("[[", "RxA", function(x, i, j, ...) x@x * i)
+setMethod("$", "RxA", function(x, name) name)
+setMethod("[<-", "RxA", function(x, i, j, ..., value) { x@x <- i + value; x })
+setMethod("[[<-", "RxA", function(x, i, j, ..., value) { x@x <- i * value; x })
+setMethod("$<-", "RxA", function(x, name, value) { x@x <- nchar(name) + value; x })
+dput(list(a[2], a[[2]], a$field))
+a[2] <- 7
+dput(a@x)
+a[[2]] <- 7
+dput(a@x)
+a$field <- 7
+dput(a@x)
+
+=== case: s4_attribute_methods ===
+#@ tags: layer3,s4
+invisible(setClass("RxA", slots = c(x = "numeric")))
+a <- new("RxA", x = 4)
+setMethod("names", "RxA", function(x) "names")
+setMethod("dim", "RxA", function(x) c(2L, 3L))
+setMethod("dimnames", "RxA", function(x) list("row", "column"))
+setMethod("names<-", "RxA", function(x, value) { x@x <- nchar(value); x })
+setMethod("dim<-", "RxA", function(x, value) { x@x <- sum(value); x })
+setMethod("dimnames<-", "RxA", function(x, value) { x@x <- length(value); x })
+setMethod("length", "RxA", function(x) 3L)
+setMethod("length<-", "RxA", function(x, value) { x@x <- value; x })
+dput(list(names(a), dim(a), dimnames(a), length(a)))
+names(a) <- "set"
+dput(a@x)
+dim(a) <- c(2, 3)
+dput(a@x)
+dimnames(a) <- list("row", "column")
+dput(a@x)
+dput(getMethod("length", "RxA")(a))
+dput(getMethod("length<-", "RxA")(a, 5)@x)
+
+=== case: s4_coercion_methods ===
+#@ tags: layer3,s4
+invisible(setClass("RxA", slots = c(x = "numeric")))
+a <- new("RxA", x = 4)
+setMethod("c", "RxA", function(x, ...) c(x@x, ...))
+setMethod("as.character", "RxA", function(x, ...) paste("value", x@x))
+setMethod("as.numeric", "RxA", function(x, ...) x@x)
+setMethod("as.integer", "RxA", function(x, ...) 34L)
+setMethod("as.logical", "RxA", function(x, ...) FALSE)
+setMethod("as.list", "RxA", function(x, ...) list(x@x))
+dput(list(c(a, 5), as.character(a), as.double(a), as.numeric(a),
+          as.integer(a), as.logical(a), as.list(a)))
+setMethod("as.double", "RxA", function(x, ...) .Generic)
+dput(as.numeric(a))
+dput(as.double(a))
+
+=== case: s4_call_generic ===
+#@ tags: layer3,s4
+invisible(setClass("RxMeta", slots = c(x = "numeric")))
+invisible(setGeneric("rxRestart", function(x, y = 3) standardGeneric("rxRestart")))
+setMethod("rxRestart", "RxMeta", function(x, y) callGeneric(x@x))
+setMethod("rxRestart", "numeric", function(x, y) x + y)
+x <- new("RxMeta", x = 8)
+dput(rxRestart(x, 7))
+setMethod("rxRestart", "RxMeta", function(x, y) { x <- x@x; callGeneric() })
+dput(rxRestart(x, 7))
+setMethod("+", c("RxMeta", "numeric"), function(e1, e2) callGeneric(e1@x, e2))
+dput(x + 9)
+
+=== case: s4_metadata_queries ===
+#@ tags: layer3,s4
+invisible(setClass("RxMeta", slots = c(x = "numeric")))
+invisible(setGeneric("rxRestart", function(x, y = 3) standardGeneric("rxRestart")))
+setMethod("rxRestart", "RxMeta", function(x, y) x@x + y)
+setMethod("rxRestart", "numeric", function(x, y) x + y)
+setMethod("+", c("RxMeta", "numeric"), function(e1, e2) e1@x + e2)
+x <- new("RxMeta", x = 8)
+dput(getClasses(.GlobalEnv))
+g <- getGenerics(.GlobalEnv, searchForm = TRUE)
+dput(as.character(g))
+dput(packageSlot(g))
+dput(findMethodSignatures("rxRestart", where = .GlobalEnv))
+dput(findMethodSignatures("rxRestart", where = .GlobalEnv, classes = "RxMeta", target = FALSE))
+dput(names(findMethods("rxRestart", where = .GlobalEnv, package = ".GlobalEnv")))
+dput(cacheGenericsMetaData("rxRestart", getGeneric("rxRestart")))
+dput(packageSlot(getClass("RxMeta")))
+dput(packageSlot(class(x)))
+p <- "test"
+packageSlot(p) <- "rxPackage"
+dput(packageSlot(p))
+e <- new.env(parent = .GlobalEnv)
+invisible(setClass("RxLocal", slots = c(x = "numeric"), where = e))
+invisible(cacheMetaData(e))
+dput(getClasses(e))
+classes <- getClasses(e, inherits = TRUE)
+dput(any(classes == "RxMeta") && any(classes == "RxLocal"))
+invisible(cacheMetaData(e, attach = FALSE))
+
+=== case: s4_s3_interop ===
+#@ tags: layer3,s4
+setOldClass("rxLegacy", prototype = structure(0, class = "rxLegacy"))
+invisible(setClass("RxModern", contains = "rxLegacy", slots = c(tag = "character")))
+invisible(setGeneric("rxOldDispatch", function(x) standardGeneric("rxOldDispatch")))
+setMethod("rxOldDispatch", "rxLegacy", function(x) "old method")
+format.rxLegacy <- function(x, ...) "S3 format"
+x <- new("RxModern", tag = "modern")
+dput(format(x))
+dput(rxOldDispatch(x))
+dput(class(S3Part(x, strictS3 = TRUE)))
+dput(S3Part(structure(7L, class = "rxLegacy")))
+
+=== case: s4_namespace_meta_lifecycle ===
+#@ tags: layer3,s4,package-loader
+fixture <- function(pkg, namespace, code) {
+    d <- file.path(tempdir(), pkg)
+    dir.create(file.path(d, "Meta"), recursive = TRUE)
+    dir.create(file.path(d, "R"))
+    writeLines(c(paste0("Package: ", pkg), "Version: 1.0"), file.path(d, "DESCRIPTION"))
+    writeLines(namespace, file.path(d, "NAMESPACE"))
+    writeLines(code, file.path(d, "R", pkg))
+    saveRDS(list(Built = list(R = getRversion(), Platform = R.version$platform,
+                              OStype = .Platform$OS.type),
+                 DESCRIPTION = c(Package = pkg, Version = "1.0")), file.path(d, "Meta", "package.rds"))
+}
+fixture("rxmetaa",
+        c("import(methods)", "exportClasses(RxExport)", "exportClassPattern('^RxPattern')",
+          "exportMethods(rxMeta, names)"),
+        c("setClass('RxExport', slots = c(value = 'numeric'))",
+          "setClass('RxPattern', slots = c(value = 'numeric'))",
+          "setClass('RxPrivate', slots = c(value = 'numeric'))",
+          "setGeneric('rxMeta', function(x) standardGeneric('rxMeta'))",
+          "setMethod('rxMeta', 'RxExport', function(x) x@value + 1)",
+          "setMethod('names', 'RxExport', function(x) 'provided')"))
+fixture("rxmetab",
+        c("import(methods)", "importClassesFrom(rxmetaa, RxExport, RxPattern)",
+          "importMethodsFrom(rxmetaa, rxMeta, names)", "export(probe)"),
+        c("setClass('RxConsumer', slots = c(value = 'numeric'))",
+          "setMethod('rxMeta', 'RxConsumer', function(x) x@value * 2)",
+          "probe <- function() {",
+          "    x <- new('RxExport', value = 5)",
+          "    y <- new('RxConsumer', value = 7)",
+          "    list(rxMeta(x), rxMeta(y), names(x), packageSlot(class(new('RxPattern'))))",
+          "}"))
+a <- loadNamespace("rxmetaa", lib.loc = tempdir())
+s <- getNamespaceExports(a)
+dput(c(any(s == ".__C__RxExport"), any(s == ".__C__RxPattern"),
+       any(s == ".__C__RxPrivate"), any(s == ".__T__names:base")))
+dput(sort(getClasses(a)))
+b <- loadNamespace("rxmetab", lib.loc = tempdir())
+dput(rxmetab::probe())
+unloadNamespace(b)
+library(rxmetaa, lib.loc = tempdir())
+x <- new("RxExport")
+dput(names(x))
+detach("package:rxmetaa")
+dput(names(x))
+unloadNamespace(a)
+dput(isNamespaceLoaded("rxmetaa"))
+dput(is.null(getMethod("names", "RxExport", optional = TRUE)))

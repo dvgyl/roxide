@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
 
 use roxide_eval::{Args, Call, Ctx, EvalResult};
@@ -13,17 +13,17 @@ use crate::registry::{GenericInfo, MethodsExt};
 
 const ANY: &str = "ANY";
 
-pub(super) fn attr(ctx: &mut Ctx, value: SexpId, name: &str) -> EvalResult<SexpId> {
+pub(crate) fn attr(ctx: &mut Ctx, value: SexpId, name: &str) -> EvalResult<SexpId> {
     let sym = ctx.session_mut().intern(name)?;
     Ok(ctx.session().attr(value, sym))
 }
 
-fn set_attr(ctx: &mut Ctx, value: SexpId, name: &str, data: SexpId) -> EvalResult<()> {
+pub(crate) fn set_attr(ctx: &mut Ctx, value: SexpId, name: &str, data: SexpId) -> EvalResult<()> {
     let sym = ctx.session_mut().intern(name)?;
     Ok(ctx.session_mut().set_attrib(value, sym, data)?)
 }
 
-pub(super) fn strings(ctx: &mut Ctx, values: &[String]) -> EvalResult<SexpId> {
+pub(crate) fn strings(ctx: &mut Ctx, values: &[String]) -> EvalResult<SexpId> {
     let chars = values
         .iter()
         .map(|value| {
@@ -34,7 +34,7 @@ pub(super) fn strings(ctx: &mut Ctx, values: &[String]) -> EvalResult<SexpId> {
     Ok(ctx.session_mut().alloc_str_from(&chars)?)
 }
 
-pub(super) fn texts(ctx: &mut Ctx, value: SexpId) -> EvalResult<Vec<String>> {
+pub(crate) fn texts(ctx: &mut Ctx, value: SexpId) -> EvalResult<Vec<String>> {
     if value == SEXP_NIL {
         return Ok(Vec::new());
     }
@@ -57,7 +57,7 @@ fn text(ctx: &mut Ctx, value: SexpId) -> EvalResult<String> {
     }
 }
 
-pub(super) fn flag(ctx: &Ctx, value: SexpId) -> bool {
+pub(crate) fn flag(ctx: &Ctx, value: SexpId) -> bool {
     ctx.session()
         .lgl(value)
         .is_ok_and(|v| v.get(0) == RLogical::TRUE)
@@ -71,13 +71,13 @@ fn logical(ctx: &mut Ctx, value: bool) -> EvalResult<SexpId> {
     })?)
 }
 
-fn set_class(ctx: &mut Ctx, value: SexpId, name: &str) -> EvalResult<()> {
+pub(crate) fn set_class(ctx: &mut Ctx, value: SexpId, name: &str) -> EvalResult<()> {
     let class = package_string(ctx, name, "methods")?;
     set_attr(ctx, value, "class", class)?;
     Ok(ctx.session_mut().set_s4_flag(value, true)?)
 }
 
-pub(super) fn package_string(ctx: &mut Ctx, value: &str, pkg: &str) -> EvalResult<SexpId> {
+pub(crate) fn package_string(ctx: &mut Ctx, value: &str, pkg: &str) -> EvalResult<SexpId> {
     let value = ctx.session_mut().scalar_str(value)?;
     let pkg = ctx.session_mut().scalar_str(pkg)?;
     set_attr(ctx, value, "package", pkg)?;
@@ -121,52 +121,179 @@ fn table_name(name: &str, package: &str) -> String {
     format!(".__T__{name}:{package}")
 }
 
-pub(super) fn canonical(
+/// Read the signature and default for a canonical method table.
+pub(crate) fn canonical(
     ctx: &mut Ctx,
     table: SexpId,
     name: &str,
     package: &str,
+    env: SexpId,
 ) -> EvalResult<GenericInfo> {
-    let signature = attr(ctx, table, "signature")?;
+    let mut signature = attr(ctx, table, "signature")?;
+    let mut default_fun = attr(ctx, table, "default")?;
+    if signature == SEXP_NIL {
+        let definition = definition_in(ctx, name, env)?;
+        signature = attr(ctx, definition, "signature")?;
+        default_fun = attr(ctx, definition, "default")?;
+    }
+    let signature = if signature == SEXP_NIL {
+        super::invoke::primitive_formals(name).map_or_else(Vec::new, |(_, signature, _, _)| {
+            signature.iter().map(|param| (*param).to_owned()).collect()
+        })
+    } else {
+        texts(ctx, signature)?
+    };
     Ok(GenericInfo {
         name: name.to_owned(),
         package: package.to_owned(),
-        signature: texts(ctx, signature)?,
+        signature,
         table,
-        default_fun: attr(ctx, table, "default")?,
+        default_fun,
     })
+}
+
+fn definition_in(ctx: &mut Ctx, name: &str, env: SexpId) -> EvalResult<SexpId> {
+    let sym = ctx.session_mut().intern(name)?;
+    let fun = ctx.get_var(sym, env)?.unwrap_or(SEXP_NIL);
+    if ctx.session().type_of(fun)? == SexpType::Clo && attr(ctx, fun, "generic")? != SEXP_NIL {
+        Ok(fun)
+    } else {
+        Ok(SEXP_NIL)
+    }
+}
+
+pub(super) fn generic_definition(
+    ctx: &mut Ctx,
+    info: &GenericInfo,
+    env: SexpId,
+) -> EvalResult<SexpId> {
+    let fun = attr(ctx, info.table, "generic")?;
+    if fun != SEXP_NIL {
+        return Ok(fun);
+    }
+    let fun = definition_in(ctx, &info.name, env)?;
+    if fun != SEXP_NIL || super::invoke::primitive_formals(&info.name).is_none() {
+        return Ok(fun);
+    }
+    let ns = ctx.ns_lookup("methods").unwrap_or(GLOBAL_ENV);
+    match lookup(ctx, &info.name, &info.package, ns)? {
+        Some(prototype) => attr(ctx, prototype.table, "generic"),
+        None => Ok(SEXP_NIL),
+    }
 }
 
 pub(super) fn find_table(
     ctx: &mut Ctx,
     name: &str,
     package: &str,
-    mut where_: SexpId,
+    where_: SexpId,
 ) -> EvalResult<Option<GenericInfo>> {
-    let prefix = format!(".__T__{name}:");
-    let mut visited = HashSet::new();
-    while where_ != EMPTY_ENV && where_ != SEXP_NIL && visited.insert(where_) {
-        if !package.is_empty() {
-            if let Some(table) = binding(ctx, where_, &table_name(name, package))?
-                && ctx.session().type_of(table)? == SexpType::Env
-            {
-                return canonical(ctx, table, name, package).map(Some);
-            }
-            where_ = ctx.session().env_enclos(where_)?;
-            continue;
+    for env in environment_chain(ctx, where_)? {
+        if let Some(info) = local_tables(ctx, name, package, env)?.into_iter().next() {
+            return Ok(Some(info));
         }
-        for (sym, binding) in ctx.session().env_entries(where_)? {
-            let key = ctx.session().sym_name(sym)?;
-            if let Some(pkg) = key.strip_prefix(&prefix)
-                && ctx.session().type_of(binding.value)? == SexpType::Env
-            {
-                let pkg = pkg.to_owned();
-                return canonical(ctx, binding.value, name, &pkg).map(Some);
-            }
-        }
-        where_ = ctx.session().env_enclos(where_)?;
     }
     Ok(None)
+}
+
+/// List the environments from the current scope to the end of its parent chain.
+pub(crate) fn environment_chain(ctx: &Ctx, mut env: SexpId) -> EvalResult<Vec<SexpId>> {
+    let mut seen = HashSet::new();
+    let mut chain = Vec::new();
+    while env != EMPTY_ENV && env != SEXP_NIL && seen.insert(env) {
+        chain.push(env);
+        env = ctx.session().env_enclos(env)?;
+    }
+    Ok(chain)
+}
+
+fn local_tables(
+    ctx: &mut Ctx,
+    name: &str,
+    package: &str,
+    env: SexpId,
+) -> EvalResult<Vec<GenericInfo>> {
+    if !package.is_empty() {
+        let sym = ctx.session_mut().intern(&table_name(name, package))?;
+        return match ctx.get_local(sym, env)? {
+            Some(table) if ctx.session().type_of(table)? == SexpType::Env => {
+                Ok(vec![canonical(ctx, table, name, package, env)?])
+            }
+            _ => Ok(Vec::new()),
+        };
+    }
+    let prefix = format!(".__T__{name}:");
+    let mut tables = Vec::new();
+    for (sym, _) in ctx.session().env_entries(env)? {
+        let Some(pkg) = ctx.session().sym_name(sym)?.strip_prefix(&prefix) else {
+            continue;
+        };
+        let pkg = pkg.to_owned();
+        if let Some(table) = ctx.get_local(sym, env)?
+            && ctx.session().type_of(table)? == SexpType::Env
+        {
+            tables.push(canonical(ctx, table, name, &pkg, env)?);
+        }
+    }
+    Ok(tables)
+}
+
+pub(super) fn dispatch_tables(
+    ctx: &mut Ctx,
+    info: &GenericInfo,
+    env: SexpId,
+) -> EvalResult<Vec<GenericInfo>> {
+    let mut environments = environment_chain(ctx, env)?;
+    environments.extend(ctx.ns_records().iter().rev().map(|rec| rec.ns));
+    let mut sources = Vec::new();
+    let mut seen = HashSet::new();
+    for env in environments {
+        for table in local_tables(ctx, &info.name, &info.package, env)? {
+            if seen.insert(table.table) {
+                sources.push(table);
+            }
+        }
+    }
+    if seen.insert(info.table) {
+        sources.push(info.clone());
+    }
+    Ok(sources)
+}
+
+pub(super) fn merge_tables(
+    ctx: &mut Ctx,
+    mut info: GenericInfo,
+    sources: &[GenericInfo],
+    include_primitive_default: bool,
+) -> EvalResult<GenericInfo> {
+    if let [only] = sources
+        && (include_primitive_default || only.table == info.table)
+    {
+        return Ok(only.clone());
+    }
+    // Earlier tables win when they define the same signature. Rank distinct signatures together.
+    let mut entries = BTreeMap::new();
+    for source in sources {
+        for method in methods(ctx, source)? {
+            if !include_primitive_default && method.fun == source.default_fun {
+                continue;
+            }
+            let mut signature = method.signature;
+            signature.resize(info.signature.len(), ANY.to_owned());
+            entries.entry(signature).or_insert(method.fun);
+        }
+    }
+    let width = entries.keys().map(|sig| sig_width(sig)).max().unwrap_or(1);
+    let table = ctx.session_mut().alloc_env(EMPTY_ENV)?;
+    ctx.protect(table);
+    for (sym, value) in ctx.session().attrs(info.table)? {
+        ctx.session_mut().set_attrib(table, sym, value)?;
+    }
+    for (signature, fun) in entries {
+        bind(ctx, table, &method_key(&signature, width), fun)?;
+    }
+    info.table = table;
+    Ok(info)
 }
 
 pub(super) fn lookup(
@@ -191,7 +318,7 @@ pub(super) fn lookup(
         return Ok(None);
     }
     if let Some(table) = binding(ctx, ns, &table_name(name, pkg))? {
-        return canonical(ctx, table, name, pkg).map(Some);
+        return canonical(ctx, table, name, pkg, ns).map(Some);
     }
     if primitive.is_none() {
         return Ok(None);
@@ -316,7 +443,31 @@ fn create(ctx: &mut Ctx, spec: &GenericSpec<'_>, primitive: bool) -> EvalResult<
     let fun = ctx.session_mut().alloc_closure(formals, body, env)?;
     let table = ctx.session_mut().alloc_env(EMPTY_ENV)?;
     let signature_value = strings(ctx, &signature)?;
-    set_class(ctx, fun, "standardGeneric")?;
+    let group = if primitive {
+        super::groups::group_names(ctx, name)?
+    } else {
+        group
+    };
+    let members = super::groups::members(name).filter(|_| primitive);
+    set_class(
+        ctx,
+        fun,
+        if members.is_some() {
+            "groupGenericFunction"
+        } else {
+            "standardGeneric"
+        },
+    )?;
+    if let Some(members) = members {
+        let members = strings(
+            ctx,
+            &members
+                .iter()
+                .map(|member| (*member).to_owned())
+                .collect::<Vec<_>>(),
+        )?;
+        set_attr(ctx, fun, "groupMembers", members)?;
+    }
     let package_value = ctx.session_mut().scalar_str(package)?;
     for (key, value) in [
         ("generic", name_value),
@@ -408,7 +559,7 @@ pub(super) fn get_generic(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalRe
         .next()
         .unwrap_or_default();
     match lookup(ctx, &name, &package, args.get(1))? {
-        Some(info) => attr(ctx, info.table, "generic"),
+        Some(info) => generic_definition(ctx, &info, args.get(1)),
         None if flag(ctx, args.get(3)) => Err(ctx.stop(
             call.err_call(),
             format!("no generic function found for ‘{name}’"),
@@ -526,9 +677,9 @@ pub(super) struct Method {
     pub(super) fun: SexpId,
 }
 
-pub(super) fn methods(ctx: &Ctx, info: &GenericInfo) -> EvalResult<Vec<Method>> {
+pub(super) fn methods(ctx: &mut Ctx, info: &GenericInfo) -> EvalResult<Vec<Method>> {
     let mut methods = Vec::new();
-    for (sym, binding) in ctx.session().env_entries(info.table)? {
+    for (sym, _) in ctx.session().env_entries(info.table)? {
         let mut signature: Vec<_> = ctx
             .session()
             .sym_name(sym)?
@@ -536,10 +687,10 @@ pub(super) fn methods(ctx: &Ctx, info: &GenericInfo) -> EvalResult<Vec<Method>> 
             .map(str::to_owned)
             .collect();
         signature.resize(info.signature.len(), ANY.to_owned());
-        methods.push(Method {
-            signature,
-            fun: binding.value,
-        });
+        if let Some(fun) = ctx.get_local(sym, info.table)? {
+            ctx.protect(fun);
+            methods.push(Method { signature, fun });
+        }
     }
     methods.sort_by(|a, b| a.signature.cmp(&b.signature));
     Ok(methods)
@@ -622,10 +773,12 @@ fn local_table(ctx: &mut Ctx, info: &mut GenericInfo, where_: SexpId) -> EvalRes
         for (sym, value) in ctx.session().attrs(info.table)? {
             ctx.session_mut().set_attrib(table, sym, value)?;
         }
-        for (sym, value) in ctx.session().env_entries(info.table)? {
-            ctx.session_mut().env_define_binding(table, sym, value)?;
+        if info.default_fun != SEXP_NIL {
+            bind(ctx, table, "ANY", info.default_fun)?;
         }
         bind(ctx, where_, &key, table)?;
+        info.table = table;
+    } else if let Some(table) = binding(ctx, where_, &key)? {
         info.table = table;
     }
     Ok(())
@@ -637,7 +790,10 @@ fn activate(ctx: &mut Ctx, info: &GenericInfo) -> EvalResult<()> {
 }
 
 pub(super) fn set_method(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
-    let name = text(ctx, args.get(0))?;
+    let mut name = text(ctx, args.get(0))?;
+    if name == "as.double" {
+        name = "as.numeric".to_owned();
+    }
     let where_ = args.get(3);
     let sig_arg = args.get(1);
     let definition = args.get(2);
@@ -661,7 +817,7 @@ pub(super) fn set_method(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalRes
         }
     };
     let signature = normalize(ctx, &info, sig_arg)?;
-    let generic = attr(ctx, info.table, "generic")?;
+    let generic = generic_definition(ctx, &info, where_)?;
     let definition = missing_defaults(ctx, generic, definition)?;
     let definition = method_definition(
         ctx,
@@ -723,7 +879,10 @@ pub(super) fn set_method(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalRes
 
 pub(super) fn remove_method(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     let name = text(ctx, args.get(0))?;
-    let Some(info) = lookup(ctx, &name, "", args.get(2))? else {
+    let Some(info) = local_tables(ctx, &name, "", args.get(2))?
+        .into_iter()
+        .next()
+    else {
         return logical(ctx, false);
     };
     let signature = normalize(ctx, &info, args.get(1))?;
@@ -782,7 +941,7 @@ pub(super) fn by_definition(
     }
     let package = attr(ctx, fun, "package")?;
     let package = text(ctx, package)?;
-    canonical(ctx, table, name, &package).map(Some)
+    canonical(ctx, table, name, &package, GLOBAL_ENV).map(Some)
 }
 
 pub(super) fn select_method(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
@@ -792,12 +951,16 @@ pub(super) fn select_method(ctx: &mut Ctx, call: &Call, args: &mut Args) -> Eval
         Some(info) => Some(info),
         None => lookup(ctx, &name, "", args.get(2))?,
     };
+    crate::meta::clear_unloaded(ctx);
     if let Some(mut info) = info {
+        let inherited = flag(ctx, args.get(4));
         if ctx.session().type_of(args.get(7))? == SexpType::Env {
             info.table = args.get(7);
+        } else if inherited {
+            let sources = super::invoke::primitive_sources(ctx, &info, args.get(2))?;
+            info = merge_tables(ctx, info, &sources, true)?;
         }
         let signature = normalize(ctx, &info, args.get(1))?;
-        let inherited = flag(ctx, args.get(4));
         let target = signature
             .iter()
             .cloned()
@@ -865,7 +1028,13 @@ fn listing(
     entries.retain(|(target, _)| {
         classes.is_empty() || target.iter().any(|class| classes.contains(class))
     });
-    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    entries.sort_by_cached_key(|entry| {
+        entry
+            .0
+            .iter()
+            .map(|name| name.to_lowercase())
+            .collect::<Vec<_>>()
+    });
     entries.dedup_by(|a, b| a.0 == b.0);
     Ok(MethodListing { entries, width })
 }
@@ -876,16 +1045,33 @@ pub(super) fn find_methods(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalR
         .into_iter()
         .next()
         .unwrap_or_default();
-    let Some(info) = lookup(ctx, &name, &package, args.get(1))? else {
+    crate::meta::clear_unloaded(ctx);
+    let where_ = args.get(1);
+    let scope = if where_ == SEXP_NIL {
+        args.get(5)
+    } else {
+        where_
+    };
+    let Some(mut info) = lookup(ctx, &name, &package, scope)? else {
         ctx.warn_now(
             call.err_call(),
             format!("non-generic function '{name}' given to findMethods()"),
         )?;
         return Ok(ctx.session_mut().alloc_list(0)?);
     };
+    let sources = if where_ == SEXP_NIL {
+        dispatch_tables(ctx, &info, scope)?
+    } else {
+        local_tables(ctx, &name, &info.package, where_)?
+    };
+    info = merge_tables(ctx, info, &sources, true)?;
     let inherited = flag(ctx, args.get(3));
-    let MethodListing { entries, width } = listing(ctx, &info, args.get(2), inherited)?;
+    let MethodListing { mut entries, width } = listing(ctx, &info, args.get(2), inherited)?;
+    if where_ != SEXP_NIL && super::invoke::primitive_formals(&name).is_some() {
+        entries.retain(|(_, method)| method.fun != info.default_fun);
+    }
     let list = ctx.session_mut().alloc_list(entries.len())?;
+    let signatures = ctx.session_mut().alloc_list(entries.len())?;
     let mut names = Vec::new();
     for (i, (target, method)) in entries.into_iter().enumerate() {
         let fun = if target == method.signature {
@@ -902,9 +1088,16 @@ pub(super) fn find_methods(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalR
         };
         ctx.session_mut().list_set(list, i, fun)?;
         names.push(method_key(&target, width));
+        let signature = strings(ctx, &target[..width.min(target.len())])?;
+        ctx.session_mut().list_set(signatures, i, signature)?;
     }
     let names = strings(ctx, &names)?;
+    let arguments = strings(ctx, &info.signature)?;
+    let generic = generic_definition(ctx, &info, scope)?;
     set_attr(ctx, list, "names", names)?;
+    set_attr(ctx, list, "arguments", arguments)?;
+    set_attr(ctx, list, "signatures", signatures)?;
+    set_attr(ctx, list, "generic", generic)?;
     set_class(ctx, list, "listOfMethods")?;
     Ok(list)
 }

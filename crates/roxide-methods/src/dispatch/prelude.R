@@ -43,13 +43,24 @@ hasMethod <- function(f, signature = character(), where = topenv(parent.frame())
     !is.null(.rx_selectMethod(f, signature, where, TRUE, TRUE, NULL, FALSE))
 }
 
-findMethods <- function(f, where = topenv(parent.frame()), classes = NULL,
+findMethods <- function(f, where, classes = NULL,
                         inherited = FALSE, package = "", ...) {
-    .rx_findMethods(f, where, classes, inherited, package)
+    .rx_findMethods(f, if (missing(where)) NULL else .rx_metaEnvironment(where),
+                    classes, inherited, package, topenv(parent.frame()))
 }
 
 showMethods <- function(f = character(), where = topenv(parent.frame()), classes = NULL,
                         includeDefs = FALSE, inherited = !includeDefs, showEmpty = TRUE,
                         printTo = stdout(), fdef = NULL) {
     .rx_showMethods(f, where, classes, includeDefs, inherited, showEmpty, printTo, fdef)
+}
+
+getGroup <- function(fdef, recursive = FALSE) .rx_getGroup(fdef, recursive)
+
+getGroupMembers <- function(group, recursive = FALSE, character = FALSE) {
+    .rx_getGroupMembers(group, recursive, missing(character) || character)
+}
+
+isGroup <- function(f, where = topenv(parent.frame()), fdef) {
+    .rx_isGroup(if (missing(fdef)) f else fdef, .rx_metaEnvironment(where))
 }
