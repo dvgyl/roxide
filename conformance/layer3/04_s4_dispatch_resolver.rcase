@@ -1,0 +1,36 @@
+=== case: s4_generic_signature_order ===
+#@ tags: layer3,s4
+invisible(setGeneric("rxChoose", function(x, y, lazy = stop("forced")) {
+    standardGeneric("rxChoose")
+}, signature = c("y", "x")))
+setMethod("rxChoose", c(x = "integer", y = "numeric"), function(x, y, lazy) "x")
+setMethod("rxChoose", c(x = "numeric", y = "integer"), function(x, y, lazy) "y")
+dput(isGeneric("rxChoose"))
+dput(getGeneric("rxChoose")@signature)
+dput(rxChoose(1L, 2L))
+dput(is.null(selectMethod("rxChoose", c("integer", "integer"), optional = TRUE, useInherited = FALSE)))
+dput(existsMethod("rxChoose", c(x = "integer", y = "numeric")))
+dput(hasMethod("rxChoose", c("integer", "integer")))
+dput(names(findMethods("rxChoose")))
+dput(removeGeneric("rxChoose"))
+dput(isGeneric("rxChoose"))
+
+=== case: s4_omitted_dispatch_argument_and_lazy_argument ===
+#@ tags: layer3,s4
+invisible(setGeneric("rxMissing", function(x, y = 3L, z) {
+    standardGeneric("rxMissing")
+}, signature = c("x", "y")))
+setMethod("rxMissing", c("numeric", "missing"), function(x, y = 5L, z) {
+    list(missing(y), y, .Generic[[1L]], as.character(.defined), as.character(.target))
+})
+dput(rxMissing(1L, z = stop("forced")))
+
+=== case: s4_method_list_includes_cached_inheritance ===
+#@ tags: layer3,s4
+invisible(setGeneric("rxListMethods", function(x, y) standardGeneric("rxListMethods")))
+setMethod("rxListMethods", "numeric", function(x, y) x)
+setMethod("rxListMethods", c("ANY", "character"), function(x, y) y)
+invisible(rxListMethods(1L, 2))
+dput(names(findMethods("rxListMethods", inherited = TRUE)))
+showMethods("rxListMethods", inherited = TRUE)
+showMethods("rxListMethods", classes = "logical")

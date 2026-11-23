@@ -1,0 +1,52 @@
+=== case: s4_next_method_defined_signature ===
+#@ tags: layer3,s4
+invisible(setGeneric("rxNext", function(x, y = "default") standardGeneric("rxNext")))
+setMethod("rxNext", c("ANY"), function(x, y) paste("ANY", x, y, missing(y)))
+setMethod("rxNext", c("numeric"), function(x, y) {
+    paste("numeric", x, y, missing(y), callNextMethod(), sep = ":")
+})
+setMethod("rxNext", c("integer"), function(x, y) {
+    x <- "changed"
+    if (missing(y)) return(callNextMethod())
+    callNextMethod(x, "explicit")
+})
+dput(rxNext(1L))
+dput(rxNext(1L, "supplied"))
+dput(removeMethod("rxNext", "integer"))
+dput(rxNext(1L, "supplied"))
+setMethod("rxNext", "integer", function(x, y) "new method")
+dput(rxNext(1L))
+
+=== case: s4_show_print_and_auto_print ===
+#@ tags: layer3,s4
+showDefault(1L)
+x <- asS4(structure(2L, class = "rxShown"))
+show(x)
+x <- asS4(structure(2L, class = "integer"))
+setMethod("show", "integer", function(object) {
+    cat("show", class(object)[[1L]], "\n")
+})
+show(x)
+print(x)
+x
+invisible(x)
+
+=== case: s4_primitive_and_group_dispatch ===
+#@ tags: layer3,s4
+x <- asS4(structure(list(a = 1L), class = "data.frame", row.names = 1L))
+setMethod("length", "data.frame", function(x) callNextMethod() + 41L)
+setMethod("[", "data.frame", function(x, i, j, ..., drop) i + 9L)
+setMethod("Arith", c("data.frame", "numeric"), function(e1, e2) e2 + 20L)
+dput(length(x))
+dput(x[2L])
+dput(x + 1)
+
+=== case: s4_field_and_math_dispatch ===
+#@ tags: layer3,s4
+x <- asS4(structure(list(a = 1L), class = "data.frame", row.names = 1L))
+setMethod("[[", "data.frame", function(x, i, j, ...) i + 30L)
+setMethod("$", "data.frame", function(x, name) paste("field", name))
+setMethod("Math", "integer", function(x) 44L)
+dput(x[[2L]])
+dput(x$a)
+dput(abs(asS4(structure(2L, class = "integer"))))

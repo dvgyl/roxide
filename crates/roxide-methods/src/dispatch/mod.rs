@@ -1,26 +1,112 @@
-//! S4 generic functions, multiple dispatch resolver, `callNextMethod()`, primitive & group generics.
+//! S4 generic registration and method dispatch.
 
-use roxide_eval::{Args, Call, Ctx, EvalResult, FrameId, Module};
+mod invoke;
+mod metadata;
+mod rank;
+mod resolver;
+
+use roxide_eval::{
+    ArgEval, Args, Arity, Call, Ctx, Dispatch, EvalResult, FrameId, Module, PrimDef, PrimKind,
+    Visibility,
+};
 use roxide_gc::SexpId;
-use roxide_value::{SEXP_NIL, Sym};
+use roxide_value::Sym;
 
-/// S4 dispatch submodule (owned by M3 Builder B).
+/// S4 generic and method operations.
 pub const MODULE: Module = Module {
-    prims: &[],
-    prelude: "",
+    prims: &[
+        prim(
+            ".rx_setGeneric",
+            metadata::set_generic,
+            ArgEval::Eval,
+            Visibility::On,
+        ),
+        prim(
+            ".rx_generic",
+            metadata::get_generic,
+            ArgEval::Eval,
+            Visibility::On,
+        ),
+        prim(
+            ".rx_isGeneric",
+            metadata::is_generic,
+            ArgEval::Eval,
+            Visibility::On,
+        ),
+        prim(
+            ".rx_removeGeneric",
+            metadata::remove_generic,
+            ArgEval::Eval,
+            Visibility::On,
+        ),
+        prim(
+            ".rx_setMethod",
+            metadata::set_method,
+            ArgEval::Eval,
+            Visibility::Off,
+        ),
+        prim(
+            ".rx_removeMethod",
+            metadata::remove_method,
+            ArgEval::Eval,
+            Visibility::On,
+        ),
+        prim(
+            ".rx_selectMethod",
+            metadata::select_method,
+            ArgEval::Eval,
+            Visibility::On,
+        ),
+        prim(
+            ".rx_findMethods",
+            metadata::find_methods,
+            ArgEval::Eval,
+            Visibility::On,
+        ),
+        prim(
+            ".rx_showMethods",
+            metadata::show_methods,
+            ArgEval::Eval,
+            Visibility::Off,
+        ),
+        prim(
+            "callNextMethod",
+            invoke::call_next_method,
+            ArgEval::Unevaluated,
+            Visibility::SetByFn,
+        ),
+    ],
+    prelude: include_str!("prelude.R"),
 };
 
-/// Attempt S4 primitive/group generic dispatch; returns `Ok(None)` to fall through.
-pub(crate) fn dispatch_primitive(
-    _ctx: &mut Ctx,
-    _generic: Sym,
-    _call: &Call,
-    _args: &Args,
-) -> EvalResult<Option<SexpId>> {
-    Ok(None)
+const fn prim(
+    name: &'static str,
+    fun: roxide_eval::PrimFn,
+    args: ArgEval,
+    visibility: Visibility,
+) -> PrimDef {
+    PrimDef {
+        name,
+        fun,
+        args,
+        visibility,
+        arity: Arity::Any,
+        dispatch: Dispatch::None,
+        kind: PrimKind::Primitive,
+    }
 }
 
-/// Execute `standardGeneric(name)` in active call `frame`.
-pub(crate) fn standard_generic(ctx: &mut Ctx, _name: Sym, _frame: FrameId) -> EvalResult<SexpId> {
-    Err(ctx.stop(SEXP_NIL, "S4 dispatch not yet implemented"))
+/// Dispatch an S4 primitive or group generic when it has an applicable method.
+pub(crate) fn dispatch_primitive(
+    ctx: &mut Ctx,
+    generic: Sym,
+    call: &Call,
+    args: &Args,
+) -> EvalResult<Option<SexpId>> {
+    invoke::dispatch_primitive(ctx, generic, call, args)
+}
+
+/// Dispatch from the active frame of a standard generic.
+pub(crate) fn standard_generic(ctx: &mut Ctx, name: Sym, frame: FrameId) -> EvalResult<SexpId> {
+    invoke::standard_generic(ctx, name, frame)
 }

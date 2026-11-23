@@ -1,0 +1,55 @@
+setGeneric <- function(name, def = NULL, group = list(), valueClass = character(),
+                       where = topenv(parent.frame()), package = NULL,
+                       signature = NULL, useAsDefault = NULL,
+                       genericFunction = NULL, simpleInheritanceOnly = NULL) {
+    .rx_setGeneric(name, def, where, package, signature, useAsDefault,
+                   genericFunction, group, valueClass, simpleInheritanceOnly)
+}
+
+getGeneric <- function(f, mustFind = FALSE, where = topenv(parent.frame()), package = "") {
+    .rx_generic(f, where, package, mustFind)
+}
+
+isGeneric <- function(f, where = topenv(parent.frame()), fdef = NULL, getName = FALSE) {
+    .rx_isGeneric(f, where, fdef, getName)
+}
+
+removeGeneric <- function(f, where = topenv(parent.frame())) .rx_removeGeneric(f, where)
+
+setMethod <- function(f, signature = character(), definition,
+                      where = topenv(parent.frame()), valueClass = NULL, sealed = FALSE) {
+    .rx_setMethod(f, signature, definition, where, valueClass, sealed)
+}
+
+removeMethod <- function(f, signature = character(), where = topenv(parent.frame())) {
+    .rx_removeMethod(f, signature, where)
+}
+
+selectMethod <- function(f, signature, optional = FALSE, useInherited = TRUE,
+                         mlist = NULL, fdef = NULL, verbose = FALSE, doCache = FALSE) {
+    .rx_selectMethod(f, signature, topenv(parent.frame()), optional, useInherited, fdef, doCache, mlist)
+}
+
+getMethod <- function(f, signature = character(), where = topenv(parent.frame()),
+                      optional = FALSE, ...) {
+    .rx_selectMethod(f, signature, where, optional, FALSE, NULL, FALSE)
+}
+
+existsMethod <- function(f, signature = character(), where = topenv(parent.frame())) {
+    !is.null(getMethod(f, signature, where, optional = TRUE))
+}
+
+hasMethod <- function(f, signature = character(), where = topenv(parent.frame())) {
+    !is.null(.rx_selectMethod(f, signature, where, TRUE, TRUE, NULL, FALSE))
+}
+
+findMethods <- function(f, where = topenv(parent.frame()), classes = NULL,
+                        inherited = FALSE, package = "", ...) {
+    .rx_findMethods(f, where, classes, inherited, package)
+}
+
+showMethods <- function(f = character(), where = topenv(parent.frame()), classes = NULL,
+                        includeDefs = FALSE, inherited = !includeDefs, showEmpty = TRUE,
+                        printTo = stdout(), fdef = NULL) {
+    .rx_showMethods(f, where, classes, includeDefs, inherited, showEmpty, printTo, fdef)
+}
