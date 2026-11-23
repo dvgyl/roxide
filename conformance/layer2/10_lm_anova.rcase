@@ -1,0 +1,256 @@
+=== case: lm_fit_orders_and_pivot ===
+#@ tags: layer2,linmod
+#@ compare: rel=1e-11,abs=1e-13
+x <- cbind(i=1,a=1:6,b=2*(1:6),g=c(1,0,1,0,1,0))
+dimnames(x) <- list(c("a","b","c","d","e","f"), colnames(x))
+y <- setNames(c(3,2,6,1,8,4), c("A","B","C","D","E","F"))
+m <- lm.fit(x,y)
+cat(names(m), names(m$qr), class(m$qr), "\n")
+cat(m$rank, m$df.residual, names(m$coefficients), m$coefficients, "\n")
+cat(m$qr$pivot, rownames(m$qr$qr), colnames(m$qr$qr), "\n")
+cat(names(m$effects), m$effects, "\n")
+cat(names(m$residuals), m$residuals, m$fitted.values, "\n")
+
+=== case: lm_fit_errors_and_empty ===
+#@ tags: layer2,linmod
+#@ compare: exact
+err <- function(e) cat(conditionMessage(e), "\n")
+tryCatch(lm.fit(matrix(numeric(),0,1),numeric()), error=err)
+tryCatch(lm.fit(cbind(1,1:2,1:2),1:2,singular.ok=FALSE), error=err)
+tryCatch(lm.fit(cbind(1,0),1:2,tol=0), error=err)
+tryCatch(lm.wfit(cbind(1,1:2),1:2,c(1,-1)), error=err)
+m <- lm.fit(matrix(numeric(),2,0),setNames(c(3,4),c("a","b")),offset=1)
+cat(names(m), typeof(m$rank), names(m$residuals), m$residuals, m$fitted.values, m$df.residual, "\n")
+
+=== case: lm_weighted_zero_and_offset ===
+#@ tags: layer2,linmod
+#@ compare: rel=1e-11,abs=1e-13
+x <- cbind(i=1,a=1:5,b=2*(1:5))
+dimnames(x) <- list(c("a","b","c","d","e"), colnames(x))
+y <- setNames(c(3,1,6,2,8), c("A","B","C","D","E"))
+m <- lm.wfit(x,y,c(1,0,2,0,4),offset=1:5)
+cat(names(m), m$rank, m$df.residual, m$coefficients, "\n")
+cat(rownames(m$qr$qr), colnames(m$qr$qr), names(m$effects), m$effects, "\n")
+cat(names(m$residuals), m$residuals, names(m$fitted.values), m$fitted.values, "\n")
+z <- lm.wfit(x,y,rep(0,5),singular.ok=FALSE)
+cat(names(z), length(z$residuals), z$coefficients, z$df.residual, "\n")
+
+=== case: lm_multiple_responses ===
+#@ tags: layer2,linmod
+#@ compare: rel=1e-11,abs=1e-13
+d <- data.frame(y=c(3,1,6,2,8),z=c(4,1,2,9,7),x=1:5,w=c(1,0,2,1,4))
+m <- lm(cbind(y,z)~x,d,weights=w)
+cat(class(m), dim(coef(m)), rownames(coef(m)), colnames(coef(m)), coef(m), "\n")
+cat(dim(m$effects), dim(fitted(m)), dim(residuals(m)), "\n")
+cat(sigma(m), deviance(m), predict(m,d[1:2,]), "\n")
+one <- lm.fit(cbind(i=1,x=d$x), matrix(d$y,5,1))
+cat(is.matrix(one$coefficients), one$coefficients, "\n")
+
+=== case: lm_call_and_model_components ===
+#@ tags: layer2,linmod
+#@ compare: rel=1e-11,abs=1e-13
+d <- data.frame(y=c(3,1,6,2,NA,4),x=1:6,z=2:7,f=factor(rep(c("a","b"),3)))
+m <- lm(y~x+f,d,subset=x>1, offset=z, x=TRUE,y=TRUE,qr=FALSE,na.action=na.exclude)
+cat(names(m), names(m$xlevels), m$xlevels$f, "\n")
+cat(deparse1(m$call), names(m$model), colnames(model.matrix(m)), "\n")
+cat(m$y, m$offset, coef(m), residuals(m), fitted(m), "\n")
+n <- lm(y~x+f,d,model=FALSE)
+cat(rownames(model.frame(n)), colnames(model.matrix(n)), "\n")
+
+=== case: lm_summary_singular_columns ===
+#@ tags: layer2,linmod
+#@ compare: rel=1e-10,abs=1e-12
+d <- data.frame(y=c(3,1,6,2,8,4,9,5),a=0:7,b=2*(0:7),
+                f=factor(rep(c("lo","hi"),4),levels=c("lo","hi")),row.names=c("a","b","c","d","e","f","g","h"))
+m <- lm(y~a+b+f,d)
+s <- summary(m)
+cat(names(s), s$df, s$aliased, "\n")
+cat(rownames(s$coefficients), colnames(s$coefficients), s$coefficients, "\n")
+cat(s$sigma,s$r.squared,s$adj.r.squared,s$fstatistic, s$cov.unscaled, "\n")
+
+=== case: lm_summary_weighted ===
+#@ tags: layer2,linmod
+#@ compare: rel=1e-10,abs=1e-12
+d <- data.frame(y=c(3,1,6,2,8,4,9,5),a=0:7,b=2*(0:7),
+                f=factor(rep(c("lo","hi"),4),levels=c("lo","hi")),row.names=c("a","b","c","d","e","f","g","h"))
+m <- lm(y~a+f,d,weights=a+1)
+s <- summary(m)
+cat(names(s), s$df, s$aliased, "\n")
+cat(rownames(s$coefficients), colnames(s$coefficients), s$coefficients, "\n")
+cat(s$sigma,s$r.squared,s$adj.r.squared,s$fstatistic, s$cov.unscaled, "\n")
+
+=== case: lm_summary_intercept_only ===
+#@ tags: layer2,linmod
+#@ compare: rel=1e-10,abs=1e-12
+d <- data.frame(y=c(3,1,6,2,8,4,9,5))
+m <- lm(y~1,d)
+s <- summary(m)
+cat(names(s), s$df, s$aliased, "\n")
+cat(rownames(s$coefficients), colnames(s$coefficients), s$coefficients, "\n")
+cat(s$sigma,s$r.squared,s$adj.r.squared,s$fstatistic, s$cov.unscaled, "\n")
+
+=== case: lm_summary_zero_columns ===
+#@ tags: layer2,linmod
+#@ compare: rel=1e-10,abs=1e-12
+d <- data.frame(y=c(3,1,6,2,8,4,9,5))
+m <- lm(y~0,d)
+s <- summary(m)
+cat(names(s), s$df, s$aliased, "\n")
+cat(rownames(s$coefficients), colnames(s$coefficients), s$coefficients, "\n")
+cat(s$sigma,s$r.squared,s$adj.r.squared,s$fstatistic, s$cov.unscaled, "\n")
+
+=== case: lm_print_summary ===
+#@ tags: layer2,linmod
+#@ compare: exact
+d <- data.frame(y=c(3,1,6,2,8,4,9,5),a=0:7,b=2*(0:7),
+                f=factor(rep(c("lo","hi"),4),levels=c("lo","hi")),row.names=c("a","b","c","d","e","f","g","h"))
+m <- lm(y~a+b+f,d)
+print(m)
+print(summary(m))
+
+=== case: lm_anova_single ===
+#@ tags: layer2,linmod
+#@ compare: rel=1e-10,abs=1e-12
+d <- data.frame(y=c(3,1,6,2,8,4,9,5),a=0:7,b=2*(0:7),f=factor(rep(c("lo","hi"),4)))
+one <- function(x) {
+    cat(class(x), names(x), rownames(x), "\n")
+    for (v in x) cat(v, "\n")
+}
+one(anova(lm(y~a+b+f,d)))
+one(anova(lm(y~1,d)))
+one(anova(lm(y~0,d)))
+
+=== case: lm_anova_model_comparisons ===
+#@ tags: layer2,linmod
+#@ compare: rel=1e-10,abs=1e-12
+d <- data.frame(y=c(3,1,6,2,8,4,9,5),a=0:7,b=2*(0:7),f=factor(rep(c("lo","hi"),4)))
+one <- function(x) {
+    cat(class(x), names(x), rownames(x), "\n")
+    for (v in x) cat(v, "\n")
+}
+small <- lm(y~a,d)
+full <- lm(y~a+b+f,d)
+for (type in list("F","Cp","Chisq","Rao","LRT",NULL)) one(anova(small,full,test=type))
+
+=== case: lm_prediction_intervals_and_missing_rows ===
+#@ tags: layer2,linmod
+#@ compare: rel=1e-9,abs=1e-12
+d <- data.frame(y=c(3,1,6,NA,8,4,9,5),a=0:7)
+m <- lm(y~a,d,na.action=na.exclude)
+cat(residuals(m), fitted(m), predict(m), "\n")
+p <- predict(m,se.fit=TRUE,interval="confidence")
+cat(names(p), colnames(p$fit), rownames(p$fit), p$fit,p$se.fit,p$df,p$residual.scale,"\n")
+n <- data.frame(a=c(0,NA,5,8))
+p <- predict(m,n,se.fit=TRUE,interval="prediction",level=.8)
+cat(rownames(p$fit), p$fit,p$se.fit,p$df,p$residual.scale,"\n")
+
+=== case: lm_prediction_poly_factors_and_terms ===
+#@ tags: layer2,linmod
+#@ compare: rel=1e-9,abs=1e-12
+d <- data.frame(y=c(3,1,6,2,8,4,9,5),a=c(0,1,2,4,8,16,17,20),
+                f=factor(rep(c("lo","hi"),4),levels=c("lo","hi")))
+m <- lm(y~poly(a,2)+f,d)
+n <- d[c(2,5,8),]
+p <- predict(m,n,se.fit=TRUE)
+cat(p$fit,p$se.fit,p$df,p$residual.scale,"\n")
+q <- predict(m,n,type="terms",se.fit=TRUE,interval="confidence")
+cat(colnames(q$fit), attr(q$fit,"constant"), q$fit,q$se.fit,q$lwr,q$upr,"\n")
+tryCatch(predict(m,data.frame(a=2,f="new")),error=function(e)cat(conditionMessage(e),"\n"))
+
+=== case: lm_prediction_rank_and_offset ===
+#@ tags: layer2,linmod
+#@ compare: rel=1e-10,abs=1e-12
+d <- data.frame(y=c(3,1,6,2,8,4),x=1:6,z=2*(1:6),o=c(0,1,2,0,1,2))
+m <- lm(y~x+z+offset(o),d,offset=x/2)
+n <- data.frame(x=2:4,z=c(4,7,8),o=c(0,1,0))
+p <- predict(m,n,rankdeficient="non-estim")
+cat(p, attr(p,"non-estim"), names(attr(p,"non-estim")), "\n")
+p <- withCallingHandlers(predict(m,n),warning=function(w) {
+    cat(conditionMessage(w),"\n")
+    invokeRestart("muffleWarning")
+})
+cat(attr(p,"non-estim"), "\n")
+cat(predict(m,n,rankdeficient="NA"), "\n")
+cat(predict(m), fitted(m), "\n")
+
+=== case: lm_dummy_aliased ===
+#@ tags: layer2,linmod
+#@ compare: rel=1e-10,abs=1e-12
+d <- data.frame(y=c(3,1,6,2,8,4,9,5),a=0:7,b=2*(0:7),
+                f=factor(rep(c("lo","hi"),4),levels=c("lo","hi")),
+                g=factor(rep(c("A","B"),each=4)))
+m <- lm(y~a+b+f,d)
+for (use.na in c(FALSE,TRUE)) {
+    z <- dummy.coef(m,use.na=use.na)
+    cat(class(z), names(z), attr(z,"matrix"), "\n")
+    for (v in z) cat(names(v), v, "\n")
+}
+
+=== case: lm_dummy_numeric_factor_interaction ===
+#@ tags: layer2,linmod
+#@ compare: rel=1e-10,abs=1e-12
+d <- data.frame(y=c(3,1,6,2,8,4,9,5),a=0:7,b=2*(0:7),
+                f=factor(rep(c("lo","hi"),4),levels=c("lo","hi")),
+                g=factor(rep(c("A","B"),each=4)))
+m <- lm(y~a*f,d)
+for (use.na in c(FALSE,TRUE)) {
+    z <- dummy.coef(m,use.na=use.na)
+    cat(class(z), names(z), attr(z,"matrix"), "\n")
+    for (v in z) cat(names(v), v, "\n")
+}
+
+=== case: lm_dummy_factor_interaction ===
+#@ tags: layer2,linmod
+#@ compare: rel=1e-10,abs=1e-12
+d <- data.frame(y=c(3,1,6,2,8,4,9,5),a=0:7,b=2*(0:7),
+                f=factor(rep(c("lo","hi"),4),levels=c("lo","hi")),
+                g=factor(rep(c("A","B"),each=4)))
+m <- lm(y~f*g,d)
+for (use.na in c(FALSE,TRUE)) {
+    z <- dummy.coef(m,use.na=use.na)
+    cat(class(z), names(z), attr(z,"matrix"), "\n")
+    for (v in z) cat(names(v), v, "\n")
+}
+
+=== case: lm_dummy_empty_and_intercept ===
+#@ tags: layer2,linmod
+#@ compare: rel=1e-10,abs=1e-12
+d <- data.frame(y=c(3,1,6,2,8,4,9,5))
+for (f in list(y~1,y~0)) {
+    m <- lm(f,d)
+    for (use.na in c(FALSE,TRUE)) {
+        z <- dummy.coef(m,use.na=use.na)
+        cat(class(z), names(z), attr(z,"matrix"), "\n")
+        for (v in z) cat(names(v), v, "\n")
+    }
+}
+
+=== case: lm_extractors_and_influence ===
+#@ tags: layer2,linmod
+#@ compare: rel=1e-9,abs=1e-12
+d <- data.frame(y=c(3,1,6,2,8,4,9,5),x=0:7,z=2*(0:7),w=c(1,0,2,3,1,4,2,1))
+m <- lm(y~x+z,d,weights=w)
+cat(coef(m), coef(m,complete=FALSE), deviance(m), df.residual(m), sigma(m), nobs(m), weights(m), "\n")
+cat(vcov(m), confint(m), "\n")
+cat(AIC(m), BIC(m), logLik(m), logLik(m,REML=TRUE), attr(logLik(m),"df"), "\n")
+cat(names(hatvalues(m)), hatvalues(m), rstandard(m), rstudent(m), cooks.distance(m), "\n")
+
+=== case: lm_print_anova_and_dummy ===
+#@ tags: layer2,linmod
+#@ compare: exact
+d <- data.frame(y=c(3,1,6,2,8,4,9,5),a=0:7,f=factor(rep(c("lo","hi"),4),levels=c("lo","hi")))
+m <- lm(y~a+f,d)
+print(anova(m))
+print(dummy.coef(m))
+
+=== case: lm_update_and_compare_information_criteria ===
+#@ tags: layer2,linmod
+#@ compare: rel=1e-9,abs=1e-12
+d <- data.frame(y=c(3,1,6,2,8,4,9,5),x=0:7,z=c(0,2,1,3,6,7,4,5))
+small <- lm(y~x,d)
+big <- update(small,.~.+z, model=FALSE)
+cat(coef(big), names(big), names(model.frame(big)), "\n")
+scores <- AIC(small,big,k=3)
+cat(names(scores), rownames(scores), scores$AIC, "\n")
+cat(BIC(small,big)$BIC, "\n")
+cat(class(lm(y~x,d,method="model.frame")), "\n")
