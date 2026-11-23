@@ -1,3 +1,4 @@
+use super::read::{CodecSession, PERSIST};
 use std::collections::HashMap;
 
 use roxide_gc::SexpId;
@@ -21,9 +22,51 @@ pub(super) fn encode(
     limits: &Limits,
     registry: &Registry,
 ) -> WireResult<Vec<u8>> {
+    encode_with_session(
+        &mut CodecSession::Plain(session),
+        value,
+        version,
+        workspace,
+        limits,
+        registry,
+    )
+}
+
+pub(super) fn encode_hook(
+    ctx: &mut roxide_eval::Ctx,
+    value: SexpId,
+    version: u32,
+    limits: &Limits,
+    registry: &Registry,
+    hook: &mut dyn super::PersistHook,
+) -> roxide_eval::EvalResult<Vec<u8>> {
+    ctx.scoped(|ctx| {
+        ctx.protect(value);
+        let mut session = CodecSession::Hook {
+            ctx,
+            hook,
+            error: None,
+        };
+        let result = encode_with_session(&mut session, value, version, false, limits, registry);
+        session.finish(result)
+    })
+}
+
+fn encode_with_session(
+    session: &mut CodecSession<'_, '_>,
+    value: SexpId,
+    version: u32,
+    workspace: bool,
+    limits: &Limits,
+    registry: &Registry,
+) -> WireResult<Vec<u8>> {
+    if !matches!(version, 2 | 3) {
+        return Err(invalid("unsupported serialization version"));
+    }
     let mut writer = Writer {
         bytes: Vec::new(),
         refs: HashMap::new(),
+        reference_count: 0,
         registry,
         version,
         limits,
@@ -50,6 +93,7 @@ pub(super) fn encode(
 struct Writer<'a> {
     bytes: Vec<u8>,
     refs: HashMap<SexpId, u32>,
+    reference_count: u32,
     registry: &'a Registry,
     version: u32,
     limits: &'a Limits,
@@ -93,14 +137,39 @@ impl Writer<'_> {
             }
             Ok(true)
         } else {
-            let index = u32::try_from(self.refs.len() + 1).map_err(invalid)?;
+            let index = self.next_reference()?;
             self.refs.try_reserve(1).map_err(invalid)?;
             self.refs.insert(id, index);
             Ok(false)
         }
     }
 
-    fn item(&mut self, session: &mut RSession, mut id: SexpId, depth: usize) -> WireResult<()> {
+    fn next_reference(&mut self) -> WireResult<u32> {
+        self.reference_count = self
+            .reference_count
+            .checked_add(1)
+            .ok_or_else(|| invalid("serialization reference table exceeds the size limit"))?;
+        Ok(self.reference_count)
+    }
+
+    fn persistent(&mut self, session: &RSession, key: SexpId) -> WireResult<()> {
+        let chars = session.str_slice(key)?;
+        self.next_reference()?;
+        self.word(PERSIST)?;
+        self.word(0)?;
+        self.word(i32::try_from(chars.len()).map_err(invalid)? as u32)?;
+        for &ch in chars {
+            self.character(session, ch)?;
+        }
+        Ok(())
+    }
+
+    fn item(
+        &mut self,
+        session: &mut CodecSession<'_, '_>,
+        mut id: SexpId,
+        depth: usize,
+    ) -> WireResult<()> {
         if depth > self.limits.max_expressions {
             return Err(invalid("serialized object exceeds the nesting limit"));
         }
@@ -119,6 +188,22 @@ impl Writer<'_> {
                 return self.word(singleton);
             }
             let ty = session.type_of(id)?;
+            let registry = self.registry;
+            let registered = if ty == SexpType::Env {
+                registry
+                    .packages
+                    .iter()
+                    .find(|(_, ns, attached)| *ns == id || *attached == Some(id))
+            } else {
+                None
+            };
+            if registered.is_none()
+                && matches!(ty, SexpType::Env | SexpType::ExtPtr | SexpType::WeakRef)
+                && let Some(key) = session.persist(id)?
+            {
+                session.root(key);
+                return self.persistent(session, key);
+            }
             if matches!(ty, SexpType::Sym | SexpType::Env) && self.reference(id)? {
                 return Ok(());
             }
@@ -135,20 +220,19 @@ impl Writer<'_> {
 
             let attrs = session.attrs(id)?;
             if ty == SexpType::Env {
-                for (name, namespace, attached) in &self.registry.packages {
+                if let Some((name, namespace, _)) = registered {
                     if id == *namespace {
                         self.word(NAMESPACE)?;
                         self.word(0)?;
                         self.word(2)?;
                         self.string(name.as_bytes(), Encoding::Native)?;
-                        return self.string(b"4.6.2", Encoding::Native);
+                        let version = namespace_version(session, id)?;
+                        return self.string(version.as_bytes(), Encoding::Native);
                     }
-                    if Some(id) == *attached {
-                        self.word(PACKAGE)?;
-                        self.word(0)?;
-                        self.word(1)?;
-                        return self.string(format!("package:{name}").as_bytes(), Encoding::Native);
-                    }
+                    self.word(PACKAGE)?;
+                    self.word(0)?;
+                    self.word(1)?;
+                    return self.string(format!("package:{name}").as_bytes(), Encoding::Native);
                 }
                 return self.environment(session, id, &attrs, depth + 1);
             }
@@ -198,7 +282,7 @@ impl Writer<'_> {
 
     fn leaf(
         &mut self,
-        session: &mut RSession,
+        session: &mut CodecSession<'_, '_>,
         id: SexpId,
         ty: SexpType,
         flags: u32,
@@ -311,7 +395,7 @@ impl Writer<'_> {
 
     fn attributes(
         &mut self,
-        session: &mut RSession,
+        session: &mut CodecSession<'_, '_>,
         attrs: &[(Sym, SexpId)],
         depth: usize,
     ) -> WireResult<()> {
@@ -325,7 +409,7 @@ impl Writer<'_> {
 
     fn environment(
         &mut self,
-        session: &mut RSession,
+        session: &mut CodecSession<'_, '_>,
         env: SexpId,
         attrs: &[(Sym, SexpId)],
         depth: usize,
@@ -351,7 +435,7 @@ impl Writer<'_> {
 
     fn altrep(
         &mut self,
-        session: &mut RSession,
+        session: &mut CodecSession<'_, '_>,
         class: &str,
         ty: SexpType,
         [len, start, step]: [f64; 3],
@@ -375,6 +459,20 @@ impl Writer<'_> {
         }
         self.word(NIL)
     }
+}
+
+fn namespace_version(session: &mut RSession, env: SexpId) -> WireResult<String> {
+    let info = session.intern(".__NAMESPACE__.")?;
+    let spec = session.intern("spec")?;
+    if let Some(info) = session.env_get(env, info)
+        && let Some(spec) = session.env_get(info.value, spec)
+        && let &[_, version] = session.str_slice(spec.value)?
+    {
+        return Ok(std::str::from_utf8(session.char_bytes(version)?)
+            .map_err(invalid)?
+            .to_owned());
+    }
+    Ok("4.6.2".to_owned())
 }
 
 fn compact<T: Elem>(

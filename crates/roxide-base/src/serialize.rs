@@ -214,11 +214,12 @@ pub fn serialize_bytes(
     version: u32,
     hook: Option<&mut dyn PersistHook>,
 ) -> EvalResult<Vec<u8>> {
-    let _ = hook;
     let limits = limits(ctx);
-    let result = Registry::for_write(ctx).and_then(|registry| {
-        write::encode(ctx.session_mut(), x, version, false, &limits, &registry)
-    });
+    let registry = Registry::for_write(ctx).map_err(|error| ctx.stop(SEXP_NIL, error.0))?;
+    if let Some(hook) = hook {
+        return write::encode_hook(ctx, x, version, &limits, &registry, hook);
+    }
+    let result = write::encode(ctx.session_mut(), x, version, false, &limits, &registry);
     result.map_err(|error| ctx.stop(SEXP_NIL, error.0))
 }
 
@@ -228,9 +229,11 @@ pub fn unserialize_bytes(
     bytes: &[u8],
     hook: Option<&mut dyn PersistHook>,
 ) -> EvalResult<SexpId> {
-    let _ = hook;
     let limits = limits(ctx);
     let registry = Registry::new(ctx);
+    if let Some(hook) = hook {
+        return read::decode_hook(ctx, bytes, &limits, &registry, hook);
+    }
     let result = read::decode(ctx.session_mut(), bytes, false, &limits, &registry);
     result.map_err(|error| ctx.stop(SEXP_NIL, error.0))
 }

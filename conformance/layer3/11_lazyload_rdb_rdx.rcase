@@ -1,0 +1,45 @@
+=== case: lazy_load_raw_records_and_selection ===
+#@ tags: layer3,lazy-load
+#@ compare: exact
+p <- file.path(tempdir(), "database")
+a <- serialize(6L, NULL, version = 2)
+b <- serialize(quote(x + 1L), NULL, version = 2)
+writeBin(c(a, b), paste0(p, ".rdb"))
+ka <- c(0L, length(a))
+kb <- c(length(a), length(b))
+saveRDS(list(variables = list(a = ka, b = kb),
+             references = list(), compressed = FALSE), paste0(p, ".rdx"))
+e <- new.env()
+lazyLoad(p, e, function(names) names == "b")
+dput(ls(e))
+x <- 9L
+dput(eval(e$b))
+dput(lazyLoadDBfetch(ka, paste0(p, ".rdb"), FALSE, function(key) key))
+dput(lazyLoadDBexec(p, function(frame) frame$vars, function(names) names != "b"))
+
+=== case: persistent_environment_with_separate_lazy_binding ===
+#@ tags: layer3,lazy-load
+#@ compare: exact
+p <- file.path(tempdir(), "persistent")
+xdr <- function(x) serialize(x, NULL, version = 2)
+header <- xdr(NULL)[1L:14L]
+persist <- c(header, as.raw(c(0L, 0L, 0L, 247L, 0L, 0L, 0L, 0L,
+                             0L, 0L, 0L, 1L, 0L, 4L, 0L, 9L,
+                             0L, 0L, 0L, 6L)), charToRaw("env::1"))
+desc <- xdr(list(bindings = list(value = 7L), enclos = baseenv(),
+                 attributes = list(label = "env"), isS4 = FALSE, locked = TRUE))
+binding <- xdr(11L)
+writeBin(c(persist, desc, binding), paste0(p, ".rdb"))
+variable <- c(0L, length(persist))
+ref <- list(eagerKey = c(length(persist), length(desc)),
+            lazyKeys = list(later = c(length(persist) + length(desc), length(binding))))
+saveRDS(list(variables = list(a = variable, b = variable),
+             references = list("env::1" = ref), compressed = FALSE), paste0(p, ".rdx"))
+target <- new.env()
+invisible(lazyLoad(p, target))
+a <- target$a
+dput(c(identical(a, target$b), environmentIsLocked(a), bindingIsLocked("value", a)))
+dput(a$later)
+dput(attr(a, "label"))
+a$value <- 12L
+dput(target$b$value)

@@ -97,6 +97,16 @@ fn load_new(
         return Err(ctx.stop(call, format!("package ‘{name}’ has an invalid DESCRIPTION")));
     }
     version_check(ctx, name, &description.version, check, false)?;
+    let filebase = path.join("R").join(name);
+    let [index, data] = [".rdx", ".rdb"].map(|suffix| {
+        ctx.host()
+            .metadata(&path.join("R").join(format!("{name}{suffix}")), true)
+            .is_ok_and(|meta| meta.is_file)
+    });
+    if index != data {
+        return Err(ctx.stop(call, "incomplete package lazy-load database"));
+    }
+    let installed = index;
     let cached = path.join("Meta/nsInfo.rds");
     let spec = if ctx
         .host()
@@ -114,20 +124,12 @@ fn load_new(
     for dependency in description.depends.iter().filter(|dep| dep.package == "R") {
         crate::library::check_dependency(ctx, dependency, crate::library::R_VERSION)?;
     }
-    source(ctx, name, &path, &description.collate, ns)?;
-    if partial {
-        return Ok(ns);
+    if !installed {
+        source(ctx, name, &path, &description.collate, ns)?;
+        if partial {
+            return Ok(ns);
+        }
     }
-    if let Some(methods) = ctx.ns_lookup("methods")
-        && let Some(cache) = local(ctx, methods, ".rx_cacheMetaData")?
-    {
-        ctx.apply(cache, &[(None, ns)], SEXP_NIL, methods)?;
-    }
-    let dynlibs = spec.dynlib_names(ctx)?;
-    define(ctx, info, "dynlibs", dynlibs)?;
-    let native = spec.native_routines(ctx)?;
-    define(ctx, info, "nativeRoutines", native)?;
-    let registrations = crate::s3reg::resolve(ctx, ns, &spec)?;
     let record = NsRecord {
         name: name.to_owned(),
         ns,
@@ -137,7 +139,28 @@ fn load_new(
         builtin: false,
     };
     let result = (|| {
-        ctx.ns_register(record)?;
+        if installed {
+            // The byte stream can refer to the namespace that owns it.
+            ctx.ns_register(record.clone())?;
+            crate::lazyload::load_namespace_db(ctx, &filebase, ns)?;
+            if partial {
+                ctx.ns_unregister(name);
+                return Ok(ns);
+            }
+        }
+        if let Some(methods) = ctx.ns_lookup("methods")
+            && let Some(cache) = local(ctx, methods, ".rx_cacheMetaData")?
+        {
+            ctx.apply(cache, &[(None, ns)], SEXP_NIL, methods)?;
+        }
+        let dynlibs = spec.dynlib_names(ctx)?;
+        define(ctx, info, "dynlibs", dynlibs)?;
+        let native = spec.native_routines(ctx)?;
+        define(ctx, info, "nativeRoutines", native)?;
+        let registrations = crate::s3reg::resolve(ctx, ns, &spec)?;
+        if !installed {
+            ctx.ns_register(record)?;
+        }
         crate::s3reg::install(ctx, registrations)?;
         call_hook(
             ctx,
@@ -161,6 +184,33 @@ fn load_new(
     result
 }
 
+pub(crate) fn build_namespace(
+    ctx: &mut Ctx,
+    path: &Path,
+    description: &Description,
+    paths: &[PathBuf],
+) -> EvalResult<SexpId> {
+    let name = &description.package;
+    let spec = NsSpec::read(ctx, &path.join("NAMESPACE"))?;
+    let (ns, imports) = ctx.ns_create(name, &description.version, Some(&path.to_string_lossy()))?;
+    ctx.protect(ns);
+    let info = namespace_info(ctx, ns)?;
+    imports::populate(ctx, info, imports, &spec, paths, &description.imports)?;
+    for dependency in description.depends.iter().filter(|dep| dep.package == "R") {
+        crate::library::check_dependency(ctx, dependency, crate::library::R_VERSION)?;
+    }
+    source_files(ctx, path, &description.collate, ns)?;
+    ctx.ns_register(NsRecord {
+        name: name.clone(),
+        ns,
+        imports,
+        attached: None,
+        path: Some(path.to_path_buf()),
+        builtin: false,
+    })?;
+    Ok(ns)
+}
+
 fn source(
     ctx: &mut Ctx,
     name: &str,
@@ -177,6 +227,11 @@ fn source(
     {
         return source_file(ctx, &installed, ns);
     }
+    source_files(ctx, path, collate, ns)
+}
+
+fn source_files(ctx: &mut Ctx, path: &Path, collate: &[String], ns: SexpId) -> EvalResult<()> {
+    let directory = path.join("R");
     if !collate.is_empty() {
         for name in collate {
             source_file(ctx, &directory.join(name), ns)?;

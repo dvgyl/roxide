@@ -1,0 +1,48 @@
+=== case: install_and_load_pure_r_package ===
+#@ tags: layer3,package-install
+#@ compare: exact
+src <- file.path(tempdir(), "roxinstall")
+lib <- file.path(tempdir(), "lib")
+dir.create(file.path(src, "R"), recursive = TRUE)
+dir.create(lib)
+writeLines(c("Package: roxinstall", "Version: 1.0", "Title: Install Probe",
+             "Description: Exercise package installation.",
+             "Author: Roxide Test Team", "Maintainer: Test Team <example@example.org>",
+             "License: MIT", "Collate: 'z.R' 'a.R'"), file.path(src, "DESCRIPTION"))
+writeLines("export(answer)", file.path(src, "NAMESPACE"))
+writeLines("start <- 7L", file.path(src, "R", "z.R"))
+writeLines("answer <- local({ n <- start; function(x) n + x })", file.path(src, "R", "a.R"))
+command <- file.path(R.home("bin"), "R")
+args <- c("CMD", "INSTALL", "--no-byte-compile", "--no-docs", "-l",
+          paste0("'", gsub("'", "'\"'\"'", c(lib, src), fixed = TRUE), "'"))
+oracle <- Sys.getenv("ROXIDE_ORACLE_R")
+if (!is.null(R.version$nickname) && nzchar(oracle)) {
+    # The local oracle wrapper starts the R executable directly.
+    command <- oracle
+    bootstrap <- paste(
+        "install <- tools:::.install_packages",
+        "home <- tempfile(); dir.create(home); dir.create(file.path(home, 'bin'))",
+        "paths <- list.files(R.home(), full.names = TRUE)",
+        "paths <- paths[basename(paths) != 'bin']",
+        "stopifnot(all(file.symlink(paths, file.path(home, basename(paths)))))",
+        "bin <- list.files(R.home('bin'), full.names = TRUE)",
+        "bin <- bin[basename(bin) != 'R']",
+        "stopifnot(all(file.symlink(bin, file.path(home, 'bin', basename(bin)))))",
+        "wrapper <- file.path(home, 'bin', 'R')",
+        "line <- paste('exec', shQuote(Sys.getenv('ROXIDE_ORACLE_R')), '\"$@\"')",
+        "writeLines(c('#!/bin/sh', line), wrapper)",
+        "Sys.chmod(wrapper, '0755')",
+        "Sys.setenv(R_HOME = home)",
+        "install(args = commandArgs(TRUE))", sep = "; ")
+    args <- c("--vanilla", "--slave", "-e", shQuote(bootstrap),
+              "--args", args[-c(1L, 2L)])
+} else if (!file.exists(command) && is.null(R.version$nickname)) {
+    command <- file.path(getwd(), "target", "debug", "roxide")
+}
+status <- system2(command, args, stdout = TRUE, stderr = TRUE)
+stopifnot(is.null(attr(status, "status")))
+ns <- loadNamespace("roxinstall", lib.loc = lib)
+dput(getExportedValue("roxinstall", "answer")(5L))
+r <- file.path(lib, "roxinstall", "R", "roxinstall")
+dput(file.exists(paste0(r, ".rdb"), paste0(r, ".rdx")))
+dput(file.exists(file.path(lib, "00LOCK-roxinstall")))

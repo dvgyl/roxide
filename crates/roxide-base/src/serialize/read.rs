@@ -13,8 +13,31 @@ use super::{
     MISSING, NAMESPACE, NIL, PACKAGE, REF, Registry, S4, TAG, UNBOUND, UTF8, WireResult, invalid,
 };
 
+pub(super) const PERSIST: u32 = 247;
+const BCODE: u32 = 21;
+const BCREPREF: u32 = 243;
+const BCREPDEF: u32 = 244;
+const ATTRLANG: u32 = 240;
+const ATTRLIST: u32 = 239;
+
 pub(super) fn decode(
     session: &mut RSession,
+    bytes: &[u8],
+    workspace: bool,
+    limits: &Limits,
+    registry: &Registry,
+) -> WireResult<SexpId> {
+    decode_bytes(
+        &mut CodecSession::Plain(session),
+        bytes,
+        workspace,
+        limits,
+        registry,
+    )
+}
+
+fn decode_bytes(
+    session: &mut CodecSession<'_, '_>,
     bytes: &[u8],
     workspace: bool,
     limits: &Limits,
@@ -33,11 +56,17 @@ pub(super) fn decode_stream(
     limits: &Limits,
     registry: &Registry,
 ) -> WireResult<SexpId> {
-    decode_from(session, Input::Stream(input), workspace, limits, registry)
+    decode_from(
+        &mut CodecSession::Plain(session),
+        Input::Stream(input),
+        workspace,
+        limits,
+        registry,
+    )
 }
 
 fn decode_from(
-    session: &mut RSession,
+    session: &mut CodecSession<'_, '_>,
     input: Input<'_>,
     workspace: bool,
     limits: &Limits,
@@ -213,10 +242,12 @@ impl Reader<'_, '_> {
         Ok(())
     }
 
-    fn item(&mut self, session: &mut RSession, depth: usize) -> WireResult<SexpId> {
+    fn item(&mut self, session: &mut CodecSession<'_, '_>, depth: usize) -> WireResult<SexpId> {
         self.check_depth(depth)?;
         let flags = self.word()?;
-        self.item_with_flags(session, flags, depth + 1)
+        let value = self.item_with_flags(session, flags, depth + 1)?;
+        session.root(value);
+        Ok(value)
     }
 
     fn check_depth(&self, depth: usize) -> WireResult<()> {
@@ -241,7 +272,7 @@ impl Reader<'_, '_> {
 
     fn item_with_flags(
         &mut self,
-        session: &mut RSession,
+        session: &mut CodecSession<'_, '_>,
         flags: u32,
         depth: usize,
     ) -> WireResult<SexpId> {
@@ -323,21 +354,45 @@ impl Reader<'_, '_> {
                 }
                 session.alloc_expr_from(&exprs)?
             }
-            21 => return self.bytecode(session, depth),
+            BCODE => return self.bytecode(session, depth),
             24 => {
                 let len = self.vector_len::<u8>(1)?;
                 session.alloc_raw_from(self.take(len)?)?
+            }
+            PERSIST => {
+                if self.word()? != 0 {
+                    return Err(invalid("invalid persistent reference header"));
+                }
+                let count = self.vector_len::<CharId>(8)?;
+                let mut chars = Vec::new();
+                self.reserve_vector(&mut chars, count)?;
+                for _ in 0..count {
+                    let ch = self.read_char(session, depth)?;
+                    session.root(ch.as_sexp());
+                    chars.try_reserve(1).map_err(invalid)?;
+                    chars.push(ch);
+                }
+                let key = session.alloc_str_from(&chars)?;
+                session.root(key);
+                let value = session.restore(key)?;
+                self.reference(value)?;
+                return Ok(value);
             }
             NAMESPACE | PACKAGE => return self.named_environment(session, ty, depth),
             ALTREP if self.version == 3 => return self.altrep(session, flags, depth),
             _ => return Err(invalid(format!("unsupported serialized R type {ty}"))),
         };
+        session.root(value);
         let attrs = self.optional_attributes(session, flags, depth)?;
         apply_attributes(session, value, attrs, flags)?;
         Ok(value)
     }
 
-    fn read_char(&mut self, session: &mut RSession, depth: usize) -> WireResult<CharId> {
+    fn read_char(
+        &mut self,
+        session: &mut CodecSession<'_, '_>,
+        depth: usize,
+    ) -> WireResult<CharId> {
         let flags = self.word()?;
         if flags & 0xff != SexpType::Char as u32 {
             return Err(invalid("invalid serialized character element"));
@@ -347,7 +402,7 @@ impl Reader<'_, '_> {
 
     fn character(
         &mut self,
-        session: &mut RSession,
+        session: &mut CodecSession<'_, '_>,
         flags: u32,
         depth: usize,
     ) -> WireResult<CharId> {
@@ -374,13 +429,14 @@ impl Reader<'_, '_> {
             };
             session.mk_char(bytes, encoding)?
         };
+        session.root(ch.as_sexp());
         self.optional_attributes(session, flags, depth)?;
         Ok(ch)
     }
 
     fn optional_attributes(
         &mut self,
-        session: &mut RSession,
+        session: &mut CodecSession<'_, '_>,
         flags: u32,
         depth: usize,
     ) -> WireResult<SexpId> {
@@ -393,7 +449,7 @@ impl Reader<'_, '_> {
 
     fn cons_chain(
         &mut self,
-        session: &mut RSession,
+        session: &mut CodecSession<'_, '_>,
         mut flags: u32,
         depth: usize,
     ) -> WireResult<SexpId> {
@@ -416,6 +472,7 @@ impl Reader<'_, '_> {
             flags = self.word()?;
         }
         let mut tail = self.item_with_flags(session, flags, depth)?;
+        session.root(tail);
         for (flags, attrs, tag, car) in cells.into_iter().rev() {
             self.check_heap(session)?;
             tail = match flags & 0xff {
@@ -432,7 +489,12 @@ impl Reader<'_, '_> {
         Ok(tail)
     }
 
-    fn function(&mut self, session: &mut RSession, flags: u32, depth: usize) -> WireResult<SexpId> {
+    fn function(
+        &mut self,
+        session: &mut CodecSession<'_, '_>,
+        flags: u32,
+        depth: usize,
+    ) -> WireResult<SexpId> {
         let attrs = self.optional_attributes(session, flags, depth)?;
         let env = if flags & TAG != 0 {
             self.item(session, depth)?
@@ -462,8 +524,13 @@ impl Reader<'_, '_> {
         Ok(value)
     }
 
-    fn environment(&mut self, session: &mut RSession, depth: usize) -> WireResult<SexpId> {
+    fn environment(
+        &mut self,
+        session: &mut CodecSession<'_, '_>,
+        depth: usize,
+    ) -> WireResult<SexpId> {
         let env = session.alloc_env(EMPTY_ENV)?;
+        session.root(env);
         self.reference(env)?;
         let locked = match self.word()? {
             0 => false,
@@ -498,7 +565,7 @@ impl Reader<'_, '_> {
 
     fn define_frame(
         &mut self,
-        session: &mut RSession,
+        session: &mut CodecSession<'_, '_>,
         env: SexpId,
         mut frame: SexpId,
     ) -> WireResult<()> {
@@ -538,7 +605,7 @@ impl Reader<'_, '_> {
 
     fn named_environment(
         &mut self,
-        session: &mut RSession,
+        session: &mut CodecSession<'_, '_>,
         ty: u32,
         depth: usize,
     ) -> WireResult<SexpId> {
@@ -584,7 +651,7 @@ impl Reader<'_, '_> {
         Ok(env)
     }
 
-    fn primitive(&mut self, session: &mut RSession, ty: u32) -> WireResult<SexpId> {
+    fn primitive(&mut self, session: &mut CodecSession<'_, '_>, ty: u32) -> WireResult<SexpId> {
         let len = self.vector_len::<u8>(1)?;
         let name = std::str::from_utf8(self.take(len)?).map_err(invalid)?;
         let sym = session.intern(name)?;
@@ -601,7 +668,12 @@ impl Reader<'_, '_> {
         Err(invalid(format!("unknown serialized primitive '{name}'")))
     }
 
-    fn altrep(&mut self, session: &mut RSession, flags: u32, depth: usize) -> WireResult<SexpId> {
+    fn altrep(
+        &mut self,
+        session: &mut CodecSession<'_, '_>,
+        flags: u32,
+        depth: usize,
+    ) -> WireResult<SexpId> {
         let class = self.item(session, depth)?;
         let state = self.item(session, depth)?;
         let attrs = self.item(session, depth)?;
@@ -648,7 +720,7 @@ impl Reader<'_, '_> {
         Ok(value)
     }
 
-    fn bytecode(&mut self, session: &mut RSession, depth: usize) -> WireResult<SexpId> {
+    fn bytecode(&mut self, session: &mut CodecSession<'_, '_>, depth: usize) -> WireResult<SexpId> {
         let count = self.vector_len::<Option<SexpId>>(1)?;
         let mut refs = Vec::new();
         refs.try_reserve_exact(count).map_err(invalid)?;
@@ -658,7 +730,7 @@ impl Reader<'_, '_> {
 
     fn bytecode_body(
         &mut self,
-        session: &mut RSession,
+        session: &mut CodecSession<'_, '_>,
         refs: &mut [Option<SexpId>],
         depth: usize,
     ) -> WireResult<SexpId> {
@@ -667,69 +739,98 @@ impl Reader<'_, '_> {
         if session.type_of(code)? != SexpType::Int {
             return Err(invalid("invalid serialized bytecode instructions"));
         }
-        let count = self.vector_len::<SexpId>(4)?;
+        let count = self.vector_len::<SexpId>(8)?;
         if count == 0 {
             return Err(invalid("serialized bytecode has no source expression"));
         }
         // The first constant is the source expression. Read the rest to keep the reference table in order.
-        let source = self.bytecode_constant(session, refs, depth + 1)?;
+        let marker = self.word()?;
+        let source = self.bytecode_constant(session, refs, marker, depth + 1)?;
         for _ in 1..count {
-            self.bytecode_constant(session, refs, depth + 1)?;
+            let marker = self.word()?;
+            self.bytecode_constant(session, refs, marker, depth + 1)?;
         }
         Ok(source)
     }
 
     fn bytecode_constant(
         &mut self,
-        session: &mut RSession,
+        session: &mut CodecSession<'_, '_>,
+        refs: &mut [Option<SexpId>],
+        kind: u32,
+        depth: usize,
+    ) -> WireResult<SexpId> {
+        match kind {
+            BCODE => self.bytecode_body(session, refs, depth),
+            2 | 6 | ATTRLIST | ATTRLANG | BCREPREF | BCREPDEF => {
+                self.bytecode_node(session, refs, kind, depth)
+            }
+            _ => self.item(session, depth),
+        }
+    }
+
+    fn bytecode_child(
+        &mut self,
+        session: &mut CodecSession<'_, '_>,
         refs: &mut [Option<SexpId>],
         depth: usize,
     ) -> WireResult<SexpId> {
+        match self.word()? {
+            0 => self.item(session, depth),
+            kind => self.bytecode_node(session, refs, kind, depth),
+        }
+    }
+
+    fn bytecode_node(
+        &mut self,
+        session: &mut CodecSession<'_, '_>,
+        refs: &mut [Option<SexpId>],
+        kind: u32,
+        depth: usize,
+    ) -> WireResult<SexpId> {
         self.check_depth(depth)?;
-        let kind = self.word()?;
-        let (kind, index) = match kind {
-            243 => {
-                let i = self.word()? as usize;
-                return refs
-                    .get(i)
-                    .copied()
-                    .flatten()
-                    .ok_or_else(|| invalid("invalid bytecode reference"));
-            }
-            244 => {
-                let i = self.word()? as usize;
-                if !matches!(refs.get(i), Some(None)) {
+        self.check_heap(session)?;
+        match kind {
+            BCREPREF => refs
+                .get(self.word()? as usize)
+                .copied()
+                .flatten()
+                .filter(|&value| value != SEXP_NIL)
+                .ok_or_else(|| invalid("invalid or cyclic bytecode repetition reference")),
+            BCREPDEF => {
+                let index = self.word()? as usize;
+                if !matches!(refs.get(index), Some(None)) {
                     return Err(invalid("invalid bytecode repetition index"));
                 }
-                (self.word()?, Some(i))
+                let kind = self.word()?;
+                if !matches!(kind, 2 | 6 | ATTRLIST | ATTRLANG) {
+                    return Err(invalid("invalid bytecode repetition node"));
+                }
+                refs[index] = Some(SEXP_NIL);
+                let value = self.bytecode_node(session, refs, kind, depth + 1)?;
+                refs[index] = Some(value);
+                Ok(value)
             }
-            _ => (kind, None),
-        };
-        let value = match kind {
-            21 => self.bytecode_body(session, refs, depth + 1)?,
-            2 | 6 | 239 | 240 => {
-                let attrs = if matches!(kind, 239 | 240) {
+            2 | 6 | ATTRLIST | ATTRLANG => {
+                let attrs = if matches!(kind, ATTRLIST | ATTRLANG) {
                     self.item(session, depth + 1)?
                 } else {
                     SEXP_NIL
                 };
                 let tag = self.item(session, depth + 1)?;
-                let car = self.bytecode_constant(session, refs, depth + 1)?;
-                let tail = self.bytecode_constant(session, refs, depth + 1)?;
-                let value = if matches!(kind, 6 | 240) {
+                let car = self.bytecode_child(session, refs, depth + 1)?;
+                let tail = self.bytecode_child(session, refs, depth + 1)?;
+                let value = if matches!(kind, 6 | ATTRLANG) {
                     session.lcons(car, tail, tag)?
                 } else {
                     session.cons(car, tail, tag)?
                 };
+                session.root(value);
                 apply_attributes(session, value, attrs, 0)?;
-                value
+                Ok(value)
             }
-            _ => self.item(session, depth + 1)?,
-        };
-        if let Some(i) = index {
-            refs[i] = Some(value);
+            _ => Err(invalid("invalid bytecode child marker")),
         }
-        Ok(value)
     }
 }
 
@@ -813,4 +914,92 @@ fn apply_attributes(
 
 fn truncated() -> super::CodecError {
     invalid("truncated XDR stream")
+}
+
+// Keep the stream decoder usable by connections, which lend only an RSession.
+pub(super) enum CodecSession<'a, 'h> {
+    Plain(&'a mut RSession),
+    Hook {
+        ctx: &'a mut roxide_eval::Ctx,
+        hook: &'h mut dyn super::PersistHook,
+        error: Option<roxide_eval::Unwind>,
+    },
+}
+
+impl std::ops::Deref for CodecSession<'_, '_> {
+    type Target = RSession;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Plain(session) => session,
+            Self::Hook { ctx, .. } => ctx.session(),
+        }
+    }
+}
+
+impl std::ops::DerefMut for CodecSession<'_, '_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match self {
+            Self::Plain(session) => session,
+            Self::Hook { ctx, .. } => ctx.session_mut(),
+        }
+    }
+}
+
+impl CodecSession<'_, '_> {
+    pub(super) fn root(&mut self, value: SexpId) {
+        if let Self::Hook { ctx, .. } = self {
+            ctx.protect(value);
+        }
+    }
+
+    fn restore(&mut self, key: SexpId) -> WireResult<SexpId> {
+        let Self::Hook { ctx, hook, error } = self else {
+            return Err(invalid("persistent reference requires a hook"));
+        };
+        hook.read(ctx, key).map_err(|unwind| {
+            *error = Some(unwind);
+            invalid("persistent reference hook failed")
+        })
+    }
+
+    pub(super) fn persist(&mut self, value: SexpId) -> WireResult<Option<SexpId>> {
+        let Self::Hook { ctx, hook, error } = self else {
+            return Ok(None);
+        };
+        hook.write(ctx, value).map_err(|unwind| {
+            *error = Some(unwind);
+            invalid("persistent reference hook failed")
+        })
+    }
+
+    pub(super) fn finish<T>(&mut self, result: WireResult<T>) -> roxide_eval::EvalResult<T> {
+        let Self::Hook { ctx, error, .. } = self else {
+            return result.map_err(|error| {
+                roxide_eval::Unwind::Internal(roxide_eval::InternalError { message: error.0 })
+            });
+        };
+        if let Some(error) = error.take() {
+            return Err(error);
+        }
+        result.map_err(|error| ctx.stop(SEXP_NIL, error.0))
+    }
+}
+
+pub(super) fn decode_hook(
+    ctx: &mut roxide_eval::Ctx,
+    bytes: &[u8],
+    limits: &Limits,
+    registry: &Registry,
+    hook: &mut dyn super::PersistHook,
+) -> roxide_eval::EvalResult {
+    ctx.scoped(|ctx| {
+        let mut session = CodecSession::Hook {
+            ctx,
+            hook,
+            error: None,
+        };
+        let result = decode_bytes(&mut session, bytes, false, limits, registry);
+        session.finish(result)
+    })
 }
