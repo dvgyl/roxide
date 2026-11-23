@@ -21,8 +21,8 @@ y <- withCallingHandlers(choose(x, c(1, 0)), warning = function(w) {
     warnings <<- c(warnings, conditionMessage(w))
     invokeRestart("muffleWarning")
 })
-if (!identical(warnings, "longer object length is not a multiple of shorter object length"))
-    stop("Partial recycling must emit one warning")
+if (length(warnings) != 0L)
+    stop("GNU R recycles special-function lengths silently without warning")
 if (!identical(y, structure(c(1, 1, 3), names = names(x))))
     stop("The result must use the attributes of the longer input")
 y <- withCallingHandlers(

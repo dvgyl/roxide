@@ -287,12 +287,6 @@ fn evaluate(ctx: &mut Ctx, call: &Call, args: &Args, op: Operation) -> EvalResul
         lengths[0].max(lengths[1]).max(lengths[2])
     };
     vector_limit(ctx, call, len, size_of::<f64>())?;
-    if len != 0 && lengths.iter().any(|&n| len % n != 0) {
-        ctx.warn_now(
-            call.err_call(),
-            "longer object length is not a multiple of shorter object length",
-        )?;
-    }
     let mut values = Vec::with_capacity(len);
     let mut nan_produced = false;
     for i in 0..len {
