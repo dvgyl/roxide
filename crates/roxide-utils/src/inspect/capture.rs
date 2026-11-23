@@ -109,8 +109,8 @@ fn collect(
         env: caller,
         ..*call
     };
-    let (result, data) = ctx.capture_streams(!messages, messages, split, |ctx| {
-        let result = ctx.scoped(|ctx| {
+    let evaluate = |ctx: &mut Ctx| {
+        ctx.scoped(|ctx| {
             let mut pending = dots;
             while pending != SEXP_NIL && pending != SEXP_MISSING {
                 let (expr, next, _) = ctx.session().cons_parts(pending)?;
@@ -122,26 +122,35 @@ fn collect(
                 pending = next;
             }
             Ok(SEXP_NIL)
-        });
-        Ok(result)
-    })?;
+        })
+    };
     if dest != SEXP_NIL {
-        ctx.protect_eval_result(&result);
-        let s = ctx.session_mut();
-        let text = s.mk_char(&data, Encoding::Bytes)?;
-        let payload = s.alloc_str_from(&[text])?;
-        ctx.protect(payload);
-        let separator = ctx.session_mut().scalar_str("")?;
-        let written = base_call(
-            ctx,
-            call,
-            "writeLines",
-            &[payload, dest, separator, TRUE_SCALAR],
+        let call = *call;
+        let split = split && ctx.session().int(dest)?.get(0) != 1;
+        return ctx.capture_streams_to(
+            !messages,
+            messages,
+            split,
+            move |ctx, data| {
+                ctx.scoped(|ctx| {
+                    let s = ctx.session_mut();
+                    let text = s.mk_char(data, Encoding::Bytes)?;
+                    let payload = s.alloc_str_from(&[text])?;
+                    ctx.protect(payload);
+                    let separator = ctx.session_mut().scalar_str("")?;
+                    base_call(
+                        ctx,
+                        &call,
+                        "writeLines",
+                        &[payload, dest, separator, TRUE_SCALAR],
+                    )?;
+                    Ok(())
+                })
+            },
+            evaluate,
         );
-        result.and(written)?;
-        return Ok(SEXP_NIL);
     }
-    result?;
+    let (_, data) = ctx.capture_streams(!messages, messages, split, evaluate)?;
     let lines = data.split_inclusive(|&byte| byte == b'\n').map(|line| {
         let line = line.strip_suffix(b"\n").unwrap_or(line);
         line.strip_suffix(b"\r").unwrap_or(line)

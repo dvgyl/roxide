@@ -18,6 +18,15 @@ pub(crate) enum ArgInput<'a> {
 }
 
 impl Ctx {
+    /// List registered package namespaces and their attached environments.
+    pub fn package_environments(
+        &self,
+    ) -> impl Iterator<Item = (&'static str, SexpId, Option<SexpId>)> + '_ {
+        self.packages
+            .iter()
+            .map(|pkg| (pkg.name, pkg.namespace, pkg.attached))
+    }
+
     /// Evaluate an R expression `expr` in environment `env`.
     pub fn eval(&mut self, expr: SexpId, env: SexpId) -> EvalResult {
         let marker = 0_u8;
@@ -543,7 +552,11 @@ impl Ctx {
         if dispatch && let Some(result) = self.dispatch_primitive(def, call, args, raw)? {
             return Ok(result);
         }
-        let result = (def.fun)(self, &call, args)?;
+        let result = if self.has_stream_sink() {
+            self.invoke_streaming_primitive(def.fun, &call, args)
+        } else {
+            (def.fun)(self, &call, args)
+        }?;
         let result = self.preserve_group_attributes(def, args, result)?;
         self.visible = match def.visibility {
             Visibility::On => true,

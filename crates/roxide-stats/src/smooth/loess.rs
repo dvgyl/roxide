@@ -1,8 +1,8 @@
 use super::{list, median, reals};
-use crate::distn::support::{limit, numbers};
+use crate::distn::support::{attr, limit, numbers};
 use roxide_eval::{Args, Call, Ctx, EvalResult};
 use roxide_math::{MatRef, linalg::spectral::svd};
-use roxide_value::{NA_REAL, SEXP_NIL, ValueApi};
+use roxide_value::{FALSE_SCALAR, NA_INTEGER, NA_REAL, SEXP_NIL, TRUE_SCALAR, ValueApi};
 use std::collections::BTreeMap;
 
 type Point = [f64; 4];
@@ -17,6 +17,7 @@ struct Model {
     parametric: Vec<bool>,
     terms: Vec<(usize, usize)>,
     stats: usize,
+    approximate_trace: bool,
     iterations: usize,
     interpolate: bool,
     normalize: bool,
@@ -34,7 +35,7 @@ impl Model {
             || y.is_empty()
             || x.len() != y.len() * d
             || weights.len() != y.len()
-            || options.len() != 8 + 2 * d
+            || options.len() != 9 + 2 * d
             || !x.iter().chain(&y).all(|x| x.is_finite())
             || !weights.iter().all(|w| w.is_finite() && *w >= 0.0)
             || options[1] < 0.0
@@ -49,8 +50,8 @@ impl Model {
         }
         limit::<Point>(ctx, call, y.len())?;
         let degree = options[1] as usize;
-        let parametric: Vec<_> = options[8..8 + d].iter().map(|x| *x != 0.0).collect();
-        let drop_square: Vec<_> = options[8 + d..].iter().map(|x| *x != 0.0).collect();
+        let parametric: Vec<_> = options[9..9 + d].iter().map(|x| *x != 0.0).collect();
+        let drop_square: Vec<_> = options[9 + d..].iter().map(|x| *x != 0.0).collect();
         let terms = if degree < 2 {
             Vec::new()
         } else {
@@ -76,6 +77,7 @@ impl Model {
             degree,
             span: options[2],
             stats: options[3] as usize,
+            approximate_trace: options[5] != 0.0 && options[8] != 0.0,
             iterations: options[4] as usize,
             interpolate: options[5] != 0.0,
             normalize: options[6] != 0.0,
@@ -206,7 +208,9 @@ fn corners(lo: Point, hi: Point, d: usize) -> impl Iterator<Item = Point> {
 }
 
 impl Tree {
-    fn new(m: &Model) -> Self {
+    fn new(ctx: &mut Ctx, call: &Call, m: &Model) -> EvalResult<Self> {
+        limit::<Cell>(ctx, call, 1)?;
+        limit::<Point>(ctx, call, 1 << m.d)?;
         let mut lo = [0.0; 4];
         let mut hi = [0.0; 4];
         for j in 0..m.d {
@@ -284,9 +288,14 @@ impl Tree {
             left.hi[axis] = split;
             right.lo[axis] = split;
             let child = tree.cells.len();
+            limit::<Cell>(ctx, call, child.saturating_add(2))?;
             tree.cells[index].split = Some((axis, split, child));
             for v in corners(left.lo, left.hi, m.d).filter(|v| v[axis] == split) {
-                if seen.insert(v.map(f64::to_bits), ()).is_none() {
+                if let std::collections::btree_map::Entry::Vacant(entry) =
+                    seen.entry(v.map(f64::to_bits))
+                {
+                    limit::<Point>(ctx, call, tree.vertices.len().saturating_add(1))?;
+                    entry.insert(());
                     tree.vertices.push(v);
                 }
             }
@@ -294,7 +303,7 @@ impl Tree {
             let rest = rows.split_off(cut);
             groups.extend([(child, rows), (child + 1, rest)]);
         }
-        tree
+        Ok(tree)
     }
 }
 
@@ -415,14 +424,16 @@ fn dot(x: &[f64], y: &[f64]) -> f64 {
     x.iter().zip(y).map(|(x, y)| x * y).sum()
 }
 
-fn kd(ctx: &mut Ctx, m: &Model, tree: Option<&Tree>, robust: &[f64]) -> EvalResult {
+fn kd(ctx: &mut Ctx, call: &Call, m: &Model, tree: Option<&Tree>, robust: &[f64]) -> EvalResult {
     let Some(tree) = tree else {
         return Ok(SEXP_NIL);
     };
     let vertices = 1 << m.d;
     let lv = 200.max(m.x.len());
     let mut buffer = vec![0.0; m.x.len()];
-    let mut vval = Vec::with_capacity(tree.vertices.len() * (1 + m.d));
+    let count = tree.vertices.len().saturating_mul(1 + m.d);
+    limit::<f64>(ctx, call, count)?;
+    let mut vval = Vec::with_capacity(count);
     for &q in &tree.vertices {
         for i in 0..=m.d {
             let mut component = [0.0; 5];
@@ -468,17 +479,107 @@ fn kd(ctx: &mut Ctx, m: &Model, tree: Option<&Tree>, robust: &[f64]) -> EvalResu
     list(ctx, &[parameter, a, xi, vert, vval])
 }
 
-fn residual_scale(residuals: &[f64], weights: &[f64]) -> f64 {
-    let mut absolute: Vec<_> = residuals
-        .iter()
-        .zip(weights)
-        .map(|(e, w)| e.abs() * w.sqrt())
-        .collect();
+fn residual_scale(residuals: &[f64]) -> f64 {
+    let mut absolute: Vec<_> = residuals.iter().map(|e| e.abs()).collect();
     6.0 * median(&mut absolute)
 }
 
 fn weighted_squares(x: &[f64], weights: &[f64]) -> f64 {
     x.iter().zip(weights).map(|(v, w)| w * v * v).sum()
+}
+
+// Cleveland and Grosse (1991), section 4. The curve and coefficients come
+// from black-box queries to GNU R 4.6.2 across dimensions, degrees, and spans.
+const DELTA_CURVE: [(f64, f64, f64); 10] = [
+    (0.0, 0.0, 4.191779105360),
+    (0.1204, 0.164691390237, -0.7978),
+    (0.2017, 0.095036390237, -0.7286),
+    (0.2815, 0.036958390237, -0.4457),
+    (0.3705, 0.015166390237, -0.3495),
+    (0.4536, 0.004714390237, 0.032813),
+    (0.5591, 0.010497390237, 0.1611),
+    (0.7132, 0.048248390237, 0.335),
+    (0.8751, 0.109056390237, -0.041032),
+    (1.0, 0.061817744987, -0.742184838131),
+];
+
+type DeltaCoefficients = [(f64, f64, f64); 2];
+
+const DELTA_COEFFICIENTS: [[DeltaCoefficients; 2]; 4] = [
+    [
+        [
+            (0.277381289037, 0.3802660, 0.5886043),
+            (0.265870920445, 0.2254512, 0.2914126),
+        ],
+        [
+            (0.150447346498, 0.3091323, 0.4401023),
+            (0.193750217126, 0.2822574, 0.2369957),
+        ],
+    ],
+    [
+        [
+            (0.397994665950, 0.3346498, 0.6271053),
+            (0.503459519622, 0.2517230, 0.3898970),
+        ],
+        [
+            (0.274393271577, 0.3580278, 0.5555741),
+            (0.365119099761, 0.2981154, 0.3623232),
+        ],
+    ],
+    [
+        [
+            (0.489231549571, 0.3484836, 0.6687687),
+            (0.709711879589, 0.2969113, 0.4740130),
+        ],
+        [
+            (0.370796622299, 0.4171278, 0.6293196),
+            (0.514216886532, 0.3501989, 0.4371032),
+        ],
+    ],
+    [
+        [
+            (0.591685049919, 0.4076457, 0.7207693),
+            (0.902160422182, 0.3629838, 0.5348889),
+        ],
+        [
+            (0.436396818305, 0.4699070, 0.6674802),
+            (0.653653158599, 0.4291632, 0.4930370),
+        ],
+    ],
+];
+
+fn approximate_deltas(m: &Model, trace: &mut f64) -> [f64; 2] {
+    let n = m.x.len() as f64;
+    let linear = (1 + m.d) as f64;
+    let quadratic_terms = m.d * (m.d + 1) / 2;
+    let terms = linear + m.terms.len() as f64;
+    if m.approximate_trace {
+        let span_factor = [1.09875, 0.985, 0.70875, 0.27][m.d - 1];
+        *trace = terms * (span_factor / m.span).max(1.0);
+    }
+    if *trace <= terms || *trace >= n {
+        return [n - *trace; 2];
+    }
+    let base = n.sqrt().recip();
+    let z = (trace.sqrt().recip() - base) / (terms.sqrt().recip() - base);
+    let upper = DELTA_CURVE
+        .partition_point(|&(at, _, _)| at < z)
+        .clamp(1, DELTA_CURVE.len() - 1);
+    let (left, y0, d0) = DELTA_CURVE[upper - 1];
+    let (right, y1, d1) = DELTA_CURVE[upper];
+    let width = right - left;
+    let t = (z - left) / width;
+    let (v0, g0) = hermite(1.0 - t, width);
+    let (v1, g1) = hermite(t, -width);
+    let curve = (v0 * y0 + g0 * d0 + v1 * y1 + g1 * d1).exp();
+    let [linear_coefficients, quadratic_coefficients] = DELTA_COEFFICIENTS[m.d - 1];
+    let mix = m.terms.len() as f64 / quadratic_terms as f64;
+    let delta = |(scale, a, b): (f64, f64, f64)| {
+        n - *trace * (curve * scale * z.powf(a) * (1.0 - z).powf(b)).exp()
+    };
+    std::array::from_fn(|i| {
+        (1.0 - mix) * delta(linear_coefficients[i]) + mix * delta(quadratic_coefficients[i])
+    })
 }
 
 fn check_space(ctx: &mut Ctx, call: &Call, m: &Model) -> EvalResult<()> {
@@ -493,7 +594,10 @@ pub(super) fn fit(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     let mut m = Model::read(ctx, call, args)?;
     check_space(ctx, call, &m)?;
     let divisor = m.divisor();
-    let tree = m.interpolate.then(|| Tree::new(&m));
+    let tree = m
+        .interpolate
+        .then(|| Tree::new(ctx, call, &m))
+        .transpose()?;
     let n = m.x.len();
     let mut fitted = vec![0.0; n];
     let mut residuals = vec![0.0; n];
@@ -503,15 +607,10 @@ pub(super) fn fit(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     let mut delta1 = 0.0;
     let mut delta2 = 0.0;
     let mut matrix = Vec::new();
-    if m.stats == 2 && n > 512 {
-        return Err(ctx.stop(
-            call.err_call(),
-            "exact loess statistics exceed the computation limit",
-        ));
-    }
-    if m.stats != 0 && n <= 512 {
-        limit::<f64>(ctx, call, n * n)?;
-        matrix.reserve_exact(n * n);
+    if m.stats == 2 {
+        let count = n.saturating_mul(n);
+        limit::<f64>(ctx, call, count)?;
+        matrix.reserve_exact(count);
     }
     for iter in 0..m.iterations {
         for i in 0..n {
@@ -522,20 +621,23 @@ pub(super) fn fit(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
             residuals[i] = m.y[i] - fitted[i];
             if iter == 0 && m.stats != 0 {
                 trace += buffer[i];
-                buffer[i] -= 1.0;
-                delta1 += dot(&buffer, &buffer);
-                if n <= 512 {
+                if m.stats == 2 {
+                    buffer[i] -= 1.0;
+                    delta1 += dot(&buffer, &buffer);
                     matrix.extend_from_slice(&buffer);
                 }
             }
         }
         if iter + 1 < m.iterations {
-            let scale = residual_scale(&residuals, &m.weights);
-            for ((w, r), a) in robust.iter_mut().zip(&residuals).zip(&m.weights) {
-                *w = if scale <= f64::MIN_POSITIVE {
+            let scale = residual_scale(&residuals);
+            for (w, r) in robust.iter_mut().zip(&residuals) {
+                let absolute = r.abs();
+                *w = if absolute <= 0.001 * scale {
                     1.0
+                } else if absolute <= 0.999 * scale {
+                    (1.0 - (r / scale).powi(2)).powi(2)
                 } else {
-                    (1.0 - a * (r / scale).powi(2)).max(0.0).powi(2)
+                    0.0
                 };
             }
         }
@@ -548,12 +650,17 @@ pub(super) fn fit(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
                 delta2 += dot(a, b).powi(2) * if i == j { 1.0 } else { 2.0 };
             }
         }
-    } else if m.stats != 0 {
-        delta2 = delta1;
+    } else if m.stats == 1 {
+        [delta1, delta2] = approximate_deltas(&m, &mut trace);
     }
     let enp = delta1 + 2.0 * trace - n as f64;
     let ss = if m.iterations > 1 {
-        let scale = residual_scale(&residuals, &m.weights);
+        let weighted: Vec<_> = residuals
+            .iter()
+            .zip(&m.weights)
+            .map(|(e, w)| e * w.sqrt())
+            .collect();
+        let scale = residual_scale(&weighted);
         let derivative = residuals
             .iter()
             .zip(&m.weights)
@@ -589,7 +696,7 @@ pub(super) fn fit(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     let divisor = reals(ctx, &divisor)?;
     let robust_id = reals(ctx, &robust)?;
     let stats = reals(ctx, &[enp, s, delta1, delta2, trace])?;
-    let kd = kd(ctx, &m, tree.as_ref(), &robust)?;
+    let kd = kd(ctx, call, &m, tree.as_ref(), &robust)?;
     list(ctx, &[fit, residuals, divisor, robust_id, stats, kd])
 }
 
@@ -605,7 +712,10 @@ pub(super) fn predict(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult
     let se = options[1] != 0.0;
     let robust = &options[2..];
     let divisor = m.divisor();
-    let tree = m.interpolate.then(|| Tree::new(&m));
+    let tree = m
+        .interpolate
+        .then(|| Tree::new(ctx, call, &m))
+        .transpose()?;
     let mut buffer = vec![0.0; m.x.len()];
     let prior = vec![1.0; robust.len()];
     let mut lower = [f64::INFINITY; 4];
@@ -645,4 +755,13 @@ pub(super) fn predict(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult
     let fitted = reals(ctx, &fitted)?;
     let error = reals(ctx, &error)?;
     list(ctx, &[fitted, error])
+}
+
+pub(super) fn two_auto_rows(ctx: &mut Ctx, _: &Call, args: &mut Args) -> EvalResult {
+    let rows = attr(ctx, args.get(0), "row.names")?;
+    let automatic = ctx
+        .session()
+        .int(rows)
+        .is_ok_and(|rows| rows.len() == 2 && rows.get(0) == NA_INTEGER && rows.get(1) == -2);
+    Ok(if automatic { TRUE_SCALAR } else { FALSE_SCALAR })
 }

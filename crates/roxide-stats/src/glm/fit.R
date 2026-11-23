@@ -127,18 +127,14 @@ glm.fit <- function(x, y, weights = rep(1, nobs), start = NULL, etastart = NULL,
             boundary <- FALSE
             finite <- is.finite(newdev)
             valid <- .glm_valid(family, proposed, mean)
-            # The initial mean can be outside the design's column space.
-            comparable <- i > 1L || (!is.null(start) && is.null(etastart))
-            increased <- comparable && finite && is.finite(dev) &&
-                newdev - dev > control$epsilon * (0.1 + abs(newdev))
-            if (!finite || !valid || increased) {
+            if (!finite || !valid) {
                 if (is.null(previous))
                     stop("no valid set of coefficients has been found: please supply starting values")
                 if (!finite) warning("step size truncated due to divergence", call. = FALSE)
-                else if (!valid) warning("step size truncated: out of bounds", call. = FALSE)
+                else warning("step size truncated: out of bounds", call. = FALSE)
                 attempts <- 0L
                 loop <- if (!finite) 1L else 2L
-                while (!finite || !valid || increased) {
+                while (!finite || !valid) {
                     attempts <- attempts + 1L
                     if (attempts > control$maxit)
                         stop(paste0("inner loop ", loop, "; cannot correct step size"))
@@ -148,8 +144,6 @@ glm.fit <- function(x, y, weights = rep(1, nobs), start = NULL, etastart = NULL,
                     newdev <- .glm_deviance(family, y, mean, weights)
                     finite <- is.finite(newdev)
                     valid <- .glm_valid(family, proposed, mean)
-                    increased <- comparable && finite && is.finite(dev) &&
-                        newdev - dev > control$epsilon * (0.1 + abs(newdev))
                     if (control$trace) cat("Step halved: new deviance = ", newdev, "\n", sep = "")
                 }
                 boundary <- TRUE

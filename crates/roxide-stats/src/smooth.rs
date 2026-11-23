@@ -26,6 +26,7 @@ pub const MODULE: Module = Module {
         internal("C_smooth_lowess", 5, lowess::fit),
         internal("C_smooth_loess", 5, loess::fit),
         internal("C_smooth_loess_predict", 6, loess::predict),
+        internal("C_smooth_two_auto_rows", 1, loess::two_auto_rows),
         internal("C_smooth_nonlinear", 9, nonlinear::fit),
     ],
     prelude: concat!(

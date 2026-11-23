@@ -76,8 +76,7 @@ make.link <- function(link) {
 }
 
 power <- function(lambda = 1) {
-    if (lambda <= 0) return(.glm_link("log", function(mu) log(mu),
-                                     function(eta) exp(eta), function(eta) exp(eta)))
+    if (lambda <= 0) return(make.link("log"))
     if (lambda == 1) return(.glm_identity())
     .glm_link(paste0("mu^", lambda), function(mu) mu^lambda,
               function(eta) .glm_floor(eta^(1 / lambda), .glm_eps),

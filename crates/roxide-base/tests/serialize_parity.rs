@@ -504,3 +504,54 @@ fn decodes_long_parent_chains_and_large_attribute_lists() {
     let two_environment_cycle = [4, 0, 4, 0, 0x1ff, 254, 254, 254, 254, 254, 254];
     rejects_raw(&mut ctx, &xdr_body(&two_environment_cycle));
 }
+
+#[test]
+fn package_namespaces_and_primitives_roundtrip() {
+    const MODULE: Module = Module {
+        prims: &[PrimDef {
+            name: "packagePrimitive",
+            ..CAPTURE.prims[0]
+        }],
+        prelude: "twice <- function(x) x + x",
+    };
+    let mut ctx = context(Box::new(PureHost::new()));
+    ctx.register_package(&roxide_eval::Package {
+        name: "stats",
+        attach: true,
+        modules: &[&MODULE],
+    })
+    .expect("Register test package");
+    run(
+        &mut ctx,
+        "Package closure round trip",
+        r#"
+f <- stats::twice
+p <- stats::packagePrimitive
+for (version in c(2L, 3L)) {
+    result <- unserialize(serialize(list(f, f, p), NULL, version=version))
+    stopifnot(identical(result[[1L]](21), 42),
+              identical(environment(result[[1L]]), environment(f)),
+              identical(environment(result[[2L]]), environment(f)),
+              identical(result[[3L]], p))
+}
+"#,
+    );
+    if let Some(executable) = env::var_os("ROXIDE_ORACLE_RSCRIPT") {
+        let raw = oracle(
+            Path::new(&executable),
+            r#"cat(as.integer(serialize(asNamespace("stats"), NULL, version=2)), sep=",")"#,
+        );
+        run(
+            &mut ctx,
+            "GNU R namespace reference",
+            &format!(
+                r#"
+bytes <- as.raw(c({raw}))
+ns <- environment(stats::twice)
+stopifnot(identical(serialize(ns, NULL, version=2), bytes),
+          identical(unserialize(bytes), ns))
+"#
+            ),
+        );
+    }
+}

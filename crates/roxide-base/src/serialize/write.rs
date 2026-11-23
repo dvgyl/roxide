@@ -3,14 +3,14 @@ use std::collections::HashMap;
 use roxide_gc::SexpId;
 use roxide_host::Limits;
 use roxide_value::{
-    BASE_ENV, BASE_NAMESPACE, CharId, EMPTY_ENV, Elem, Encoding, GLOBAL_ENV, PrimId, PromiseState,
+    BASE_ENV, BASE_NAMESPACE, CharId, EMPTY_ENV, Elem, Encoding, GLOBAL_ENV, PromiseState,
     RSession, SEXP_MISSING, SEXP_NIL, SEXP_UNBOUND, SexpType, Sym, ValueApi, ValueError, VecView,
 };
 
 use super::{
     ACTIVE_BINDING, ALTREP, ASCII, ATTR, BASE, BASE_NS, BYTES, EMPTY, GLOBAL, LATIN1,
-    LOCKED_BINDING, MAX_INLINE_REF, MISSING, NIL, OBJECT, REF, S4, TAG, UNBOUND, UTF8, WireResult,
-    invalid,
+    LOCKED_BINDING, MAX_INLINE_REF, MISSING, NAMESPACE, NIL, OBJECT, PACKAGE, REF, Registry, S4,
+    TAG, UNBOUND, UTF8, WireResult, invalid,
 };
 
 pub(super) fn encode(
@@ -19,11 +19,12 @@ pub(super) fn encode(
     version: u32,
     workspace: bool,
     limits: &Limits,
+    registry: &Registry,
 ) -> WireResult<Vec<u8>> {
     let mut writer = Writer {
         bytes: Vec::new(),
         refs: HashMap::new(),
-        primitives: HashMap::new(),
+        registry,
         version,
         limits,
     };
@@ -49,7 +50,7 @@ pub(super) fn encode(
 struct Writer<'a> {
     bytes: Vec<u8>,
     refs: HashMap<SexpId, u32>,
-    primitives: HashMap<PrimId, Sym>,
+    registry: &'a Registry,
     version: u32,
     limits: &'a Limits,
 }
@@ -134,6 +135,21 @@ impl Writer<'_> {
 
             let attrs = session.attrs(id)?;
             if ty == SexpType::Env {
+                for &(name, namespace, attached) in &self.registry.packages {
+                    if id == namespace {
+                        self.word(NAMESPACE)?;
+                        self.word(0)?;
+                        self.word(2)?;
+                        self.string(name.as_bytes(), Encoding::Native)?;
+                        return self.string(b"4.6.2", Encoding::Native);
+                    }
+                    if Some(id) == attached {
+                        self.word(PACKAGE)?;
+                        self.word(0)?;
+                        self.word(1)?;
+                        return self.string(format!("package:{name}").as_bytes(), Encoding::Native);
+                    }
+                }
                 return self.environment(session, id, &attrs, depth + 1);
             }
             let object = if session.is_object(id)? { OBJECT } else { 0 };
@@ -236,19 +252,13 @@ impl Writer<'_> {
                 }
             }
             SexpType::Special | SexpType::Builtin => {
-                if self.primitives.is_empty() {
-                    for (sym, binding) in session.env_entries(BASE_ENV)? {
-                        if let Ok((id, _)) = session.prim_parts(binding.value) {
-                            self.primitives.insert(id, sym);
-                        }
-                    }
-                }
                 let (prim, _) = session.prim_parts(id)?;
                 let name = self
+                    .registry
                     .primitives
                     .get(&prim)
-                    .ok_or_else(|| invalid("cannot write an unregistered primitive"))?;
-                let name = session.sym_name(*name)?.as_bytes();
+                    .ok_or_else(|| invalid("cannot write an unregistered primitive"))?
+                    .as_bytes();
                 self.length(name.len())?;
                 self.push(name)?;
             }

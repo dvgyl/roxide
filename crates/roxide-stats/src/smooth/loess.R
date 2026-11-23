@@ -14,7 +14,7 @@ loess.control <- function(surface = c("interpolate", "direct"),
 .smooth_loess_options <- function(d, pars, statistics) {
     c(d, pars$degree, pars$span, .model_match(statistics, c("none", "approximate", "exact")) - 1L,
       pars$iterations, pars$surface == "interpolate", pars$normalize,
-      pars$cell, pars$parametric, pars$drop.square)
+      pars$cell, pars$trace.hat == "approximate", pars$parametric, pars$drop.square)
 }
 
 .smooth_loess_flags <- function(value, labels, arg) {
@@ -104,6 +104,7 @@ predict.loess <- function(object, newdata = NULL, se = FALSE, na.action = na.pas
         frame <- model.frame(tt, newdata, na.action = na.action)
         x <- as.matrix(frame[xnames])
         labels <- rownames(frame)
+        if (length(labels) == 2L && .Internal(C_smooth_two_auto_rows(newdata))) labels <- NULL
     } else {
         x <- if (is.matrix(newdata)) newdata else matrix(newdata, ncol = d)
         if (ncol(x) != d) stop("wrong number of columns in 'newdata'")

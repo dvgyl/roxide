@@ -1,7 +1,7 @@
 .glm_dispersion <- function(object) {
     fixed <- family(object)$dispersion
     if (!is.null(fixed) && !is.na(fixed)) return(fixed)
-    if (is.null(fixed) && .glm_in(family(object)$family, c("poisson", "binomial"))) return(1)
+    if (.glm_in(family(object)$family, c("poisson", "binomial"))) return(1)
     w <- object$weights
     keep <- w > 0
     if (any(!keep))
@@ -15,8 +15,8 @@ summary.glm <- function(object, dispersion = NULL, correlation = FALSE, symbolic
     rank <- object$rank
     fam <- family(object)
     fixed <- fam$dispersion
-    estimated <- is.null(dispersion) &&
-        (if (is.null(fixed)) !.glm_in(fam$family, c("poisson", "binomial")) else is.na(fixed))
+    estimated <- is.null(dispersion) && (is.null(fixed) || is.na(fixed)) &&
+        !.glm_in(fam$family, c("poisson", "binomial"))
     if (is.null(dispersion)) dispersion <- .glm_dispersion(object)
     prefix <- c("call", "terms", "family", "deviance", "aic", "contrasts", "df.residual",
                 "null.deviance", "df.null", "iter")
@@ -111,22 +111,23 @@ confint.glm <- function(object, parm, level = 0.95, ...) {
 predict.glm <- function(object, newdata = NULL, type = c("link", "response", "terms"),
                         se.fit = FALSE, dispersion = NULL, terms = NULL, na.action = na.pass, ...) {
     type <- .lm_choice(type, c("link", "response", "terms"))
+    pad <- missing(newdata)
     training <- is.null(newdata)
     action <- object[["na.action"]]
     if (training && !se.fit && type != "terms") {
         value <- if (type == "link") object$linear.predictors else object$fitted.values
-        return(napredict(action, value))
+        return(if (pad) napredict(action, value) else value)
     }
     if (se.fit && is.null(dispersion)) dispersion <- .glm_dispersion(object)
     residual.scale <- if (se.fit) sqrt(dispersion) else NULL
     object["na.action"] <- list(NULL)
-    object$assign <- attr(model.matrix(object), "assign")
+    if (type == "terms") object$assign <- attr(model.matrix(object), "assign")
     value <- predict.lm(object, newdata, se.fit = se.fit, scale = residual.scale,
                         type = if (type == "terms") "terms" else "response", terms = terms,
                         na.action = na.action, ...)
     if (!se.fit) {
         if (type == "response") value <- family(object)$linkinv(value)
-        return(if (training) napredict(action, value) else value)
+        return(if (pad) napredict(action, value) else value)
     }
     fit <- value$fit
     errors <- value$se.fit
@@ -136,7 +137,7 @@ predict.glm <- function(object, newdata = NULL, type = c("link", "response", "te
         fit <- fam$linkinv(fit)
     }
     if (!object$rank && type != "terms") names(errors) <- NULL
-    if (training) {
+    if (pad) {
         fit <- napredict(action, fit)
         errors <- napredict(action, errors)
     }
@@ -182,7 +183,8 @@ influence <- function(model, ...) UseMethod("influence")
         hat[as.integer(action)] <- 0
         sigma[as.integer(action)] <- sqrt(rss / model$df.residual)
     }
-    ans <- list(hat = hat, coefficients = naresid(action, coeff))
+    if (do.coef) coeff <- naresid(action, coeff)
+    ans <- list(hat = hat, coefficients = coeff)
     if (!do.coef && rank) names(ans) <- c("hat", NA_character_)
     ans$sigma <- sigma
     ans$wt.res <- naresid(action, used)

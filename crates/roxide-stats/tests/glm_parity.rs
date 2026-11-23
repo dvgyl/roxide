@@ -9,6 +9,7 @@ use roxide_value::{GLOBAL_ENV, ValueApi};
 
 fn check(script: &str, policy: GcPolicy) {
     let mut ctx = Ctx::new(Box::new(PureHost::new()), policy).expect("Create session");
+    ctx.set_stack_budget(1024 * 1024);
     roxide_base::register_all(&mut ctx).expect("Register base");
     roxide_stats::register(&mut ctx).expect("Register stats");
     let script = format!(
@@ -97,4 +98,74 @@ stopifnot(all(is.finite(prediction$se.fit)))
 "#,
         GcPolicy::default(),
     );
+}
+
+#[test]
+fn audit_cases_match_oracle() {
+    let script = r#"
+x <- matrix(1, 6, 1)
+warnings <- character()
+fit <- withCallingHandlers(
+    glm.fit(x, 1:6, start=-1, family=gaussian("log"), control=list(maxit=1)),
+    warning=function(w) {
+        warnings <<- c(warnings, conditionMessage(w))
+        invokeRestart("muffleWarning")
+    })
+stopifnot(abs(coef(fit) - (-1 + 3.5 * exp(1) - 1)) < 1e-12,
+          !fit$converged, !fit$boundary,
+          identical(warnings, "glm.fit: algorithm did not converge"))
+stopifnot(glm.fit(x, 1:6, start=0, family=gaussian("log"))$iter == 6)
+stopifnot(abs(poisson()$dev.resids(1e10, 1e10 + .01, 1) - 9.00198064306135e-7) < 1e-15,
+          power(0)$linkinv(-1000) == 2.220446049250313e-16,
+          power(0)$mu.eta(-1000) == 2.220446049250313e-16)
+
+d <- data.frame(x=1:6, y=c(2,4,NA,6,7,8), z=c(1,4,2,6,7,8))
+f <- poisson()
+f$dispersion <- NA_real_
+g <- glm(y ~ x, f, d, na.action=na.exclude)
+near <- function(a, b) stopifnot(length(a) == length(b), max(abs(a - b)) < 1e-8)
+keep <- c(1,2,4,5,6)
+r <- rstandard(g)
+cooks <- cooks.distance(g)
+stopifnot(length(r) == 6L, length(cooks) == 6L, is.na(r[3]), is.na(cooks[3]))
+near(r[keep], c(-.617159026,.390847066,.276702303,.077548545,-.334057060))
+near(cooks[keep], c(.187927933,.045052191,.010107549,.001244138,.095321216))
+stopifnot(summary(g)$dispersion == 1, colnames(coef(summary(g)))[3] == "z value")
+single <- anova(g)
+other <- glm(z ~ x, f, d)
+seen <- character()
+sequential <- withCallingHandlers(anova(g, other), warning=function(w) {
+    seen <<- c(seen, conditionMessage(w))
+    invokeRestart("muffleWarning")
+})
+stopifnot(identical(sequential, single), length(seen) == 1L, any(names(single) == "Pr(>F)"))
+near(single[["Pr(>F)"]][2], .12671209104732115)
+near(predict(g)[keep], predict(g, newdata=NULL))
+stopifnot(is.na(predict(g)[3]))
+for (type in c("link", "response", "terms")) {
+    padded <- predict(g, type=type, se.fit=TRUE)
+    explicit <- predict(g, newdata=NULL, type=type, se.fit=TRUE)
+    stopifnot(length(padded$fit) == 6L, length(explicit$fit) == 5L)
+    near(as.double(padded$fit)[keep], as.double(explicit$fit))
+    near(as.double(padded$se.fit)[keep], as.double(explicit$se.fit))
+}
+g <- glm(y ~ x, f, data=d, model=FALSE)
+d <- NULL
+p <- predict(g, newdata=data.frame(x=c(2,4)), type="response", se.fit=TRUE)
+near(p$fit, exp(c(1.2314601967277752, 1.6913265102577864)))
+near(p$se.fit, exp(c(1.2314601967277752, 1.6913265102577864)) *
+               c(.32906491297379270, .19619136203219301))
+"#;
+    if let Some(rscript) = std::env::var_os("ROXIDE_ORACLE_RSCRIPT") {
+        let output = std::process::Command::new(rscript)
+            .args(["--vanilla", "-e", script])
+            .output()
+            .expect("Run GNU R");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    check(script, GcPolicy::default());
 }

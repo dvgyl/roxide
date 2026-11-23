@@ -10,7 +10,7 @@ use roxide_value::{
 
 use super::{
     ACTIVE_BINDING, ALTREP, ATTR, BASE, BASE_NS, BYTES, EMPTY, GLOBAL, LATIN1, LOCKED_BINDING,
-    MISSING, NAMESPACE, NIL, PACKAGE, REF, S4, TAG, UNBOUND, UTF8, WireResult, invalid,
+    MISSING, NAMESPACE, NIL, PACKAGE, REF, Registry, S4, TAG, UNBOUND, UTF8, WireResult, invalid,
 };
 
 pub(super) fn decode(
@@ -18,11 +18,12 @@ pub(super) fn decode(
     bytes: &[u8],
     workspace: bool,
     limits: &Limits,
+    registry: &Registry,
 ) -> WireResult<SexpId> {
     if bytes.len() > limits.max_decompress_bytes {
         return Err(invalid("serialized input exceeds the decompression limit"));
     }
-    decode_from(session, Input::Slice(bytes), workspace, limits)
+    decode_from(session, Input::Slice(bytes), workspace, limits, registry)
 }
 
 pub(super) fn decode_stream(
@@ -30,8 +31,9 @@ pub(super) fn decode_stream(
     input: &mut dyn BufRead,
     workspace: bool,
     limits: &Limits,
+    registry: &Registry,
 ) -> WireResult<SexpId> {
-    decode_from(session, Input::Stream(input), workspace, limits)
+    decode_from(session, Input::Stream(input), workspace, limits, registry)
 }
 
 fn decode_from(
@@ -39,6 +41,7 @@ fn decode_from(
     input: Input<'_>,
     workspace: bool,
     limits: &Limits,
+    registry: &Registry,
 ) -> WireResult<SexpId> {
     let remaining = match &input {
         Input::Slice(bytes) => bytes.len(),
@@ -54,6 +57,7 @@ fn decode_from(
         version: 0,
         heap_start: session.heap.live_bytes(),
         limits,
+        registry,
     };
     let workspace_version = if workspace {
         match reader.take(5)? {
@@ -97,6 +101,7 @@ struct Reader<'a, 'limits> {
     version: u32,
     heap_start: usize,
     limits: &'limits Limits,
+    registry: &'limits Registry,
 }
 
 impl Reader<'_, '_> {
@@ -552,7 +557,26 @@ impl Reader<'_, '_> {
         let env = match name.as_str() {
             "base" if ty == NAMESPACE => BASE_NAMESPACE,
             "package:base" => BASE_ENV,
-            _ => session.alloc_env(BASE_ENV)?,
+            _ => {
+                let registered = self
+                    .registry
+                    .packages
+                    .iter()
+                    .find_map(|&(pkg, ns, attached)| {
+                        if ty == NAMESPACE && name == pkg {
+                            Some(ns)
+                        } else if ty == PACKAGE && name.strip_prefix("package:") == Some(pkg) {
+                            attached
+                        } else {
+                            None
+                        }
+                    });
+                if let Some(env) = registered {
+                    env
+                } else {
+                    session.alloc_env(BASE_ENV)?
+                }
+            }
         };
         self.reference(env)?;
         Ok(env)
@@ -562,18 +586,17 @@ impl Reader<'_, '_> {
         let len = self.vector_len::<u8>(1)?;
         let name = std::str::from_utf8(self.take(len)?).map_err(invalid)?;
         let sym = session.intern(name)?;
-        let binding = session
-            .env_get(BASE_ENV, sym)
-            .ok_or_else(|| invalid(format!("unknown serialized primitive '{name}'")))?;
-        let (_, special) = session.prim_parts(binding.value)?;
         let expected = ty == SexpType::Special as u32;
-        if special != expected {
-            // Evaluation strategy belongs to the registered primitive.
-            return Err(invalid(format!(
-                "serialized primitive '{name}' has a different evaluation strategy"
-            )));
+        for env in Registry::envs(&self.registry.packages) {
+            if let Some(binding) = session.env_get(env, sym)
+                && let Ok((_, special)) = session.prim_parts(binding.value)
+                && special == expected
+            {
+                return Ok(binding.value);
+            }
         }
-        Ok(binding.value)
+        let name = session.sym_name(sym)?;
+        Err(invalid(format!("unknown serialized primitive '{name}'")))
     }
 
     fn altrep(&mut self, session: &mut RSession, flags: u32, depth: usize) -> WireResult<SexpId> {

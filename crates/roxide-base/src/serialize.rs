@@ -6,6 +6,7 @@ mod files;
 mod read;
 mod write;
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::{fmt, io};
 
@@ -16,7 +17,8 @@ use roxide_eval::{
 use roxide_gc::SexpId;
 use roxide_host::Limits;
 use roxide_value::{
-    CharId, RLogical, SEXP_MISSING, SEXP_NIL, SEXP_UNBOUND, SexpType, ValueApi, ValueError,
+    BASE_ENV, CharId, PrimId, RLogical, SEXP_MISSING, SEXP_NIL, SEXP_UNBOUND, SexpType, ValueApi,
+    ValueError,
 };
 
 use crate::io_os::connection::{self, Serialization};
@@ -197,6 +199,41 @@ fn compression(ctx: &mut Ctx, call: &Call, value: SexpId) -> EvalResult<Compress
     }
 }
 
+struct Registry {
+    packages: Vec<(&'static str, SexpId, Option<SexpId>)>,
+    primitives: HashMap<PrimId, &'static str>,
+}
+
+impl Registry {
+    fn new(ctx: &Ctx) -> Self {
+        Self {
+            packages: ctx.package_environments().collect(),
+            primitives: HashMap::new(),
+        }
+    }
+
+    fn for_write(ctx: &Ctx) -> WireResult<Self> {
+        let mut registry = Self::new(ctx);
+        let session = ctx.session();
+        for env in Self::envs(&registry.packages) {
+            for (_, binding) in session.env_entries(env)? {
+                if let Ok((id, _)) = session.prim_parts(binding.value)
+                    && let Some(name) = ctx.primitive_name(binding.value)
+                {
+                    registry.primitives.insert(id, name);
+                }
+            }
+        }
+        Ok(registry)
+    }
+
+    fn envs<'a>(
+        packages: &'a [(&'static str, SexpId, Option<SexpId>)],
+    ) -> impl Iterator<Item = SexpId> + 'a {
+        std::iter::once(BASE_ENV).chain(packages.iter().map(|&(_, ns, _)| ns))
+    }
+}
+
 fn encode(
     ctx: &mut Ctx,
     call: &Call,
@@ -205,13 +242,23 @@ fn encode(
     workspace: bool,
 ) -> EvalResult<Vec<u8>> {
     let limits = limits(ctx);
-    let result = write::encode(ctx.session_mut(), value, version, workspace, &limits);
+    let result = Registry::for_write(ctx).and_then(|registry| {
+        write::encode(
+            ctx.session_mut(),
+            value,
+            version,
+            workspace,
+            &limits,
+            &registry,
+        )
+    });
     checked(ctx, call, result)
 }
 
 fn decode(ctx: &mut Ctx, call: &Call, bytes: &[u8], workspace: bool) -> EvalResult {
     let limits = limits(ctx);
-    let result = read::decode(ctx.session_mut(), bytes, workspace, &limits);
+    let registry = Registry::new(ctx);
+    let result = read::decode(ctx.session_mut(), bytes, workspace, &limits, &registry);
     checked(ctx, call, result)
 }
 
@@ -264,12 +311,14 @@ fn read_connection(
     serialization: Serialization,
 ) -> EvalResult {
     let limits = limits(ctx);
+    let registry = Registry::new(ctx);
     connection::read_serialized(ctx, call, source, serialization, |session, input| {
         read::decode_stream(
             session,
             input,
             serialization == Serialization::Workspace,
             &limits,
+            &registry,
         )
         .map_err(|error| io::Error::other(error.0))
     })

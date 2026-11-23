@@ -2,7 +2,7 @@ use super::{list, reals};
 use crate::distn::support::{attr, limit, logical, number, numbers, set_attr, set_dim};
 use roxide_eval::{Args, Call, Ctx, EvalResult};
 use roxide_gc::SexpId;
-use roxide_value::{SEXP_NIL, ValueApi};
+use roxide_value::{SEXP_NIL, SexpType, ValueApi};
 
 struct Sample {
     value: f64,
@@ -45,6 +45,7 @@ impl Objective<'_> {
         }
         let call = self.call;
         let port = self.port;
+        let first = self.evals[0] == 1;
         self.call(self.fun, x, |ctx, out| {
             if !matches!(
                 ctx.session().type_of(out)?,
@@ -58,12 +59,12 @@ impl Objective<'_> {
                 ctx.warn_now(call.err_call(), "NA/Inf replaced by maximum positive value")?;
                 value = f64::MAX;
             }
-            let (gradient, hessian) = if port {
+            let (gradient, hessian) = if port || !count {
                 (None, None)
             } else {
-                let gradient = derivative(ctx, call, out, "gradient", x.len())?;
+                let gradient = derivative(ctx, call, out, "gradient", x.len(), first)?;
                 let hessian = if gradient.is_some() {
-                    derivative(ctx, call, out, "hessian", x.len() * x.len())?
+                    derivative(ctx, call, out, "hessian", x.len() * x.len(), first)?
                 } else {
                     None
                 };
@@ -154,11 +155,19 @@ impl Objective<'_> {
         }
         let call = self.call;
         self.call(self.hessian, x, |ctx, out| {
-            let mut h = numbers(ctx, call, out)?;
             let n = x.len();
-            if h.len() != n * n {
-                return Err(ctx.stop(call.err_call(), "Hessian has the wrong dimension"));
+            let dims = attr(ctx, out, "dim")?;
+            let square = ctx
+                .session()
+                .int(dims)
+                .is_ok_and(|dim| dim.len() == 2 && dim.iter().all(|v| v as usize == n));
+            if !square || !matches!(ctx.session().type_of(out)?, SexpType::Real | SexpType::Int) {
+                return Err(ctx.stop(
+                    call.err_call(),
+                    format!("Hessian function must return a square numeric matrix of order {n}"),
+                ));
             }
+            let mut h = numbers(ctx, call, out)?;
             for i in 0..n {
                 for j in i + 1..n {
                     h[j * n + i] = h[i * n + j];
@@ -208,16 +217,21 @@ fn derivative(
     out: SexpId,
     name: &str,
     len: usize,
+    warn: bool,
 ) -> EvalResult<Option<Vec<f64>>> {
     let id = attr(ctx, out, name)?;
     if id == SEXP_NIL {
         return Ok(None);
     }
-    if ctx.session().xlength(id)? != len {
-        ctx.warn_now(
-            call.err_call(),
-            format!("{name} supplied is of the wrong length"),
-        )?;
+    if !matches!(ctx.session().type_of(id)?, SexpType::Real | SexpType::Int)
+        || ctx.session().xlength(id)? != len
+    {
+        if warn {
+            ctx.warn_now(
+                call.err_call(),
+                format!("{name} supplied is of the wrong length or mode, so ignored"),
+            )?;
+        }
         return Ok(None);
     }
     let derivative = numbers(ctx, call, id)?;
@@ -315,6 +329,9 @@ impl Control {
                 result_hessian: options[8] != 0.0,
             }
         };
+        if !port && c.iter <= 0 {
+            return Err(ctx.stop(call.err_call(), "invalid iteration limit in nlm"));
+        }
         if !(0..=100_000).contains(&c.iter)
             || c.eval < 1
             || c.stepmax <= 0.0
@@ -479,7 +496,12 @@ fn minimize(f: &mut Objective<'_>, c: &Control, mut x: Vec<f64>) -> EvalResult<R
             break;
         }
         let projected = c.projected(&x, &g);
-        let relative_grad = scaled_gradient(c, &x, &projected, sm.value);
+        let relative_grad = if f.port {
+            scaled_gradient(c, &x, &projected, 0.0)
+        } else {
+            scaled_gradient(c, &x, &projected, sm.value)
+        };
+        let analytic = f.analytic_hessian(&x, &sm)?;
         if relative_grad <= c.gradtol {
             let bounded = c.lower.iter().chain(&c.upper).any(|v| v.is_finite());
             code = if f.port && bounded { 5 } else { 1 };
@@ -491,7 +513,6 @@ fn minimize(f: &mut Objective<'_>, c: &Control, mut x: Vec<f64>) -> EvalResult<R
             .enumerate()
             .map(|(i, (&p, &g))| p == g && c.lower[i] != c.upper[i])
             .collect();
-        let analytic = f.analytic_hessian(&x, &sm)?;
         let direction = newton(analytic.as_deref().unwrap_or(&h), &projected, &free)
             .filter(|d| dot(d, &projected) < 0.0)
             .unwrap_or_else(|| {
@@ -610,7 +631,8 @@ fn minimize(f: &mut Objective<'_>, c: &Control, mut x: Vec<f64>) -> EvalResult<R
                 break;
             }
             if relative_step < c.steptol
-                || (sm.value != 0.0 && value_change <= c.reltol * sm.value.abs())
+                || (value_change <= c.reltol * sm.value.abs()
+                    && scaled_gradient(c, &x, &c.projected(&x, &g), 0.0) <= c.gradtol)
             {
                 code = if relative_step < c.steptol { 1 } else { 2 };
                 break;

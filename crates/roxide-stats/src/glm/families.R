@@ -34,7 +34,7 @@ print.family <- function(x, ...) {
         mu = list(
             variance = function(mu) mu,
             dev.resids = function(y, mu, wt) {
-                value <- 2 * wt * (.glm_unit_log(y, mu) - y + mu)
+                value <- 2 * wt * (.glm_unit_log(y, mu) + (mu - y))
                 w <- rep(wt, length.out = length(value))
                 value[!is.na(w) & w == 0] <- 0
                 value

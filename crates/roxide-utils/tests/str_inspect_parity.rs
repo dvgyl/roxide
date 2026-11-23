@@ -119,3 +119,54 @@ stopifnot(identical(dim(head(big, 2L)), c(2L, 1L)),
     )
     .expect("Check inspection behavior");
 }
+
+#[test]
+fn capture_streams_to_open_file_and_text_connections() {
+    let script = r#"
+path <- tempfile()
+con <- file(path, "wt")
+capture.output({
+    cat("first\n")
+    writeLines("direct", con)
+    cat("last\n")
+}, file=con)
+close(con)
+stopifnot(identical(readLines(path), c("first", "direct", "last")))
+unlink(path)
+
+con <- textConnection("captured", "w")
+capture.output({
+    cat("first\n")
+    stopifnot(identical(textConnectionValue(con), "first"))
+    writeLines("direct", con)
+    cat("last\n")
+}, file=con)
+stopifnot(identical(textConnectionValue(con), c("first", "direct", "last")))
+error <- tryCatch(capture.output({
+    message("before")
+    writeLines("during", con)
+    stop("original error")
+}, file=con, type="message"), error=conditionMessage)
+stopifnot(identical(error, "original error"),
+          identical(textConnectionValue(con),
+                    c("first", "direct", "last", "before", "during")))
+close(con)
+stopifnot(identical(capture.output(cat("next")), "next"))
+"#;
+    if let Some(rscript) = std::env::var_os("ROXIDE_ORACLE_RSCRIPT") {
+        let output = std::process::Command::new(rscript)
+            .args(["--vanilla", "-e", script])
+            .output()
+            .expect("Run GNU R");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let mut ctx = Ctx::new(Box::new(PureHost::new()), GcPolicy::Torture).expect("Create session");
+    roxide_base::register_all(&mut ctx).expect("Register base");
+    roxide_utils::register(&mut ctx).expect("Register utils");
+    ctx.run_script("Capture output", script, GLOBAL_ENV, false)
+        .expect("Check capture with an open connection");
+}

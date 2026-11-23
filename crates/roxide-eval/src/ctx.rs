@@ -18,8 +18,8 @@ use roxide_value::{
 };
 
 use crate::api::{
-    ArgEval, CtxExt, EvalResult, InternalError, Module, OptionsCache, Package, PrimDef, PrimKind,
-    S4Hooks, Unwind,
+    ArgEval, Call, CtxExt, EvalResult, InternalError, Module, OptionsCache, Package, PrimDef,
+    PrimKind, S4Hooks, Unwind,
 };
 use crate::builtins;
 
@@ -159,12 +159,17 @@ pub struct Ctx {
     pub(crate) interactive: bool,
 }
 
+type StreamSink = Box<dyn FnMut(&mut Ctx, &[u8]) -> EvalResult<()>>;
+
 struct StreamCapture {
     capture_out: bool,
     capture_err: bool,
     split: bool,
     exceeded: bool,
+    received: usize,
     bytes: Vec<u8>,
+    sink: Option<StreamSink>,
+    flushing: bool,
 }
 
 pub(crate) struct HostStack {
@@ -197,16 +202,17 @@ impl HostStack {
                 StdStream::Stderr => capture.capture_err,
                 StdStream::Stdin => false,
             };
-            if !selected {
+            if !selected || capture.flushing {
                 continue;
             }
-            if capture.exceeded || bytes.len() > limit.saturating_sub(capture.bytes.len()) {
+            if capture.exceeded || bytes.len() > limit.saturating_sub(capture.received) {
                 capture.exceeded = true;
                 return Err(HostError::new(
                     HostErrorKind::Other,
                     "output capture exceeds the vector size limit",
                 ));
             }
+            capture.received += bytes.len();
             capture.bytes.extend_from_slice(bytes);
             if !capture.split {
                 return Ok(());
@@ -567,12 +573,54 @@ impl Ctx {
         split: bool,
         f: impl FnOnce(&mut Self) -> EvalResult<R>,
     ) -> EvalResult<(R, Vec<u8>)> {
+        self.with_stream_capture(capture_out, capture_err, split, None, f)
+    }
+
+    /// Send selected host output to `sink` before the next R primitive runs.
+    ///
+    /// Each capture limits the total number of bytes that it accepts.
+    pub fn capture_streams_to(
+        &mut self,
+        capture_out: bool,
+        capture_err: bool,
+        split: bool,
+        sink: impl FnMut(&mut Self, &[u8]) -> EvalResult<()> + 'static,
+        f: impl FnOnce(&mut Self) -> EvalResult<SexpId>,
+    ) -> EvalResult {
+        self.with_stream_capture(
+            capture_out,
+            capture_err,
+            split,
+            Some(Box::new(sink)),
+            |ctx| {
+                ctx.scoped(|ctx| {
+                    let result = f(ctx);
+                    ctx.protect_eval_result(&result);
+                    let written = ctx.flush_stream_captures();
+                    result.and_then(|value| written.map(|()| value))
+                })
+            },
+        )
+        .map(|(value, _)| value)
+    }
+
+    fn with_stream_capture<R>(
+        &mut self,
+        capture_out: bool,
+        capture_err: bool,
+        split: bool,
+        sink: Option<StreamSink>,
+        f: impl FnOnce(&mut Self) -> EvalResult<R>,
+    ) -> EvalResult<(R, Vec<u8>)> {
         self.host.captures.push(StreamCapture {
             capture_out,
             capture_err,
             split,
             exceeded: false,
+            received: 0,
             bytes: Vec::new(),
+            sink,
+            flushing: false,
         });
         let result = f(self);
         let Some(capture) = self.host.captures.pop() else {
@@ -582,6 +630,53 @@ impl Ctx {
             return Err(self.stop(SEXP_NIL, "output capture exceeds the vector size limit"));
         }
         Ok((result?, capture.bytes))
+    }
+
+    pub(crate) fn has_stream_sink(&self) -> bool {
+        self.host
+            .captures
+            .iter()
+            .any(|capture| capture.sink.is_some())
+    }
+
+    fn flush_stream_captures(&mut self) -> EvalResult<()> {
+        if self.host.captures.iter().any(|capture| capture.flushing) {
+            return Ok(());
+        }
+        for i in (0..self.host.captures.len()).rev() {
+            let capture = &mut self.host.captures[i];
+            if capture.bytes.is_empty() {
+                continue;
+            }
+            let Some(mut sink) = capture.sink.take() else {
+                continue;
+            };
+            let bytes = std::mem::take(&mut capture.bytes);
+            capture.flushing = true;
+            let visible = self.visible;
+            let result = sink(self, &bytes);
+            self.visible = visible;
+            let capture = &mut self.host.captures[i];
+            capture.flushing = false;
+            capture.sink = Some(sink);
+            result?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn invoke_streaming_primitive(
+        &mut self,
+        fun: crate::PrimFn,
+        call: &Call,
+        args: &mut Args,
+    ) -> EvalResult {
+        self.flush_stream_captures()?;
+        let result = fun(self, call, args);
+        self.scoped(|ctx| {
+            ctx.protect_eval_result(&result);
+            let written = ctx.flush_stream_captures();
+            result.and_then(|value| written.map(|()| value))
+        })
     }
 
     /// Return the registered name of a primitive, if the value is a primitive.

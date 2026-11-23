@@ -110,9 +110,14 @@ density.default <- function(x, bw = "nrd0", adjust = 1,
     if (w) {
         if (any(!is.finite(weights))) stop("'weights' must all be finite")
         if (any(weights < 0)) stop("'weights' must not be negative")
-        if (!subdensity && abs(sum(weights) - 1) >= 1.49e-8)
+        total <- sum(weights)
+        if (!subdensity && abs(total - 1) >= 1.49e-8)
             warning("sum(weights) != 1  -- will not get true density")
-        weights <- weights[finite]
+        if (any(!finite)) {
+            weights <- weights[finite]
+            if (total == 0) stop("need at least two non-NA values to interpolate")
+            weights <- weights * (sum(weights) / total)
+        }
     } else {
         weights <- rep(1 / nx, length(x))
     }

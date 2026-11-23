@@ -133,6 +133,7 @@ spline <- function(x, y = NULL, n = 3 * length(x), method = "fmm",
     xy <- .smooth_knots(x, y, ties, TRUE, FALSE)
     f <- .smooth_spline(xy, method)
     if (missing(xout)) {
+        if (length(n) != 1L || !is.finite(n) || n < 1) stop("'spline' requires n >= 1")
         left <- if (missing(xmin)) min(xy$x) else xmin
         right <- if (missing(xmax)) max(xy$x) else xmax
         xout <- seq.int(left, right, length.out = n)
@@ -210,11 +211,8 @@ print.ecdf <- function(x, digits = getOption("digits") - 2L, ...) {
 lowess <- function(x, y = NULL, f = 2 / 3, iter = 3L, delta = .01 * diff(range(x))) {
     xy <- .smooth_xy(x, y)
     if (length(xy$x) != length(xy$y)) stop("'x' and 'y' lengths differ")
-    keep <- !is.na(xy$x) & !is.na(xy$y)
-    x <- xy$x[keep]
-    y <- xy$y[keep]
-    ix <- order(x)
-    result <- .Internal(C_smooth_lowess(x[ix], y[ix], f, iter, delta))
+    ix <- order(xy$x)
+    result <- .Internal(C_smooth_lowess(xy$x[ix], xy$y[ix], f, iter, delta))
     names(result) <- c("x", "y")
     result
 }

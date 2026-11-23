@@ -53,12 +53,10 @@
 anova.glm <- function(object, ..., dispersion = NULL, test = NULL) {
     others <- list(...)
     if (length(others)) return(.glm_analysis_models(c(list(object), others), dispersion, test))
-    if (is.null(test) && (.glm_in(family(object)$family, c("poisson", "binomial")) || !is.null(dispersion)))
-        test <- "Chisq"
+    if (is.null(test) && !is.null(dispersion)) test <- "Chisq"
     if (is.null(test)) {
         fixed <- family(object)$dispersion
-        if (!is.null(fixed) && !is.na(fixed)) test <- "Chisq"
-        else test <- "F"
+        if (!is.null(fixed)) test <- if (is.na(fixed)) "F" else "Chisq"
     }
     data <- .glm_analysis_data(object)
     assignment <- attr(data$x, "assign")
@@ -67,8 +65,8 @@ anova.glm <- function(object, ..., dispersion = NULL, test = NULL) {
     rdf <- c(object$df.null, rep(NA_integer_, terms.count))
     dev <- c(object$null.deviance, rep(NA_real_, terms.count))
     score <- rep(NA_real_, terms.count + 1L)
-    test <- .lm_choice(test, c("Rao", "LRT", "Chisq", "F", "Cp"))
-    need.score <- test == "Rao"
+    if (!is.null(test)) test <- .lm_choice(test, c("Rao", "LRT", "Chisq", "F", "Cp"))
+    need.score <- identical(test, "Rao")
     if (need.score && terms.count) previous <- .glm_refit(object, data, assignment == 0)
     for (j in seq_along(labels)) {
         fit <- if (j == terms.count) object else .glm_refit(object, data, assignment <= j)
@@ -98,6 +96,7 @@ anova.glm <- function(object, ..., dispersion = NULL, test = NULL) {
                        " removed because response differs from model 1"))
         models <- models[!different]
     }
+    if (length(models) == 1L) return(anova.glm(models[[1L]], dispersion = dispersion, test = test))
     sizes <- vapply(models, function(model) length(model$residuals), 0L)
     if (any(sizes != sizes[[1L]])) stop("models were not all fitted to the same size of dataset")
     rdf <- vapply(models, function(model) as.double(model$df.residual), 0)
@@ -108,11 +107,12 @@ anova.glm <- function(object, ..., dispersion = NULL, test = NULL) {
     if (is.null(test)) {
         fam <- family(largest)
         fixed <- fam$dispersion
-        test <- if (!is.null(dispersion) || (!is.null(fixed) && !is.na(fixed))) "Chisq" else "F"
+        if (!is.null(dispersion)) test <- "Chisq"
+        else if (!is.null(fixed)) test <- if (is.na(fixed)) "F" else "Chisq"
     }
     score <- rep(NA_real_, length(models))
-    test <- .lm_choice(test, c("Rao", "LRT", "Chisq", "F", "Cp"))
-    if (test == "Rao" && length(models) > 1L) {
+    if (!is.null(test)) test <- .lm_choice(test, c("Rao", "LRT", "Chisq", "F", "Cp"))
+    if (identical(test, "Rao")) {
         for (j in seq_len(length(models) - 1L) + 1L) {
             smaller <- if (ddf[j] >= 0) j - 1L else j
             larger <- if (smaller == j) j - 1L else j
