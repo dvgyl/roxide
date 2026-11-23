@@ -1,9 +1,11 @@
 //! Base graphics state, coordinate conversion, and drawing.
 
 mod coords;
+mod histogram;
 mod layout;
 mod lowlevel;
 mod par;
+mod replay;
 
 use roxide_eval::{
     ArgEval, Arity, Call, Ctx, Dispatch, EvalResult, Module, PrimDef, PrimFn, PrimKind, Visibility,
@@ -19,13 +21,25 @@ pub const MODULE: Module = Module {
         internal("C_rx_par", 3, par::par),
         internal("C_rx_layout", 4, layout::layout),
         internal("C_rx_plot_new", 0, coords::plot_new),
+        internal("C_rx_require_frame", 0, coords::check_frame),
         internal("C_rx_plot_window", 5, coords::plot_window),
         internal("C_rx_grconvert", 4, coords::convert),
         internal("C_rx_strmetric", 5, coords::strmetric),
         internal("C_rx_ax_ticks", 5, coords::ax_ticks),
         internal("C_rx_draw", 3, lowlevel::draw),
+        internal("C_rx_hist_counts", 5, histogram::counts),
+        internal("C_rx_formula_frame", 4, formula_frame),
+        internal("C_rx_dev_control", 1, replay::control),
+        internal("C_rx_is_recording", 0, replay::is_recording),
+        internal("C_rx_record_plot", 2, replay::snapshot),
+        internal("C_rx_replay_plot", 1, replay::replay),
     ],
-    prelude: include_str!("prelude.R"),
+    prelude: concat!(
+        include_str!("prelude.R"),
+        include_str!("axes.R"),
+        include_str!("distributions.R"),
+        include_str!("multivariate.R"),
+    ),
 };
 
 const fn internal(name: &'static str, arity: usize, fun: PrimFn) -> PrimDef {
@@ -134,6 +148,15 @@ fn element(ctx: &Ctx, list: SexpId, i: usize) -> EvalResult {
 }
 
 fn record(ctx: &mut Ctx, call: &Call, name: &str, args: &[SexpId]) -> EvalResult<()> {
+    if !active(ctx, call, false)?.recording {
+        return Ok(());
+    }
+    let entry = recorded_call(ctx, name, args)?;
+    active(ctx, call, false)?.display_list.push(entry);
+    Ok(())
+}
+
+fn recorded_call(ctx: &mut Ctx, name: &str, args: &[SexpId]) -> EvalResult {
     ctx.scoped(|ctx| {
         let mut tail = SEXP_NIL;
         for &value in args.iter().rev() {
@@ -146,8 +169,33 @@ fn record(ctx: &mut Ctx, call: &Call, name: &str, args: &[SexpId]) -> EvalResult
         let tail = ctx.session_mut().cons(expr, SEXP_NIL, SEXP_NIL)?;
         ctx.protect(tail);
         let internal = ctx.session_mut().intern(".Internal")?.as_sexp();
-        let entry = ctx.session_mut().lcons(internal, tail, SEXP_NIL)?;
-        active(ctx, call, false)?.display_list.push(entry);
-        Ok(())
+        Ok(ctx.session_mut().lcons(internal, tail, SEXP_NIL)?)
+    })
+}
+
+fn formula_frame(ctx: &mut Ctx, _: &Call, args: &mut roxide_eval::Args) -> EvalResult {
+    let values = args.get(0);
+    let labels = names(ctx, values)?;
+    ctx.scoped(|ctx| {
+        let mut tail = SEXP_NIL;
+        if !labels
+            .iter()
+            .any(|name| name.as_deref() == Some("na.action"))
+        {
+            let key = ctx.session_mut().intern("na.action")?.as_sexp();
+            tail = ctx.session_mut().cons(args.get(3), tail, key)?;
+            ctx.protect(tail);
+        }
+        for (i, label) in labels.iter().enumerate().rev() {
+            if let Some(name @ ("formula" | "data" | "subset" | "na.action")) = label.as_deref() {
+                let value = ctx.session().list_get(values, i)?;
+                let key = ctx.session_mut().intern(name)?.as_sexp();
+                tail = ctx.session_mut().cons(value, tail, key)?;
+                ctx.protect(tail);
+            }
+        }
+        let expr = ctx.session_mut().lcons(args.get(2), tail, SEXP_NIL)?;
+        ctx.protect(expr);
+        ctx.eval(expr, args.get(1))
     })
 }

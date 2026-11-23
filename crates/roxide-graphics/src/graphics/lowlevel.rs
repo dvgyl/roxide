@@ -213,7 +213,10 @@ impl Style {
                     }
                 }
                 Some(
-                    "type" | "xlab" | "ylab" | "main" | "sub" | "xaxt" | "yaxt" | "las" | "ann",
+                    "type" | "xlab" | "ylab" | "main" | "sub" | "xaxt" | "yaxt" | "las" | "ann"
+                    | "xaxs" | "yaxs" | "lab" | "col.axis" | "cex.axis" | "font.axis" | "col.lab"
+                    | "cex.lab" | "font.lab" | "col.main" | "cex.main" | "font.main" | "col.sub"
+                    | "cex.sub" | "font.sub" | "bty" | "mgp" | "tcl" | "tck",
                 )
                 | None => {}
                 Some(name) if !name.is_empty() => {

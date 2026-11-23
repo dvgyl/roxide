@@ -11,7 +11,7 @@ fn choose_unit(cell: f64, high_bias: f64, five_bias: f64) -> f64 {
         (5.0 * base, five_bias),
         (10.0 * base, high_bias),
     ] {
-        if candidate - cell >= bias * (cell - unit) {
+        if !candidate.is_finite() || candidate - cell >= bias * (cell - unit) {
             break;
         }
         unit = candidate;
@@ -92,6 +92,21 @@ pub(super) fn pretty(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult 
     let tolerance = 1e-10;
     let mut lower = (lo / unit + tolerance).floor();
     let mut upper = (hi / unit - tolerance).ceil();
+    let (mut corrected_lo, mut corrected_hi) = (lo, hi);
+    if eps_correct == 2.0 || (eps_correct == 1.0 && !small) {
+        corrected_lo = (lo - (lo.abs() * f64::EPSILON).max(f64::MIN_POSITIVE)).max(-f64::MAX);
+        corrected_hi = (hi + (hi.abs() * f64::EPSILON).max(f64::MIN_POSITIVE)).min(f64::MAX);
+        lower = lower.min((corrected_lo / unit + tolerance).floor());
+        upper = upper.max((corrected_hi / unit - tolerance).ceil());
+    }
+    let edge = (f64::MAX / unit).floor();
+    let edge = if (edge * unit).is_finite() {
+        edge
+    } else {
+        edge - 1.0
+    };
+    lower = lower.max(-edge);
+    upper = upper.min(edge);
     let extra = (min_n - (upper - lower)).max(0.0);
     let left = if lo == 0.0 && hi != 0.0 {
         0.0
@@ -111,17 +126,18 @@ pub(super) fn pretty(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult 
     }
     let count = divisions as usize + 1;
     limit::<f64>(ctx, call, count)?;
-    let mut start = lower * unit;
-    let mut end = upper * unit;
-    if bounds {
-        let (mut lo, mut hi) = (lo, hi);
-        if eps_correct == 2.0 || (eps_correct == 1.0 && !small) {
-            lo -= (lo.abs() * f64::EPSILON).max(f64::MIN_POSITIVE);
-            hi += (hi.abs() * f64::EPSILON).max(f64::MIN_POSITIVE);
-        }
-        start = start.min(lo);
-        end = end.max(hi);
-    }
+    let grid_start = (lower * unit).max(-f64::MAX);
+    let grid_end = (upper * unit).min(f64::MAX);
+    let start = if bounds {
+        grid_start.min(corrected_lo)
+    } else {
+        grid_start
+    };
+    let end = if bounds {
+        grid_end.max(corrected_hi)
+    } else {
+        grid_end
+    };
     let can_use_int = unit >= 1.0
         && unit.fract() == 0.0
         && start.abs() <= f64::from(i32::MAX)
@@ -139,7 +155,7 @@ pub(super) fn pretty(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult 
     let step = (end - start) / divisions.max(1.0);
     let values: Vec<_> = (0..count)
         .map(|i| {
-            if regular {
+            let value = if regular {
                 (lower + i as f64) * unit
             } else if i == 0 {
                 start
@@ -148,8 +164,18 @@ pub(super) fn pretty(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult 
             } else if step.is_finite() {
                 start + (i as f64) * step
             } else {
-                let ratio = i as f64 / divisions;
-                start * (1.0 - ratio) + end * ratio
+                let step = end / divisions - start / divisions;
+                if i as f64 <= divisions / 2.0 {
+                    start + i as f64 * step
+                } else {
+                    end - (divisions - i as f64) * step
+                }
+            };
+            let scale = end / divisions.max(1.0) - start / divisions.max(1.0);
+            if eps_correct == 0.0 && (value / scale).abs() < 1e-14 {
+                0.0
+            } else {
+                value
             }
         })
         .collect();

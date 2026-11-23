@@ -9,7 +9,7 @@ use crate::{
     grdevices::parse_rgba,
 };
 
-use super::{active, alloc_strings, flag, layout::Layout, names, nums, string, strings};
+use super::{active, alloc_strings, flag, layout::Layout, names, nums, record, string, strings};
 
 #[derive(Clone)]
 pub(super) enum Param {
@@ -147,7 +147,8 @@ pub(super) struct GPar {
     plot: Option<Region>,
     panel: Panel,
     index: usize,
-    pub(super) usr: [f64; 4],
+    usr: [f64; 4],
+    logusr: [f64; 4],
     pub(super) log: [bool; 2],
     pub(super) axp: [[f64; 3]; 2],
     pub(super) new: bool,
@@ -220,10 +221,31 @@ impl GPar {
             index: 0,
             plot: None,
             usr: UNIT,
+            logusr: [0.0; 4],
             log: [false; 2],
             axp: [[0.0, 1.0, 5.0]; 2],
             new: false,
             clip: None,
+        }
+    }
+
+    pub(super) fn usr(&self) -> [f64; 4] {
+        std::array::from_fn(|i| {
+            if self.log[i / 2] {
+                self.logusr[i]
+            } else {
+                self.usr[i]
+            }
+        })
+    }
+
+    pub(super) fn set_usr(&mut self, axis: usize, range: [f64; 2]) {
+        let indices = 2 * axis..2 * axis + 2;
+        if self.log[axis] {
+            self.logusr[indices.clone()].copy_from_slice(&range);
+            self.usr[indices].copy_from_slice(&range.map(|x| 10.0_f64.powf(x)));
+        } else {
+            self.usr[indices].copy_from_slice(&range);
         }
     }
 
@@ -389,7 +411,7 @@ impl GPar {
             "csi" => Real(self.csi),
             "cxy" => {
                 let [pw, ph] = size(g.plot);
-                let [ux, uy] = size(self.usr);
+                let [ux, uy] = size(self.usr());
                 Reals(vec![self.cin[0] * ux / pw, self.cin[1] * uy / ph])
             }
             "din" => Reals(self.din.to_vec()),
@@ -413,7 +435,7 @@ impl GPar {
             "mfrow" | "mfcol" => Ints(vec![nr as i32, nc as i32]),
             "mfg" => Ints(vec![r as i32, c as i32, nr as i32, nc as i32]),
             "new" => flag(self.new),
-            "usr" => Reals(self.usr.to_vec()),
+            "usr" => Reals(self.usr().to_vec()),
             "xlog" => flag(self.log[0]),
             "ylog" => flag(self.log[1]),
             "xaxp" => Reals(self.axp[0].to_vec()),
@@ -736,9 +758,13 @@ fn set(ctx: &mut Ctx, call: &Call, name: &str, value: SexpId) -> EvalResult<()> 
                 }
                 "plt" => par.plot = Some(Region::Normalized(v)),
                 _ => {
-                    par.usr = v;
                     for axis in 0..2 {
                         let [a, b] = [v[2 * axis], v[2 * axis + 1]];
+                        par.set_usr(axis, [a, b]);
+                        if !par.log[axis] {
+                            let logged = [a, b].map(|x| if x > 0.0 { x.log10() } else { NA_REAL });
+                            par.logusr[2 * axis..2 * axis + 2].copy_from_slice(&logged);
+                        }
                         let limits = if par.log[axis] {
                             [10.0_f64.powf(a), 10.0_f64.powf(b)]
                         } else {
@@ -825,16 +851,7 @@ fn set(ctx: &mut Ctx, call: &Call, name: &str, value: SexpId) -> EvalResult<()> 
                     par.new = v;
                 } else {
                     let axis = usize::from(name == "ylog");
-                    if par.log[axis] != v {
-                        for x in &mut par.usr[2 * axis..2 * axis + 2] {
-                            *x = if v {
-                                if *x > 0.0 { x.log10() } else { 0.0 }
-                            } else {
-                                10.0_f64.powf(*x)
-                            };
-                        }
-                        par.log[axis] = v;
-                    }
+                    par.log[axis] = v;
                 }
             }
         }
@@ -904,10 +921,171 @@ pub(super) fn par(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
                 }
             }
         }
+        if entries.iter().any(|(_, value)| value.is_some()) {
+            record(ctx, call, "C_rx_par", &[input, args.get(1), args.get(2)])?;
+        }
         let names = alloc_strings(ctx, entries.iter().map(|(name, _)| name.as_str()))?;
         ctx.protect(names);
         let key = ctx.session_mut().intern("names")?;
         ctx.session_mut().set_attrib(result, key, names)?;
         Ok(result)
     })
+}
+
+pub(super) fn snapshot(ctx: &mut Ctx, call: &Call) -> EvalResult {
+    let slot = active(ctx, call, true)?;
+    let layout = slot.par_state;
+    let frame = slot.frame_open;
+    let par = state(slot)?;
+    let mut params: Vec<_> = par
+        .params
+        .iter()
+        .map(|(name, value)| (*name, value.clone()))
+        .collect();
+    let mut geometry = vec![
+        (if matches!(par.mar, Margins::Lines(_)) {
+            "mar"
+        } else {
+            "mai"
+        }),
+        (if par.omd.is_some() {
+            "omd"
+        } else if matches!(par.oma, Margins::Lines(_)) {
+            "oma"
+        } else {
+            "omi"
+        }),
+    ];
+    match &par.panel {
+        Panel::Grid { by_row, .. } => geometry.insert(0, if *by_row { "mfrow" } else { "mfcol" }),
+        Panel::Custom(Region::Size(_)) => geometry.insert(0, "fin"),
+        Panel::Custom(Region::Normalized(_)) => geometry.insert(0, "fig"),
+        Panel::Layout(_) => {}
+    }
+    match par.plot {
+        Some(Region::Normalized(_)) => geometry.push("plt"),
+        Some(Region::Size(_)) => geometry.push("pin"),
+        None => {}
+    }
+    geometry.extend(["mfg", "xlog", "ylog", "xaxp", "yaxp", "new"]);
+    let layout = if matches!(par.panel, Panel::Layout(_)) {
+        layout
+    } else {
+        SEXP_NIL
+    };
+    let layout_and_margins = geometry
+        .into_iter()
+        .filter_map(|name| par.get(name).map(|v| (name, v)));
+    params.splice(..0, layout_and_margins);
+    params.extend([
+        (".usr", Param::Reals(par.usr.to_vec())),
+        (".logusr", Param::Reals(par.logusr.to_vec())),
+        (".frame", Param::Flag(Some(frame))),
+        (".csi", Param::Real(par.csi)),
+    ]);
+    let clip = par.clip;
+    ctx.scoped(|ctx| {
+        ctx.protect(layout);
+        let result = ctx.session_mut().alloc_list(params.len() + 2)?;
+        ctx.protect(result);
+        for (i, (_, param)) in params.iter().enumerate() {
+            let value = param.alloc(ctx)?;
+            ctx.session_mut().list_set(result, i, value)?;
+        }
+        ctx.session_mut().list_set(result, params.len(), layout)?;
+        if let Some(clip) = clip {
+            let value = ctx.session_mut().alloc_real_from(&clip)?;
+            ctx.session_mut()
+                .list_set(result, params.len() + 1, value)?;
+        }
+        let labels = alloc_strings(
+            ctx,
+            params
+                .iter()
+                .map(|(name, _)| *name)
+                .chain([".layout", ".clip"]),
+        )?;
+        ctx.protect(labels);
+        let key = ctx.session_mut().intern("names")?;
+        ctx.session_mut().set_attrib(result, key, labels)?;
+        Ok(result)
+    })
+}
+
+pub(super) fn restore(ctx: &mut Ctx, call: &Call, input: SexpId) -> EvalResult<()> {
+    let labels = names(ctx, input)?;
+    if ctx.session().type_of(input)? != SexpType::Vec
+        || ctx.session().xlength(input)? != labels.len()
+    {
+        return Err(ctx.stop(call.err_call(), "invalid recorded graphics state"));
+    }
+    let slot = active(ctx, call, false)?;
+    slot.par_data = None;
+    slot.par_state = SEXP_NIL;
+    let layout = labels.iter().position(|x| x.as_deref() == Some(".layout"));
+    if let Some(i) = layout {
+        let expr = ctx.session().list_get(input, i)?;
+        if expr != SEXP_NIL {
+            ctx.eval(expr, call.env)?;
+        }
+    }
+    for (i, name) in labels.iter().enumerate() {
+        let Some(name) = name.as_deref() else {
+            continue;
+        };
+        let value = ctx.session().list_get(input, i)?;
+        let template = state(active(ctx, call, false)?)?.value(name).cloned();
+        if let Some(template) = template {
+            let key = state(active(ctx, call, false)?)?
+                .params
+                .get_key_value(name)
+                .map(|(&key, _)| key);
+            let template = if name == "pch" {
+                Param::Int(1)
+            } else {
+                template
+            };
+            let param = parse(ctx, call, name, &template, value)?;
+            if let Some(key) = key {
+                state(active(ctx, call, false)?)?.params.insert(key, param);
+            }
+        } else {
+            match name {
+                ".usr" | ".logusr" => {
+                    let range = <[f64; 4]>::try_from(nums(ctx, value)?)
+                        .map_err(|_| invalid(ctx, call, name))?;
+                    let par = state(active(ctx, call, false)?)?;
+                    if name == ".usr" {
+                        par.usr = range;
+                    } else {
+                        par.logusr = range;
+                    }
+                }
+                ".clip" => {
+                    let clip = if value == SEXP_NIL {
+                        None
+                    } else {
+                        Some(vector::<4>(ctx, call, name, value)?)
+                    };
+                    state(active(ctx, call, false)?)?.clip = clip;
+                }
+                ".csi" => {
+                    let [csi] = vector::<1>(ctx, call, name, value)?;
+                    state(active(ctx, call, false)?)?.csi = csi;
+                }
+                ".frame" => active(ctx, call, false)?.frame_open = flag(ctx, value)? == Some(true),
+                ".layout" => {}
+                "new" => {
+                    let new = flag(ctx, value)? == Some(true);
+                    state(active(ctx, call, false)?)?.new = new;
+                }
+                _ => set(ctx, call, name, value)?,
+            }
+        }
+    }
+    let slot = active(ctx, call, false)?;
+    let par = state(slot)?;
+    let clip = par.clip.unwrap_or_else(|| par.geometry().plot);
+    slot.device.clip(super::coords::rect(clip));
+    Ok(())
 }

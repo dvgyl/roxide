@@ -28,8 +28,7 @@ impl Default for Settings {
 }
 
 pub(super) struct PdfDevice {
-    file: PageName,
-    first_path: PathBuf,
+    file: Option<(PageName, PathBuf)>,
     size: (f64, f64),
     points: Rect,
     onefile: bool,
@@ -54,6 +53,7 @@ impl PdfDevice {
         host: &mut dyn Host,
         spec: &crate::engine::DeviceSpec,
         settings: Settings,
+        in_memory: bool,
     ) -> Result<Self, String> {
         let crate::engine::DeviceSpec::Pdf {
             file,
@@ -68,17 +68,21 @@ impl PdfDevice {
             return Err("invalid PDF device specification".into());
         };
         output::dimensions(*width, *height, *pointsize)?;
-        let file = PageName::new(file, !onefile)?;
-        let first_path = output::path(host, &file.at(1));
-        let first_path = if first_path.is_relative() {
-            host.cwd().map_err(|err| err.message)?.join(first_path)
+        let file = if in_memory {
+            None
         } else {
-            first_path
+            let name = PageName::new(file, true)?;
+            let path = output::path(host, &name.at(1));
+            let path = if path.is_relative() {
+                host.cwd().map_err(|err| err.message)?.join(path)
+            } else {
+                path
+            };
+            output::write_path(host, &path, &[]).map_err(|err| err.message)?;
+            Some((name, path))
         };
-        output::write_path(host, &first_path, &[]).map_err(|err| err.message)?;
         Ok(Self {
             file,
-            first_path,
             size: (*width, *height),
             points: Rect::normalized(0.0, 0.0, width * 72.0, height * 72.0),
             onefile: *onefile,
@@ -109,7 +113,7 @@ impl PdfDevice {
     }
 
     fn page(&mut self) -> Option<&mut Page> {
-        if self.closed {
+        if self.closed || self.file.is_none() {
             return None;
         }
         if self.page.is_none() {
@@ -119,12 +123,13 @@ impl PdfDevice {
     }
 
     fn flush_numbered(&mut self, host: &mut dyn Host) -> HostResult<()> {
-        let pages = self.page.as_slice();
-        let file = self.document(pages)?;
-        if self.index == 1 {
-            output::write_path(host, &self.first_path, &file)?;
-        } else {
-            output::write(host, &self.file.at(self.index), &file)?;
+        if let Some((name, first_path)) = &self.file {
+            let bytes = self.document(self.page.as_slice())?;
+            if self.index == 1 {
+                output::write_path(host, first_path, &bytes)?;
+            } else {
+                output::write(host, &name.at(self.index), &bytes)?;
+            }
         }
         self.page = None;
         Ok(())
@@ -252,6 +257,9 @@ impl Device for PdfDevice {
     fn new_page(&mut self, host: &mut dyn Host, bg: Rgba) -> HostResult<()> {
         if self.closed {
             return Err(output::invalid("graphics device is closed"));
+        }
+        if self.file.is_none() {
+            return Ok(());
         }
         if self.onefile {
             self.pages.extend(self.page.take());
@@ -388,7 +396,9 @@ impl Device for PdfDevice {
         if self.onefile {
             self.pages.extend(self.page.take());
             let bytes = self.document(&self.pages)?;
-            output::write_path(host, &self.first_path, &bytes)?;
+            if let Some((_, first_path)) = &self.file {
+                output::write_path(host, first_path, &bytes)?;
+            }
             self.pages.clear();
         } else {
             self.flush_numbered(host)?;

@@ -11,7 +11,7 @@ use roxide_graphics::engine::{
     Device, DeviceSpec, GContext, GraphicsExt, LineEnd, LineJoin, Rect, Rgba, dl::DisplayList,
     open_device,
 };
-use roxide_host::{CommandSpec, Host, NativeHost, OpenMode, PureHost};
+use roxide_host::{CommandSpec, Host, Limits, NativeHost, OpenMode, PureHost};
 use roxide_value::{GLOBAL_ENV, ValueApi};
 
 const RED: Rgba = Rgba::new(255, 0, 0, 128);
@@ -574,4 +574,30 @@ fn live_r_cairo_png_and_svg() {
     if oracle(script).is_some_and(|s| s.contains("cairo unavailable")) {
         eprintln!("GNU R Cairo is unavailable. The Roxide Cairo file checks ran separately.");
     }
+}
+
+#[test]
+fn png_devices_share_and_release_framebuffer_budget() {
+    let host = NativeHost::with_limits(Limits {
+        max_vector_bytes: 1 << 20,
+        ..Limits::default()
+    });
+    let mut ctx = Ctx::new(Box::new(host), GcPolicy::default()).unwrap();
+    roxide_base::register_all(&mut ctx).unwrap();
+    roxide_graphics::register(&mut ctx).unwrap();
+    r(
+        &mut ctx,
+        r#"
+        png("/tmp/a.png", 400, 400)
+        fail <- tryCatch(png("/tmp/b.png", 400, 400), error = function(e) conditionMessage(e))
+        stopifnot(identical(fail, "PNG framebuffer exceeds the host vector limit"),
+                  length(dev.list()) == 1L)
+        dev.off()
+        png("/tmp/b.png", 400, 400)
+        stopifnot(length(dev.list()) == 1L)
+        "#,
+    );
+    assert_eq!(ctx.ext::<GraphicsExt>().framebuffer_bytes(), 640_000);
+    r(&mut ctx, "dev.off()");
+    assert_eq!(ctx.ext::<GraphicsExt>().framebuffer_bytes(), 0);
 }

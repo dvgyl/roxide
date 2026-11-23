@@ -26,7 +26,7 @@ pub(super) struct PngDevice {
 }
 
 impl PngDevice {
-    pub(super) fn open(host: &dyn Host, spec: &DeviceSpec) -> Result<Self, String> {
+    pub(super) fn open(max_bytes: usize, spec: &DeviceSpec) -> Result<Self, String> {
         let DeviceSpec::Png {
             filename,
             width_px,
@@ -53,7 +53,7 @@ impl PngDevice {
         }
         let count = (width as usize)
             .checked_mul(height as usize)
-            .filter(|count| *count <= host.limits().max_vector_bytes / 4)
+            .filter(|count| *count <= max_bytes / 4)
             .ok_or("PNG framebuffer exceeds the host vector limit")?;
         let file = PageName::new(filename, true)?;
         let mut pixels = Vec::new();
@@ -103,6 +103,9 @@ impl PngDevice {
 }
 
 impl Device for PngDevice {
+    fn framebuffer_bytes(&self) -> usize {
+        self.frame.pixels.capacity() * size_of::<[u8; 4]>()
+    }
     fn name(&self) -> &str {
         &self.name
     }

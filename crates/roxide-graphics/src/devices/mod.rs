@@ -54,9 +54,13 @@ pub fn open_device(host: &mut dyn Host, spec: &DeviceSpec) -> Result<Box<dyn Dev
             host,
             spec,
             pdf::Settings::default(),
+            false,
         )?)),
         DeviceSpec::Svg { .. } => Ok(Box::new(svg::SvgDevice::open(spec, "sans".into())?)),
-        DeviceSpec::Png { .. } => Ok(Box::new(raster::PngDevice::open(host, spec)?)),
+        DeviceSpec::Png { .. } => Ok(Box::new(raster::PngDevice::open(
+            host.limits().max_vector_bytes,
+            spec,
+        )?)),
     }
 }
 
@@ -76,8 +80,13 @@ fn install(
 }
 
 fn pdf(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    let in_memory = args.get(0) == SEXP_NIL;
     let spec = DeviceSpec::Pdf {
-        file: text(ctx, call, args.get(0), "file")?,
+        file: if in_memory {
+            String::new()
+        } else {
+            text(ctx, call, args.get(0), "file")?
+        },
         width: number(ctx, call, args.get(1), "width")?,
         height: number(ctx, call, args.get(2), "height")?,
         onefile: flag(ctx, call, args.get(3), "onefile")?,
@@ -95,7 +104,9 @@ fn pdf(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
         return Err(ctx.stop(call.err_call(), format!("unknown family '{family}'")));
     }
     install(ctx, call, |host| {
-        Ok(Box::new(pdf::PdfDevice::open(host, &spec, settings)?))
+        Ok(Box::new(pdf::PdfDevice::open(
+            host, &spec, settings, in_memory,
+        )?))
     })
 }
 
@@ -165,7 +176,11 @@ fn png(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
         res,
         device_name: device_name.into(),
     };
-    install(ctx, call, |host| open_device(host, &spec))
+    let used = ctx.ext::<GraphicsExt>().framebuffer_bytes();
+    let remaining = ctx.host().limits().max_vector_bytes.saturating_sub(used);
+    install(ctx, call, |_| {
+        Ok(Box::new(raster::PngDevice::open(remaining, &spec)?))
+    })
 }
 
 fn number(ctx: &mut Ctx, call: &Call, value: SexpId, name: &str) -> EvalResult<f64> {

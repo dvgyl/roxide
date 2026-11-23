@@ -33,7 +33,6 @@ pub const MODULE: Module = Module {
         internal("C_gd_dev_step", 2, dev::step),
         internal("C_gd_dev_set", 1, dev::set),
         internal("C_gd_dev_off", 1, dev::off),
-        internal("C_gd_dev_new", 0, dev::open),
         internal("C_gd_dev_size", 1, dev::size),
         internal("C_gd_graphics_off", 0, dev::close_all),
         internal("C_gd_pretty", 9, ranges::pretty),

@@ -42,7 +42,14 @@ pub(super) fn plot_new(ctx: &mut Ctx, call: &Call, _: &mut Args) -> EvalResult {
         return Err(ctx.stop(call.err_call(), "figure margins too large"));
     }
     if start_page {
+        let recording = active(ctx, call, false)?.recording;
+        let initial = if recording {
+            super::par::snapshot(ctx, call)?
+        } else {
+            SEXP_NIL
+        };
         let id = ctx.ext::<GraphicsExt>().current;
+        // The backend uses only Host. No garbage collection can occur while the slot is out.
         let mut slot = ctx.ext::<GraphicsExt>().slots[id]
             .take()
             .ok_or_else(|| ctx.stop(call.err_call(), "no active graphics device"))?;
@@ -50,7 +57,7 @@ pub(super) fn plot_new(ctx: &mut Ctx, call: &Call, _: &mut Args) -> EvalResult {
         if result.is_ok() {
             slot.page_count += 1;
             slot.display_list.clear();
-            slot.display_list.set_enabled(true);
+            slot.initial_state = initial;
         }
         ctx.ext::<GraphicsExt>().slots[id] = Some(slot);
         result.map_err(|error| ctx.stop(call.err_call(), error.to_string()))?;
@@ -61,12 +68,17 @@ pub(super) fn plot_new(ctx: &mut Ctx, call: &Call, _: &mut Args) -> EvalResult {
     par.log = [false; 2];
     for (axis, name) in ["xaxs", "yaxs"].into_iter().enumerate() {
         let range = expand([0.0, 1.0], par.text(name) == "r");
-        par.usr[2 * axis..2 * axis + 2].copy_from_slice(&range);
+        par.set_usr(axis, range);
         par.axp[axis] = linear_ticks(range, par.axis_count(axis));
     }
     slot.frame_open = true;
     slot.device.clip(rect(geom.plot));
     record(ctx, call, "C_rx_plot_new", &[])?;
+    Ok(SEXP_NIL)
+}
+
+pub(super) fn check_frame(ctx: &mut Ctx, call: &Call, _: &mut Args) -> EvalResult {
+    require_frame(ctx, call)?;
     Ok(SEXP_NIL)
 }
 
@@ -273,7 +285,7 @@ pub(super) fn plot_window(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalRe
         } else {
             linear_ticks(range, count)
         };
-        par.usr[2 * axis..2 * axis + 2].copy_from_slice(&range);
+        par.set_usr(axis, range);
     }
     record(
         ctx,
@@ -324,7 +336,7 @@ fn transform(unit: Units, g: Geometry, par: &GPar, axis: usize) -> (f64, f64) {
         Units::Inches => return (0.0, 1.0),
         Units::Device => return (0.0, 1.0 / 72.0),
         Units::Lines => return (0.0, par.line()),
-        Units::Chars => return (0.0, par.char_size(axis)),
+        Units::Chars => return (0.0, par.char_size(1)),
         Units::Ndc => g.device,
         Units::Nic => g.inner,
         Units::Nfc => g.figure,
@@ -332,8 +344,8 @@ fn transform(unit: Units, g: Geometry, par: &GPar, axis: usize) -> (f64, f64) {
     };
     let span = r[step + 1] - r[step];
     if unit == Units::User {
-        let a = par.usr[step];
-        let b = par.usr[step + 1];
+        let a = par.usr()[step];
+        let b = par.usr()[step + 1];
         let scale = if (b - a).is_finite() {
             span / (b - a)
         } else {
@@ -449,7 +461,7 @@ pub(super) fn ax_ticks(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResul
     let par = state(active(ctx, call, true)?)?;
     let (default_axp, default_usr, default_log, default_intervals) = (
         par.axp[axis],
-        [par.usr[2 * axis], par.usr[2 * axis + 1]],
+        [par.usr()[2 * axis], par.usr()[2 * axis + 1]],
         par.log[axis],
         par.axis_count(axis),
     );

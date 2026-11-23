@@ -13,7 +13,7 @@ use std::any::Any;
 use roxide_eval::{Ctx, CtxExt, EvalResult};
 use roxide_gc::{SexpId, Trace, Tracer};
 use roxide_host::{Host, HostResult};
-use roxide_value::SEXP_NIL;
+use roxide_value::{GLOBAL_ENV, SEXP_NIL, ValueApi};
 
 use dl::DisplayList;
 
@@ -273,6 +273,14 @@ pub trait Device {
     fn str_width(&self, s: &str, gc: &GContext) -> f64;
     /// Return `(ascent, descent, width)` in device points for character `c` under `gc`.
     fn metric_info(&self, c: char, gc: &GContext) -> (f64, f64, f64);
+    /// Return the number of bytes held in a raster framebuffer.
+    fn framebuffer_bytes(&self) -> usize {
+        0
+    }
+    /// Return whether the device starts with display-list recording enabled.
+    fn records_by_default(&self) -> bool {
+        false
+    }
     /// Finalize and write any buffered output via `host`.
     fn close(&mut self, host: &mut dyn Host) -> HostResult<()>;
 }
@@ -338,6 +346,9 @@ impl RecordingDevice {
 }
 
 impl Device for RecordingDevice {
+    fn records_by_default(&self) -> bool {
+        true
+    }
     fn name(&self) -> &str {
         &self.name
     }
@@ -388,19 +399,17 @@ pub fn open_device(host: &mut dyn Host, spec: &DeviceSpec) -> Result<Box<dyn Dev
 /// Open the session's default graphics device (invoked on demand by `dev.new()`, `dev.size()`,
 /// `dev.set(1)`, and plotting functions when only the null device is active).
 pub fn open_default_device(ctx: &mut Ctx) -> EvalResult<usize> {
-    let spec = DeviceSpec::Pdf {
-        file: String::from("Rplots.pdf"),
-        width: 7.0,
-        height: 7.0,
-        onefile: true,
-        compress: true,
-        bg: Rgba::TRANSPARENT,
-        pointsize: 12.0,
-    };
-    let dev = open_device(ctx.host(), &spec).map_err(|msg| ctx.stop(SEXP_NIL, msg))?;
-    ctx.ext::<GraphicsExt>()
-        .open_slot(dev)
-        .ok_or_else(|| ctx.stop(SEXP_NIL, "too many open devices"))
+    ctx.scoped(|ctx| {
+        let dev_new = ctx.session_mut().intern("dev.new")?.as_sexp();
+        let call = ctx.session_mut().lcons(dev_new, SEXP_NIL, SEXP_NIL)?;
+        ctx.protect(call);
+        ctx.eval(call, GLOBAL_ENV)?;
+        let id = ctx.ext::<GraphicsExt>().current;
+        if id == 1 {
+            return Err(ctx.stop(SEXP_NIL, "no active graphics device"));
+        }
+        Ok(id)
+    })
 }
 
 /// Active state held for one open graphics device slot.
@@ -409,10 +418,14 @@ pub struct DeviceSlot {
     pub device: Box<dyn Device>,
     /// Recorded display list for `recordPlot()` / `replayPlot()`.
     pub display_list: DisplayList,
+    /// Whether new drawing calls are recorded.
+    pub recording: bool,
     /// Optional typed Rust `par()` state owned by `graphics::par` (dropped automatically on `dev.off()`).
     pub par_data: Option<Box<dyn Any>>,
-    /// Per-device R-level `par()` state (`SEXP_NIL` until initialized).
+    /// Call that installed the current custom layout.
     pub par_state: SexpId,
+    /// Base graphics state at the start of the recorded page.
+    pub initial_state: SexpId,
     /// Per-device R-level `grid` state (`SEXP_NIL` until initialized).
     pub grid_state: SexpId,
     /// Whether `plot.new()` has initialized a base graphics frame on this device.
@@ -425,11 +438,16 @@ impl DeviceSlot {
     /// Wrap a newly opened [`Device`] in a fresh [`DeviceSlot`].
     #[must_use]
     pub fn new(device: Box<dyn Device>) -> Self {
+        let recording = device.records_by_default();
+        let mut display_list = DisplayList::default();
+        display_list.set_enabled(recording);
         Self {
             device,
-            display_list: DisplayList::default(),
+            display_list,
+            recording,
             par_data: None,
             par_state: SEXP_NIL,
+            initial_state: SEXP_NIL,
             grid_state: SEXP_NIL,
             frame_open: false,
             page_count: 0,
@@ -487,6 +505,13 @@ impl GraphicsExt {
         self.slots.get_mut(self.current).and_then(Option::as_mut)
     }
 
+    /// Return the total framebuffer bytes held by open devices.
+    pub fn framebuffer_bytes(&self) -> usize {
+        self.slots.iter().flatten().fold(0usize, |total, slot| {
+            total.saturating_add(slot.device.framebuffer_bytes())
+        })
+    }
+
     /// Return all open non-null device IDs in ascending order.
     #[must_use]
     pub fn open_ids(&self) -> Vec<usize> {
@@ -501,6 +526,7 @@ impl Trace for GraphicsExt {
         for slot in self.slots.iter().flatten() {
             slot.display_list.trace(tracer);
             tracer.edge(slot.par_state);
+            tracer.edge(slot.initial_state);
             tracer.edge(slot.grid_state);
         }
     }

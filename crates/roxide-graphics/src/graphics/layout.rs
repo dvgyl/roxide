@@ -1,7 +1,7 @@
 use roxide_eval::{Args, Call, Ctx, EvalResult};
 use roxide_value::{SexpType, ValueApi};
 
-use super::{active, attr, nums, par::state, strings};
+use super::{active, attr, nums, par::state, recorded_call, strings};
 
 #[derive(Clone, Copy)]
 enum Track {
@@ -228,6 +228,11 @@ pub(super) fn layout(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult 
         widths: tracks(ctx, call, args.get(1), cols, "widths")?,
         heights: tracks(ctx, call, args.get(2), rows, "heights")?,
     };
-    state(active(ctx, call, true)?)?.set_layout(layout);
+    let values = [args.get(0), args.get(1), args.get(2), args.get(3)];
+    let entry = recorded_call(ctx, "C_rx_layout", &values)?;
+    let slot = active(ctx, call, true)?;
+    state(slot)?.set_layout(layout);
+    slot.par_state = entry;
+    slot.display_list.push(entry);
     Ok(ctx.session_mut().alloc_int_from(&[count as i32])?)
 }

@@ -2,8 +2,8 @@ par <- function(..., no.readonly = FALSE) {
     args <- list(...)
     all.params <- length(args) == 0L
     scalar <- FALSE
-    if (length(args) > 1L && all(vapply(args, is.character, logical(1))))
-        args <- as.list(unlist(args))
+    if (length(args) > 1L && is.null(names(args)) && all(vapply(args, is.character, logical(1))))
+        args <- as.list(do.call(c, args))
     if (length(args) == 1L && (is.null(names(args)) || names(args)[1L] == "")) {
         if (is.null(args[[1L]]) || is.list(args[[1L]])) {
             args <- as.list(args[[1L]])

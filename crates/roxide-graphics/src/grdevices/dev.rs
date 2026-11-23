@@ -126,11 +126,6 @@ pub(super) fn close_all(ctx: &mut Ctx, call: &Call, _: &mut Args) -> EvalResult 
     Ok(SEXP_NIL)
 }
 
-pub(super) fn open(ctx: &mut Ctx, _: &Call, _: &mut Args) -> EvalResult {
-    open_default_device(ctx)?;
-    Ok(SEXP_NIL)
-}
-
 pub(super) fn size(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     let unit = number(ctx, args.get(0))?;
     if ctx.ext::<GraphicsExt>().current == 1 {

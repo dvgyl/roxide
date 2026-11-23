@@ -1,0 +1,67 @@
+=== case: histogram_results_and_boundary_fuzz ===
+#@ tags: layer3,graphics
+#@ compare: exact
+x <- c(1,2,2,3,3,3,4,4,5,10,NA,Inf)
+h <- hist(x, plot = FALSE)
+dput(class(h))
+dput(names(h))
+dput(as.double(h$breaks))
+dput(h$counts)
+dput(round(h$density, 8))
+dput(h$mids)
+dput(h$xname)
+dput(h$equidist)
+dput(hist(c(0,1,1+1e-8,2), breaks = 0:2, plot = FALSE)$counts)
+dput(hist(c(0,1,1+1e-8,2), breaks = 0:2, fuzz = 0, plot = FALSE)$counts)
+dput(hist(1:4, breaks = function(x) c(0, 2, 4), right = FALSE, plot = FALSE)$counts)
+dput(nclass.FD(c(rep(0,99),100)) == 21)
+
+=== case: boxplot_statistics_and_bxp_window ===
+#@ tags: layer3,graphics
+#@ compare: exact
+pdf(NULL)
+b <- boxplot(list(a = c(1:10,30), b = c(2,4,6,8), empty = numeric()), plot = FALSE)
+dput(names(b))
+dput(as.double(b$stats))
+dput(b$n)
+dput(round(as.double(b$conf), 8))
+dput(b$out)
+dput(b$group)
+dput(b$names)
+m <- withVisible(bxp(b, at = c(1,3,4), axes = FALSE))
+dput(as.double(m$value))
+dput(m$visible)
+dput(round(par("usr"), 8))
+
+=== case: bar_midpoints_for_vector_and_matrix ===
+#@ tags: layer3,graphics
+#@ compare: exact
+x <- barplot(c(3,5,2), plot = FALSE)
+dput(dim(x))
+dput(round(as.double(x), 8))
+dput(round(as.double(barplot(c(3,5,2), width = c(1,2,3), plot = FALSE)), 8))
+m <- matrix(1:6, 2)
+dput(round(barplot(m, plot = FALSE), 8))
+b <- barplot(m, beside = TRUE, space = c(.2, 1), plot = FALSE)
+dput(dim(b))
+dput(round(as.double(b), 8))
+
+=== case: formula_boxplot_preserves_factor_levels ===
+#@ tags: layer3,graphics
+#@ compare: exact
+d <- data.frame(y = 1:6, g = factor(c("b","a","b","a","b","b"), levels = c("a","b","c")))
+b <- boxplot(y ~ g, data = d, subset = y > 1, plot = FALSE)
+dput(b$names)
+dput(b$n)
+dput(boxplot(y ~ g, data = d, drop = TRUE, plot = FALSE)$names)
+
+=== case: histogram_invalid_range_and_plot_arguments ===
+#@ tags: layer3,graphics
+#@ compare: exact
+handle <- function(w) {
+    dput(conditionMessage(w))
+    invokeRestart("muffleWarning")
+}
+invisible(withCallingHandlers(hist(1:3, plot = FALSE, freq = TRUE, col = "red"), warning = handle))
+dput(tryCatch(hist(c(0,1,2), breaks = 0:2, fuzz = 0, include.lowest = FALSE, plot = FALSE),
+              error = conditionMessage))

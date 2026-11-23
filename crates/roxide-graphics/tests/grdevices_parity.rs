@@ -94,3 +94,27 @@ stopifnot(identical(pretty(2), c(0, 2)),
     )
     .expect("Check range and coordinate helpers");
 }
+
+#[test]
+fn extreme_pretty_coords_and_default_device_options() {
+    let mut ctx = graphics_context();
+    ctx.run_script(
+        "device_hardening.R",
+        r#"
+br <- pretty(c(-1.7e308, 1.7e308))
+stopifnot(length(br) == 7L, all(is.finite(br)), br[4L] == 0,
+          br[1L] == -1.7e308, br[7L] == 1.7e308)
+xyz <- xyz.coords(1:3, recycle = TRUE)
+stopifnot(identical(xyz$y, numeric()), identical(xyz$z, numeric()))
+xy <- xy.coords(cbind(foo = 1, bar = 2), ylab = "matrix")
+stopifnot(identical(xy$xlab, "foo"), identical(xy$ylab, "bar"))
+options(device = function(...) pdf(NULL, ...))
+dev.new(width = 5, height = 4)
+stopifnot(identical(dev.size(), c(5,4)), identical(names(par("mar","cex")), c("mar","cex")))
+dev.off()
+        "#,
+        GLOBAL_ENV,
+        false,
+    )
+    .expect("Check device and coordinate behavior");
+}

@@ -20,3 +20,18 @@ dput(result$visible)
 #@ compare: exact
 dput(is.function(grDevices::svg))
 dput(identical(grDevices::svg, svg))
+
+=== case: metrics_pdf_and_first_page_filename_format ===
+#@ tags: layer3,devices
+#@ compare: exact
+pdf(NULL)
+dput(dev.size())
+dput(round(strwidth("AV", "inches"), 8))
+invisible(dev.off())
+for (one in c(TRUE,FALSE)) {
+    p <- file.path(tempdir(), paste0("first-", one, "-%2d-%%.pdf"))
+    pdf(p, onefile = one)
+    plot.new()
+    invisible(dev.off())
+    dput(file.exists(file.path(tempdir(), paste0("first-", one, "- 1-%.pdf"))))
+}

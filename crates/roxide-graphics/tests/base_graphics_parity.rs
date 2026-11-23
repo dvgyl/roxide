@@ -155,3 +155,31 @@ fn base_functions_draw_on_pdf_svg_and_png() {
         assert_eq!(&rows[pixel..pixel + 4], &[255, 0, 0, 255]);
     }
 }
+
+#[test]
+fn record_and_replay_restore_state_and_keep_one_copy_of_the_calls() {
+    let mut ctx = context(GcPolicy::default());
+    run(
+        &mut ctx,
+        r#"
+        pdf(NULL)
+        plot.new()
+        stopifnot(is.null(recordPlot()[[1L]]))
+        dev.control("enable")
+        par(mfrow = c(1L,2L), mar = rep(1,4L))
+        plot.default(1:3, axes = FALSE, ann = FALSE)
+        plot.default(c(1,10), c(3,5), log = "x", axes = FALSE, ann = FALSE)
+        saved <- recordPlot()
+        n <- length(saved[[1L]])
+        expected <- par(c("mfrow","mfg","usr","xlog"))
+        stopifnot(n > 0L, identical(attr(saved,"engineVersion"), 17L))
+        pdf(NULL)
+        dev.control("enable")
+        replayPlot(saved)
+        stopifnot(identical(par(c("mfrow","mfg","usr","xlog")), expected),
+                  length(recordPlot()[[1L]]) == n)
+        replayPlot(saved)
+        stopifnot(length(recordPlot()[[1L]]) == n)
+        "#,
+    );
+}

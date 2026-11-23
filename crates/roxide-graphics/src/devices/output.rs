@@ -62,7 +62,7 @@ pub(super) fn write_path(host: &mut dyn Host, path: &Path, bytes: &[u8]) -> Host
 
 pub(super) struct PageName {
     prefix: String,
-    field: Option<(usize, String)>,
+    field: Option<(usize, bool, String)>,
 }
 
 impl PageName {
@@ -83,24 +83,23 @@ impl PageName {
             let part = name
                 .field
                 .as_mut()
-                .map_or(&mut name.prefix, |(_, suffix)| suffix);
+                .map_or(&mut name.prefix, |(_, _, suffix)| suffix);
             if c != '%' || chars.next_if_eq(&'%').is_some() {
                 part.push(c);
                 continue;
             }
             let mut width = 0;
-            if chars.next_if_eq(&'0').is_some() {
-                while let Some(digit) = chars.next_if(char::is_ascii_digit) {
-                    width = width * 10 + (digit as usize - '0' as usize);
-                    if width > 32 {
-                        return Err("graphics filename has an invalid page number width".into());
-                    }
+            let zero_pad = chars.next_if_eq(&'0').is_some();
+            while let Some(digit) = chars.next_if(char::is_ascii_digit) {
+                width = width * 10 + (digit as usize - '0' as usize);
+                if width > 32 {
+                    return Err("graphics filename has an invalid page number width".into());
                 }
             }
             if chars.next_if_eq(&'d').is_none() || name.field.is_some() {
                 return Err("invalid page number format in graphics filename".into());
             }
-            name.field = Some((width, String::new()));
+            name.field = Some((width, zero_pad, String::new()));
         }
         Ok(name)
     }
@@ -108,7 +107,8 @@ impl PageName {
     pub(super) fn at(&self, page: usize) -> String {
         match &self.field {
             None => self.prefix.clone(),
-            Some((width, suffix)) => format!("{}{page:0width$}{suffix}", self.prefix),
+            Some((width, true, suffix)) => format!("{}{page:0width$}{suffix}", self.prefix),
+            Some((width, false, suffix)) => format!("{}{page:width$}{suffix}", self.prefix),
         }
     }
 }

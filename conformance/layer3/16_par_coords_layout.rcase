@@ -77,3 +77,16 @@ for (i in 1:4) {
     dput(round(par("fin"), 8))
 }
 invisible(dev.off())
+
+=== case: log_toggle_uses_separate_coordinate_ranges ===
+#@ tags: layer3,graphics
+#@ compare: exact
+pdf(NULL)
+plot.new()
+plot.window(c(1,100), c(1,4), log = "x")
+dput(round(par("usr"), 8))
+par(xlog = FALSE)
+dput(round(par("usr"), 8))
+plot.new()
+par(xlog = TRUE)
+dput(round(par("usr"), 8))

@@ -214,7 +214,14 @@ dev.off <- function(which = dev.cur()) {
     if (which == 1L) stop("cannot shut down device 1 (the null device)")
     .Internal(C_gd_dev_off(which))
 }
-dev.new <- function(..., noRStudioGD = FALSE) invisible(.Internal(C_gd_dev_new()))
+dev.new <- function(..., noRStudioGD = FALSE) {
+    device <- getOption("device")
+    if (is.null(device)) device <- pdf
+    if (is.character(device) && length(device) == 1L)
+        device <- get(device, mode = "function", envir = parent.frame())
+    if (!is.function(device)) stop("invalid 'device' option")
+    invisible(device(...))
+}
 dev.size <- function(units = c("in", "cm", "px")) {
     units <- .gd_choice(units, c("in", "cm", "px"))
     scale <- if (units == "in") 1 else if (units == "cm") 2.54 else 72
@@ -326,9 +333,9 @@ xy.coords <- function(x, y = NULL, xlab = NULL, ylab = NULL, log = NULL,
         } else if ((is.matrix(x) || is.data.frame(x)) && ncol(x) >= 2L) {
             labels <- colnames(x)
             if (setLab) {
-                if (is.null(labels)) labels <- c("[,1]", "[,2]")
-                if (is.null(xlab)) xlab <- labels[1L]
-                if (is.null(ylab)) ylab <- labels[2L]
+                if (is.null(labels)) labels <- paste0(if (is.null(ylab)) "" else ylab, c("[,1]", "[,2]"))
+                xlab <- labels[1L]
+                ylab <- labels[2L]
             }
             y <- x[, 2L]
             x <- x[, 1L]
@@ -409,10 +416,54 @@ xyz.coords <- function(x, y = NULL, z = NULL, xlab = NULL, ylab = NULL, zlab = N
     n <- max(lengths)
     if (any(lengths != n)) {
         if (!recycle) stop("'x', 'y' and 'z' lengths differ")
-        x <- .gd_recycle(as.double(x), n)
-        y <- .gd_recycle(as.double(y), n)
-        z <- .gd_recycle(as.double(z), n)
+        if (length(x)) x <- .gd_recycle(as.double(x), n)
+        if (length(y)) y <- .gd_recycle(as.double(y), n)
+        if (length(z)) z <- .gd_recycle(as.double(z), n)
     }
     list(x = .gd_log_coords(x, "x", log), y = .gd_log_coords(y, "y", log),
          z = .gd_log_coords(z, "z", log), xlab = xlab, ylab = ylab, zlab = zlab)
+}
+
+dev.control <- function(displaylist = c("inhibit","enable")) {
+    invisible(.Internal(C_rx_dev_control(.gd_choice(displaylist, c("inhibit","enable")))))
+}
+
+recordPlot <- function(load = NULL, attach = NULL) {
+    .Internal(C_rx_record_plot(as.character(load), as.character(attach)))
+}
+
+replayPlot <- function(x, reloadPkgs = FALSE) {
+    if (reloadPkgs && inherits(x, "recordedplot")) {
+        for (pkg in attr(x, "load")) loadNamespace(pkg)
+        for (pkg in attr(x, "attach")) library(pkg, character.only = TRUE)
+    }
+    invisible(.Internal(C_rx_replay_plot(x)))
+}
+
+dev.copy <- function(device, ..., which = dev.next()) {
+    source <- dev.cur()
+    if (source == 1L) stop("no device to copy from")
+    if (missing(device) && which == source) stop("cannot copy device to itself")
+    plot <- recordPlot()
+    if (missing(device)) {
+        if (is.null(dev.list()) || !any(which == dev.list())) stop("cannot copy to the null device")
+        dev.set(which)
+    } else {
+        if (!missing(which)) stop("cannot supply 'which' and 'device' at the same time")
+        if (!is.function(device)) stop("'device' should be a function")
+        device(...)
+    }
+    replayPlot(plot)
+    dev.cur()
+}
+
+dev.print <- function(device = pdf, ..., width = dev.size()[1L], height = dev.size()[2L]) {
+    source <- dev.cur()
+    if (source == 1L) stop("no device to print from")
+    if (!.Internal(C_rx_is_recording())) stop("can only print from a screen device")
+    width <- width
+    height <- height
+    on.exit(dev.set(source))
+    copy <- dev.copy(device = device, ..., width = width, height = height)
+    dev.off(copy)
 }
