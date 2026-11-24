@@ -1,8 +1,21 @@
-use roxide_eval::{Ctx, EvalResult, Unwind};
-use roxide_gc::SexpId;
+use roxide_eval::{Ctx, CtxExt, EvalResult, Unwind};
+use roxide_gc::{SexpId, Trace, Tracer};
 use roxide_value::RSession;
 
 use super::{PersistHook, WireResult, invalid};
+
+#[derive(Default)]
+struct CodecRoots(Vec<Vec<SexpId>>);
+
+impl Trace for CodecRoots {
+    fn trace(&self, tracer: &mut Tracer<'_>) {
+        for frame in &self.0 {
+            tracer.edges(frame);
+        }
+    }
+}
+
+impl CtxExt for CodecRoots {}
 
 pub(super) enum CodecSession<'a, 'h> {
     Stream(&'a mut RSession),
@@ -34,6 +47,14 @@ impl std::ops::DerefMut for CodecSession<'_, '_> {
     }
 }
 
+impl Drop for CodecSession<'_, '_> {
+    fn drop(&mut self) {
+        if let Self::Eval { ctx, .. } = self {
+            ctx.ext::<CodecRoots>().0.pop();
+        }
+    }
+}
+
 impl CodecSession<'_, '_> {
     pub(super) fn run<T>(
         ctx: &mut Ctx,
@@ -42,7 +63,7 @@ impl CodecSession<'_, '_> {
         codec: impl FnOnce(&mut CodecSession<'_, '_>) -> WireResult<T>,
     ) -> EvalResult<T> {
         ctx.scoped(|ctx| {
-            ctx.protect(call);
+            ctx.ext::<CodecRoots>().0.push(vec![call]);
             let mut error = None;
             let result = codec(&mut CodecSession::Eval {
                 ctx,
@@ -57,10 +78,14 @@ impl CodecSession<'_, '_> {
         })
     }
 
-    pub(super) fn root(&mut self, value: SexpId) {
-        if let Self::Eval { ctx, .. } = self {
-            ctx.protect(value);
+    pub(super) fn root(&mut self, value: SexpId) -> WireResult<()> {
+        if let Self::Eval { ctx, .. } = self
+            && let Some(frame) = ctx.ext::<CodecRoots>().0.last_mut()
+        {
+            frame.try_reserve(1).map_err(invalid)?;
+            frame.push(value);
         }
+        Ok(())
     }
 
     pub(super) fn eval<T>(

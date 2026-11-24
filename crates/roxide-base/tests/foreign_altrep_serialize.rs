@@ -26,6 +26,13 @@ const XDR: &str = concat!(
 
 const ASCII: &[u8] = b"A\n3\n263682\n197888\n5\nUTF-8\n494\n2\n1\n262153\n14\nforeign_vector\n2\n1\n262153\n18\nc4_missing_package\n2\n13\n1\n13\n254\n13\n3\n7\n2\n9\n1026\n1\n262153\n5\nclass\n16\n1\n262153\n10\ntest_class\n1026\n1\n262153\n5\nlabel\n13\n1\n42\n254\n";
 
+const NAMED_ASCII: &[u8] = concat!(
+    "A\n3\n263682\n197888\n5\nUTF-8\n238\n2\n1\n262153\n14\nforeign_vector\n",
+    "2\n1\n262153\n18\nc4_missing_package\n2\n13\n1\n13\n254\n13\n3\n7\n2\n9\n",
+    "1026\n1\n262153\n5\nnames\n16\n3\n262153\n1\na\n262153\n1\nb\n262153\n1\nc\n254\n",
+)
+.as_bytes();
+
 const COMPACT_ASCII: &[u8] = b"A\n3\n263682\n197888\n5\nUTF-8\n238\n2\n1\n262153\n14\ncompact_intseq\n2\n1\n262153\n4\nbase\n2\n13\n1\n13\n254\n14\n3\n10\n1\n1\n254\n";
 
 #[derive(Default)]
@@ -36,7 +43,10 @@ struct Methods {
     loads: usize,
     restore_after_load: bool,
     loaded: bool,
+    missing_class: bool,
     flags: Option<(i32, i32)>,
+    ignore_attributes: bool,
+    protect_depth: usize,
 }
 
 impl Trace for Methods {
@@ -49,6 +59,13 @@ struct Hook;
 
 impl NativeHooks for Hook {
     fn altrep(&self, ctx: &mut Ctx, op: AltOp) -> EvalResult<AltReply> {
+        let heap = &mut ctx.session_mut().heap;
+        let mark = heap.protect_mark();
+        heap.try_protect(SEXP_NIL).unwrap();
+        let depth = heap.protect_depth();
+        heap.unprotect_to(mark);
+        let methods = ctx.ext::<Methods>();
+        methods.protect_depth = methods.protect_depth.max(depth);
         ctx.collect_gc();
         Ok(match op {
             AltOp::SerializedState(value) => {
@@ -75,16 +92,33 @@ impl NativeHooks for Hook {
                     && ctx.session().sym_name(package)? == PACKAGE;
                 let methods = ctx.ext::<Methods>();
                 methods.restored += 1;
-                if !matches || (methods.restore_after_load && !methods.loaded) {
+                if !matches
+                    || methods.missing_class
+                    || (methods.restore_after_load && !methods.loaded)
+                {
                     return Ok(AltReply::Value(None));
                 }
                 methods.flags = Some((objf, levels));
-                assert_eq!(ctx.session().type_of(attrs)?, SexpType::List);
+                let ignore_attributes = methods.ignore_attributes;
                 let descriptor = ctx.session_mut().alloc_alt_class(class, package, 0)?;
-                AltReply::Value(Some(
-                    ctx.session_mut()
-                        .alloc_foreign_alt(descriptor, ty, state, SEXP_NIL)?,
-                ))
+                let value = ctx
+                    .session_mut()
+                    .alloc_foreign_alt(descriptor, ty, state, SEXP_NIL)?;
+                if !ignore_attributes {
+                    let mut attrs = attrs;
+                    let mut entries = Vec::new();
+                    while attrs != SEXP_NIL {
+                        let (attr, rest, tag) = ctx.session().cons_parts(attrs)?;
+                        entries.push((ctx.session().sexp_as_sym(tag)?, attr));
+                        attrs = rest;
+                    }
+                    ctx.altrep_len(value)?;
+                    let session = ctx.session_mut();
+                    session.replace_attributes(value, entries)?;
+                    session.set_object_flag(value, objf != 0)?;
+                    session.set_gp(value, levels as u16)?;
+                }
+                AltReply::Value(Some(value))
             }
             AltOp::Materialize(value) => {
                 ctx.ext::<Methods>().materialized += 1;
@@ -212,7 +246,7 @@ fn v3_uses_serialized_state_before_and_after_materialization() {
 
 #[test]
 fn v2_and_missing_state_write_dense_vectors() {
-    for (version, mode, serialized) in [(2, 0, 0), (3, 1, 1), (3, 2, 1)] {
+    for (version, mode, serialized) in [(2, 0, 0), (3, 1, 1)] {
         let mut ctx = context();
         ctx.set_native_hooks(&Hook);
         let source = foreign(&mut ctx, &[7, 2, 9], mode);
@@ -228,6 +262,29 @@ fn v2_and_missing_state_write_dense_vectors() {
         assert_eq!(ctx.ext::<Methods>().materialized, 1);
         assert_eq!(ctx.ext::<Methods>().restored, 0);
     }
+}
+
+#[test]
+fn nil_serialized_state_is_written_as_custom_state() {
+    let mut ctx = context();
+    ctx.set_native_hooks(&Hook);
+    let source = foreign(&mut ctx, &[7, 2, 9], 2);
+    define(&mut ctx, "source", source);
+    let result = ctx.run_global(
+        "<serialize>",
+        "bytes <- serialize(source, NULL, ascii = TRUE)",
+    );
+    evaluated(result, &ctx);
+    let expected = std::str::from_utf8(ASCII)
+        .unwrap()
+        .replace("254\n13\n3\n7\n2\n9\n", "254\n254\n");
+    let bytes = get(&mut ctx, "bytes");
+    assert_eq!(
+        ctx.session().raw(bytes).unwrap().as_slice(),
+        Some(expected.as_bytes())
+    );
+    assert_eq!(ctx.ext::<Methods>().serialized, 1);
+    assert_eq!(ctx.ext::<Methods>().materialized, 0);
 }
 
 #[test]
@@ -283,16 +340,18 @@ fn r_entry_points_preserve_lazy_state_and_connection_position() {
 #[test]
 fn unknown_class_warns_and_discards_metadata_like_gnu_r() {
     let mut ctx = context();
+    ctx.set_native_hooks(&Hook);
     ctx.set_namespace_loader(&Loader);
-    let raw = ctx.session_mut().alloc_raw_from(&fixture()).unwrap();
+    ctx.ext::<Methods>().missing_class = true;
+    let raw = ctx.session_mut().alloc_raw_from(NAMED_ASCII).unwrap();
     define(&mut ctx, "stream", raw);
     let result = ctx.run_global(
         "<unserialize>",
         r#"
-        seen <- NULL
+        seen <- character()
         origin <- NULL
         result <- withCallingHandlers(unserialize(stream), warning = function(w) {
-            seen <<- conditionMessage(w)
+            seen <<- c(seen, conditionMessage(w))
             origin <<- conditionCall(w)
             invokeRestart("muffleWarning")
         })
@@ -306,6 +365,7 @@ fn unknown_class_warns_and_discards_metadata_like_gnu_r() {
     assert!(!ctx.session().is_object(value).unwrap());
     let message = get(&mut ctx, "seen");
     let chars = ctx.session().str_slice(message).unwrap();
+    assert_eq!(chars.len(), 1);
     assert_eq!(
         ctx.session().char_bytes(chars[0]).unwrap(),
         WARNING.as_bytes()
@@ -316,6 +376,89 @@ fn unknown_class_warns_and_discards_metadata_like_gnu_r() {
         ["unserialize(stream)"]
     );
     assert_eq!(ctx.ext::<Methods>().loads, 1);
+    assert_eq!(ctx.ext::<Methods>().restored, 2);
+}
+
+#[test]
+fn unserialize_ex_owns_attributes_and_flags() {
+    let mut ctx = context();
+    ctx.set_native_hooks(&Hook);
+    ctx.ext::<Methods>().ignore_attributes = true;
+    let levels = 2;
+    let flags = 494 | (levels << 12);
+    let stream = std::str::from_utf8(ASCII)
+        .unwrap()
+        .replacen("494\n", &format!("{flags}\n"), 1);
+    let restored = evaluated(unserialize_bytes(&mut ctx, stream.as_bytes(), None), &ctx);
+    assert_eq!(ctx.ext::<Methods>().flags, Some((1, levels)));
+    assert!(ctx.session().attrs(restored).unwrap().is_empty());
+    assert!(!ctx.session().is_object(restored).unwrap());
+    assert_eq!(ctx.session().gp(restored).unwrap(), 0);
+}
+
+#[test]
+fn large_lists_leave_room_for_native_protect() {
+    const LEN: usize = 56_000;
+    let mut ctx = context();
+    ctx.set_native_hooks(&Hook);
+    let foreign = foreign(&mut ctx, &[7, 2, 9], 0);
+    let session = ctx.session_mut();
+    let source = session.alloc_list(LEN + 1).unwrap();
+    for i in 0..LEN {
+        let child = session.alloc_int_from(&[i as i32, 0]).unwrap();
+        session.list_set(source, i, child).unwrap();
+    }
+    session.list_set(source, LEN, foreign).unwrap();
+    let depth = ctx.session().heap.protect_depth();
+    let bytes = evaluated(serialize_bytes(&mut ctx, source, 3, None), &ctx);
+    let restored = evaluated(unserialize_bytes(&mut ctx, &bytes, None), &ctx);
+    assert_eq!(ctx.session().heap.protect_depth(), depth);
+    assert!(ctx.ext::<Methods>().protect_depth < 100);
+    assert_eq!(ctx.session().xlength(restored).unwrap(), LEN + 1);
+    for i in 0..LEN {
+        let child = ctx.session().list_get(restored, i).unwrap();
+        assert_eq!(
+            ctx.session().int(child).unwrap().as_slice(),
+            Some(&[i as i32, 0][..])
+        );
+    }
+    let restored_foreign = ctx.session().list_get(restored, LEN).unwrap();
+    assert!(ctx.session().is_altrep(restored_foreign).unwrap());
+    check_attrs(&mut ctx, restored_foreign);
+}
+
+#[test]
+fn connection_reads_across_buffer_boundaries() {
+    let mut ctx = context();
+    ctx.set_native_hooks(&Hook);
+    let source = foreign(&mut ctx, &[7, 2, 9], 0);
+    define(&mut ctx, "source", source);
+    let result = ctx.run_global(
+        "<serialize>",
+        r#"
+        out <- file("streams.bin", "wb")
+        serialize(raw(30000L), out, version = 2)
+        serialize(raw(31000L), out)
+        serialize(list(raw(10000L), source), out, ascii = TRUE)
+        serialize(42L, out)
+        close(out)
+        input <- file("streams.bin", "rb")
+        dense <- unserialize(input)
+        dense_v3 <- unserialize(input)
+        restored <- unserialize(input)[[2L]]
+        next_value <- unserialize(input)
+        close(input)
+    "#,
+    );
+    evaluated(result, &ctx);
+    for (name, len) in [("dense", 30_000), ("dense_v3", 31_000)] {
+        let dense = get(&mut ctx, name);
+        assert_eq!(ctx.session().xlength(dense).unwrap(), len);
+    }
+    let restored = get(&mut ctx, "restored");
+    check_attrs(&mut ctx, restored);
+    let next = get(&mut ctx, "next_value");
+    assert_eq!(ctx.session().int(next).unwrap().get(0), 42);
 }
 
 #[test]

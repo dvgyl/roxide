@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 
-use roxide_eval::AltOp;
 use roxide_gc::SexpId;
 use roxide_host::Limits;
 use roxide_value::{
@@ -10,12 +9,18 @@ use roxide_value::{
 };
 
 use super::{
-    ACTIVE_BINDING, ALTREP, ASCII, ATTR, BASE, BASE_NS, BYTES, EMPTY, Format, GLOBAL, LATIN1,
-    LOCKED_BINDING, MAX_INLINE_REF, MISSING, NAMESPACE, NIL, OBJECT, PACKAGE, PERSIST, REF,
-    Registry, S4, TAG, UNBOUND, UTF8, WireResult, invalid,
+    ASCII, ATTR, BASE, BASE_NS, BYTES, EMPTY, Format, GLOBAL, LATIN1, MAX_INLINE_REF, MISSING,
+    NAMESPACE, NIL, OBJECT, PACKAGE, PERSIST, REF, Registry, S4, TAG, UNBOUND, UTF8, WireResult,
+    invalid,
 };
 
 use super::session::CodecSession;
+
+mod altrep;
+mod environment;
+
+use altrep::compact;
+use environment::namespace_version;
 
 pub(super) fn encode(
     session: &mut CodecSession<'_, '_>,
@@ -28,7 +33,7 @@ pub(super) fn encode(
     limits: &Limits,
     registry: &Registry,
 ) -> WireResult<Vec<u8>> {
-    session.root(value);
+    session.root(value)?;
     if !matches!(version, 2 | 3) {
         return Err(invalid("unsupported serialization version"));
     }
@@ -220,14 +225,14 @@ impl Writer<'_> {
                 && matches!(ty, SexpType::Env | SexpType::ExtPtr | SexpType::WeakRef)
                 && let Some(key) = session.persist(id)?
             {
-                session.root(key);
+                session.root(key)?;
                 return self.persistent(session, key);
             }
             if matches!(ty, SexpType::Sym | SexpType::Env | SexpType::ExtPtr) {
                 if self.reference(id)? {
                     return Ok(());
                 }
-                session.root(id);
+                session.root(id)?;
             }
             if ty == SexpType::Sym {
                 self.word(ty as u32)?;
@@ -242,7 +247,7 @@ impl Writer<'_> {
 
             let attrs = session.attrs(id)?;
             for &(_, value) in &attrs {
-                session.root(value);
+                session.root(value)?;
             }
             if ty == SexpType::Env {
                 if let Some((name, namespace, _)) = registered {
@@ -268,7 +273,7 @@ impl Writer<'_> {
                 SexpType::List | SexpType::Lang | SexpType::Dot => {
                     let (car, cdr, tag) = session.cons_parts(id)?;
                     for value in [car, cdr, tag] {
-                        session.root(value);
+                        session.root(value)?;
                     }
                     self.word(flags | if tag == SEXP_NIL { 0 } else { TAG })?;
                     if !attrs.is_empty() {
@@ -294,7 +299,7 @@ impl Writer<'_> {
                         )
                     };
                     for value in [car, cdr, tag] {
-                        session.root(value);
+                        session.root(value)?;
                     }
                     self.word(flags | if tag == SEXP_NIL { 0 } else { TAG })?;
                     if !attrs.is_empty() {
@@ -373,7 +378,7 @@ impl Writer<'_> {
                 self.length(len)?;
                 for i in 0..len {
                     let child = session.list_get(id, i)?;
-                    session.root(child);
+                    session.root(child)?;
                     self.item(session, child, depth)?;
                 }
             }
@@ -391,8 +396,8 @@ impl Writer<'_> {
             SexpType::ExtPtr => {
                 let prot = session.extptr_prot(id)?;
                 let tag = session.extptr_tag(id)?;
-                session.root(tag);
-                session.root(prot);
+                session.root(tag)?;
+                session.root(prot)?;
                 self.item(session, prot, depth)?;
                 self.item(session, tag, depth)?;
             }
@@ -456,144 +461,4 @@ impl Writer<'_> {
         }
         self.word(NIL)
     }
-
-    fn environment(
-        &mut self,
-        session: &mut CodecSession<'_, '_>,
-        env: SexpId,
-        attrs: &[(Sym, SexpId)],
-        depth: usize,
-    ) -> WireResult<()> {
-        let locked = frame_locked(session, env)?;
-        self.word(SexpType::Env as u32)?;
-        self.word(u32::from(locked))?;
-        self.item(session, session.env_enclos(env)?, depth)?;
-        // R stores non-hashed bindings in reverse insertion order.
-        let entries = session.env_entries(env)?;
-        for (_, binding) in &entries {
-            session.root(binding.value);
-        }
-        for (tag, binding) in entries.into_iter().rev() {
-            let locked = if binding.locked { LOCKED_BINDING } else { 0 };
-            let active = if binding.active { ACTIVE_BINDING } else { 0 };
-            self.word(
-                SexpType::List as u32 | TAG | locked | active | (u32::from(binding.missing) << 12),
-            )?;
-            self.item(session, tag.as_sexp(), depth)?;
-            self.item(session, binding.value, depth)?;
-        }
-        self.word(NIL)?;
-        self.word(NIL)?;
-        self.attributes(session, attrs, depth)
-    }
-
-    fn write_foreign(
-        &mut self,
-        session: &mut CodecSession<'_, '_>,
-        id: SexpId,
-        ty: SexpType,
-        depth: usize,
-    ) -> WireResult<bool> {
-        if self.version >= 3
-            && let Some(state) = session
-                .eval(|ctx, _| ctx.altrep_method(AltOp::SerializedState(id)))?
-                .filter(|&state| state != SEXP_NIL)
-        {
-            session.root(state);
-            let (class, package) = session
-                .alt_class_names(id)?
-                .ok_or_else(|| invalid("missing foreign ALTREP class"))?;
-            let flags = ALTREP
-                | if session.is_object(id)? { OBJECT } else { 0 }
-                | if session.is_s4(id)? { S4 } else { 0 }
-                | (u32::from(session.gp(id)?) << 12);
-            self.altrep_header(session, flags, [class, package], ty, depth)?;
-            let attrs = session.attrs(id)?;
-            for &(_, value) in &attrs {
-                session.root(value);
-            }
-            self.item(session, state, depth)?;
-            self.attributes(session, &attrs, depth)?;
-            return Ok(true);
-        }
-        session.eval(|ctx, _| ctx.resolve_altrep(id))?;
-        Ok(false)
-    }
-
-    fn altrep(
-        &mut self,
-        session: &mut CodecSession<'_, '_>,
-        class: &str,
-        ty: SexpType,
-        [len, start, step]: [f64; 3],
-        depth: usize,
-    ) -> WireResult<()> {
-        let class = session.intern(class)?;
-        let package = session.intern("base")?;
-        self.altrep_header(session, ALTREP, [class, package], ty, depth)?;
-        self.word(SexpType::Real as u32)?;
-        self.word(3)?;
-        for elt in [len, start, step] {
-            self.real(elt)?;
-        }
-        self.word(NIL)
-    }
-
-    fn altrep_header(
-        &mut self,
-        session: &mut CodecSession<'_, '_>,
-        flags: u32,
-        names: [Sym; 2],
-        ty: SexpType,
-        depth: usize,
-    ) -> WireResult<()> {
-        self.word(flags)?;
-        for name in names {
-            self.word(SexpType::List as u32)?;
-            self.item(session, name.as_sexp(), depth)?;
-        }
-        self.word(SexpType::List as u32)?;
-        self.word(SexpType::Int as u32)?;
-        self.word(1)?;
-        self.word(ty as u32)?;
-        self.word(NIL)
-    }
-}
-
-fn namespace_version(session: &mut RSession, env: SexpId) -> WireResult<String> {
-    let info = session.intern(".__NAMESPACE__.")?;
-    let spec = session.intern("spec")?;
-    if let Some(info) = session.env_get(env, info)
-        && let Some(spec) = session.env_get(info.value, spec)
-        && let &[_, version] = session.str_slice(spec.value)?
-    {
-        return Ok(std::str::from_utf8(session.char_bytes(version)?)
-            .map_err(invalid)?
-            .to_owned());
-    }
-    Ok("4.6.2".to_owned())
-}
-
-fn compact<T: Elem>(
-    view: VecView<'_, T>,
-    name: &'static str,
-    real: impl Fn(T) -> f64,
-) -> Option<(&'static str, [f64; 3])> {
-    let VecView::Alt { class, len, .. } = &view else {
-        return None;
-    };
-    if *len < 2 || class.class_name() != name || class.package_name() != "base" {
-        return None;
-    }
-    let start = real(view.get(0));
-    let step = if real(view.get(*len - 1)) < start {
-        -1.0
-    } else {
-        1.0
-    };
-    Some((name, [*len as f64, start, step]))
-}
-
-fn frame_locked(session: &RSession, env: SexpId) -> WireResult<bool> {
-    Ok(session.env_is_locked(env)?)
 }
