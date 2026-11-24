@@ -6,6 +6,7 @@
 //! (alongside `roxide-libr`). All 15 pure-Rust engine crates retain `#![forbid(unsafe_code)]`.
 //!
 pub mod abi;
+pub mod api;
 pub mod cx;
 pub mod globals;
 pub mod jump;

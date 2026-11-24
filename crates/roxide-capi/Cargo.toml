@@ -11,6 +11,7 @@ roxide-eval = { workspace = true }
 roxide-gc = { workspace = true }
 roxide-host = { workspace = true }
 roxide-math = { workspace = true }
+roxide-syntax = { workspace = true }
 roxide-value = { workspace = true }
 
 [build-dependencies]

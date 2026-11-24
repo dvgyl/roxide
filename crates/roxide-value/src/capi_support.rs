@@ -6,7 +6,7 @@ use roxide_gc::{FinalizerKind, HeapError, SexpId, WeakRefEntry};
 use crate::alt::AltMaterialized;
 use crate::api::ValueError;
 use crate::na::{RComplex, RLogical};
-use crate::object::{Attrs, Body, CharId, ExtPtrData, RObject, RVec, SexpType, WeakRefData};
+use crate::object::{Attrs, Body, CharId, ExtPtrData, RObject, RVec, SexpType, Sym, WeakRefData};
 use crate::session::{BASE_ENV, BASE_NAMESPACE, RSession, SEXP_NIL};
 
 impl RSession {
@@ -606,6 +606,18 @@ impl RSession {
         self.heap.inc_ref(env);
         self.heap.dec_ref(old);
         Ok(())
+    }
+
+    /// Validate that `x` is a `SYMSXP` and return it as a typed [`Sym`] without re-interning.
+    pub fn sexp_as_sym(&self, x: SexpId) -> Result<Sym, ValueError> {
+        let obj = self.heap.get(x)?;
+        match obj.body {
+            Body::Sym { .. } => Ok(Sym(x)),
+            _ => Err(ValueError::TypeMismatch {
+                expected: "symbol",
+                actual: obj.sexp_type().type_name(obj.flags.s4),
+            }),
+        }
     }
 
     /// Reset an environment frame to empty unlocked state with a new parent (`METHODS_NAMESPACE` reload).
