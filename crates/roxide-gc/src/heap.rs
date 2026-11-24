@@ -114,6 +114,22 @@ impl std::error::Error for HeapError {}
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ProtectIndex(usize);
 
+impl ProtectIndex {
+    /// Construct a [`ProtectIndex`] from a raw stack offset (for C `PROTECT_INDEX` interop).
+    #[inline]
+    #[must_use]
+    pub const fn from_raw(raw: usize) -> Self {
+        Self(raw)
+    }
+
+    /// Return the raw protect-stack offset (for C `PROTECT_INDEX` interop).
+    #[inline]
+    #[must_use]
+    pub const fn as_raw(self) -> usize {
+        self.0
+    }
+}
+
 /// Saved depth of the protect stack for scoped restoration via [`Heap::unprotect_to`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ProtectMark(usize);
@@ -489,10 +505,21 @@ impl<T: Trace + HeapSize> Heap<T> {
 
     /// Remove the topmost occurrence of `id` from the protect stack (`UNPROTECT_PTR`).
     pub fn unprotect_ptr(&mut self, id: SexpId) -> Result<(), HeapError> {
-        let Some(pos) = self.protect_stack.iter().rposition(|&entry| entry == id) else {
+        self.unprotect_ptr_from(id, 0)
+    }
+
+    /// Remove the topmost occurrence of `id` at or above `min_depth` on the protect stack.
+    ///
+    /// Prevents nested C frames from unprotecting roots owned by enclosing trampoline frames.
+    pub fn unprotect_ptr_from(&mut self, id: SexpId, min_depth: usize) -> Result<(), HeapError> {
+        let start = min_depth.min(self.protect_stack.len());
+        let Some(rel) = self.protect_stack[start..]
+            .iter()
+            .rposition(|&entry| entry == id)
+        else {
             return Err(HeapError::ProtectPtrNotFound(id));
         };
-        self.protect_stack.remove(pos);
+        self.protect_stack.remove(start + rel);
         Ok(())
     }
 

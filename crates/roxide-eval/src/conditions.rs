@@ -169,6 +169,9 @@ struct Restart {
 pub(crate) struct Conditions {
     handlers: Vec<Handler>,
     restarts: Vec<Restart>,
+    /// Outer handler/restart stacks isolated by `Ctx::with_native_toplevel` (`R_ToplevelExec`),
+    /// kept here so they remain GC-rooted across nested collections.
+    saved_stacks: Vec<(Vec<Handler>, Vec<Restart>)>,
     last_error: String,
 }
 
@@ -181,10 +184,69 @@ impl Conditions {
             tracer.edge(restart.fun);
             tracer.edge(restart.value);
         }
+        for (handlers, restarts) in &self.saved_stacks {
+            for handler in handlers {
+                tracer.edge(handler.fun);
+            }
+            for restart in restarts {
+                tracer.edge(restart.fun);
+                tracer.edge(restart.value);
+            }
+        }
     }
 }
 
 impl Ctx {
+    /// Execute `body` with an exiting `"error"` handler (`R_tryCatchError`, ADR-0018).
+    ///
+    /// If `body` signals an R `"error"` condition, the handler stack is restored and
+    /// `handler` is invoked with the GC-protected condition `SEXP`.
+    pub fn with_native_error_handler(
+        &mut self,
+        body: impl FnOnce(&mut Self) -> EvalResult,
+        handler: impl FnOnce(&mut Self, SexpId) -> EvalResult,
+    ) -> EvalResult {
+        let target = self.next_frame();
+        let base = self.conditions.handlers.len();
+        self.conditions.handlers.push(Handler {
+            target: Some(target),
+            class: String::from("error"),
+            fun: SEXP_NIL,
+        });
+        let result = body(self);
+        self.conditions.handlers.truncate(base);
+        match result {
+            Err(Unwind::Transfer {
+                target: dest,
+                kind: Transfer::ExitingHandler { cond, .. },
+            }) if dest == target => self.scoped(|ctx| {
+                ctx.protect(cond);
+                handler(ctx, cond)
+            }),
+            other => other,
+        }
+    }
+
+    /// Execute `body` with isolated condition handlers and restarts (`R_ToplevelExec`, ADR-0018).
+    ///
+    /// Outer handlers and restarts are saved inside `Ctx::conditions` (remaining GC-rooted)
+    /// and unconditionally restored when `body` returns or unwinds.
+    pub fn with_native_toplevel<R>(
+        &mut self,
+        body: impl FnOnce(&mut Self) -> EvalResult<R>,
+    ) -> EvalResult<R> {
+        let saved_handlers = std::mem::take(&mut self.conditions.handlers);
+        let saved_restarts = std::mem::take(&mut self.conditions.restarts);
+        self.conditions
+            .saved_stacks
+            .push((saved_handlers, saved_restarts));
+        let result = body(self);
+        if let Some((handlers, restarts)) = self.conditions.saved_stacks.pop() {
+            self.conditions.handlers = handlers;
+            self.conditions.restarts = restarts;
+        }
+        result
+    }
     fn simple_condition(&mut self, kind: &str, message: SexpId, call: SexpId) -> EvalResult {
         let class = match kind {
             "error" => "simpleError",
