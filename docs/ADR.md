@@ -274,6 +274,7 @@ Roxide differs from GNU R in two ways.
   - Stamp Roxide-installed compiled packages with `Meta/Roxide.rds` and refuse foreign-runtime shared libraries via pure-Rust Mach-O/ELF dependency inspection so GNU R is never loaded into a Roxide process.
   - Adopt two vetted permissive dependencies: `cc` (`MIT OR Apache-2.0`) for building `roxide-capi`'s C/C++ trampoline shim and `libloading` (`ISC`) for dynamic library loading (`dyn.load`), plus optional out-of-workspace nightly `cargo-fuzz` (`MIT OR Apache-2.0`).
   - Never execute GNU R `BCODESXP` instruction streams; lower `consts[0]` ASTs to Roxide's own clean-room register IR (`roxide-eval::vm`) with `ENVSXP` `shape_version` inline caches (bumped on binding insert/remove, `env_set_enclos`, lock/active flag mutations, and function/promise binding overwrites; call-site cache hits also confirm the target function `SexpId` in the defining frame) and guard-based fallback to the AST semantic reference.
+  - `compiler::enableJIT` levels `1` and `2` both compile closures on call 1 (with loops) or call 2 (without loops) without a separate body-size threshold, matching the observed GNU R 4.6.2 probes in `docs/M4_PROBES.md` §5; level `3` additionally compiles top-level loops, and `.Rc` files serialize source expressions that `loadcmp` recompiles on load.
 
 
 
