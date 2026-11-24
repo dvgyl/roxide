@@ -21,6 +21,7 @@ pub struct ShlibOptions {
     preclean: bool,
     clean: bool,
     debug: bool,
+    package: bool,
     lto: Option<bool>,
     overrides: Vec<String>,
     inputs: Vec<PathBuf>,
@@ -97,6 +98,7 @@ impl ShlibOptions {
             inputs,
             output: Some(output),
             preclean: true,
+            package: true,
             ..Self::default()
         }
     }
@@ -197,6 +199,13 @@ impl ShlibOptions {
             targets.push("clean");
         }
         let make = make_program(host)?;
+        let (program, prefix) = if self.package {
+            let mut environment = build_env(host, home, conf)?;
+            environment.push(make.clone());
+            ("env", environment)
+        } else {
+            (make.as_str(), Vec::new())
+        };
         if self.dry_run {
             let command = std::iter::once(make.as_str())
                 .chain(args.iter().map(String::as_str))
@@ -208,17 +217,46 @@ impl ShlibOptions {
                 .map_err(|error| error.to_string())?;
         }
         for target in targets {
-            let mut args = args.clone();
-            args.push(target.into());
-            if let Err(error) = run_process(host, &make, args) {
+            let mut command = prefix.clone();
+            command.extend(args.iter().cloned());
+            command.push(target.into());
+            if let Err(error) = run_process(host, program, command) {
                 return Err(format!("SHLIB {target}: {error}"));
             }
         }
-        if !self.dry_run && !is_file(host, &output_file) {
+        if !self.package && !self.dry_run && !is_file(host, &output_file) {
             return Err(format!("build did not produce '{}'", output.display()));
         }
         Ok(())
     }
+}
+
+pub(crate) fn os_type(host: &dyn Host) -> &'static str {
+    if host.sys_info().sysname.eq_ignore_ascii_case("windows") {
+        "windows"
+    } else {
+        "unix"
+    }
+}
+
+pub(crate) fn build_env(
+    host: &dyn Host,
+    home: &Path,
+    conf: &Makeconf,
+) -> Result<Vec<String>, String> {
+    let include = conf
+        .get("R_INCLUDE_DIR")
+        .unwrap_or(path_text(&home.join("include"))?);
+    let share = conf
+        .get("R_SHARE_DIR")
+        .unwrap_or(path_text(&home.join("share"))?);
+    Ok(vec![
+        format!("R_HOME={}", path_text(home)?),
+        format!("R_INCLUDE_DIR={include}"),
+        format!("R_SHARE_DIR={share}"),
+        format!("SHLIB_EXT={}", shared_extension(conf)?),
+        format!("R_OSTYPE={}", os_type(host)),
+    ])
 }
 
 #[derive(Default)]

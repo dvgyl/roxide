@@ -13,6 +13,7 @@ endif
 F77 ?= $(FC)
 
 ROXIDE_CXX = $(if $(CXX_STD),$($(CXX_STD)) $($(CXX_STD)STD),$(CXX))
+SHLIB_LINK ?= $(if $(filter cc cpp cxx mm,$(roxide_object_kinds)),$(roxide_cxx_ld) $(roxide_cxx_ldflags),$(SHLIB_LD) $(SHLIB_LDFLAGS)) $(LDFLAGS)
 roxide_cxx_flags = $(if $(and $(CXX_STD),$(filter-out undefined,$(origin $(CXX_STD)$(1)))),$($(CXX_STD)$(1)),$(CXX$(1)))
 ALL_CXXFLAGS = $(call roxide_cxx_flags,PICFLAGS) $(PKG_CXXFLAGS) $(call roxide_cxx_flags,FLAGS) $(ROXIDE_LTO_C)
 
@@ -99,10 +100,8 @@ ifeq ($(origin SHLIB_LD),command line)
 roxide_cxx_ld = $(SHLIB_LD)
 endif
 
-roxide_link = $(if $(filter cc cpp cxx mm,$(roxide_object_kinds)),$(roxide_cxx_ld) $(roxide_cxx_ldflags),$(SHLIB_LD) $(SHLIB_LDFLAGS))
-
 $(SHLIB): $(OBJECTS)
-	$(roxide_link) $(ROXIDE_LTO_LINK) -o "$@" $(OBJECTS) $(PKG_LIBS) $(ROXIDE_LINK_FLAGS) $(LIBR)
+	$(SHLIB_LINK) $(ROXIDE_LTO_LINK) -o "$@" $(OBJECTS) $(PKG_LIBS) $(ROXIDE_LINK_FLAGS) $(LIBR)
 
 RM ?= rm -f
 clean preclean:

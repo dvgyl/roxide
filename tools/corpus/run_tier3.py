@@ -67,7 +67,7 @@ class Suite:
 def mac_oracle_launcher(root: Path, original: Path) -> Path:
     home = root / "oracle-home"
     (home / "bin").mkdir(parents=True)
-    for item in ("bin/exec", "bin/Rcmd", "bin/Rscript", "bin/SHLIB", "bin/INSTALL",
+    for item in ("bin/exec", "bin/Rcmd", "bin/Rscript", "bin/SHLIB", "bin/INSTALL", "bin/config",
                  "doc", "etc", "include", "lib", "library", "modules", "share"):
         (home / item).symlink_to(original / item)
 

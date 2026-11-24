@@ -131,3 +131,75 @@ stopifnot(license$is_canonical, identical(license$spdx, "MPL-2.0 OR GPL-2.0-only
 "#,
     );
 }
+
+#[test]
+fn md5sum_hashes_raw_bytes_and_host_files() {
+    run(
+        PureHost::new(),
+        r#"
+stopifnot(identical(tools::md5sum(bytes = raw()), "d41d8cd98f00b204e9800998ecf8427e"))
+stopifnot(identical(tools::md5sum(bytes = charToRaw("abc")), "900150983cd24fb0d6963f7d28e17f72"))
+long <- charToRaw(paste(rep("0123456789", 8L), collapse = ""))
+stopifnot(identical(tools::md5sum(bytes = long), "0faef1f4cb01d560d59016a2d5e91da6"))
+path <- tempfile()
+file <- file(path, "wb")
+writeBin(charToRaw("abc"), file)
+close(file)
+paths <- c(named = path, paste0(path, ".missing"), NA_character_, "")
+stopifnot(identical(tools::md5sum(paths),
+    setNames(c("900150983cd24fb0d6963f7d28e17f72", rep(NA_character_, 3L)), unname(paths))))
+stopifnot(identical(tools::md5sum(character()), setNames(character(), character())))
+stopifnot(inherits(try(tools::md5sum(bytes = "abc"), silent = TRUE), "try-error"))
+stopifnot(inherits(try(tools::md5sum(bytes = NULL), silent = TRUE), "try-error"))
+stopifnot(inherits(try(tools::md5sum(path, raw()), silent = TRUE), "try-error"))
+"#,
+    );
+}
+
+#[test]
+fn adist_returns_weighted_distances_and_edit_paths() {
+    run(
+        PureHost::new(),
+        r#"
+x <- c(first = "kitten", second = "a", third = NA_character_)
+y <- c(target = "sitting", other = "b")
+d <- utils::adist(x, y, counts = TRUE)
+stopifnot(identical(dim(d), c(3L, 2L)), identical(dimnames(d), list(names(x), names(y))))
+stopifnot(d[1L, 1L] == 3, d[2L, 2L] == 1, all(is.na(d[3L, ])))
+stopifnot(identical(unname(attr(d, "counts")[1L, 1L, ]), c(1L, 0L, 2L)))
+stopifnot(attr(d, "trafos")[1L, 1L] == "SMMMSMI")
+d <- utils::adist("a", "b", costs = c(ins = .25, del = .25, sub = .75), counts = TRUE)
+stopifnot(d[1L, 1L] == .5, attr(d, "trafos")[1L, 1L] == "DI")
+stopifnot(utils::adist("É", "é", ignore.case = TRUE)[1L, 1L] == 0)
+stopifnot(utils::adist("é", "", useBytes = TRUE)[1L, 1L] == 2)
+stopifnot(identical(dim(utils::adist(character(), letters)), c(0L, 26L)))
+stopifnot(identical(dimnames(utils::adist(c(a = "a"))), list("a", "a")))
+"#,
+    );
+}
+
+#[test]
+fn adist_returns_partial_match_offsets() {
+    run(
+        PureHost::new(),
+        r#"
+d <- utils::adist("abc", c("zabcq", "zz", ""), partial = TRUE, counts = TRUE)
+stopifnot(identical(as.vector(d), c(0, 3, 3)))
+stopifnot(identical(as.vector(attr(d, "offsets")), c(2L, 1L, 1L, 4L, 2L, 0L)))
+stopifnot(identical(as.vector(attr(d, "counts")), c(0L, 0L, 0L, 0L, 1L, 3L, 0L, 2L, 0L)))
+d <- utils::adist("aa", "aba", partial = TRUE, counts = TRUE)
+stopifnot(identical(as.vector(attr(d, "offsets")), c(1L, 2L)))
+d <- utils::adist("aa", "aba", costs = c(sub = 2), partial = TRUE, counts = TRUE)
+stopifnot(identical(as.vector(attr(d, "offsets")), c(1L, 3L)))
+d <- utils::adist("a[0-9]+", c("xA123z", NA_character_), fixed = FALSE,
+                  ignore.case = TRUE, counts = TRUE)
+stopifnot(identical(as.vector(d), c(0, NA_real_)))
+stopifnot(identical(as.vector(attr(d, "offsets")), c(2L, -1L, 5L, -1L)))
+d <- utils::adist("ab|cd", "xcx", fixed = FALSE, counts = TRUE)
+stopifnot(d[1L, 1L] == 1, is.null(attr(d, "trafos")))
+stopifnot(identical(as.vector(utils::adist("(?i:a)b", c("Ab", "AB"), fixed = FALSE)), c(0, 1)))
+stopifnot(utils::adist("(.)\\1", "aa", fixed = FALSE)[1L, 1L] == Inf)
+stopifnot(inherits(try(utils::adist("[", "x", fixed = FALSE), silent = TRUE), "try-error"))
+"#,
+    );
+}

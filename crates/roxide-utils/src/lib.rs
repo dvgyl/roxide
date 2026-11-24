@@ -2,6 +2,7 @@
 
 //! Clean-room GNU R 4.6.2 `utils` and `tools` packages split into disjoint submodules.
 
+mod adist;
 mod archive;
 pub mod datasets;
 pub mod inspect;
@@ -10,6 +11,7 @@ pub mod str;
 pub mod table_io;
 mod tools_build;
 pub mod tools_license;
+mod tools_md5;
 pub mod tools_rd;
 
 use roxide_eval::{Ctx, InternalError, Module, Package};
@@ -24,6 +26,7 @@ pub const UTILS_MODULES: &[&Module] = &[
     &archive::MODULE,
     &pkgutils::PACKAGE_TOOLS,
     &pkgutils::NAMESPACE_TOOLS,
+    &adist::MODULE,
 ];
 
 /// Submodules registered into `namespace:tools`.
@@ -31,6 +34,7 @@ pub const TOOLS_MODULES: &[&Module] = &[
     &tools_rd::MODULE,
     &tools_license::MODULE,
     &tools_build::MODULE,
+    &tools_md5::MODULE,
 ];
 
 /// Package descriptor for `utils` (attached on `search()` as `package:utils`).

@@ -15,8 +15,13 @@ use crate::loader::values::{base_call, list, named, names, strings};
 use crate::makeconf::{Makeconf, env_text, is_file, r_home};
 use crate::nsfile::NsSpec;
 use crate::shlib::{
-    self, ShlibOptions, make_args, make_program, path_text, run_process, shared_extension,
+    self, ShlibOptions, build_env, make_args, make_program, path_text, run_process,
+    shared_extension,
 };
+
+pub(crate) mod hooks;
+#[cfg(all(test, unix))]
+mod tests;
 
 pub(super) struct CompiledPackage {
     pub(super) source: PathBuf,
@@ -40,12 +45,12 @@ impl CompiledPackage {
         let stage = lock.join("source");
         copy_tree(ctx, source, &stage, PackageTree::Source { lock })?;
         if !crate::description::is_windows(ctx) {
-            preserve_executable_bits(source, &stage, lock, ctx.host())
+            preserve_executable_bits(source, &stage, Some(lock), ctx.host())
                 .map_err(|error| ctx.stop(SEXP_NIL, error))?;
         }
         if !no_configure && is_file(ctx.host(), &stage.join("configure")) {
             let configure = (|| {
-                let mut args = build_env(&home, &conf)?;
+                let mut args = build_env(ctx.host(), &home, &conf)?;
                 args.extend([
                     "sh".into(),
                     "-c".into(),
@@ -127,20 +132,26 @@ impl CompiledPackage {
                 )
                 .map_err(|error| ctx.stop(SEXP_NIL, error))?;
         }
-        if !is_file(ctx.host(), &binary) {
+        let hook = src.join("install.libs.R");
+        let use_hook = is_file(ctx.host(), &hook);
+        if !use_hook && !is_file(ctx.host(), &binary) {
             return Err(ctx.stop(SEXP_NIL, format!("build did not produce '{name}'")));
         }
         let libs = dest.join("libs");
         create_dir(ctx, &libs, true)?;
-        ctx.host()
-            .rename(&binary, &libs.join(&name))
-            .map_err(|error| ctx.stop(SEXP_NIL, error.to_string()))?;
+        if use_hook {
+            hooks::install(ctx, &hook, &self.source, dest, package, &extension)?;
+        } else {
+            ctx.host()
+                .rename(&binary, &libs.join(&name))
+                .map_err(|error| ctx.stop(SEXP_NIL, error.to_string()))?;
+        }
         write_stamp(ctx, dest, built)
     }
 
     fn custom_make(&self, ctx: &mut Ctx, src: &Path) -> Result<(), String> {
         let host = ctx.host();
-        let mut args = build_env(&self.home, &self.conf)?;
+        let mut args = build_env(host, &self.home, &self.conf)?;
         if !self.linking_flags.is_empty() {
             let inherited = env_text(host, "PKG_CPPFLAGS")?.unwrap_or_default();
             args.push(format!("PKG_CPPFLAGS={inherited} {}", self.linking_flags));
@@ -155,10 +166,13 @@ impl CompiledPackage {
 fn preserve_executable_bits(
     source: &Path,
     stage: &Path,
-    lock: &Path,
+    lock: Option<&Path>,
     host: &mut dyn roxide_host::Host,
 ) -> Result<(), String> {
-    let lock_pattern = path_text(lock)?
+    let lock_pattern = lock
+        .map(path_text)
+        .transpose()?
+        .unwrap_or_default()
         .replace('\\', "\\\\")
         .replace('[', "\\[")
         .replace('*', "\\*")
@@ -171,7 +185,8 @@ for mode in 100 010 001; do
             source=$1 stage=$2 who=$3
             shift 3
             for file do
-                copy=$stage/${file#"$source"/}
+                if [ "$file" = "$source" ]; then copy=$stage
+                else copy=$stage/${file#"$source"/}; fi
                 if [ -f "$copy" ]; then chmod "$who+x" "$copy"; fi
             done
         ' chmod "$1" "$2" "$who" {} +
@@ -189,21 +204,6 @@ done
             lock_pattern,
         ],
     )
-}
-
-fn build_env(home: &Path, conf: &Makeconf) -> Result<Vec<String>, String> {
-    let include = conf
-        .get("R_INCLUDE_DIR")
-        .unwrap_or(path_text(&home.join("include"))?);
-    let share = conf
-        .get("R_SHARE_DIR")
-        .unwrap_or(path_text(&home.join("share"))?);
-    Ok(vec![
-        format!("R_HOME={}", path_text(home)?),
-        format!("R_INCLUDE_DIR={include}"),
-        format!("R_SHARE_DIR={share}"),
-        format!("SHLIB_EXT={}", shared_extension(conf)?),
-    ])
 }
 
 fn build_fields(
