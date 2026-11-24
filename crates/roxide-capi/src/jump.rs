@@ -11,6 +11,7 @@ use roxide_gc::{ProtectIndex, SexpId, Trace, Tracer};
 use roxide_value::{SEXP_NIL, SexpType, ValueApi};
 
 use crate::abi::{Rboolean, Sexp};
+use crate::api::memory::{release_transient_frame, save_transient_frame};
 use crate::cx::{self, ActiveFrame, Mode};
 use crate::globals::R_NilValue;
 
@@ -156,11 +157,14 @@ pub unsafe fn enter_trampoline_with(
     data: *mut c_void,
 ) -> EvalResult<()> {
     let expected_depth = cx::depth() as c_int;
-    let inherit_floor = matches!(kind, FrameKind::Callback);
-    let Some(frame) = ActiveFrame::push(&ctx.session().heap, inherit_floor) else {
+    let entry = matches!(kind, FrameKind::Entry { .. });
+    let Some(frame) = ActiveFrame::push(&ctx.session().heap, !entry) else {
         return Err(ctx.signal_error_at(SEXP_NIL, "native trampoline depth limit exceeded"));
     };
     let depth = cx::depth();
+    if entry {
+        save_transient_frame(ctx);
+    }
     let mut jump_code = 0;
     let mut exception = [0u8; 512];
     let status = cx::with_released(ctx, Mode::Full, || {
@@ -181,6 +185,9 @@ pub unsafe fn enter_trampoline_with(
     let pending = frame.take_unwind();
     drop(frame);
     ctx.ext::<UnwindConts>().drop_owner(depth);
+    if entry {
+        release_transient_frame(ctx);
+    }
 
     match status {
         0 => {
@@ -219,7 +226,7 @@ pub unsafe fn enter_trampoline_with(
     }
 }
 
-fn call_body(ctx: &mut Ctx, fun: BodyFn, data: *mut c_void) -> EvalResult {
+pub(crate) fn call_body(ctx: &mut Ctx, fun: BodyFn, data: *mut c_void) -> EvalResult {
     let mut call = BodyCall {
         fun,
         data,
@@ -236,6 +243,31 @@ fn call_body(ctx: &mut Ctx, fun: BodyFn, data: *mut c_void) -> EvalResult {
         )?
     };
     id(ctx, call.result, "native callback")
+}
+
+pub(crate) fn call_handler(
+    ctx: &mut Ctx,
+    fun: HandlerFn,
+    condition: SexpId,
+    data: *mut c_void,
+) -> EvalResult {
+    let mut call = HandlerCall {
+        fun,
+        condition: Sexp::from_id(condition),
+        data,
+        result: Sexp::NULL,
+    };
+    // SAFETY: The C caller supplies the callback and data. The adapter uses
+    // the descriptor only during this call.
+    unsafe {
+        enter_trampoline_with(
+            ctx,
+            FrameKind::Callback,
+            rox_capi_call_handler,
+            std::ptr::from_mut(&mut call).cast(),
+        )?
+    };
+    id(ctx, call.result, "native condition handler")
 }
 
 fn id(ctx: &mut Ctx, value: Sexp, name: &str) -> EvalResult {
@@ -605,21 +637,7 @@ pub unsafe extern "C" fn R_tryCatchError(
             let handler = checked_callback(ctx, handler, "R_tryCatchError")?;
             ctx.with_native_error_handler(
                 |ctx| catch_api_panic(|| call_body(ctx, fun, data)),
-                |ctx, cond| {
-                    let mut call = HandlerCall {
-                        fun: handler,
-                        condition: Sexp::from_id(cond),
-                        data: handler_data,
-                        result: Sexp::NULL,
-                    };
-                    enter_trampoline_with(
-                        ctx,
-                        FrameKind::Callback,
-                        rox_capi_call_handler,
-                        std::ptr::from_mut(&mut call).cast(),
-                    )?;
-                    id(ctx, call.result, "R_tryCatchError handler")
-                },
+                |ctx, cond| call_handler(ctx, handler, cond, handler_data),
             )
             .map(Sexp::from_id)
         })

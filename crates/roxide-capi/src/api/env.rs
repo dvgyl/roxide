@@ -7,49 +7,12 @@ use std::ffi::{CStr, c_char, c_int};
 use roxide_eval::{Ctx, EvalResult, Unwind};
 use roxide_gc::SexpId;
 use roxide_value::{
-    BASE_ENV, BASE_NAMESPACE, Binding, CharId, Encoding, GLOBAL_ENV, SEXP_MISSING, SEXP_NIL,
-    SEXP_UNBOUND, SYM_NAME, SYM_NAMESPACE_ENV, SYM_SPEC, SexpType, Sym, ValueApi,
+    BASE_NAMESPACE, Binding, CharId, Encoding, GLOBAL_ENV, SEXP_MISSING, SEXP_NIL, SEXP_UNBOUND,
+    SYM_NAME, SYM_NAMESPACE_ENV, SYM_SPEC, SexpType, Sym, ValueApi, ValueError,
 };
 
+use super::{api, environment, root, symbol};
 use crate::abi::{Rboolean, Sexp};
-use crate::jump;
-
-pub(super) unsafe fn api<R: Copy>(fallback: R, f: impl FnOnce(&mut Ctx) -> EvalResult<R>) -> R {
-    // SAFETY: All callers require an active native trampoline.
-    unsafe {
-        jump::boundary(fallback, |ctx| {
-            ctx.scoped(|ctx| match f(ctx) {
-                Err(Unwind::Value(err)) => Err(ctx.stop(SEXP_NIL, err.to_string())),
-                result => result,
-            })
-        })
-    }
-}
-
-pub(super) fn root(ctx: &mut Ctx, value: Sexp) -> EvalResult {
-    let id = value
-        .to_id()
-        .ok_or_else(|| ctx.stop(SEXP_NIL, "invalid SEXP handle"))?;
-    if ctx.session().heap.get(id).is_err() {
-        return Err(ctx.stop(SEXP_NIL, "stale SEXP handle"));
-    }
-    ctx.session_mut()
-        .heap
-        .try_protect(id)
-        .map_err(|err| ctx.stop(SEXP_NIL, err.to_string()))?;
-    Ok(id)
-}
-
-pub(super) fn symbol(ctx: &mut Ctx, value: Sexp) -> EvalResult<Sym> {
-    let id = root(ctx, value)?;
-    Ok(ctx.session().sexp_as_sym(id)?)
-}
-
-pub(super) fn environment(ctx: &mut Ctx, value: Sexp) -> EvalResult {
-    let id = root(ctx, value)?;
-    ctx.session().env_enclos(id)?;
-    Ok(id)
-}
 
 fn binding_key(ctx: &mut Ctx, sym: Sexp, rho: Sexp) -> EvalResult<(Sym, SexpId)> {
     Ok((symbol(ctx, sym)?, environment(ctx, rho)?))
@@ -80,6 +43,7 @@ fn binding_frame(ctx: &Ctx, sym: Sym, mut env: SexpId) -> EvalResult<Option<Sexp
 /// Call inside an active native trampoline.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn Rf_defineVar(sym: Sexp, value: Sexp, rho: Sexp) {
+    // SAFETY: The caller provides an active native trampoline.
     unsafe {
         api((), |ctx| {
             let (sym, env) = binding_key(ctx, sym, rho)?;
@@ -95,6 +59,7 @@ pub unsafe extern "C" fn Rf_defineVar(sym: Sexp, value: Sexp, rho: Sexp) {
 /// Call inside an active native trampoline.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn Rf_setVar(sym: Sexp, value: Sexp, rho: Sexp) {
+    // SAFETY: The caller provides an active native trampoline.
     unsafe {
         api((), |ctx| {
             let (sym, env) = binding_key(ctx, sym, rho)?;
@@ -121,6 +86,7 @@ fn legacy_lookup(ctx: &mut Ctx, sym: Sym, env: SexpId) -> EvalResult {
 /// Call inside an active native trampoline.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn Rf_findVar(sym: Sexp, rho: Sexp) -> Sexp {
+    // SAFETY: The caller provides an active native trampoline.
     unsafe {
         api(Sexp::NULL, |ctx| {
             let (sym, env) = binding_key(ctx, sym, rho)?;
@@ -139,6 +105,7 @@ pub unsafe extern "C" fn Rf_findVar(sym: Sexp, rho: Sexp) -> Sexp {
 /// Call inside an active native trampoline.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn Rf_findVarInFrame(rho: Sexp, sym: Sexp) -> Sexp {
+    // SAFETY: The caller provides an active native trampoline.
     unsafe { Rf_findVarInFrame3(rho, sym, 1) }
 }
 
@@ -148,12 +115,29 @@ pub unsafe extern "C" fn Rf_findVarInFrame(rho: Sexp, sym: Sexp) -> Sexp {
 /// Call inside an active native trampoline.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn Rf_findVarInFrame3(rho: Sexp, sym: Sexp, _do_get: Rboolean) -> Sexp {
+    // SAFETY: The caller provides an active native trampoline.
     unsafe {
         api(Sexp::NULL, |ctx| {
             let (sym, env) = binding_key(ctx, sym, rho)?;
             legacy_lookup(ctx, sym, env).map(Sexp::from_id)
         })
     }
+}
+
+fn get_var_key(ctx: &mut Ctx, sym: Sexp, rho: Sexp) -> EvalResult<(Sym, SexpId)> {
+    let id = root(ctx, sym)?;
+    let sym = ctx
+        .session()
+        .sexp_as_sym(id)
+        .map_err(|_| ctx.stop(SEXP_NIL, "first argument to 'R_getVarEx' must be a symbol"))?;
+    let env = root(ctx, rho)?;
+    if ctx.session().type_of(env)? != SexpType::Env {
+        return Err(ctx.stop(
+            SEXP_NIL,
+            "second argument to 'R_getVarEx' must be an environment",
+        ));
+    }
+    Ok((sym, env))
 }
 
 fn get_var(ctx: &mut Ctx, sym: Sym, env: SexpId, inherits: Rboolean) -> EvalResult<Option<SexpId>> {
@@ -178,9 +162,10 @@ fn get_var(ctx: &mut Ctx, sym: Sym, env: SexpId, inherits: Rboolean) -> EvalResu
 /// Call inside an active native trampoline.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn R_getVar(sym: Sexp, rho: Sexp, inherits: Rboolean) -> Sexp {
+    // SAFETY: The caller provides an active native trampoline.
     unsafe {
         api(Sexp::NULL, |ctx| {
-            let (sym, env) = binding_key(ctx, sym, rho)?;
+            let (sym, env) = get_var_key(ctx, sym, rho)?;
             let value = get_var(ctx, sym, env, inherits)?.ok_or_else(|| {
                 let name = ctx.session().sym_name(sym).unwrap_or("").to_owned();
                 ctx.stop(SEXP_NIL, format!("object '{name}' not found"))
@@ -201,9 +186,10 @@ pub unsafe extern "C" fn R_getVarEx(
     inherits: Rboolean,
     fallback: Sexp,
 ) -> Sexp {
+    // SAFETY: The caller provides an active native trampoline.
     unsafe {
         api(Sexp::NULL, |ctx| {
-            let (sym, env) = binding_key(ctx, sym, rho)?;
+            let (sym, env) = get_var_key(ctx, sym, rho)?;
             let fallback = root(ctx, fallback)?;
             Ok(Sexp::from_id(
                 get_var(ctx, sym, env, inherits)?.unwrap_or(fallback),
@@ -218,6 +204,7 @@ pub unsafe extern "C" fn R_getVarEx(
 /// Call inside an active native trampoline.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn R_existsVarInFrame(rho: Sexp, sym: Sexp) -> Rboolean {
+    // SAFETY: The caller provides an active native trampoline.
     unsafe {
         api(0, |ctx| {
             let (sym, env) = binding_key(ctx, sym, rho)?;
@@ -236,9 +223,13 @@ pub unsafe extern "C" fn R_existsVarInFrame(rho: Sexp, sym: Sexp) -> Rboolean {
 /// Call inside an active native trampoline.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn R_removeVarFromFrame(sym: Sexp, rho: Sexp) {
+    // SAFETY: The caller provides an active native trampoline.
     unsafe {
         api((), |ctx| {
             let (sym, env) = binding_key(ctx, sym, rho)?;
+            if ctx.session().env_is_locked(env)? {
+                return Err(ctx.stop(SEXP_NIL, "cannot remove bindings from a locked environment"));
+            }
             ctx.session_mut().env_remove(env, sym)?;
             Ok(())
         })
@@ -251,6 +242,7 @@ pub unsafe extern "C" fn R_removeVarFromFrame(sym: Sexp, rho: Sexp) {
 /// Call inside an active native trampoline.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn R_NewEnv(enclos: Sexp, _hash: c_int, _size: c_int) -> Sexp {
+    // SAFETY: The caller provides an active native trampoline.
     unsafe {
         api(Sexp::NULL, |ctx| {
             let parent = environment(ctx, enclos)?;
@@ -266,6 +258,7 @@ pub unsafe extern "C" fn R_NewEnv(enclos: Sexp, _hash: c_int, _size: c_int) -> S
 /// Call inside an active native trampoline.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn R_ParentEnv(rho: Sexp) -> Sexp {
+    // SAFETY: The caller provides an active native trampoline.
     unsafe {
         api(Sexp::NULL, |ctx| {
             let env = environment(ctx, rho)?;
@@ -297,12 +290,12 @@ fn package_name(ctx: &Ctx, env: SexpId) -> EvalResult<Option<SexpId>> {
 /// Call inside an active native trampoline.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn R_IsPackageEnv(rho: Sexp) -> Rboolean {
+    // SAFETY: The caller provides an active native trampoline.
     unsafe {
         api(0, |ctx| {
             let id = root(ctx, rho)?;
             Ok(i32::from(
-                ctx.session().type_of(id)? == SexpType::Env
-                    && (id == BASE_ENV || package_name(ctx, id)?.is_some()),
+                ctx.session().type_of(id)? == SexpType::Env && package_name(ctx, id)?.is_some(),
             ))
         })
     }
@@ -314,12 +307,11 @@ pub unsafe extern "C" fn R_IsPackageEnv(rho: Sexp) -> Rboolean {
 /// Call inside an active native trampoline.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn R_PackageEnvName(rho: Sexp) -> Sexp {
+    // SAFETY: The caller provides an active native trampoline.
     unsafe {
         api(Sexp::NULL, |ctx| {
             let id = root(ctx, rho)?;
-            let value = if id == BASE_ENV {
-                ctx.session_mut().scalar_str("package:base")?
-            } else if ctx.session().type_of(id)? == SexpType::Env {
+            let value = if ctx.session().type_of(id)? == SexpType::Env {
                 package_name(ctx, id)?.unwrap_or(SEXP_NIL)
             } else {
                 SEXP_NIL
@@ -335,6 +327,7 @@ pub unsafe extern "C" fn R_PackageEnvName(rho: Sexp) -> Sexp {
 /// Call inside an active native trampoline.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn R_IsNamespaceEnv(rho: Sexp) -> Rboolean {
+    // SAFETY: The caller provides an active native trampoline.
     unsafe {
         api(0, |ctx| {
             let id = root(ctx, rho)?;
@@ -349,6 +342,7 @@ pub unsafe extern "C" fn R_IsNamespaceEnv(rho: Sexp) -> Rboolean {
 /// Call inside an active native trampoline.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn R_NamespaceEnvSpec(rho: Sexp) -> Sexp {
+    // SAFETY: The caller provides an active native trampoline.
     unsafe {
         api(Sexp::NULL, |ctx| {
             let id = root(ctx, rho)?;
@@ -371,6 +365,7 @@ pub unsafe extern "C" fn R_NamespaceEnvSpec(rho: Sexp) -> Sexp {
 /// Call inside an active native trampoline.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn R_FindNamespace(name: Sexp) -> Sexp {
+    // SAFETY: The caller provides an active native trampoline.
     unsafe {
         api(Sexp::NULL, |ctx| {
             let id = root(ctx, name)?;
@@ -397,6 +392,7 @@ pub unsafe extern "C" fn R_FindNamespace(name: Sexp) -> Sexp {
 /// Call inside an active native trampoline. `name` must point to a C string.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn R_getRegisteredNamespace(name: *const c_char) -> Sexp {
+    // SAFETY: The caller provides a trampoline and a C string.
     unsafe {
         api(Sexp::NULL, |ctx| {
             if name.is_null() {
@@ -414,6 +410,7 @@ pub unsafe extern "C" fn R_getRegisteredNamespace(name: *const c_char) -> Sexp {
 /// Call inside an active native trampoline.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn R_LockEnvironment(rho: Sexp, bindings: Rboolean) {
+    // SAFETY: The caller provides an active native trampoline.
     unsafe {
         api((), |ctx| {
             let env = environment(ctx, rho)?;
@@ -431,6 +428,7 @@ pub unsafe extern "C" fn R_LockEnvironment(rho: Sexp, bindings: Rboolean) {
 /// Call inside an active native trampoline.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn R_EnvironmentIsLocked(rho: Sexp) -> Rboolean {
+    // SAFETY: The caller provides an active native trampoline.
     unsafe {
         api(0, |ctx| {
             let env = environment(ctx, rho)?;
@@ -440,6 +438,7 @@ pub unsafe extern "C" fn R_EnvironmentIsLocked(rho: Sexp) -> Rboolean {
 }
 
 unsafe fn set_binding_lock(sym: Sexp, rho: Sexp, locked: bool) {
+    // SAFETY: The caller provides an active native trampoline.
     unsafe {
         api((), |ctx| {
             let (sym, env) = binding_key(ctx, sym, rho)?;
@@ -457,6 +456,7 @@ unsafe fn set_binding_lock(sym: Sexp, rho: Sexp, locked: bool) {
 /// Call inside an active native trampoline.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn R_LockBinding(sym: Sexp, rho: Sexp) {
+    // SAFETY: The caller provides an active native trampoline.
     unsafe { set_binding_lock(sym, rho, true) }
 }
 
@@ -466,6 +466,7 @@ pub unsafe extern "C" fn R_LockBinding(sym: Sexp, rho: Sexp) {
 /// Call inside an active native trampoline.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn R_unLockBinding(sym: Sexp, rho: Sexp) {
+    // SAFETY: The caller provides an active native trampoline.
     unsafe { set_binding_lock(sym, rho, false) }
 }
 
@@ -482,6 +483,7 @@ fn required_binding(ctx: &mut Ctx, sym: Sexp, rho: Sexp) -> EvalResult<Binding> 
 /// Call inside an active native trampoline.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn R_BindingIsLocked(sym: Sexp, rho: Sexp) -> Rboolean {
+    // SAFETY: The caller provides an active native trampoline.
     unsafe {
         api(0, |ctx| {
             Ok(i32::from(required_binding(ctx, sym, rho)?.locked))
@@ -495,6 +497,7 @@ pub unsafe extern "C" fn R_BindingIsLocked(sym: Sexp, rho: Sexp) -> Rboolean {
 /// Call inside an active native trampoline.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn R_BindingIsActive(sym: Sexp, rho: Sexp) -> Rboolean {
+    // SAFETY: The caller provides an active native trampoline.
     unsafe {
         api(0, |ctx| {
             Ok(i32::from(required_binding(ctx, sym, rho)?.active))
@@ -508,11 +511,17 @@ pub unsafe extern "C" fn R_BindingIsActive(sym: Sexp, rho: Sexp) -> Rboolean {
 /// Call inside an active native trampoline.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn R_ActiveBindingFunction(sym: Sexp, rho: Sexp) -> Sexp {
+    // SAFETY: The caller provides an active native trampoline.
     unsafe {
         api(Sexp::NULL, |ctx| {
-            let binding = required_binding(ctx, sym, rho)?;
+            let (sym, env) = binding_key(ctx, sym, rho)?;
+            let binding = ctx
+                .session()
+                .env_get(env, sym)
+                .ok_or_else(|| missing_binding(ctx, sym))?;
             if !binding.active {
-                return Err(ctx.stop(SEXP_NIL, "binding is not active"));
+                let name = ctx.session().sym_name(sym)?.to_owned();
+                return Err(ctx.stop(SEXP_NIL, format!("no active binding for \"{name}\"")));
             }
             Ok(Sexp::from_id(binding.value))
         })
@@ -525,6 +534,7 @@ pub unsafe extern "C" fn R_ActiveBindingFunction(sym: Sexp, rho: Sexp) -> Sexp {
 /// Call inside an active native trampoline.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn R_MakeActiveBinding(sym: Sexp, fun: Sexp, rho: Sexp) {
+    // SAFETY: The caller provides an active native trampoline.
     unsafe {
         api((), |ctx| {
             let (sym, env) = binding_key(ctx, sym, rho)?;
@@ -533,7 +543,7 @@ pub unsafe extern "C" fn R_MakeActiveBinding(sym: Sexp, fun: Sexp, rho: Sexp) {
                 ctx.session().type_of(fun)?,
                 SexpType::Clo | SexpType::Builtin | SexpType::Special
             ) {
-                return Err(ctx.stop(SEXP_NIL, "invalid function"));
+                return Err(ctx.stop(SEXP_NIL, "not a function"));
             }
             if ctx
                 .session()
@@ -542,7 +552,7 @@ pub unsafe extern "C" fn R_MakeActiveBinding(sym: Sexp, fun: Sexp, rho: Sexp) {
             {
                 return Err(ctx.stop(SEXP_NIL, "symbol already has a regular binding"));
             }
-            Ok(ctx.session_mut().env_define_binding(
+            let result = ctx.session_mut().env_define_binding(
                 env,
                 sym,
                 Binding {
@@ -551,7 +561,14 @@ pub unsafe extern "C" fn R_MakeActiveBinding(sym: Sexp, fun: Sexp, rho: Sexp) {
                     locked: false,
                     missing: 0,
                 },
-            )?)
+            );
+            match result {
+                Err(ValueError::LockedBinding(_)) => Err(ctx.stop(
+                    SEXP_NIL,
+                    "cannot change active binding if binding is locked",
+                )),
+                other => Ok(other?),
+            }
         })
     }
 }
@@ -562,6 +579,7 @@ pub unsafe extern "C" fn R_MakeActiveBinding(sym: Sexp, fun: Sexp, rho: Sexp) {
 /// Call inside an active native trampoline.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn R_lsInternal(rho: Sexp, all: Rboolean) -> Sexp {
+    // SAFETY: The caller provides an active native trampoline.
     unsafe { R_lsInternal3(rho, all, 1) }
 }
 
@@ -571,6 +589,7 @@ pub unsafe extern "C" fn R_lsInternal(rho: Sexp, all: Rboolean) -> Sexp {
 /// Call inside an active native trampoline.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn R_lsInternal3(rho: Sexp, all: Rboolean, sorted: Rboolean) -> Sexp {
+    // SAFETY: The caller provides an active native trampoline.
     unsafe {
         api(Sexp::NULL, |ctx| {
             let env = environment(ctx, rho)?;

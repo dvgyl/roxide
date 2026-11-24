@@ -8,11 +8,14 @@ use roxide_capi::api::{env::*, error::*, eval::*, parse::*, print::*, unwind::*}
 use roxide_capi::globals::{R_BaseEnv, R_EmptyEnv, R_GlobalEnv, R_NilValue, R_UnboundValue};
 use roxide_capi::jump::{Rf_protect, Rf_unprotect, VoidFn, enter_trampoline};
 use roxide_eval::{
-    ArgEval, Args, Arity, Call, Ctx, Dispatch, EvalResult, Module, PrimDef, PrimKind, Visibility,
+    ArgEval, Args, Arity, Call, Ctx, Dispatch, EvalResult, Module, PrimDef, PrimKind, Unwind,
+    Visibility,
 };
 use roxide_gc::{GcPolicy, SexpId};
 use roxide_host::PureHost;
-use roxide_value::{BASE_ENV, GLOBAL_ENV, SYM_SRCFILE, SYM_SRCREF, SexpType, ValueApi};
+use roxide_value::{
+    BASE_ENV, Encoding, GLOBAL_ENV, SEXP_NIL, SYM_SRCFILE, SYM_SRCREF, SexpType, ValueApi,
+};
 
 fn each_policy(mut test: impl FnMut(&mut Ctx)) {
     for policy in [GcPolicy::default(), GcPolicy::Torture] {
@@ -64,6 +67,7 @@ struct EnvProbe {
     value: Sexp,
     getter: Sexp,
     parent: Sexp,
+    base_package: (c_int, Sexp),
     inherited: Sexp,
     fallback: Sexp,
     updated: Sexp,
@@ -84,6 +88,7 @@ unsafe extern "C" fn env_probe(data: *mut c_void) {
         let env = Rf_protect(R_NewEnv(R_EmptyEnv, 0, 0));
         let child = Rf_protect(R_NewEnv(env, 1, 7));
         p.parent = R_ParentEnv(child);
+        p.base_package = (R_IsPackageEnv(R_BaseEnv), R_PackageEnvName(R_BaseEnv));
         Rf_defineVar(p.name, p.value, env);
         Rf_defineVar(p.hidden, p.value, env);
         p.inherited = R_getVar(p.name, child, 1);
@@ -120,6 +125,7 @@ fn environment_operations() {
             value: text(ctx, "bound"),
             getter: Sexp::NULL,
             parent: Sexp::NULL,
+            base_package: (-1, Sexp::NULL),
             inherited: Sexp::NULL,
             fallback: Sexp::NULL,
             updated: Sexp::NULL,
@@ -140,6 +146,7 @@ fn environment_operations() {
                 ctx.session().type_of(p.parent.to_id().unwrap())?,
                 SexpType::Env
             );
+            assert_eq!(p.base_package, (0, R_NilValue));
             assert_eq!(p.inherited, p.value);
             assert_eq!(p.fallback, R_NilValue);
             assert_eq!(p.updated, R_NilValue);
@@ -267,15 +274,26 @@ fn evaluation_options_print_and_current_environment() {
         assert_eq!(out, b"[1] 5\n");
 
         ctx.register_module(&Module {
-            prims: &[PrimDef {
-                name: "nativeCurrentEnv",
-                kind: PrimKind::Primitive,
-                args: ArgEval::Eval,
-                arity: Arity::Exact(0),
-                dispatch: Dispatch::None,
-                visibility: Visibility::On,
-                fun: native_current_env,
-            }],
+            prims: &[
+                PrimDef {
+                    name: "nativeCurrentEnv",
+                    kind: PrimKind::Primitive,
+                    args: ArgEval::Eval,
+                    arity: Arity::Exact(0),
+                    dispatch: Dispatch::None,
+                    visibility: Visibility::On,
+                    fun: native_current_env,
+                },
+                PrimDef {
+                    name: "nativePrint",
+                    kind: PrimKind::Primitive,
+                    args: ArgEval::Eval,
+                    arity: Arity::Exact(1),
+                    dispatch: Dispatch::None,
+                    visibility: Visibility::Off,
+                    fun: native_print,
+                },
+            ],
             prelude: "",
         })
         .unwrap();
@@ -286,7 +304,34 @@ fn evaluation_options_print_and_current_environment() {
             false,
         )
         .unwrap();
+        let ((), out) = ctx
+            .capture_streams(true, false, false, |ctx| {
+                ctx.run_script(
+                    "print-env",
+                    r#"
+                    print.zzz <- function(x) cat("global method\n")
+                    (function() {
+                        print.zzz <- function(x) cat("local method\n")
+                        nativePrint(structure(5L, class = "zzz"))
+                    })()
+                    "#,
+                    GLOBAL_ENV,
+                    false,
+                )
+            })
+            .unwrap();
+        assert_eq!(out, b"global method\n");
     });
+}
+
+unsafe extern "C" fn print_probe(data: *mut c_void) {
+    // SAFETY: The caller passes a live Sexp and enters the trampoline.
+    unsafe { Rf_PrintValue(*data.cast::<Sexp>()) };
+}
+
+fn native_print(ctx: &mut Ctx, _: &Call, args: &mut Args) -> EvalResult {
+    call(ctx, print_probe, &mut handle(args.get(0)))?;
+    Ok(SEXP_NIL)
 }
 
 struct ParseProbe {
@@ -331,22 +376,39 @@ fn parser_status_counts_and_source_refs() {
             }
         }
         let env = ctx.session_mut().alloc_env(BASE_ENV).unwrap();
-        let mut p = ParseProbe {
-            text: text(ctx, "1L\n2L"),
-            count: -1,
-            srcfile: handle(env),
-            status: -1,
-            result: Sexp::NULL,
-        };
-        call(ctx, parse_probe, &mut p).unwrap();
-        let result = p.result.to_id().unwrap();
-        assert_eq!(p.status, 1);
-        assert_eq!(ctx.session().attr(result, SYM_SRCFILE), env);
-        let refs = ctx.session().attr(result, SYM_SRCREF);
-        assert_eq!(ctx.session().xlength(refs).unwrap(), 2);
-        let second = ctx.session().list_get(refs, 1).unwrap();
-        assert_eq!(ctx.session().int(second).unwrap().get(0), 2);
-        assert_eq!(ctx.session().attr(second, SYM_SRCFILE), env);
+        let first = ctx
+            .session_mut()
+            .mk_char(b"x <- 1", Encoding::Native)
+            .unwrap();
+        let second = ctx.session_mut().mk_char(b"y", Encoding::Native).unwrap();
+        let lines = ctx.session_mut().alloc_str_from(&[first, second]).unwrap();
+        let whole = ctx.session_mut().intern("wholeSrcref").unwrap();
+        for (count, end_line, length) in [(-1, 3, 2), (1, 2, 1), (0, 1, 0)] {
+            let mut p = ParseProbe {
+                text: handle(lines),
+                count,
+                srcfile: handle(env),
+                status: -1,
+                result: Sexp::NULL,
+            };
+            call(ctx, parse_probe, &mut p).unwrap();
+            let result = p.result.to_id().unwrap();
+            assert_eq!(p.status, 1);
+            let session = ctx.session();
+            assert_eq!(session.attr(result, SYM_SRCFILE), env);
+            let coords = session.int(session.attr(result, whole)).unwrap();
+            assert_eq!(
+                coords.iter().collect::<Vec<_>>(),
+                [1, 0, end_line, 0, 0, 0, 1, end_line]
+            );
+            let refs = session.attr(result, SYM_SRCREF);
+            assert_eq!(session.xlength(refs).unwrap(), length);
+            if length == 2 {
+                let second = session.list_get(refs, 1).unwrap();
+                assert_eq!(session.int(second).unwrap().get(0), 2);
+                assert_eq!(session.attr(second, SYM_SRCFILE), env);
+            }
+        }
     });
 }
 
@@ -362,15 +424,13 @@ unsafe extern "C" fn try_probe(data: *mut c_void) {
     unsafe {
         let expr = Rf_protect(R_ParseString(c"9L".as_ptr()));
         let fail = Rf_protect(R_ParseString(
-            c"{ message('test message'); stop('native test error') }".as_ptr(),
+            c"{ message('test message'); warning('test warning'); f() }".as_ptr(),
         ));
         let eval = if p.silent { R_tryEvalSilent } else { R_tryEval };
         p.successes[0] = Rf_protect(eval(expr, R_BaseEnv, &mut p.errors[0]));
-        p.successes[1] = eval(fail, R_BaseEnv, &mut p.errors[1]);
+        p.successes[1] = eval(fail, R_GlobalEnv, &mut p.errors[1]);
         let diagnostic = CStr::from_ptr(R_curErrorBuf()).to_bytes();
-        p.diagnostic = diagnostic
-            .windows(b"native test error".len())
-            .any(|s| s == b"native test error");
+        p.diagnostic = diagnostic == b"Error in f() : boom\n";
         Rf_unprotect(3);
     }
 }
@@ -378,7 +438,14 @@ unsafe extern "C" fn try_probe(data: *mut c_void) {
 #[test]
 fn try_eval_success_and_diagnostics() {
     each_policy(|ctx| {
-        for silent in [false, true] {
+        ctx.run_script(
+            "error fixture",
+            "f <- function() stop('boom'); stopifnot(identical(tryCatch(stop('second'), error = function(e) geterrmessage()), 'second'))",
+            GLOBAL_ENV,
+            false,
+        )
+        .unwrap();
+        for silent in [true, false] {
             let mut p = TryProbe {
                 silent,
                 successes: [Sexp::NULL; 2],
@@ -389,12 +456,18 @@ fn try_eval_success_and_diagnostics() {
                 .capture_streams(false, true, false, |ctx| call(ctx, try_probe, &mut p))
                 .unwrap();
             let stderr = String::from_utf8(stderr).unwrap();
-            assert_eq!(p.errors, [0, 1]);
+            assert_eq!(p.errors, [0, 1], "{stderr}");
             assert_eq!(int(ctx, p.successes[0]), 9);
             assert_eq!(p.successes[1], Sexp::NULL);
             assert!(p.diagnostic);
-            assert_eq!(stderr.contains("native test error"), !silent, "{stderr}");
+            assert_eq!(
+                stderr.contains("Error in f() : boom\n"),
+                !silent,
+                "{stderr}"
+            );
             assert!(stderr.contains("test message"), "{stderr}");
+            assert!(stderr.contains("test warning"), "{stderr}");
+            assert_eq!(stderr.contains("In addition: "), !silent, "{stderr}");
         }
     });
 }
@@ -407,7 +480,7 @@ struct CleanupProbe {
 }
 
 unsafe extern "C" fn return_value(_: *mut c_void) -> Sexp {
-    unsafe { R_ParseEvalString(c"123L".as_ptr(), R_BaseEnv) }
+    unsafe { Rf_protect(R_ParseEvalString(c"123L".as_ptr(), R_BaseEnv)) }
 }
 
 unsafe extern "C" fn raise_error(_: *mut c_void) -> Sexp {
@@ -421,6 +494,7 @@ unsafe extern "C" fn raise_warning(_: *mut c_void) -> Sexp {
 unsafe extern "C" fn clean(data: *mut c_void) {
     unsafe {
         (*data.cast::<CleanupProbe>()).cleaned += 1;
+        roxide_capi::api::memory::R_gc();
         R_ParseEvalString(c"invisible(789L)".as_ptr(), R_BaseEnv);
     }
 }
@@ -436,7 +510,11 @@ unsafe extern "C" fn cleanup_probe(data: *mut c_void) {
     unsafe {
         let mode = (*data.cast::<CleanupProbe>()).mode;
         let result = match mode {
-            0 => R_ExecWithCleanup(Some(return_value), null_mut(), Some(clean), data),
+            0 => {
+                let result = R_ExecWithCleanup(Some(return_value), null_mut(), Some(clean), data);
+                Rf_unprotect(1);
+                result
+            }
             1 => R_ExecWithCleanup(Some(raise_error), null_mut(), Some(clean), data),
             2 => {
                 let classes = Rf_protect(R_ParseEvalString(c"'warning'".as_ptr(), R_BaseEnv));
@@ -498,10 +576,272 @@ fn callback_cleanup_and_condition_handlers() {
                     SexpType::Vec
                 );
             }
+            let stderr = String::from_utf8(stderr).unwrap();
+            assert_eq!(stderr.contains("body error"), failed, "{stderr}");
+            if mode == 0 {
+                assert!(stderr.is_empty(), "{stderr}");
+            }
+        }
+    });
+}
+
+unsafe extern "C" fn nested_error(_: *mut c_void) -> Sexp {
+    // SAFETY: The condition bridge enters a trampoline for this callback.
+    unsafe { R_ParseEvalString(c"stop('boom')".as_ptr(), R_BaseEnv) }
+}
+
+unsafe extern "C" fn record_handler<const ID: u8>(_: Sexp, data: *mut c_void) -> Sexp {
+    // SAFETY: The test passes a live array of three bytes.
+    unsafe {
+        let order = &mut *data.cast::<[u8; 3]>();
+        *order = [order[1], order[2], ID];
+    }
+    R_NilValue
+}
+
+unsafe extern "C" fn inner_handler(data: *mut c_void) -> Sexp {
+    // SAFETY: The bridge enters a trampoline. The test supplies a live array.
+    unsafe {
+        R_withCallingErrorHandler(
+            Some(nested_error),
+            null_mut(),
+            Some(record_handler::<1>),
+            data,
+        )
+    }
+}
+
+unsafe extern "C" fn outer_handler(data: *mut c_void) {
+    // SAFETY: The test provides a trampoline and a live callback fixture.
+    unsafe {
+        R_withCallingErrorHandler(Some(inner_handler), data, Some(record_handler::<2>), data)
+    };
+}
+
+#[test]
+fn nested_native_calling_handlers_run_in_order() {
+    each_policy(|ctx| {
+        let mut order = [0u8; 3];
+        let message = ctx
+            .with_native_error_handler(
+                |ctx| {
+                    call(ctx, outer_handler, &mut order)?;
+                    panic!("stop returned normally");
+                },
+                |ctx, condition| Ok(ctx.session().list_get(condition, 0)?),
+            )
+            .unwrap();
+        assert_eq!(order, [0, 1, 2]);
+        assert_eq!(strings(ctx, handle(message)), ["boom"]);
+    });
+}
+
+unsafe extern "C" fn invalid_closure(data: *mut c_void) {
+    // SAFETY: The test passes the fixture and enters a trampoline.
+    unsafe {
+        match *data.cast::<u8>() {
+            0 => {
+                let body = Rf_protect(R_ParseEvalString(c"function() NULL".as_ptr(), R_BaseEnv));
+                R_mkClosure(R_NilValue, body, R_BaseEnv);
+                Rf_unprotect(1);
+            }
+            1 => {
+                let formals = Rf_protect(R_ParseEvalString(c"pairlist(1)".as_ptr(), R_BaseEnv));
+                R_mkClosure(formals, R_NilValue, R_BaseEnv);
+                Rf_unprotect(1);
+            }
+            _ => {
+                R_mkClosure(R_NilValue, R_NilValue, R_NilValue);
+            }
+        }
+    }
+}
+
+#[test]
+fn closure_constructor_rejects_invalid_arguments() {
+    each_policy(|ctx| {
+        for (mut case, expected) in [
+            (0u8, "invalid body argument for 'function'"),
+            (1, "invalid formal argument list for \"R_mkClosure\""),
+            (2, "invalid environment"),
+        ] {
+            let message = ctx
+                .with_native_error_handler(
+                    |ctx| {
+                        call(ctx, invalid_closure, &mut case)?;
+                        panic!("invalid closure was accepted");
+                    },
+                    |ctx, condition| Ok(ctx.session().list_get(condition, 0)?),
+                )
+                .unwrap();
+            assert_eq!(strings(ctx, handle(message)), [expected]);
+        }
+    });
+}
+
+unsafe extern "C" fn try_quit(data: *mut c_void) {
+    // SAFETY: The test supplies a trampoline and a live bool.
+    unsafe {
+        let expression = Rf_protect(R_ParseString(c"nativeQuit()".as_ptr()));
+        let evaluate = if *data.cast::<bool>() {
+            R_tryEvalSilent
+        } else {
+            R_tryEval
+        };
+        evaluate(expression, R_BaseEnv, null_mut());
+        Rf_unprotect(1);
+    }
+}
+
+#[test]
+fn try_eval_propagates_quit() {
+    each_policy(|ctx| {
+        ctx.register_module(&Module {
+            prims: &[PrimDef {
+                name: "nativeQuit",
+                kind: PrimKind::Primitive,
+                args: ArgEval::Eval,
+                arity: Arity::Exact(0),
+                dispatch: Dispatch::None,
+                visibility: Visibility::On,
+                fun: |_, _, _| {
+                    Err(Unwind::Quit {
+                        status: 17,
+                        run_last: false,
+                    })
+                },
+            }],
+            prelude: "",
+        })
+        .unwrap();
+        for mut silent in [false, true] {
             assert_eq!(
-                String::from_utf8(stderr).unwrap().contains("body error"),
-                failed
+                call(ctx, try_quit, &mut silent),
+                Err(Unwind::Quit {
+                    status: 17,
+                    run_last: false
+                })
             );
+        }
+    });
+}
+
+unsafe extern "C" fn interrupt_probe(data: *mut c_void) {
+    // SAFETY: The test supplies a trampoline and a live bool.
+    unsafe {
+        if *data.cast::<bool>() {
+            Rf_onintr();
+        } else {
+            Rf_onintrNoResume();
+        }
+    }
+}
+
+fn native_interrupt(ctx: &mut Ctx, _: &Call, args: &mut Args) -> EvalResult {
+    let mut resumable = ctx.session().lgl(args.get(0))?.get(0).get() == Some(true);
+    call(ctx, interrupt_probe, &mut resumable)?;
+    Ok(ctx.session_mut().scalar_int(42)?)
+}
+
+#[test]
+fn native_interrupt_class_and_resume_restart() {
+    each_policy(|ctx| {
+        ctx.register_module(&Module {
+            prims: &[PrimDef {
+                name: "nativeInterrupt",
+                kind: PrimKind::Primitive,
+                args: ArgEval::Eval,
+                arity: Arity::Exact(1),
+                dispatch: Dispatch::None,
+                visibility: Visibility::On,
+                fun: native_interrupt,
+            }],
+            prelude: "",
+        })
+        .unwrap();
+        ctx.run_script(
+            "native interrupt",
+            r#"
+            check_interrupt <- function(e) {
+                stopifnot(identical(class(e), c("interrupt", "condition")))
+                stopifnot(length(e) == 0L, is.null(names(e)))
+            }
+            answer <- withCallingHandlers(nativeInterrupt(TRUE), interrupt = function(e) {
+                check_interrupt(e)
+                invokeRestart("resume")
+            })
+            stopifnot(identical(answer, 42L), is.null(findRestart("resume")))
+            answer <- tryCatch(nativeInterrupt(FALSE), interrupt = function(e) {
+                check_interrupt(e)
+                stopifnot(is.null(findRestart("resume")))
+                "caught"
+            })
+            stopifnot(identical(answer, "caught"))
+            "#,
+            GLOBAL_ENV,
+            false,
+        )
+        .unwrap();
+    });
+}
+
+unsafe extern "C" fn invalid_binding_operation(data: *mut c_void) {
+    // SAFETY: The test supplies a trampoline and a live callback fixture.
+    unsafe {
+        let (case, name, active) = *data.cast::<(u8, Sexp, Sexp)>();
+        let env = Rf_protect(R_NewEnv(R_EmptyEnv, 0, 0));
+        let fun = Rf_protect(R_ParseEvalString(c"function() 1L".as_ptr(), R_BaseEnv));
+        Rf_defineVar(name, R_NilValue, env);
+        R_MakeActiveBinding(active, fun, env);
+        R_LockBinding(active, env);
+        R_LockEnvironment(env, 0);
+        match case {
+            0 => {
+                R_getVar(R_NilValue, env, 0);
+            }
+            1 => {
+                R_getVarEx(name, R_NilValue, 0, R_NilValue);
+            }
+            2 => R_removeVarFromFrame(name, env),
+            3 => R_MakeActiveBinding(active, R_NilValue, env),
+            4 => R_MakeActiveBinding(active, fun, env),
+            5 => R_MakeActiveBinding(
+                roxide_capi::api::sym::Rf_install(c"missing".as_ptr()),
+                fun,
+                env,
+            ),
+            _ => {
+                R_ActiveBindingFunction(name, env);
+            }
+        }
+        Rf_unprotect(2);
+    }
+}
+
+#[test]
+fn invalid_binding_operations_report_gnu_r_diagnostics() {
+    each_policy(|ctx| {
+        let name = symbol(ctx, "ordinary");
+        let active = symbol(ctx, "active");
+        for (case, expected) in [
+            (0u8, "first argument to 'R_getVarEx' must be a symbol"),
+            (1, "second argument to 'R_getVarEx' must be an environment"),
+            (2, "cannot remove bindings from a locked environment"),
+            (3, "not a function"),
+            (4, "cannot change active binding if binding is locked"),
+            (5, "cannot add bindings to a locked environment"),
+            (6, "no active binding for \"ordinary\""),
+        ] {
+            let message = ctx
+                .with_native_error_handler(
+                    |ctx| {
+                        call(ctx, invalid_binding_operation, &mut (case, name, active))?;
+                        panic!("invalid binding operation succeeded");
+                    },
+                    |ctx, condition| Ok(ctx.session().list_get(condition, 0)?),
+                )
+                .unwrap();
+            assert_eq!(strings(ctx, handle(message)), [expected]);
         }
     });
 }

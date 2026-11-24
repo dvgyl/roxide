@@ -26,3 +26,45 @@ pub mod rmath;
 pub mod s4;
 pub mod utils;
 pub mod weakref;
+
+use roxide_eval::{Ctx, EvalResult, Unwind};
+use roxide_value::{SEXP_NIL, Sym, ValueApi};
+
+use crate::{abi::Sexp, jump};
+
+unsafe fn api<R: Copy>(fallback: R, f: impl FnOnce(&mut Ctx) -> EvalResult<R>) -> R {
+    // SAFETY: All callers require an active native trampoline.
+    unsafe {
+        jump::boundary(fallback, |ctx| {
+            ctx.scoped(|ctx| match f(ctx) {
+                Err(Unwind::Value(err)) => Err(ctx.stop(SEXP_NIL, err.to_string())),
+                result => result,
+            })
+        })
+    }
+}
+
+fn root(ctx: &mut Ctx, value: Sexp) -> EvalResult {
+    let id = value
+        .to_id()
+        .ok_or_else(|| ctx.stop(SEXP_NIL, "invalid SEXP handle"))?;
+    if ctx.session().heap.get(id).is_err() {
+        return Err(ctx.stop(SEXP_NIL, "stale SEXP handle"));
+    }
+    ctx.session_mut()
+        .heap
+        .try_protect(id)
+        .map_err(|err| ctx.stop(SEXP_NIL, err.to_string()))?;
+    Ok(id)
+}
+
+fn symbol(ctx: &mut Ctx, value: Sexp) -> EvalResult<Sym> {
+    let id = root(ctx, value)?;
+    Ok(ctx.session().sexp_as_sym(id)?)
+}
+
+fn environment(ctx: &mut Ctx, value: Sexp) -> EvalResult {
+    let id = root(ctx, value)?;
+    ctx.session().env_enclos(id)?;
+    Ok(id)
+}

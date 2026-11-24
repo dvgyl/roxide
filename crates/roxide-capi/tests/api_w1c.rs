@@ -8,7 +8,9 @@ use roxide_capi::abi::{EXTPTRSXP, INTSXP, Sexp};
 use roxide_capi::api::{
     arith::*, extptr::*, memory::*, random::*, rmath::*, s4::*, utils::*, weakref::*,
 };
-use roxide_capi::api::{coerce::Rf_ScalarInteger, sym::Rf_install, vector::*};
+use roxide_capi::api::{
+    coerce::Rf_ScalarInteger, sym::Rf_install, unwind::R_ExecWithCleanup, vector::*,
+};
 use roxide_capi::globals::{R_GlobalEnv, R_NaReal, R_NilValue};
 use roxide_capi::jump::{Rf_protect, Rf_unprotect, VoidFn, enter_trampoline};
 use roxide_eval::{Ctx, EvalResult, Module, NativeHooks, Package};
@@ -94,6 +96,9 @@ unsafe extern "C" fn memory(data: *mut c_void) {
         vmaxset(keep);
         check!(state, vmaxget() == keep && bytes.read() == 8);
         vmaxset(start);
+        check!(state, vmaxget() == start);
+        R_alloc(32, 1);
+        R_ExecWithCleanup(Some(transient_body), null_mut(), Some(restore_mark), start);
         check!(state, vmaxget() == start);
         R_CheckStack();
         R_CheckStack2(64);
@@ -460,5 +465,57 @@ fn wave_one_c_with_both_gc_policies() {
         })
         .unwrap();
         run(&mut ctx, objects, &mut state);
+    }
+}
+
+unsafe extern "C" fn transient_exit(data: *mut c_void) {
+    // SAFETY: The caller supplies a live bool and enters a foreign trampoline.
+    unsafe {
+        R_alloc(32, 1).write(17);
+        if *data.cast::<bool>() {
+            R_alloc(1, -1);
+        }
+    }
+}
+
+unsafe extern "C" fn transient_body(_: *mut c_void) -> Sexp {
+    // SAFETY: R_ExecWithCleanup enters a trampoline before it calls this body.
+    unsafe { R_alloc(32, 1) };
+    R_NilValue
+}
+
+unsafe extern "C" fn restore_mark(mark: *mut c_void) {
+    // SAFETY: The caller supplies an arena mark. R_ExecWithCleanup enters a trampoline.
+    unsafe { vmaxset(mark) };
+}
+
+unsafe extern "C" fn read_transient_mark(data: *mut c_void) {
+    // SAFETY: The caller supplies writable pointer storage and a trampoline.
+    unsafe { data.cast::<*mut c_void>().write(vmaxget()) };
+}
+
+#[test]
+fn entry_releases_transient_allocations_on_return_and_unwind() {
+    for policy in [GcPolicy::default(), GcPolicy::Torture] {
+        let mut ctx = Ctx::new(Box::new(PureHost::default()), policy).unwrap();
+        for mut fail in [false, true] {
+            // SAFETY: Each callback receives a live value of its expected type.
+            unsafe {
+                let result = enter_trampoline(
+                    &mut ctx,
+                    transient_exit,
+                    std::ptr::from_mut(&mut fail).cast(),
+                );
+                assert_eq!(result.is_err(), fail);
+                let mut mark: *mut c_void = null_mut();
+                enter_trampoline(
+                    &mut ctx,
+                    read_transient_mark,
+                    std::ptr::from_mut(&mut mark).cast(),
+                )
+                .unwrap();
+                assert!(mark.is_null());
+            }
+        }
     }
 }

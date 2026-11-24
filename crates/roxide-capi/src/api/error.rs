@@ -2,46 +2,48 @@
 
 #![allow(non_snake_case)]
 
-use std::cell::RefCell;
+use std::cell::UnsafeCell;
 use std::ffi::{CStr, c_char};
-use std::ptr::null;
+use std::ptr::{copy_nonoverlapping, null};
 
-use roxide_eval::Unwind;
-use roxide_value::{BASE_ENV, Encoding, SEXP_NIL, SYM_CLASS, SYM_NAMES, ValueApi};
+use roxide_eval::Ctx;
+use roxide_value::SEXP_NIL;
 
-use super::env::api;
+use super::api;
+
+const ERROR_BUFFER_SIZE: usize = 8192;
 
 thread_local! {
-    static ERROR_BUFFER: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+    static ERROR_BUFFER: UnsafeCell<[u8; ERROR_BUFFER_SIZE]> = const { UnsafeCell::new([0; ERROR_BUFFER_SIZE]) };
 }
 
 /// Return a C string with the latest evaluator error message.
 ///
 /// # Safety
-/// Call inside an active native trampoline. The pointer is valid on this thread
-/// until the next call to this function.
+/// Call inside an active native trampoline. Use the pointer only on this thread.
+/// Each call replaces the contents.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn R_curErrorBuf() -> *const c_char {
-    unsafe {
-        api(null(), |ctx| {
-            let visible = ctx.is_visible();
-            let value = ctx.call_function("geterrmessage", &[], BASE_ENV);
-            ctx.set_visible(visible);
-            let value = value?;
-            let session = ctx.session();
-            let chars = session.str_slice(value)?;
-            let bytes = match chars.first() {
-                Some(&text) => session.char_bytes(text)?,
-                None => &[],
-            };
-            Ok(ERROR_BUFFER.with_borrow_mut(|buffer| {
-                buffer.clear();
-                buffer.extend(bytes.iter().copied().take_while(|&byte| byte != 0));
-                buffer.push(0);
-                buffer.as_ptr().cast()
-            }))
-        })
-    }
+    let read = |ctx: &mut Ctx| {
+        let bytes = ctx.last_error_message().as_bytes();
+        let len = bytes
+            .iter()
+            .take(ERROR_BUFFER_SIZE - 1)
+            .position(|&byte| byte == 0)
+            .unwrap_or(bytes.len().min(ERROR_BUFFER_SIZE - 1));
+        Ok(ERROR_BUFFER.with(|buffer| {
+            let dest = buffer.get().cast::<u8>();
+            // SAFETY: The thread-local buffer is disjoint from bytes.
+            // The copy and terminator fit in the buffer.
+            unsafe {
+                copy_nonoverlapping(bytes.as_ptr(), dest, len);
+                dest.add(len).write(0);
+            }
+            dest.cast_const().cast()
+        }))
+    };
+    // SAFETY: The caller provides an active native trampoline.
+    unsafe { api(null(), read) }
 }
 
 /// Write a message to the error stream.
@@ -50,6 +52,7 @@ pub unsafe extern "C" fn R_curErrorBuf() -> *const c_char {
 /// Call inside an active native trampoline. `message` must point to a C string.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn R_ShowMessage(message: *const c_char) {
+    // SAFETY: The caller provides a trampoline and a C string.
     unsafe {
         api((), |ctx| {
             if message.is_null() {
@@ -65,30 +68,14 @@ pub unsafe extern "C" fn R_ShowMessage(message: *const c_char) {
     }
 }
 
-/// Signal an interrupt condition and leave the current computation.
+/// Signal an interrupt condition with a resume restart.
 ///
 /// # Safety
 /// Call inside an active native trampoline.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn Rf_onintr() {
-    unsafe {
-        api((), |ctx| {
-            let session = ctx.session_mut();
-            let message = session.scalar_str("")?;
-            let condition = session.alloc_list(2)?;
-            session.list_set(condition, 0, message)?;
-            let message_name = session.mk_char(b"message", Encoding::Native)?;
-            let call_name = session.mk_char(b"call", Encoding::Native)?;
-            let names = session.alloc_str_from(&[message_name, call_name])?;
-            session.set_attrib(condition, SYM_NAMES, names)?;
-            let interrupt = session.mk_char(b"interrupt", Encoding::Native)?;
-            let condition_name = session.mk_char(b"condition", Encoding::Native)?;
-            let classes = session.alloc_str_from(&[interrupt, condition_name])?;
-            session.set_attrib(condition, SYM_CLASS, classes)?;
-            ctx.call_function("signalCondition", &[(None, condition)], BASE_ENV)?;
-            Err(Unwind::TopLevel)
-        })
-    }
+    // SAFETY: The caller provides an active native trampoline.
+    unsafe { api((), |ctx| ctx.signal_native_interrupt(true)) }
 }
 
 /// Signal an interrupt and leave the current computation without resuming it.
@@ -97,5 +84,6 @@ pub unsafe extern "C" fn Rf_onintr() {
 /// Call inside an active native trampoline.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn Rf_onintrNoResume() {
-    unsafe { Rf_onintr() }
+    // SAFETY: The caller provides an active native trampoline.
+    unsafe { api((), |ctx| ctx.signal_native_interrupt(false)) }
 }

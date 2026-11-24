@@ -197,6 +197,41 @@ impl Conditions {
 }
 
 impl Ctx {
+    /// Return the latest error text. The default handler formats the text for display.
+    pub fn last_error_message(&self) -> &str {
+        &self.conditions.last_error
+    }
+
+    /// Set whether the default error handler writes to stderr. Return the old setting.
+    pub fn set_show_error_messages(&mut self, show: bool) -> bool {
+        std::mem::replace(&mut self.show_error_messages, show)
+    }
+
+    /// Signal a native interrupt. Return only if a handler invokes the resume restart.
+    pub fn signal_native_interrupt(&mut self, resumable: bool) -> EvalResult<()> {
+        let condition = self.session.alloc_list(0)?;
+        let classes = self.strings(["interrupt", "condition"])?;
+        let class = self.session.intern("class")?;
+        self.session.set_attrib(condition, class, classes)?;
+        if !resumable {
+            self.signal_condition(condition)?;
+            return Err(Unwind::TopLevel);
+        }
+
+        let target = self.next_frame();
+        let base = self.conditions.restarts.len();
+        self.push_restart(target, String::from("resume"), SEXP_NIL)?;
+        let result = self.signal_condition(condition);
+        self.conditions.restarts.truncate(base);
+        match result {
+            Err(Unwind::Transfer {
+                target: dest,
+                kind: Transfer::Restart { .. },
+            }) if dest == target => Ok(()),
+            other => other.and(Err(Unwind::TopLevel)),
+        }
+    }
+
     /// Execute `body` with an exiting `"error"` handler (`R_tryCatchError`, ADR-0018).
     ///
     /// If `body` signals an R `"error"` condition, the handler stack is restored and
@@ -396,13 +431,17 @@ impl Ctx {
             self.deparse_lines(call, DeparseOpts::default()).ok()
         };
         let formatted = diag_format::error(call_lines.as_deref(), text);
-        self.conditions.last_error.clone_from(&formatted);
-        let _ = self.host.write_err(formatted.as_bytes());
-        if !self.interactive && call != SEXP_NIL {
-            self.print_call_trace(call);
+        self.conditions.last_error = formatted;
+        if self.show_error_messages {
+            let _ = self.host.write_err(self.conditions.last_error.as_bytes());
+            if !self.interactive && call != SEXP_NIL {
+                self.print_call_trace(call);
+            }
         }
         if !self.pending_warnings.is_empty() {
-            let _ = self.host.write_err(b"In addition: ");
+            if self.show_error_messages {
+                let _ = self.host.write_err(b"In addition: ");
+            }
             self.flush_warnings();
         }
         Err(Unwind::TopLevel)

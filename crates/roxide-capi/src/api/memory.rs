@@ -19,7 +19,6 @@ unsafe extern "C" {
 struct Allocation {
     ptr: NonNull<c_void>,
     bytes: usize,
-    depth: usize,
 }
 
 impl Drop for Allocation {
@@ -30,7 +29,10 @@ impl Drop for Allocation {
 }
 
 #[derive(Default)]
-struct Arena(Vec<Allocation>);
+struct Arena {
+    allocations: Vec<Allocation>,
+    entry_marks: Vec<usize>,
+}
 
 impl Trace for Arena {
     fn trace(&self, _: &mut Tracer<'_>) {}
@@ -38,11 +40,16 @@ impl Trace for Arena {
 
 impl CtxExt for Arena {}
 
-/// Release transient storage when a native trampoline returns or unwinds.
-#[doc(hidden)]
-pub fn release_transient_frame(ctx: &mut Ctx, depth: usize) {
-    let arena = &mut ctx.ext::<Arena>().0;
-    arena.truncate(arena.partition_point(|allocation| allocation.depth < depth));
+pub(crate) fn save_transient_frame(ctx: &mut Ctx) {
+    let arena = ctx.ext::<Arena>();
+    arena.entry_marks.push(arena.allocations.len());
+}
+
+pub(crate) fn release_transient_frame(ctx: &mut Ctx) {
+    let arena = ctx.ext::<Arena>();
+    if let Some(mark) = arena.entry_marks.pop() {
+        arena.allocations.truncate(mark);
+    }
 }
 
 fn bytes(ctx: &mut Ctx, count: usize, size: usize) -> EvalResult<usize> {
@@ -71,16 +78,14 @@ fn transient(ctx: &mut Ctx, bytes: usize) -> EvalResult<*mut c_void> {
         return Ok(null_mut());
     }
     ctx.ext::<Arena>()
-        .0
+        .allocations
         .try_reserve(1)
         .map_err(|_| ctx.stop(SEXP_NIL, "cannot extend transient allocation stack"))?;
     // SAFETY: The byte count was checked. The arena owns the returned allocation.
     let ptr = checked_pointer(ctx, unsafe { calloc(1, bytes) })?;
-    ctx.ext::<Arena>().0.push(Allocation {
-        ptr,
-        bytes,
-        depth: cx::depth(),
-    });
+    ctx.ext::<Arena>()
+        .allocations
+        .push(Allocation { ptr, bytes });
     Ok(ptr.as_ptr())
 }
 
@@ -183,7 +188,7 @@ api! {
         let old_count = nonnegative_count(ctx, old_count)?;
         let old_bytes = array_bytes(ctx, old_count, size)?;
         let new_bytes = array_bytes(ctx, count, size)?;
-        if old_bytes != 0 && !ctx.ext::<Arena>().0.iter().any(|allocation| {
+        if old_bytes != 0 && !ctx.ext::<Arena>().allocations.iter().any(|allocation| {
             allocation.ptr.as_ptr() == ptr.cast() && old_bytes <= allocation.bytes
         }) {
             return Err(ctx.stop(SEXP_NIL, "invalid transient allocation"));
@@ -201,24 +206,23 @@ api! {
 
     /// Return a mark for the current transient allocation stack.
     fn vmaxget() -> *mut c_void = null_mut(); |ctx| {
-        Ok(ctx.ext::<Arena>().0.last().map_or(null_mut(), |allocation| allocation.ptr.as_ptr()))
+        Ok(ctx.ext::<Arena>().allocations.last().map_or(null_mut(), |allocation| allocation.ptr.as_ptr()))
     }
 
     /// Release transient allocations made after the mark.
     fn vmaxset(mark: *const c_void) -> () = (); |ctx| {
-        let depth = cx::depth();
-        let arena = &mut ctx.ext::<Arena>().0;
+        let arena = ctx.ext::<Arena>();
         let keep = if mark.is_null() {
             0
-        } else if let Some(i) = arena.iter().position(|allocation| allocation.ptr.as_ptr() == mark.cast_mut()) {
+        } else if let Some(i) = arena.allocations.iter().position(|allocation| allocation.ptr.as_ptr() == mark.cast_mut()) {
             i + 1
         } else {
             return Err(ctx.stop(SEXP_NIL, "invalid transient allocation mark"));
         };
-        if keep < arena.partition_point(|allocation| allocation.depth < depth) {
+        if keep < arena.entry_marks.last().copied().unwrap_or(0) {
             return Err(ctx.stop(SEXP_NIL, "transient allocation mark belongs to an outer frame"));
         }
-        arena.truncate(keep);
+        arena.allocations.truncate(keep);
         Ok(())
     }
 

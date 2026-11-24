@@ -2,6 +2,7 @@
 
 #![allow(non_snake_case)]
 
+use std::collections::HashSet;
 use std::ffi::c_int;
 use std::sync::atomic::{AtomicI32, Ordering};
 
@@ -11,7 +12,7 @@ use roxide_value::{BASE_ENV, GLOBAL_ENV, SEXP_NIL, SexpType, ValueApi};
 
 use crate::abi::Sexp;
 
-use super::env::{api, environment, root, symbol};
+use super::{api, environment, root, symbol};
 
 /// Visibility of the most recent evaluation through the C API.
 #[allow(non_upper_case_globals)]
@@ -51,6 +52,7 @@ pub(super) fn current_env(ctx: &Ctx) -> SexpId {
 /// Call inside an active native trampoline.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn Rf_eval(expression: Sexp, rho: Sexp) -> Sexp {
+    // SAFETY: The caller provides an active native trampoline.
     unsafe {
         api(Sexp::NULL, |ctx| {
             let expression = root(ctx, expression)?;
@@ -66,6 +68,7 @@ pub unsafe extern "C" fn Rf_eval(expression: Sexp, rho: Sexp) -> Sexp {
 /// Call inside an active native trampoline.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn Rf_findFun(name: Sexp, rho: Sexp) -> Sexp {
+    // SAFETY: The caller provides an active native trampoline.
     unsafe {
         api(Sexp::NULL, |ctx| {
             let name = symbol(ctx, name)?;
@@ -81,6 +84,7 @@ pub unsafe extern "C" fn Rf_findFun(name: Sexp, rho: Sexp) -> Sexp {
 /// Call inside an active native trampoline.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn R_GetCurrentEnv() -> Sexp {
+    // SAFETY: The caller provides an active native trampoline.
     unsafe { api(Sexp::NULL, |ctx| Ok(Sexp::from_id(current_env(ctx)))) }
 }
 
@@ -90,16 +94,35 @@ pub unsafe extern "C" fn R_GetCurrentEnv() -> Sexp {
 /// Call inside an active native trampoline.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn R_mkClosure(formals: Sexp, body: Sexp, rho: Sexp) -> Sexp {
+    // SAFETY: The caller provides an active native trampoline.
     unsafe {
         api(Sexp::NULL, |ctx| {
             let formals = root(ctx, formals)?;
+            let mut tail = formals;
+            let mut seen = HashSet::new();
+            let invalid_formals = |ctx: &mut Ctx| {
+                ctx.stop(SEXP_NIL, "invalid formal argument list for \"R_mkClosure\"")
+            };
+            while tail != SEXP_NIL {
+                if ctx.session().type_of(tail)? != SexpType::List || !seen.insert(tail) {
+                    return Err(invalid_formals(ctx));
+                }
+                let (_, next, tag) = ctx.session().cons_parts(tail)?;
+                if ctx.session().type_of(tag)? != SexpType::Sym {
+                    return Err(invalid_formals(ctx));
+                }
+                tail = next;
+            }
+            let env = root(ctx, rho)?;
+            if ctx.session().type_of(env)? != SexpType::Env {
+                return Err(ctx.stop(SEXP_NIL, "invalid environment"));
+            }
             let body = root(ctx, body)?;
-            let env = environment(ctx, rho)?;
-            if !matches!(
-                ctx.session().type_of(formals)?,
-                SexpType::Nil | SexpType::List
+            if matches!(
+                ctx.session().type_of(body)?,
+                SexpType::Clo | SexpType::Builtin | SexpType::Special
             ) {
-                return Err(ctx.stop(SEXP_NIL, "invalid closure formals"));
+                return Err(ctx.stop(SEXP_NIL, "invalid body argument for 'function'"));
             }
             ctx.safepoint();
             Ok(Sexp::from_id(
@@ -117,6 +140,7 @@ macro_rules! accessor {
         /// Call inside an active native trampoline.
         #[unsafe(no_mangle)]
         pub unsafe extern "C" fn $name(value: Sexp) -> Sexp {
+            // SAFETY: The caller provides an active native trampoline.
             unsafe {
                 api(Sexp::NULL, |ctx| {
                     let value = root(ctx, value)?;
@@ -153,7 +177,7 @@ accessor!(
 /// Call inside an active native trampoline.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn R_BytecodeExpr(code: Sexp) -> Sexp {
-    // The evaluator currently stores interpreted expressions as closure bodies.
+    // SAFETY: The caller provides an active native trampoline.
     unsafe { api(Sexp::NULL, |ctx| root(ctx, code).map(Sexp::from_id)) }
 }
 
@@ -188,15 +212,12 @@ accessor!(
 /// Call inside an active native trampoline.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn Rf_GetOption1(tag: Sexp) -> Sexp {
+    // SAFETY: The caller provides an active native trampoline.
     unsafe {
         api(Sexp::NULL, |ctx| {
             let tag = symbol(ctx, tag)?;
-            let visible = ctx.is_visible();
             let name = ctx.session().sym_name(tag)?.to_owned();
-            let name = ctx.session_mut().scalar_str(&name)?;
-            let result = ctx.call_function("getOption", &[(None, name)], BASE_ENV);
-            ctx.set_visible(visible);
-            result.map(Sexp::from_id)
+            Ok(Sexp::from_id(ctx.option_value(&name)?.unwrap_or(SEXP_NIL)))
         })
     }
 }
@@ -207,6 +228,7 @@ pub unsafe extern "C" fn Rf_GetOption1(tag: Sexp) -> Sexp {
 /// Call inside an active native trampoline.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn Rf_GetOptionWidth() -> c_int {
+    // SAFETY: The caller provides an active native trampoline.
     unsafe { api(0, |ctx| Ok(ctx.opts().width as c_int)) }
 }
 
@@ -216,6 +238,7 @@ pub unsafe extern "C" fn Rf_GetOptionWidth() -> c_int {
 /// Call inside an active native trampoline.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn R_forceAndCall(call: Sexp, count: c_int, rho: Sexp) -> Sexp {
+    // SAFETY: The caller provides an active native trampoline.
     unsafe {
         api(Sexp::NULL, |ctx| {
             let call = root(ctx, call)?;

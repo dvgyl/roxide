@@ -2,19 +2,21 @@
 
 #![allow(non_snake_case)]
 
+use std::borrow::Cow;
 use std::ffi::{CStr, c_char, c_int};
 
 use roxide_eval::{Ctx, EvalResult};
 use roxide_gc::SexpId;
-use roxide_syntax::{ParseStep, Parser};
+use roxide_syntax::{ParseStep, Parser, TokKind};
 use roxide_value::{
-    CharId, KeepSource, SEXP_NIL, SYM_CLASS, SYM_SRCFILE, SYM_SRCREF, SexpType, ValueApi, lower,
+    CharId, Encoding, KeepSource, SEXP_NIL, SYM_CLASS, SYM_SRCFILE, SYM_SRCREF, SexpType, ValueApi,
+    lower,
 };
 
 use crate::abi::Sexp;
 
-use super::env::{api, root};
 use super::eval::eval;
+use super::{api, root};
 
 const PARSE_OK: c_int = 1;
 const PARSE_INCOMPLETE: c_int = 2;
@@ -57,7 +59,21 @@ fn parse(
     let result = ctx.session_mut().alloc_expr_from(&expressions)?;
     ctx.protect(result);
     if keep_source {
-        source_refs(ctx, result, srcfile, source, &spans)?;
+        let end = if count == 0 {
+            0
+        } else if spans.len() == count
+            && let Some(&(_, hi)) = spans.last()
+        {
+            let tokens = parser.tokens();
+            let next = tokens.partition_point(|token| token.span.lo < hi);
+            tokens[next..]
+                .iter()
+                .find(|token| token.kind != TokKind::Comment)
+                .map_or(source.len() as u32, |token| token.span.hi)
+        } else {
+            source.len() as u32
+        };
+        source_refs(ctx, result, srcfile, source, &spans, end)?;
     }
     for warning in parser.warnings() {
         ctx.warn_now(SEXP_NIL, &warning.message)?;
@@ -71,9 +87,17 @@ fn source_refs(
     srcfile: SexpId,
     source: &str,
     spans: &[(u32, u32)],
+    end: u32,
 ) -> EvalResult<()> {
     let starts: Vec<_> = std::iter::once(0)
-        .chain(source.match_indices('\n').map(|(i, _)| i + 1))
+        .chain(
+            source
+                .match_indices(['\r', '\n'])
+                .filter_map(|(i, newline)| {
+                    (newline == "\n" || source.as_bytes().get(i + 1) != Some(&b'\n'))
+                        .then_some(i + 1)
+                }),
+        )
         .collect();
     let position = |offset: u32| {
         let offset = offset as usize;
@@ -83,28 +107,37 @@ fn source_refs(
             .iter()
             .filter(|&&byte| byte & 0xc0 != 0x80)
             .count();
-        // Offset can point to the last byte of a multibyte character.
-        let col = col + usize::from(source.is_char_boundary(offset));
-        ((line + 1) as i32, (offset - start + 1) as i32, col as i32)
+        ((line + 1) as i32, (offset - start) as i32, col as i32)
     };
 
     let session = ctx.session_mut();
     let class = session.scalar_str("srcref")?;
-    let mut reference = |lo, hi: u32| -> EvalResult {
-        let (first, first_byte, first_col) = position(lo);
-        let (last, last_byte, last_col) = position(hi.saturating_sub(1).max(lo));
-        let reference = session.alloc_int_from(&[
-            first, first_byte, last, last_byte, first_col, last_col, first, last,
-        ])?;
+    let mut reference = |coordinates: [i32; 8]| -> EvalResult {
+        let reference = session.alloc_int_from(&coordinates)?;
         session.set_attrib(reference, SYM_CLASS, class)?;
         session.set_attrib(reference, SYM_SRCFILE, srcfile)?;
         Ok(reference)
     };
     let refs = spans
         .iter()
-        .map(|&(lo, hi)| reference(lo, hi))
+        .map(|&(lo, hi)| {
+            let end = hi.saturating_sub(1).max(lo);
+            let (first, first_byte, first_col) = position(lo);
+            let (last, last_byte, last_col) = position(end);
+            reference([
+                first,
+                first_byte + 1,
+                last,
+                last_byte + 1,
+                first_col + 1,
+                last_col + i32::from(source.is_char_boundary(end as usize)),
+                first,
+                last,
+            ])
+        })
         .collect::<EvalResult<Vec<_>>>()?;
-    let whole = reference(0, source.len() as u32)?;
+    let (line, byte, col) = position(end);
+    let whole = reference([1, 0, line, byte, 0, col, 1, line])?;
     let list = session.alloc_list(refs.len())?;
     for (i, reference) in refs.into_iter().enumerate() {
         session.list_set(list, i, reference)?;
@@ -127,6 +160,7 @@ pub unsafe extern "C" fn R_ParseVector(
     status: *mut c_int,
     srcfile: Sexp,
 ) -> Sexp {
+    // SAFETY: The caller provides a trampoline and writable status storage.
     unsafe {
         api(Sexp::NULL, |ctx| {
             if status.is_null() {
@@ -145,30 +179,23 @@ pub unsafe extern "C" fn R_ParseVector(
                     "'Rf_translateChar' must be called on a CHARSXP, but got 'NULL'",
                 ));
             }
-            for (i, &line) in lines.iter().enumerate() {
+            for &line in lines {
                 let line = if line == CharId::NA {
                     "NA".into()
                 } else {
                     let bytes = session.char_bytes(line)?;
                     match session.char_encoding(line)? {
-                        roxide_value::Encoding::Latin1 => std::borrow::Cow::Owned(
-                            bytes.iter().map(|&byte| char::from(byte)).collect(),
-                        ),
+                        Encoding::Latin1 => {
+                            Cow::Owned(bytes.iter().map(|&byte| char::from(byte)).collect())
+                        }
                         _ => String::from_utf8_lossy(bytes),
                     }
                 };
-                if source
-                    .len()
-                    .saturating_add(line.len())
-                    .saturating_add(usize::from(i > 0))
-                    > limit
-                {
+                if source.len().saturating_add(line.len()).saturating_add(1) > limit {
                     return Err(ctx.stop(SEXP_NIL, "parse input exceeds the session limit"));
                 }
-                if i > 0 {
-                    source.push('\n');
-                }
                 source.push_str(&line);
+                source.push('\n');
             }
             let (result, parsed) = parse(ctx, &source, count, srcfile)?;
             status.write(parsed);
@@ -181,6 +208,7 @@ unsafe fn parse_string(ctx: &mut Ctx, text: *const c_char) -> EvalResult {
     if text.is_null() {
         return Err(ctx.stop(SEXP_NIL, "invalid NULL parse input"));
     }
+    // SAFETY: The caller supplies a valid C string.
     let source = unsafe { CStr::from_ptr(text) }.to_string_lossy();
     if source.len() > ctx.host().limits().max_vector_bytes.min(i32::MAX as usize) {
         return Err(ctx.stop(SEXP_NIL, "parse input exceeds the session limit"));
@@ -201,6 +229,7 @@ unsafe fn parse_string(ctx: &mut Ctx, text: *const c_char) -> EvalResult {
 /// Call inside an active native trampoline. `text` must point to a C string.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn R_ParseString(text: *const c_char) -> Sexp {
+    // SAFETY: The caller provides a trampoline and a C string.
     unsafe {
         api(Sexp::NULL, |ctx| {
             ctx.safepoint();
@@ -215,6 +244,7 @@ pub unsafe extern "C" fn R_ParseString(text: *const c_char) -> Sexp {
 /// Call inside an active native trampoline. `text` must point to a C string.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn R_ParseEvalString(text: *const c_char, rho: Sexp) -> Sexp {
+    // SAFETY: The caller provides a trampoline and a C string.
     unsafe {
         api(Sexp::NULL, |ctx| {
             let env = root(ctx, rho)?;

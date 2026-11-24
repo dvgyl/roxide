@@ -2,81 +2,25 @@
 
 #![allow(non_snake_case)]
 
-use std::cell::Cell;
 use std::ffi::{c_int, c_void};
 
 use roxide_eval::{
     ArgEval, Args, Arity, Call, Ctx, CtxExt, Dispatch, EvalResult, Module, PrimDef, PrimKind,
-    Unwind, Visibility,
+    Transfer, Unwind, Visibility,
 };
 use roxide_gc::{SexpId, Trace, Tracer};
 use roxide_value::{BASE_ENV, CharId, SEXP_MISSING, SEXP_NIL, ValueApi};
 
 use crate::abi::Sexp;
-use crate::jump::{BodyFn, HandlerFn, VoidFn, enter_trampoline};
+use crate::jump::{
+    BodyFn, FrameKind, HandlerFn, VoidFn, boundary, call_body, call_handler, enter_trampoline_with,
+};
 
-use super::env::{api, root};
 use super::eval::{eval, sync_visibility};
-
-#[repr(C)]
-struct BodyCall {
-    fun: BodyFn,
-    data: *mut c_void,
-    result: Sexp,
-}
-
-#[repr(C)]
-struct HandlerCall {
-    fun: HandlerFn,
-    condition: Sexp,
-    data: *mut c_void,
-    result: Sexp,
-}
-
-unsafe extern "C" {
-    fn rox_capi_call_body(data: *mut c_void);
-    fn rox_capi_call_handler(data: *mut c_void);
-}
-
-fn body(ctx: &mut Ctx, fun: BodyFn, data: *mut c_void) -> EvalResult {
-    let mut call = BodyCall {
-        fun,
-        data,
-        result: Sexp::NULL,
-    };
-    // SAFETY: The C API caller supplies the callback and data. The adapter
-    // uses the descriptor only for this call.
-    unsafe {
-        enter_trampoline(
-            ctx,
-            rox_capi_call_body,
-            std::ptr::from_mut(&mut call).cast(),
-        )?
-    };
-    root(ctx, call.result)
-}
-
-fn handler(ctx: &mut Ctx, fun: HandlerFn, cond: SexpId, data: *mut c_void) -> EvalResult {
-    ctx.protect(cond);
-    let mut call = HandlerCall {
-        fun,
-        condition: Sexp::from_id(cond),
-        data,
-        result: Sexp::NULL,
-    };
-    // SAFETY: The C API caller supplies the callback and data. The adapter
-    // uses the descriptor only for this call.
-    unsafe {
-        enter_trampoline(
-            ctx,
-            rox_capi_call_handler,
-            std::ptr::from_mut(&mut call).cast(),
-        )?
-    };
-    root(ctx, call.result)
-}
+use super::{api, root};
 
 unsafe fn try_eval(expression: Sexp, rho: Sexp, error: *mut c_int, silent: bool) -> Sexp {
+    // SAFETY: The caller provides a trampoline and writable storage if error is non-null.
     unsafe {
         api(Sexp::NULL, |ctx| {
             let expression = root(ctx, expression)?;
@@ -87,12 +31,17 @@ unsafe fn try_eval(expression: Sexp, rho: Sexp, error: *mut c_int, silent: bool)
                     Err(Unwind::Value(err)) => Err(ctx.stop(SEXP_NIL, err.to_string())),
                     result => result,
                 };
-                if silent {
-                    ctx.with_native_error_handler(evaluate, |_, _| Err(Unwind::TopLevel))
-                } else {
-                    evaluate(ctx)
+                if !silent {
+                    return evaluate(ctx);
                 }
+                let previous = ctx.set_show_error_messages(false);
+                let result = evaluate(ctx);
+                ctx.set_show_error_messages(previous);
+                result
             });
+            if let Err(quit @ Unwind::Quit { .. }) = result {
+                return Err(quit);
+            }
             if !error.is_null() {
                 error.write(i32::from(result.is_err()));
             }
@@ -107,6 +56,7 @@ unsafe fn try_eval(expression: Sexp, rho: Sexp, error: *mut c_int, silent: bool)
 /// Call inside an active native trampoline. A non-null `error` must be writable.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn R_tryEval(expression: Sexp, rho: Sexp, error: *mut c_int) -> Sexp {
+    // SAFETY: The caller provides a trampoline and writable storage if error is non-null.
     unsafe { try_eval(expression, rho, error, false) }
 }
 
@@ -116,6 +66,7 @@ pub unsafe extern "C" fn R_tryEval(expression: Sexp, rho: Sexp, error: *mut c_in
 /// Call inside an active native trampoline. A non-null `error` must be writable.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn R_tryEvalSilent(expression: Sexp, rho: Sexp, error: *mut c_int) -> Sexp {
+    // SAFETY: The caller provides a trampoline and writable storage if error is non-null.
     unsafe { try_eval(expression, rho, error, true) }
 }
 
@@ -126,15 +77,33 @@ fn with_cleanup(
     run: impl FnOnce(&mut Ctx) -> EvalResult,
 ) -> EvalResult {
     let result = run(ctx);
-    if let Some(clean) = clean {
-        ctx.protect_eval_result(&result);
-        let visible = ctx.is_visible();
-        // SAFETY: The C API caller supplies valid callback data.
-        let cleanup = unsafe { enter_trampoline(ctx, clean, data) };
-        ctx.set_visible(visible);
-        sync_visibility(ctx);
-        cleanup?;
+    let Some(clean) = clean else {
+        return result;
+    };
+    let roots: &[_] = match &result {
+        Ok(value)
+        | Err(Unwind::Transfer {
+            kind: Transfer::Return(value) | Transfer::ExitingHandler { cond: value, .. },
+            ..
+        }) => std::slice::from_ref(value),
+        Err(Unwind::Transfer {
+            kind: Transfer::Restart { restart, args },
+            ..
+        }) => &[*restart, *args],
+        _ => &[],
+    };
+    for &root in roots {
+        ctx.session_mut().heap.preserve(root);
     }
+    let visible = ctx.is_visible();
+    // SAFETY: The C API caller supplies the cleanup callback and its data.
+    let cleanup = unsafe { enter_trampoline_with(ctx, FrameKind::Callback, clean, data) };
+    for &root in roots {
+        ctx.session_mut().heap.release(root);
+    }
+    ctx.set_visible(visible);
+    sync_visibility(ctx);
+    cleanup?;
     result
 }
 
@@ -150,10 +119,11 @@ pub unsafe extern "C" fn R_ExecWithCleanup(
     clean: Option<VoidFn>,
     clean_data: *mut c_void,
 ) -> Sexp {
+    // SAFETY: The caller provides an active native trampoline.
     unsafe {
-        api(Sexp::NULL, |ctx| {
+        boundary(Sexp::NULL, |ctx| {
             let fun = fun.ok_or_else(|| ctx.stop(SEXP_NIL, "invalid NULL callback"))?;
-            with_cleanup(ctx, clean, clean_data, |ctx| body(ctx, fun, data)).map(Sexp::from_id)
+            with_cleanup(ctx, clean, clean_data, |ctx| call_body(ctx, fun, data)).map(Sexp::from_id)
         })
     }
 }
@@ -161,31 +131,24 @@ pub unsafe extern "C" fn R_ExecWithCleanup(
 #[derive(Clone, Copy)]
 struct Callbacks {
     token: SexpId,
-    body: BodyFn,
-    data: *mut c_void,
-    handler: HandlerFn,
-    handler_data: *mut c_void,
-}
-
-thread_local! {
-    static CALLBACKS: Cell<Option<Callbacks>> = const { Cell::new(None) };
-}
-
-struct RestoreCallbacks(Option<Callbacks>);
-
-impl Drop for RestoreCallbacks {
-    fn drop(&mut self) {
-        CALLBACKS.set(self.0);
-    }
+    body: (BodyFn, *mut c_void),
+    handler: (HandlerFn, *mut c_void),
 }
 
 #[derive(Default)]
-struct BridgeRegistered(bool);
+struct NativeHandlers {
+    registered: bool,
+    stack: Vec<Callbacks>,
+}
 
-impl CtxExt for BridgeRegistered {}
+impl CtxExt for NativeHandlers {}
 
-impl Trace for BridgeRegistered {
-    fn trace(&self, _: &mut Tracer<'_>) {}
+impl Trace for NativeHandlers {
+    fn trace(&self, tracer: &mut Tracer<'_>) {
+        for callbacks in &self.stack {
+            tracer.edge(callbacks.token);
+        }
+    }
 }
 
 const BRIDGE: &str = "roxideNativeCondition";
@@ -204,13 +167,18 @@ const MODULE: Module = Module {
 };
 
 fn invoke_callback(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
-    let Some(callbacks) = CALLBACKS.get().filter(|call| call.token == args.get(0)) else {
+    let stack = &ctx.ext::<NativeHandlers>().stack;
+    let token = args.get(0);
+    let Some(index) = stack.iter().rposition(|callbacks| callbacks.token == token) else {
         return Err(ctx.stop(call.err_call(), "invalid native condition callback"));
     };
+    let callbacks = stack[index];
     if args.len() == 1 {
-        body(ctx, callbacks.body, callbacks.data)
+        let (fun, data) = callbacks.body;
+        call_body(ctx, fun, data)
     } else {
-        handler(ctx, callbacks.handler, args.get(1), callbacks.handler_data)
+        let (fun, data) = callbacks.handler;
+        call_handler(ctx, fun, args.get(1), data)
     }
 }
 
@@ -224,15 +192,16 @@ fn callback_expr(ctx: &mut Ctx, internal: SexpId, tail: SexpId) -> EvalResult {
 
 fn with_handler(
     ctx: &mut Ctx,
-    callbacks: Callbacks,
+    body: (BodyFn, *mut c_void),
+    handler: (HandlerFn, *mut c_void),
     classes: &[String],
     calling: bool,
 ) -> EvalResult {
-    if !ctx.ext::<BridgeRegistered>().0 {
+    if !ctx.ext::<NativeHandlers>().registered {
         if let Err(err) = ctx.register_module(&MODULE) {
             return Err(ctx.stop(SEXP_NIL, err.message));
         }
-        ctx.ext::<BridgeRegistered>().0 = true;
+        ctx.ext::<NativeHandlers>().registered = true;
     }
     let name = if calling {
         "withCallingHandlers"
@@ -259,17 +228,23 @@ fn with_handler(
     let handler_expr = callback_expr(ctx, internal, handler_args)?;
 
     let session = ctx.session_mut();
-    let handler = session.alloc_closure(formals, handler_expr, BASE_ENV)?;
+    let handler_closure = session.alloc_closure(formals, handler_expr, BASE_ENV)?;
     let mut args = SEXP_NIL;
     for class in classes.iter().rev() {
         let tag = session.intern(class)?.as_sexp();
-        args = session.cons(handler, args, tag)?;
+        args = session.cons(handler_closure, args, tag)?;
     }
     let expr_tag = session.intern("expr")?.as_sexp();
     let args = session.cons(body_expr, args, expr_tag)?;
     let expression = session.lcons(dispatcher, args, SEXP_NIL)?;
-    let _restore = RestoreCallbacks(CALLBACKS.replace(Some(Callbacks { token, ..callbacks })));
-    eval(ctx, expression, BASE_ENV)
+    ctx.ext::<NativeHandlers>().stack.push(Callbacks {
+        token,
+        body,
+        handler,
+    });
+    let result = eval(ctx, expression, BASE_ENV);
+    ctx.ext::<NativeHandlers>().stack.pop();
+    result
 }
 
 /// Run a body with an exiting handler for the specified condition classes.
@@ -287,13 +262,14 @@ pub unsafe extern "C" fn R_tryCatch(
     clean: Option<VoidFn>,
     clean_data: *mut c_void,
 ) -> Sexp {
+    // SAFETY: The caller provides an active native trampoline.
     unsafe {
         api(Sexp::NULL, |ctx| {
             let classes = root(ctx, classes)?;
             let fun = fun.ok_or_else(|| ctx.stop(SEXP_NIL, "must supply a body function"))?;
             with_cleanup(ctx, clean, clean_data, |ctx| {
                 let Some(hndlr) = hndlr.filter(|_| classes != SEXP_NIL) else {
-                    return body(ctx, fun, data);
+                    return call_body(ctx, fun, data);
                 };
                 let mut names = Vec::new();
                 for &class in ctx.session().str_slice(classes)? {
@@ -314,20 +290,9 @@ pub unsafe extern "C" fn R_tryCatch(
                     }
                 }
                 if names.is_empty() {
-                    return body(ctx, fun, data);
+                    return call_body(ctx, fun, data);
                 }
-                with_handler(
-                    ctx,
-                    Callbacks {
-                        token: SEXP_NIL,
-                        body: fun,
-                        data,
-                        handler: hndlr,
-                        handler_data,
-                    },
-                    &names,
-                    false,
-                )
+                with_handler(ctx, (fun, data), (hndlr, handler_data), &names, false)
             })
             .map(Sexp::from_id)
         })
@@ -346,19 +311,15 @@ pub unsafe extern "C" fn R_withCallingErrorHandler(
     hndlr: Option<HandlerFn>,
     handler_data: *mut c_void,
 ) -> Sexp {
+    // SAFETY: The caller provides an active native trampoline.
     unsafe {
         api(Sexp::NULL, |ctx| {
             let fun = fun.ok_or_else(|| ctx.stop(SEXP_NIL, "invalid NULL body callback"))?;
             let hndlr = hndlr.ok_or_else(|| ctx.stop(SEXP_NIL, "invalid NULL handler callback"))?;
             with_handler(
                 ctx,
-                Callbacks {
-                    token: SEXP_NIL,
-                    body: fun,
-                    data,
-                    handler: hndlr,
-                    handler_data,
-                },
+                (fun, data),
+                (hndlr, handler_data),
                 &[String::from("error")],
                 true,
             )

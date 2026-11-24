@@ -3,12 +3,11 @@
 #![allow(non_snake_case)]
 
 use roxide_host::{HostErrorKind, StdStream};
-use roxide_value::{BASE_ENV, SEXP_NIL, ValueApi};
+use roxide_value::{BASE_ENV, GLOBAL_ENV, SEXP_NIL, ValueApi};
 
 use crate::abi::Sexp;
 
-use super::env::{api, root};
-use super::eval::current_env;
+use super::{api, root};
 
 /// Print an R value to the console.
 ///
@@ -16,18 +15,18 @@ use super::eval::current_env;
 /// Call inside an active native trampoline.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn Rf_PrintValue(value: Sexp) {
+    // SAFETY: The caller provides an active native trampoline.
     unsafe {
         api((), |ctx| {
             let value = root(ctx, value)?;
-            let env = current_env(ctx);
             let visible = ctx.is_visible();
             let result = (|| {
-                if ctx.session().is_s4(value)? && ctx.show_s4(value, env)? {
+                if ctx.session().is_s4(value)? && ctx.show_s4(value, GLOBAL_ENV)? {
                     return Ok(());
                 }
                 let print = ctx.session_mut().intern("print")?;
                 let print = ctx.find_fun(print, BASE_ENV)?;
-                ctx.apply(print, &[(None, value)], SEXP_NIL, env)?;
+                ctx.apply(print, &[(None, value)], SEXP_NIL, GLOBAL_ENV)?;
                 Ok(())
             })();
             ctx.set_visible(visible);
@@ -42,6 +41,7 @@ pub unsafe extern "C" fn Rf_PrintValue(value: Sexp) {
 /// Call inside an active native trampoline.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn R_FlushConsole() {
+    // SAFETY: The caller provides an active native trampoline.
     unsafe {
         api((), |ctx| {
             ctx.flush_stream_sinks()?;
@@ -58,6 +58,7 @@ pub unsafe extern "C" fn R_FlushConsole() {
 /// Call inside an active native trampoline.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn R_ProcessEvents() {
+    // SAFETY: The caller provides an active native trampoline.
     unsafe { api((), |ctx| ctx.check_user_interrupt()) }
 }
 
@@ -67,6 +68,7 @@ pub unsafe extern "C" fn R_ProcessEvents() {
 /// Call inside an active native trampoline.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn R_CleanTempDir() {
+    // SAFETY: The caller provides an active native trampoline.
     unsafe {
         api((), |ctx| {
             let path = ctx.host().session_temp_dir().to_owned();
