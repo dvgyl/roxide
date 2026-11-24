@@ -29,6 +29,7 @@ pub mod weakref;
 
 pub mod gc_alloc;
 pub mod iconv;
+pub mod linpack;
 pub mod optim_integrate;
 
 use roxide_eval::{Ctx, EvalResult, Unwind};
