@@ -6,11 +6,14 @@ pub mod batch;
 mod data;
 pub mod description;
 pub mod install;
+mod install_compiled;
 pub mod lazyload;
 pub mod library;
 pub mod loader;
+pub mod makeconf;
 pub mod nsfile;
 pub mod s3reg;
+pub mod shlib;
 pub mod tar;
 
 use roxide_eval::{Ctx, InternalError};

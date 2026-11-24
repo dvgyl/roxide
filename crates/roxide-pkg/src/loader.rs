@@ -1,5 +1,6 @@
 //! Load, attach, inspect, and unload package namespaces.
 
+mod dynlib;
 mod imports;
 mod interface;
 pub(crate) mod values;
@@ -104,6 +105,7 @@ fn load_new(
         return Err(ctx.stop(call, format!("package ‘{name}’ has an invalid DESCRIPTION")));
     }
     version_check(ctx, name, &description.version, check, false)?;
+    dynlib::check_stamp(ctx, &path, name)?;
     let filebase = path.join("R").join(name);
     let [index, data] = [".rdx", ".rdb"].map(|suffix| {
         ctx.host()
@@ -147,6 +149,7 @@ fn load_new(
         builtin: false,
     };
     let mut cached_meta = false;
+    let mut loaded_dlls = Vec::new();
     let result = (|| {
         if installed {
             // The byte stream can refer to the namespace that owns it.
@@ -170,6 +173,7 @@ fn load_new(
         define(ctx, info, "dynlibs", dynlibs)?;
         let native = spec.native_routines(ctx)?;
         define(ctx, info, "nativeRoutines", native)?;
+        dynlib::load(ctx, ns, info, &path, dynlibs, native, &mut loaded_dlls)?;
         let registrations = crate::s3reg::resolve(ctx, ns, &spec)?;
         if !installed {
             ctx.ns_register(record)?;
@@ -194,6 +198,7 @@ fn load_new(
     })();
     if result.is_err() {
         ctx.protect_eval_result(&result);
+        dynlib::rollback(ctx, &loaded_dlls);
         if cached_meta {
             let _ = uncache_methods_metadata(ctx, ns);
         }
@@ -603,6 +608,8 @@ pub(crate) fn unload(ctx: &mut Ctx, name: &str) -> EvalResult<()> {
         let path = path.as_deref().unwrap_or(Path::new("")).to_string_lossy();
         run_user_hooks(ctx, name, "onUnload", &path)?;
         call_cleanup_hook(ctx, record.ns, ".onUnload", name, path.as_ref())?;
+        let info = namespace_info(ctx, record.ns)?;
+        dynlib::unload(ctx, info)?;
         uncache_methods_metadata(ctx, record.ns)?;
         ctx.ns_unregister(name);
         Ok(())

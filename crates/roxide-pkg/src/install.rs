@@ -1,4 +1,4 @@
-//! Build and stage pure-R packages in the current process.
+//! Build and stage R packages.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -9,6 +9,7 @@ use roxide_host::{Host, HostErrorKind, NativeHost, OpenMode};
 use roxide_value::{EMPTY_ENV, SEXP_NIL, ValueApi};
 
 use crate::description::{Dependency, Description, is_windows, read_text, version_parts};
+use crate::install_compiled::{self, CompiledPackage};
 use crate::lazyload::{DataCompression, cache_rds, write_lazyload_db, write_namespace_db};
 use crate::library::{R_VERSION, libraries};
 use crate::loader::{build_namespace, values::*};
@@ -64,6 +65,7 @@ struct Options {
     sources: Vec<PathBuf>,
     library: Option<PathBuf>,
     no_test: bool,
+    no_configure: bool,
     no_docs: bool,
     install_tests: bool,
     no_lock: bool,
@@ -95,6 +97,7 @@ impl Options {
                     options.library = Some(value.into());
                 }
                 "--no-test-load" if !positional => options.no_test = true,
+                "--no-configure" if !positional => options.no_configure = true,
                 "--no-docs" if !positional => options.no_docs = true,
                 "--install-tests" if !positional => options.install_tests = true,
                 "--no-lock" if !positional => options.no_lock = true,
@@ -211,9 +214,7 @@ fn install_source(
     let text = read_text(ctx, &source.join("DESCRIPTION"))?;
     let description =
         Description::parse(&text, is_windows(ctx)).map_err(|error| ctx.stop(SEXP_NIL, error))?;
-    if description.needs_compilation || ctx.host().metadata(&source.join("src"), true).is_ok() {
-        return Err(ctx.stop(SEXP_NIL, "compiled code requires Milestone 4"));
-    }
+    let has_compiled = install_compiled::needs_build(ctx, &description, source)?;
     let package = &description.package;
     let Some(library) = paths.first() else {
         return Err(ctx.stop(SEXP_NIL, "no library directory"));
@@ -240,9 +241,20 @@ fn install_source(
         create_dir(ctx, &path.join("Meta"), false)?;
         let mut stage_paths = vec![stage.clone()];
         stage_paths.extend_from_slice(paths);
-        build(ctx, source, &path, &text, &description, paths, options)?;
+        let compiled = has_compiled
+            .then(|| {
+                CompiledPackage::prepare(ctx, source, &lock, &stage_paths, options.no_configure)
+            })
+            .transpose()?;
+        let source = InstallSource {
+            path: source,
+            text: &text,
+            description: &description,
+            compiled: compiled.as_ref(),
+        };
+        build(ctx, source, &path, paths, options)?;
         if !options.no_test && !options.no_staged_install && !options.no_lock {
-            test_load(ctx, package, &stage_paths, host, boot)?;
+            test_load(ctx, package, &stage_paths, has_compiled, host, boot)?;
         }
 
         let previous = match ctx.host().metadata(&target, false) {
@@ -261,7 +273,7 @@ fn install_source(
             if options.no_test {
                 Ok(())
             } else {
-                test_load(ctx, package, paths, host, boot)
+                test_load(ctx, package, paths, has_compiled, host, boot)
             }
         });
         if result.is_err() {
@@ -290,15 +302,27 @@ fn install_source(
     Ok(())
 }
 
+struct InstallSource<'a> {
+    path: &'a Path,
+    text: &'a str,
+    description: &'a Description,
+    compiled: Option<&'a CompiledPackage>,
+}
+
 fn build(
     ctx: &mut Ctx,
-    source: &Path,
+    source: InstallSource<'_>,
     dest: &Path,
-    text: &str,
-    description: &Description,
     paths: &[PathBuf],
     options: &Options,
 ) -> EvalResult<()> {
+    let InstallSource {
+        path,
+        text,
+        description,
+        compiled,
+    } = source;
+    let source = compiled.map_or(path, |package| package.source.as_path());
     ctx.scoped(|ctx| {
         let namespace = read_text(ctx, &source.join("NAMESPACE"))?;
         let seconds = ctx.host().now().unix_us as f64 / 1_000_000.0;
@@ -311,24 +335,39 @@ fn build(
         let date = base_call(ctx, "format.POSIXct", &[time, format, utc])?;
         let date = string(ctx, date)?;
         let os = if is_windows(ctx) { "windows" } else { "unix" };
-        let text = with_built(text, &format!("{R_VERSION}; ; {date}; {os}"));
+        let built = format!("{R_VERSION}; ; {date}; {os}");
+        let text = with_built(text, &built);
         write_file(ctx, &dest.join("DESCRIPTION"), text.as_bytes())?;
         write_file(ctx, &dest.join("NAMESPACE"), namespace.as_bytes())?;
-        copy_tree(ctx, &source.join("inst"), dest, true, options.no_docs)?;
+        copy_tree(
+            ctx,
+            &source.join("inst"),
+            dest,
+            PackageTree::Inst {
+                no_docs: options.no_docs,
+            },
+        )?;
+        if let Some(compiled) = compiled {
+            compiled.build(ctx, dest, &description.package, &built)?;
+        }
         if options.install_tests {
             copy_tree(
                 ctx,
                 &source.join("tests"),
                 &dest.join("tests"),
-                false,
-                false,
+                PackageTree::Files,
             )?;
         }
         set_library_paths(ctx, paths)?;
         if description.lazy_data == Some(true) {
             crate::data::install_lazy_data(ctx, source, dest, options.data_compression)?;
         } else {
-            copy_tree(ctx, &source.join("data"), &dest.join("data"), false, false)?;
+            copy_tree(
+                ctx,
+                &source.join("data"),
+                &dest.join("data"),
+                PackageTree::Files,
+            )?;
         }
 
         let sysdata = ctx.session_mut().alloc_env(EMPTY_ENV)?;
@@ -356,7 +395,8 @@ fn build(
         let lib = ctx.session_mut().scalar_str(&lib.to_string_lossy())?;
         let info = base_call(ctx, "parseNamespaceFile", &[name, lib])?;
         cache_rds(ctx, &dest.join("Meta/nsInfo.rds"), info)?;
-        write_metadata(ctx, dest, &date, os, description)
+        let linking_to = compiled.map_or(&[][..], |package| package.linking_to.as_slice());
+        write_metadata(ctx, dest, &date, os, description, linking_to)
     })
 }
 
@@ -397,6 +437,7 @@ fn write_metadata(
     date: &str,
     os: &str,
     dependencies: &Description,
+    linking_to: &[Dependency],
 ) -> EvalResult<()> {
     let path = ctx
         .session_mut()
@@ -444,7 +485,7 @@ fn write_metadata(
     )?;
     let suggests = dependency_list(ctx, dependencies.suggests.iter())?;
     let imports = dependency_list(ctx, dependencies.imports.iter())?;
-    let linking = list(ctx, &[])?;
+    let linking = dependency_list(ctx, linking_to.iter())?;
     let meta = named_list(
         ctx,
         &[
@@ -515,9 +556,13 @@ fn test_load(
     ctx: &mut Ctx,
     package: &str,
     paths: &[PathBuf],
+    has_compiled: bool,
     host: &mut dyn FnMut() -> Box<dyn Host>,
     boot: Boot<'_>,
 ) -> EvalResult<()> {
+    if has_compiled {
+        return install_compiled::test_load(ctx, package, paths);
+    }
     let mut test = boot(host()).map_err(Unwind::Internal)?;
     // Use a local handler to read the condition before it reaches the top level.
     let result = (|| {
@@ -555,19 +600,25 @@ fn library_values(ctx: &mut Ctx, paths: &[PathBuf]) -> EvalResult {
     strings(ctx, paths.iter().map(|path| path.as_ref()))
 }
 
-fn copy_tree(
+#[derive(Clone, Copy)]
+pub(super) enum PackageTree<'a> {
+    Files,
+    Inst { no_docs: bool },
+    Source { lock: &'a Path },
+}
+
+pub(super) fn copy_tree(
     ctx: &mut Ctx,
     source: &Path,
     dest: &Path,
-    inst: bool,
-    no_docs: bool,
+    tree: PackageTree<'_>,
 ) -> EvalResult<()> {
     match ctx.host().metadata(source, false) {
         Ok(meta) if meta.is_dir && !meta.is_symlink => {}
         Err(error) if error.kind == HostErrorKind::NotFound => return Ok(()),
         _ => return Err(ctx.stop(SEXP_NIL, "invalid package directory")),
     }
-    if !inst {
+    if !matches!(tree, PackageTree::Inst { .. }) {
         create_dir(ctx, dest, true)?;
     }
     let mut stack = vec![(source.to_path_buf(), dest.to_path_buf())];
@@ -580,15 +631,20 @@ fn copy_tree(
             .read_dir(&source)
             .map_err(|e| ctx.stop(SEXP_NIL, e.to_string()))?;
         for entry in entries {
-            if entry.name.starts_with('.')
-                || (inst
-                    && source.ends_with("inst")
-                    && matches!(
-                        entry.name.as_str(),
-                        "R" | "Meta" | "DESCRIPTION" | "NAMESPACE"
-                    ))
-                || (no_docs && entry.name == "doc")
-            {
+            let skip = match tree {
+                PackageTree::Source { lock } => entry.path == lock || entry.name == ".git",
+                PackageTree::Files => entry.name.starts_with('.'),
+                PackageTree::Inst { no_docs } => {
+                    entry.name.starts_with('.')
+                        || (source.ends_with("inst")
+                            && matches!(
+                                entry.name.as_str(),
+                                "R" | "Meta" | "DESCRIPTION" | "NAMESPACE"
+                            ))
+                        || (no_docs && entry.name == "doc")
+                }
+            };
+            if skip {
                 continue;
             }
             count += 1;
@@ -638,7 +694,7 @@ fn write_file(ctx: &mut Ctx, path: &Path, data: &[u8]) -> EvalResult<()> {
         .map_err(|e| ctx.stop(SEXP_NIL, e.to_string()))
 }
 
-fn create_dir(ctx: &mut Ctx, path: &Path, recursive: bool) -> EvalResult<()> {
+pub(super) fn create_dir(ctx: &mut Ctx, path: &Path, recursive: bool) -> EvalResult<()> {
     ctx.host()
         .create_dir(path, recursive, 0o755)
         .map_err(|e| ctx.stop(SEXP_NIL, format!("{}: {e}", path.display())))

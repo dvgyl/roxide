@@ -1,4 +1,7 @@
-//! `R CMD` subcommand dispatcher (`INSTALL`, `BATCH`, `SHLIB`; owned by M3 Builder C).
+//! `R CMD` subcommand dispatcher (`INSTALL`, `BATCH`, `SHLIB`, `config`).
+
+mod config;
+mod shlib;
 
 use std::io::{self, Write};
 use std::process::ExitCode;
@@ -18,13 +21,8 @@ pub fn dispatch(
     let status = match subcmd.as_str() {
         "INSTALL" => roxide_pkg::install::run(rest, boot),
         "BATCH" => roxide_pkg::batch::run(rest, boot),
-        "SHLIB" => {
-            let _ = writeln!(
-                io::stderr().lock(),
-                "Error: R CMD SHLIB (compiled code) requires Milestone 4 (roxide-capi)"
-            );
-            1
-        }
+        "SHLIB" => shlib::run(rest),
+        "config" => config::run(rest),
         other => {
             let _ = writeln!(io::stderr().lock(), "ERROR: unknown command '{other}'");
             1
