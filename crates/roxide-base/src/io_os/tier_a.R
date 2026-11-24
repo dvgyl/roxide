@@ -144,3 +144,7 @@ sys.source <- function(file, envir = baseenv(), chdir = FALSE, keep.source = get
     source(file, local = envir, chdir = chdir, keep.source = keep.source)
     invisible(NULL)
 }
+sink <- function(file = NULL, append = FALSE, type = c("output", "message"), split = FALSE)
+    .Internal(rox_sink(file, append, match.arg(type) == "message", split))
+sink.number <- function(type = c("output", "message"))
+    .Internal(rox_sink_number(match.arg(type) == "message"))

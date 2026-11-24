@@ -1,0 +1,160 @@
+=== case: raw_subset_bypasses_methods ===
+#@ tags: layer3,base,subset
+#@ compare: exact
+`[.tier2test` <- function(x, ...) 99L
+`[[.tier2test` <- function(x, ...) 98L
+x <- structure(1:3, class = "tier2test")
+e <- structure(new.env(), class = "tier2test")
+e$value <- 42L
+frame <- data.frame(value = 1:2, other = 3:4)
+err <- function(expr) tryCatch(expr, error = conditionMessage)
+dput(list(x[2], .subset(x, 2), x[[2]], .subset2(x, 2)))
+dput(list(.subset2(e, "value"), .subset2(e, "val", exact = FALSE),
+          e[["value"]], err(.subset(e, "value")),
+          err(.subset2(e, c("value", "other")))))
+dput(list(.subset2(list(value = 9L), "val"),
+          .subset2(list(value = 9L), "val", exact = FALSE),
+          .subset2(c(value = 9L), "val", exact = FALSE),
+          err(.subset2(c(value = 9L), "val")),
+          .subset2(frame, "val", exact = FALSE),
+          .subset(frame, 1), err(.subset2(frame, 1, 1))))
+dput(tryCatch(.subset2(list(value = 9L), "val", exact = NA), warning = conditionMessage))
+invisible(setClass("Tier2SubsetNumeric", contains = "numeric"))
+invisible(setMethod("[", "Tier2SubsetNumeric", function(x, i, j, ..., drop = TRUE) 97L))
+s4 <- new("Tier2SubsetNumeric", 1:3 + 0)
+dput(list(.subset(s4, 2), .subset2(s4, 2), isS4(.subset(s4, 2))))
+
+=== case: pairlist_replacement_keeps_formals ===
+#@ tags: layer3,base,pairlist
+#@ compare: exact
+p <- pairlist(a = 1L, b = 2L)
+dput(list(typeof(p[1]), p[1], p[c(2, 3)], p[["b"]], p$a))
+q <- p
+q[["b"]] <- 9L
+q$new <- 10L
+q[["a"]] <- NULL
+dput(list(typeof(q), names(q), q$b, q$new, p$b))
+q["b"] <- list(11L)
+dput(list(typeof(q), names(q), q$b))
+q["b"] <- NULL
+dput(q)
+f <- function(x, y = 1L) y
+formals(f)[["y"]] <- 2L
+stopifnot(identical(formals(f), as.pairlist(alist(x = , y = 2L))))
+formals(f)$y <- NULL
+stopifnot(identical(formals(f), as.pairlist(alist(x = ))))
+formals(f)["y"] <- list(3L)
+stopifnot(identical(formals(f), as.pairlist(alist(x = , y = 3L))))
+dput(list(names(formals(f)), f()))
+
+=== case: compare_symbols_and_calls ===
+#@ tags: layer3,base,language
+#@ compare: exact
+dput(list(quote(a) == "a", quote(a) == quote(a), quote(a) != quote(b),
+          quote(a) == c("a", "b"), quote(`a b`) == "a b",
+          quote(f(1)) == "f(1)", quote(f(1)) == quote(f(1)),
+          quote(f(1L)) == c("f(1)", "f(1L)"),
+          quote(a) == NULL, quote(a) == NA_character_, quote(a) == 1,
+          quote(a) == list(quote(a), quote(b)), quote(a) == parse(text = c("a", "b"))))
+err <- function(expr) tryCatch(expr, error = conditionMessage)
+dput(c(err(quote(a) < "b"), err(quote(f(1)) < "b"), err(quote(a) <= "b"),
+       err(quote(a) > "b"), err(quote(a) >= "b"), err(quote(a) == new.env())))
+
+=== case: transform_evaluates_original_columns ===
+#@ tags: layer3,base,dataframe
+#@ compare: exact
+d <- data.frame(a = 1:3, b = 4:6, c = 7:9)
+out <- local({
+    shift <- 1L
+    base::transform(d, a = a + shift, b = a * 2L, x = a + c, c = NULL)
+})
+dput(list(names(out), out$a, out$b, out$x, nrow(out), names(d)))
+dput(list(names(transform(d, a = NULL)), names(transform(d, a = NULL, b = NULL, c = NULL))))
+dput(tryCatch(transform(d, z = NULL), error = conditionMessage))
+dput(transform(list(a = 1:2), b = a + 2L))
+dput(transform(d, x = 1:6))
+
+=== case: subset_masks_rows_and_column_positions ===
+#@ tags: layer3,base,dataframe
+#@ compare: exact
+d <- data.frame(a = 1:3, b = 4:6, c = 7:9)
+out <- local({
+    threshold <- 1L
+    base::subset(d, a > threshold & c(NA, TRUE, TRUE), select = a:c)
+})
+dput(list(names(out), out$a, nrow(out), names(subset(d, a > 1L, select = -b))))
+dput(subset(d, a > 1L, select = c(c, a), drop = FALSE)$c)
+dput(subset(d, a > 1L, select = a, drop = TRUE))
+dput(subset(d, a == 1L, drop = TRUE))
+dput(subset(1:3, c(TRUE, NA, FALSE)))
+dput(subset(matrix(1:6, 3, dimnames = list(NULL, c("left", "right"))),
+            c(TRUE, NA, FALSE), select = right))
+dput(tryCatch(subset(d, 1L), error = conditionMessage))
+
+=== case: sink_output_stack_and_capture ===
+#@ tags: layer3,base,connection
+#@ compare: exact
+path <- tempfile()
+stopifnot(identical(sink.number(), 0L))
+sink(path)
+cat("first\n")
+inner <- textConnection("seen", "w")
+sink(inner, split = TRUE)
+depth <- sink.number()
+cat("both\n")
+captured <- capture.output(cat("capture\n"))
+sink()
+cat("outer\n")
+sink()
+open <- isOpen(inner)
+close(inner)
+sink(path, append = TRUE)
+cat("last\n")
+sink()
+path_lines <- readLines(path)
+con <- file(path)
+sink(con, append = TRUE)
+cat("from connection\n")
+sink()
+closed <- !isOpen(con)
+close(con)
+warning <- tryCatch(sink(), warning = conditionMessage)
+dput(list(depth, sink.number(), open, closed, seen, captured, path_lines, readLines(path), warning))
+unlink(path)
+
+=== case: sink_raw_connection_with_split ===
+#@ tags: layer3,base,connection
+#@ compare: exact
+a <- textConnection("seen", "w")
+b <- rawConnection(raw(), "w")
+sink(a)
+sink(b, split = TRUE)
+cat("raw\n")
+sink()
+sink()
+dput(list(rawToChar(rawConnectionValue(b)), seen, isOpen(a), isOpen(b)))
+close(a)
+close(b)
+
+=== case: sink_message_replaces_connection ===
+#@ tags: layer3,base,connection
+#@ compare: exact
+a <- textConnection("received_a", "w")
+b <- textConnection("received_b", "w")
+first <- sink.number("message")
+sink(a, type = "message")
+on_a <- sink.number("message") == as.integer(a)
+message("first")
+sink(b, type = "message")
+on_b <- sink.number("message") == as.integer(b)
+message("second")
+sink(type = "message")
+err <- function(expr) tryCatch(expr, error = conditionMessage)
+path <- tempfile()
+con <- file(path)
+dput(list(first, on_a, on_b, sink.number("message"), received_a, received_b,
+          err(sink(path, type = "message")), err(sink(con, type = "message")),
+          err(sink(b, type = "message", split = TRUE))))
+close(a)
+close(b)
+close(con)

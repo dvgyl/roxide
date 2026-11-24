@@ -131,8 +131,118 @@ setNames <- function(object = nm, nm) {
     object
 }
 
-.subset <- function(x, ...) `[`(unclass(x), ...)
-.subset2 <- function(x, ...) `[[`(unclass(x), ...)
+subset <- function(x, ...) UseMethod("subset")
+subset.default <- function(x, subset, ...) {
+    if (!is.logical(subset)) stop("'subset' must be logical")
+    x[subset & !is.na(subset)]
+}
+subset.data.frame <- function(x, subset, select, drop = FALSE, ...) {
+    rows <- if (missing(subset)) TRUE else eval(substitute(subset), x, parent.frame())
+    if (!is.logical(rows)) stop("'subset' must be logical")
+    cols <- if (missing(select)) TRUE else {
+        positions <- as.list(seq_along(x))
+        names(positions) <- names(x)
+        eval(substitute(select), positions, parent.frame())
+    }
+    result <- x[rows & !is.na(rows), cols, drop = drop]
+    if (drop && is.data.frame(result) && nrow(result) == 1L && ncol(result) > 0L)
+        return(as.list(result))
+    result
+}
+subset.matrix <- function(x, subset, select, drop = FALSE, ...) {
+    rows <- if (missing(subset)) TRUE else subset
+    if (!is.logical(rows)) stop("'subset' must be logical")
+    cols <- if (missing(select)) TRUE else {
+        positions <- as.list(seq_len(ncol(x)))
+        names(positions) <- colnames(x)
+        eval(substitute(select), positions, parent.frame())
+    }
+    x[rows & !is.na(rows), cols, drop = drop]
+}
+
+transform <- function(`_data`, ...) UseMethod("transform")
+transform.default <- function(`_data`, ...) {
+    frame <- if (is.list(`_data`)) {
+        do.call(data.frame, `_data`)
+    } else if (is.matrix(`_data`)) {
+        columns <- lapply(seq_len(ncol(`_data`)), function(i) `_data`[, i])
+        labels <- colnames(`_data`)
+        names(columns) <- if (is.null(labels)) paste0("V", seq_along(columns)) else labels
+        do.call(data.frame, columns)
+    } else {
+        data.frame(`_data`, check.names = FALSE)
+    }
+    .rox_transform_frame(frame, substitute(list(...)), environment())
+}
+transform.data.frame <- function(`_data`, ...)
+    .rox_transform_frame(`_data`, substitute(list(...)), parent.frame())
+.rox_transform_frame <- function(`_data`, expressions, env) {
+    updates <- eval(expressions, `_data`, env)
+    labels <- names(updates)
+    if (is.null(labels)) return(`_data`)
+    positions <- match(labels, names(`_data`))
+    existing <- which(!is.na(positions))
+    if (anyDuplicated(positions[existing])) stop("duplicate subscripts for columns")
+    rows <- nrow(`_data`)
+    columns <- as.list(`_data`)
+    for (i in existing) {
+        value <- updates[[i]]
+        if (!is.null(value)) {
+            n <- NROW(value)
+            if (n > rows) {
+                warning(sprintf("replacement element %d has %d rows to replace %d rows",
+                                match(i, existing), n, rows))
+                next
+            }
+            if (n < rows && (!n || rows %% n != 0L)) {
+                stop(sprintf("replacement element %d has %d rows, need %d",
+                             match(i, existing), n, rows))
+            }
+            if (n < rows) value <- .rox_transform_recycle(value, rows)
+        }
+        columns[positions[[i]]] <- list(value)
+    }
+    columns <- columns[!vapply(columns, is.null, FALSE)]
+    added <- which(is.na(positions))
+    if (!length(added)) {
+        attrs <- attributes(`_data`)
+        attrs$names <- names(columns)
+        attrs$row.names <- .Internal(rox_transform_row_names(`_data`, rows))
+        attributes(columns) <- attrs
+        return(columns)
+    }
+
+    lengths <- c(rows, vapply(updates[added], NROW, 0L))
+    size <- max(lengths)
+    if (size > 0L && any(lengths == 0L | size %% lengths != 0L)) {
+        stop(paste0("arguments imply differing number of rows: ",
+                    paste(unique(lengths), collapse = ", ")))
+    }
+    if (size != rows) {
+        columns <- lapply(columns, .rox_transform_recycle, size)
+    }
+    for (i in added) {
+        value <- updates[[i]]
+        if (is.null(value)) next
+        label <- labels[[i]]
+        if (!nzchar(label)) label <- deparse1(expressions[[i + 1L]])
+        if (NROW(value) != size) value <- .rox_transform_recycle(value, size)
+        if (!inherits(value, "AsIs") && (is.list(value) || is.matrix(value))) {
+            arg <- list(value)
+            names(arg) <- label
+            columns <- c(columns, as.list(do.call(data.frame, c(arg, list(check.names = FALSE)))))
+        } else {
+            columns <- c(columns, setNames(list(value), label))
+        }
+    }
+    class(columns) <- "data.frame"
+    attr(columns, "row.names") <- .Internal(rox_transform_row_names(`_data`, size))
+    columns
+}
+.rox_transform_recycle <- function(value, rows) {
+    indices <- rep_len(seq_len(NROW(value)), rows)
+    if (length(dim(value)) == 2L) value[indices, , drop = FALSE] else value[indices]
+}
 getElement <- function(object, name) {
     if (isS4(object)) return(slot(object, name))
     object[[name, exact = TRUE]]

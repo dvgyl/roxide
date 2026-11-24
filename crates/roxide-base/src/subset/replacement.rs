@@ -9,7 +9,8 @@ use crate::ops::common::{
 };
 
 use super::index::{
-    Index, array_indices, coordinates, dollar_name, index_labels, indices, lookup, selected, single,
+    Index, array_indices, coordinates, dollar_name, index_labels, indices, lookup,
+    pairlist_as_list, selected, single,
 };
 
 fn replace_one_index(
@@ -52,8 +53,15 @@ fn replace_one_index(
 }
 
 pub(super) fn replace(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
-    let x = args.get(0);
-    let x = ctx.session_mut().unshare(x)?;
+    let mut x = ctx.session_mut().unshare(args.get(0))?;
+    let s = ctx.session_mut();
+    if s.type_of(x)? == SexpType::List {
+        let positions = (0..s.xlength(x)?).map(Some).collect::<Vec<_>>();
+        let out = pairlist_as_list(s, x, &positions)?;
+        copy_attrs(s, x, out, |name| name != "names")?;
+        x = out;
+    }
+    ctx.protect(x);
     let (subs, value) = replacement_args(ctx, args);
     if has_class(ctx.session(), x, "data.frame") {
         return replace_frame(ctx, call, x, &subs, value);
@@ -155,9 +163,10 @@ pub(super) fn replace_one(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalRe
     for i in 0..len - 1 {
         let idx = replace_one_index(ctx, call, target, sub, i)?;
         let n = ctx.session().xlength(target)?;
+        let ty = ctx.session().type_of(target)?;
         let Some(pos) = idx
             .pos
-            .filter(|&p| p < n && ctx.session().type_of(target).ok() == Some(SexpType::Vec))
+            .filter(|&p| p < n && matches!(ty, SexpType::Vec | SexpType::List))
         else {
             return Err(error(
                 ctx,
@@ -165,9 +174,10 @@ pub(super) fn replace_one(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalRe
                 format!("no such index at level {}", i + 1),
             ));
         };
-        let next = ctx.session().list_get(target, pos)?;
+        let next = element(ctx.session_mut(), target, pos)?;
         parents.push((target, idx));
         target = ctx.session_mut().unshare(next)?;
+        ctx.protect(target);
     }
     let index = replace_one_index(ctx, call, target, sub, len - 1)?;
     let mut out = replace_single_column_or_item(ctx, call, target, index, value)?;
@@ -377,6 +387,9 @@ fn assign(
             return Ok(x);
         }
         if matches!(tx, SexpType::Vec | SexpType::List | SexpType::Lang) {
+            if tx == SexpType::List && one && ix.iter().any(|i| i.pos.is_some_and(|i| i >= n)) {
+                return Err(error(ctx, call, "subscript out of bounds"));
+            }
             let removed: std::collections::HashSet<_> = ix.iter().filter_map(|i| i.pos).collect();
             let keep: Vec<_> = (0..n).filter(|i| !removed.contains(i)).map(Some).collect();
             let out = selected(ctx, x, &keep)?;
@@ -470,7 +483,9 @@ fn assign(
     {
         return Ok(out);
     }
-    let named = tx == SexpType::Lang || attr(s, x, "names") != SEXP_NIL || !added.is_empty();
+    let named = matches!(tx, SexpType::List | SexpType::Lang)
+        || attr(s, x, "names") != SEXP_NIL
+        || !added.is_empty();
     let mut labels = if named { index_labels(s, x)? } else { vec![] };
     if named {
         labels.resize(end, CharId::BLANK);
@@ -493,10 +508,16 @@ fn assign(
         }
         gather(s, source, &positions)?
     } else {
-        let mut values = Vec::with_capacity(end);
-        for i in 0..end {
-            values.push(if i < n { element(s, x, i)? } else { SEXP_NIL });
-        }
+        let mut values = if matches!(tx, SexpType::List | SexpType::Lang) {
+            s.pairlist_iter(x)
+                .map(|(_, value)| value)
+                .collect::<Vec<_>>()
+        } else {
+            (0..n)
+                .map(|i| element(s, x, i))
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        values.resize(end, SEXP_NIL);
         for (i, index) in ix.into_iter().enumerate() {
             if let Some(pos) = index.pos {
                 values[pos] = if one {
@@ -506,7 +527,7 @@ fn assign(
                 };
             }
         }
-        if tx == SexpType::Lang {
+        if matches!(tx, SexpType::List | SexpType::Lang) {
             let mut tail = SEXP_NIL;
             for (i, (&value, &label)) in values.iter().zip(&labels).enumerate().rev() {
                 let tag = if label == CharId::BLANK || label == CharId::NA {
@@ -515,7 +536,7 @@ fn assign(
                     let label = text(s, label);
                     s.intern(&label)?.as_sexp()
                 };
-                tail = if i == 0 {
+                tail = if i == 0 && tx == SexpType::Lang {
                     s.lcons(value, tail, tag)?
                 } else {
                     s.cons(value, tail, tag)?

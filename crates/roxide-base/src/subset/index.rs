@@ -157,10 +157,26 @@ pub(super) fn index_labels(s: &mut roxide_value::RSession, x: SexpId) -> EvalRes
 }
 
 pub(super) fn subset(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
-    let x = args.get(0);
+    subset_impl(ctx, call, args, args.get(0))
+}
+
+pub(super) fn subset_default(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    let mut x = args.get(0);
+    let s = ctx.session_mut();
+    if s.type_of(x)? != SexpType::Env && (attr(s, x, "class") != SEXP_NIL || s.is_s4(x)?) {
+        x = s.shallow_duplicate(x)?;
+        set(s, x, "class", SEXP_NIL)?;
+        s.set_s4_flag(x, false)?;
+        ctx.protect(x);
+    }
+    subset_impl(ctx, call, args, x)
+}
+
+fn subset_impl(ctx: &mut Ctx, call: &Call, args: &Args, x: SexpId) -> EvalResult {
     if x == SEXP_NIL {
         return Ok(x);
     }
+    let ty = ctx.session().type_of(x)?;
     let drop_arg = args.named(ctx.session(), "drop").unwrap_or(SEXP_MISSING);
     let subs = argument_indices(ctx, args, &["drop"]);
     let drop = flag(
@@ -168,7 +184,7 @@ pub(super) fn subset(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult 
         drop_arg,
         !has_class(ctx.session(), x, "data.frame") || subs.len() > 1,
     )?;
-    if has_class(ctx.session(), x, "data.frame") {
+    if ty != SexpType::Env && has_class(ctx.session(), x, "data.frame") {
         return subset_frame(ctx, call, x, &subs, drop);
     }
     let s = ctx.session();
@@ -180,7 +196,18 @@ pub(super) fn subset(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult 
         return subset_array(ctx, call, x, &subs, drop);
     }
     let sub = subs.first().copied().unwrap_or(SEXP_MISSING);
-    if sub == SEXP_MISSING {
+    if matches!(
+        ty,
+        SexpType::Clo | SexpType::Builtin | SexpType::Special | SexpType::Env
+    ) {
+        let name = ty.type_name(false);
+        return Err(error(
+            ctx,
+            call,
+            format!("object of type '{name}' is not subsettable"),
+        ));
+    }
+    if sub == SEXP_MISSING && ty != SexpType::List {
         return Ok(x);
     }
     if dim != SEXP_NIL
@@ -197,22 +224,41 @@ pub(super) fn subset(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult 
     }
     let s = ctx.session();
     let n = s.xlength(x)?;
-    let is_function = matches!(
-        s.type_of(x)?,
-        SexpType::Clo | SexpType::Builtin | SexpType::Special | SexpType::Env
-    );
-    if is_function {
-        let name = s.type_of(x)?.type_name(false);
-        return Err(error(
-            ctx,
-            call,
-            format!("object of type '{name}' is not subsettable"),
-        ));
-    }
     let labels = index_labels(ctx.session_mut(), x)?;
     let index = indices(ctx, call, sub, n, &labels, false, false)?;
     let pos: Vec<_> = index.iter().map(|i| i.pos).collect();
-    selected(ctx, x, &pos)
+    if ty == SexpType::List {
+        pairlist_as_list(ctx.session_mut(), x, &pos)
+    } else {
+        selected(ctx, x, &pos)
+    }
+}
+
+pub(super) fn pairlist_as_list(s: &mut RSession, x: SexpId, pos: &[Option<usize>]) -> EvalResult {
+    let entries: Vec<_> = s.pairlist_iter(x).collect();
+    let selected: Vec<_> = pos
+        .iter()
+        .map(|i| i.and_then(|i| entries.get(i)).copied())
+        .collect();
+    let values: Vec<_> = selected
+        .iter()
+        .map(|entry| entry.map_or(SEXP_NIL, |(_, value)| value))
+        .collect();
+    let out = list(s, &values)?;
+    if entries.iter().any(|(name, _)| name.is_some()) {
+        let labels = selected
+            .into_iter()
+            .map(|entry| match entry {
+                Some((name, _)) => {
+                    let label = tag(s, name).unwrap_or("").to_owned();
+                    ch(s, &label)
+                }
+                None => Ok(CharId::NA),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        set_names(s, out, &labels)?;
+    }
+    Ok(out)
 }
 
 pub(super) fn selected(ctx: &mut Ctx, x: SexpId, pos: &[Option<usize>]) -> EvalResult {
@@ -587,6 +633,14 @@ pub(super) fn single(
 }
 
 pub(super) fn extract(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    extract_impl(ctx, call, args, true)
+}
+
+pub(super) fn extract_default(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    extract_impl(ctx, call, args, false)
+}
+
+fn extract_impl(ctx: &mut Ctx, call: &Call, args: &Args, frame_methods: bool) -> EvalResult {
     let mut x = args.get(0);
     if x == SEXP_NIL {
         return Ok(x);
@@ -606,9 +660,10 @@ pub(super) fn extract(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult
     if sub == SEXP_MISSING {
         return Err(error(ctx, call, "subscript is missing"));
     }
-    if ctx.session().type_of(x)? == SexpType::Env {
-        if let Some(name) = string(ctx.session(), sub) {
-            return env_lookup(ctx, x, &name);
+    if ctx.session().type_of(x)? == SexpType::Env && subs.len() == 1 {
+        let s = ctx.session();
+        if let Ok([key]) = s.str_slice(sub) {
+            return env_lookup(ctx, x, &text(s, *key));
         }
         return Err(error(
             ctx,
@@ -616,7 +671,7 @@ pub(super) fn extract(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult
             "wrong arguments for subsetting an environment",
         ));
     }
-    if subs.len() == 2 && has_class(ctx.session(), x, "data.frame") {
+    if frame_methods && subs.len() == 2 && has_class(ctx.session(), x, "data.frame") {
         let value = subset_frame(ctx, call, x, &subs, true)?;
         if ctx.session().xlength(value)? != 1 {
             return Err(error(ctx, call, "subscript out of bounds"));

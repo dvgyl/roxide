@@ -32,6 +32,22 @@ pub const MODULE: Module = Module {
             On
         ),
         primitive!(
+            ".subset",
+            index::subset_default,
+            EvalKeepMissing,
+            Any,
+            Dispatch::None,
+            On
+        ),
+        primitive!(
+            ".subset2",
+            index::extract_default,
+            EvalKeepMissing,
+            Any,
+            Dispatch::None,
+            On
+        ),
+        primitive!(
             "$",
             index::dollar,
             EvalDollar,

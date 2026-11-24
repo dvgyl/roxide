@@ -10,6 +10,7 @@ use roxide_gc::SexpId;
 use roxide_host::{OpenMode, StdStream};
 use roxide_value::{CharId, RLogical, SEXP_NIL, ValueApi};
 
+use crate::io_os::connection;
 use crate::ops::common::{ch, error, flag, names, number, set_names, string, text, vector_limit};
 
 pub(crate) const MODULE: Module = Module {
@@ -30,6 +31,13 @@ pub(crate) const MODULE: Module = Module {
         internal("rox_proc_time", proc_time, 0, Visibility::On),
         internal("rox_time_safepoint", time_safepoint, 0, Visibility::Off),
         internal("rox_quit", quit, 2, Visibility::Off),
+        internal("rox_sink", connection::sink, 4, Visibility::Off),
+        internal(
+            "rox_sink_number",
+            connection::sink_number,
+            1,
+            Visibility::On,
+        ),
     ],
     prelude: include_str!("tier_a.R"),
 };

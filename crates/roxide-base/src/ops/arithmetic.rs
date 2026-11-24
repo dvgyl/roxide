@@ -59,19 +59,31 @@ fn length(ctx: &mut Ctx, call: &Call, x: SexpId, y: SexpId) -> EvalResult<(usize
 }
 
 fn binary_op(ctx: &mut Ctx, call: &Call, args: &Args, op: Op) -> EvalResult {
-    let x = args.get(0);
+    let mut x = args.get(0);
     if args.len() == 1 && matches!(op, Op::Add | Op::Sub) {
         return unary(ctx, call, x, op == Op::Sub);
     }
-    let y = args.get(1);
+    let mut y = args.get(1);
+    let compare = matches!(op, Op::Eq | Op::Ne | Op::Lt | Op::Le | Op::Gt | Op::Ge);
+    let tx = ctx.session().type_of(x)?;
+    let ty = ctx.session().type_of(y)?;
+    let compare_language = compare && (language(tx) || language(ty));
+    if compare_language {
+        (x, y) = language_operands(ctx, call, (x, tx), (y, ty), op)?;
+    }
     let (nx, ny) = length(ctx, call, x, y)?;
     let len = if nx == 0 || ny == 0 { 0 } else { nx.max(ny) };
     vector_limit(ctx, call, len, size_of::<RComplex>())?;
     let tx = ctx.session().type_of(x)?;
     let ty = ctx.session().type_of(y)?;
-    let kind = if rank(tx) >= rank(ty) { tx } else { ty };
+    let kind = if compare_language {
+        SexpType::Str
+    } else if rank(tx) >= rank(ty) {
+        tx
+    } else {
+        ty
+    };
     let logic = matches!(op, Op::And | Op::Or | Op::Xor);
-    let compare = matches!(op, Op::Eq | Op::Ne | Op::Lt | Op::Le | Op::Gt | Op::Ge);
     let both_raw = tx == SexpType::Raw && ty == SexpType::Raw;
     let mut overflow = false;
     let mut accuracy = false;
@@ -177,6 +189,63 @@ fn binary_op(ctx: &mut Ctx, call: &Call, args: &Args, op: Op) -> EvalResult {
     }
     binary_attributes(ctx, result, x, y, (nx, ny, len), !logic && !compare)?;
     Ok(result)
+}
+
+fn language(ty: SexpType) -> bool {
+    matches!(ty, SexpType::Sym | SexpType::Lang)
+}
+
+fn language_operands(
+    ctx: &mut Ctx,
+    call: &Call,
+    (x, tx): (SexpId, SexpType),
+    (y, ty): (SexpId, SexpType),
+    op: Op,
+) -> EvalResult<(SexpId, SexpId)> {
+    let operator = match op {
+        Op::Eq => "==",
+        Op::Ne => "!=",
+        Op::Lt => "<",
+        Op::Le => "<=",
+        Op::Gt => ">",
+        _ => ">=",
+    };
+    if !matches!(op, Op::Eq | Op::Ne) {
+        return Err(error(
+            ctx,
+            call,
+            format!("comparison ({operator}) is not possible for language types"),
+        ));
+    }
+    let mut convert = |value, ty| {
+        let s = ctx.session_mut();
+        let out = if language(ty) {
+            let opts = roxide_value::DeparseOpts {
+                width_cutoff: usize::MAX,
+                ..Default::default()
+            };
+            let text = roxide_value::deparse(s, value, opts)?.join(" ");
+            s.scalar_str(&text)?
+        } else if ty == SexpType::Expr {
+            let values = s.list_slice(value)?.to_vec();
+            let out = super::common::list(s, &values)?;
+            copy_attrs(s, value, out, |name| {
+                matches!(name, "names" | "dim" | "dimnames")
+            })?;
+            out
+        } else if super::common::atomic(ty) || matches!(ty, SexpType::Nil | SexpType::Vec) {
+            value
+        } else {
+            return Err(error(
+                ctx,
+                call,
+                format!("comparison ({operator}) is possible only for atomic and list types"),
+            ));
+        };
+        ctx.protect(out);
+        Ok(out)
+    };
+    Ok((convert(x, tx)?, convert(y, ty)?))
 }
 
 fn binary_attributes(
