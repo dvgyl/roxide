@@ -22,9 +22,3 @@ pub const RESTART_PROMISE: &str = "restarting interrupted promise evaluation";
 
 /// Attempting to apply a non-function value.
 pub const NOT_A_FUNCTION: &str = "attempt to apply non-function";
-
-/// Embedded NUL byte in a character string.
-pub const EMBEDDED_NUL: &str = "embedded nul in string";
-
-/// `break` or `next` outside a loop.
-pub const NO_LOOP_FOR_BREAK_NEXT: &str = "no loop for break/next, jumping to top level";
