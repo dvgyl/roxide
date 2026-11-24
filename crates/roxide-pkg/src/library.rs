@@ -7,9 +7,7 @@ use std::collections::BTreeSet;
 
 use roxide_eval::{Args, Call, Ctx, EvalResult, Module, Visibility::*};
 use roxide_gc::SexpId;
-use roxide_value::{
-    BASE_ENV, BASE_NAMESPACE, EMPTY_ENV, GLOBAL_ENV, NA_INTEGER, SEXP_NIL, SexpType, ValueApi,
-};
+use roxide_value::{EMPTY_ENV, NA_INTEGER, SEXP_NIL, SexpType, ValueApi};
 
 use crate::description::{Description, is_windows};
 use crate::loader::{attach as attach_ns, detach_at, load, namespace_version, values::*};
@@ -324,28 +322,8 @@ fn format_environment(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult
     if ctx.session().type_of(env)? != SexpType::Env {
         return Err(ctx.stop(call.err_call(), "'x' must be an environment"));
     }
-    let name = match env {
-        BASE_ENV => "base".to_owned(),
-        BASE_NAMESPACE => "namespace:base".to_owned(),
-        EMPTY_ENV => "R_EmptyEnv".to_owned(),
-        GLOBAL_ENV => "R_GlobalEnv".to_owned(),
-        _ => {
-            if let Some(name) = ctx.namespace_name(env) {
-                format!("namespace:{name}")
-            } else if let Some(record) = ctx
-                .ns_records()
-                .iter()
-                .find(|rec| rec.attached == Some(env))
-            {
-                format!("package:{}", record.name)
-            } else {
-                format!("0x{:x}", env.to_bits())
-            }
-        }
-    };
-    Ok(ctx
-        .session_mut()
-        .scalar_str(&format!("<environment: {name}>"))?)
+    let label = ctx.environment_label(env)?;
+    Ok(ctx.session_mut().scalar_str(&label)?)
 }
 
 fn check_conflicts(
