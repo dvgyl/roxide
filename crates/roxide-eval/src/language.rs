@@ -1422,6 +1422,7 @@ fn switch(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
         return Err(ctx.stop(call.err_call(), "'EXPR' is missing"));
     }
     let expr = ctx.eval(args.get(0), call.env)?;
+    ctx.resolve_altrep(expr)?;
     if ctx.session.xlength(expr)? != 1 {
         return Err(ctx.stop(call.err_call(), "EXPR must be a length 1 vector"));
     }

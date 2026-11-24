@@ -295,9 +295,28 @@ impl Execution<'_> {
                 call_const,
             } => {
                 let value = self.read(ctx, sequence)?;
+                let expr = self.constant(call_const)?;
                 let (_, sym) = self.symbol(ctx, var)?;
+                if guard::lazy_foreign_altrep(&ctx.session, value) {
+                    let active = frame(ctx)?.guards.last().ok_or_else(invalid)?;
+                    let (fun, end) = (active.fun, active.end);
+                    let (prim, _) = ctx.session.prim_parts(fun)?;
+                    let call = Call {
+                        expr,
+                        env: self.env,
+                        prim,
+                        user_call: expr,
+                    };
+                    let body = subscript::arguments(ctx, expr)?.get(2);
+                    let result = ctx
+                        .scoped(|ctx| crate::control::for_sequence(ctx, &call, sym, body, value))?;
+                    self.write(ctx, sequence, result)?;
+                    ctx.visible = false;
+                    return Ok(Step::Jump(end));
+                }
+                ctx.resolve_altrep(value)?;
                 ctx.assign(sym, SEXP_NIL, self.env)?;
-                let result = ForCursor::new(ctx, value, self.constant(call_const)?)?;
+                let result = ForCursor::new(ctx, value, expr)?;
                 *self.cursor(ctx, cursor)? = result;
             }
             Op::ForNext {

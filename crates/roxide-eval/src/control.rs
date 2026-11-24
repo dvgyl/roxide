@@ -1,5 +1,5 @@
 use roxide_gc::SexpId;
-use roxide_value::{RLogical, SEXP_MISSING, SEXP_NIL, SexpType, ValueApi, ValueError};
+use roxide_value::{RLogical, SEXP_MISSING, SEXP_NIL, SexpType, Sym, ValueApi, ValueError};
 
 use crate::eval::ArgInput;
 use crate::{ArgEval, Args, Arity, Call, Ctx, EvalResult, Module, Transfer, Unwind};
@@ -43,9 +43,15 @@ pub(crate) fn assign(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult 
     }
     let sym = match ctx.session.type_of(lhs)? {
         SexpType::Sym if lhs != SEXP_MISSING => ctx.sym_from_sexp(lhs)?,
-        SexpType::Str => {
+        SexpType::Str if layers.is_empty() => {
             let name = ctx.string(lhs, call.err_call())?;
             ctx.session.intern(&name)?
+        }
+        _ if !layers.is_empty() => {
+            return Err(ctx.stop(
+                call.err_call(),
+                "target of assignment expands to non-language object",
+            ));
         }
         _ => {
             return Err(ctx.stop(
@@ -205,6 +211,7 @@ fn replacement_head(ctx: &mut Ctx, head: SexpId, call: SexpId) -> EvalResult {
 
 impl Ctx {
     pub(crate) fn truth(&mut self, value: SexpId, call: SexpId) -> EvalResult<bool> {
+        self.resolve_altrep(value)?;
         match self.session.xlength(value)? {
             0 => return Err(self.stop(call, "argument is of length zero")),
             1 => {}
@@ -277,8 +284,19 @@ fn for_loop(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
         return result;
     }
     let var = ctx.sym_from_sexp(args.get(0))?;
-    let mut sequence = ctx.eval(args.get(1), call.env)?;
+    let sequence = ctx.eval(args.get(1), call.env)?;
+    for_sequence(ctx, call, var, args.get(2), sequence)
+}
+
+pub(crate) fn for_sequence(
+    ctx: &mut Ctx,
+    call: &Call,
+    var: Sym,
+    body: SexpId,
+    mut sequence: SexpId,
+) -> EvalResult {
     ctx.protect(sequence);
+    ctx.resolve_altrep(sequence)?;
     ctx.assign(var, SEXP_NIL, call.env)?;
     if ctx
         .classes(sequence, false)?
@@ -330,7 +348,7 @@ fn for_loop(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
         _ => return Err(ctx.stop(call.err_call(), "invalid for() loop sequence")),
     };
     let mut indices = 0..len;
-    run_loop(ctx, call, args.get(2), |ctx| {
+    run_loop(ctx, call, body, |ctx| {
         let value = if tail != SEXP_NIL {
             let (value, next, _) = ctx.session.cons_parts(tail)?;
             tail = next;

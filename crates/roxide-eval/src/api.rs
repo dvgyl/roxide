@@ -5,7 +5,7 @@ use std::fmt;
 use std::path::Path;
 
 use roxide_gc::{SexpId, Trace};
-use roxide_value::{PrimId, SEXP_NIL, Sym, ValueApi, ValueError};
+use roxide_value::{PrimId, SEXP_NIL, SexpType, Sym, ValueApi, ValueError};
 
 use crate::ctx::{Args, Ctx, FrameId};
 
@@ -371,12 +371,103 @@ impl Default for DotCOpts {
 /// ABI version tag recorded in `Meta/Roxide.rds` for Roxide-compiled packages.
 pub const CAPI_ABI_VERSION: &str = "roxide-capi-4.6.2-v1";
 
+/// Operation on a foreign ALTREP vector or class.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AltOp {
+    /// Get the vector length.
+    Length(SexpId),
+    /// Move the vector elements into storage owned by Roxide.
+    Materialize(SexpId),
+    /// Get the native sortedness code.
+    IsSorted(SexpId),
+    /// Check whether the class guarantees that the vector has no missing elements.
+    NoNa(SexpId),
+    /// Get the sum.
+    Sum {
+        /// Input vector.
+        x: SexpId,
+        /// Remove missing elements.
+        na_rm: bool,
+    },
+    /// Get the minimum.
+    Min {
+        /// Input vector.
+        x: SexpId,
+        /// Remove missing elements.
+        na_rm: bool,
+    },
+    /// Get the maximum.
+    Max {
+        /// Input vector.
+        x: SexpId,
+        /// Remove missing elements.
+        na_rm: bool,
+    },
+    /// Extract elements at the requested indices.
+    ExtractSubset {
+        /// Input vector.
+        x: SexpId,
+        /// Index vector.
+        indx: SexpId,
+        /// R call that requested the subset.
+        call: SexpId,
+    },
+    /// Convert the vector to a different type.
+    Coerce {
+        /// Input vector.
+        x: SexpId,
+        /// Target type.
+        to: SexpType,
+    },
+    /// Get the state required to serialize the vector.
+    SerializedState(SexpId),
+    /// Restore a vector from serialized class information and state.
+    Unserialize {
+        /// Class name.
+        class: Sym,
+        /// Package name.
+        package: Sym,
+        /// Base vector type.
+        ty: SexpType,
+        /// Serialized state.
+        state: SexpId,
+        /// Attribute pairlist.
+        attrs: SexpId,
+        /// Object flag.
+        objf: i32,
+        /// General-purpose header bits.
+        levels: i32,
+    },
+}
+
+/// Result of a foreign ALTREP operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AltReply {
+    /// Materialization is complete.
+    Unit,
+    /// Vector length.
+    Len(usize),
+    /// Native integer flag.
+    Flag(i32),
+    /// Method result. `None` requests the default behavior.
+    Value(Option<SexpId>),
+}
+
 /// Stateless native C-API & dynamic-library hooks installed by `roxide-capi` (ADRs 0017–0020).
 ///
 /// Any `SEXP`s owned by `roxide-capi` (such as `DLLInfo` external pointers, `CCallable`
 /// registries, and ALTREP class metadata) are GC-rooted via a traced [`CtxExt`] installed
 /// inside [`Ctx`].
 pub trait NativeHooks {
+    /// Run a foreign ALTREP operation.
+    /// Return `Len` for `Length` and `Flag` for `IsSorted` and `NoNa`.
+    /// Install owned storage before returning `Unit` for `Materialize`.
+    /// Return `Value` for all other operations.
+    fn altrep(&self, ctx: &mut Ctx, op: AltOp) -> EvalResult<AltReply> {
+        let _ = (ctx, op);
+        Err(altrep_hook_missing())
+    }
+
     /// Invoke a registered or dynamically looked-up native symbol via `.Call`/`.External`/`.External2`/`.C`/`.Fortran`.
     #[allow(clippy::too_many_arguments)]
     fn call_native(
@@ -476,4 +567,10 @@ pub trait NativeHooks {
         let _ = (ctx, fun_addr, target);
         Ok(())
     }
+}
+
+pub(crate) fn altrep_hook_missing() -> Unwind {
+    Unwind::Internal(InternalError {
+        message: "foreign ALTREP hook not installed".into(),
+    })
 }

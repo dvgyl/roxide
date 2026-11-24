@@ -5,7 +5,7 @@ use roxide_value::{
     nan_propagate,
 };
 
-use super::ir::Op;
+use super::{guard, ir::Op};
 use crate::EvalResult;
 
 #[derive(Clone, Copy)]
@@ -37,7 +37,8 @@ impl Number {
 }
 
 pub(super) fn plain(session: &RSession, value: SexpId) -> bool {
-    session.is_object(value) == Ok(false)
+    !guard::lazy_foreign_altrep(session, value)
+        && session.is_object(value) == Ok(false)
         && session.is_s4(value) == Ok(false)
         && session.attrs(value).is_ok_and(|attrs| attrs.is_empty())
 }
@@ -119,6 +120,9 @@ pub(super) fn unary(session: &mut RSession, op: &Op, src: Number) -> EvalResult 
 }
 
 pub(super) fn short_operand(session: &RSession, value: SexpId) -> Option<RLogical> {
+    if guard::lazy_foreign_altrep(session, value) {
+        return None;
+    }
     if let Some(number) = number(session, value) {
         return Some(number.logical());
     }

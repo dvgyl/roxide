@@ -616,11 +616,22 @@ impl Ctx {
         if def.name == "names" && self.session.type_of(args.get(0))? == SexpType::Env {
             return self.environment_names(args.get(0));
         }
+        if self.session.foreign_alt_seen() && !self.is_altrep_aware(def.name) {
+            for &value in args.values() {
+                self.resolve_altrep(value)?;
+            }
+        }
         let result = if self.has_stream_sink() {
             self.invoke_streaming_primitive(def.fun, &call, args)
         } else {
             (def.fun)(self, &call, args)
-        }?;
+        };
+        let result = match result {
+            Err(Unwind::Value(err @ ValueError::ForeignAltrep { .. })) => {
+                return Err(self.stop(call.err_call(), err.to_string()));
+            }
+            result => result?,
+        };
         let result = self.preserve_group_attributes(def, args, result)?;
         self.visible = match def.visibility {
             Visibility::On => true,

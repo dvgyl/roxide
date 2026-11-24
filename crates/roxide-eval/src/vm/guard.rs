@@ -8,6 +8,13 @@ use roxide_value::{
 
 use super::cache::{CallCache, EnvPath, VarCache};
 
+pub(super) fn lazy_foreign_altrep(session: &RSession, value: SexpId) -> bool {
+    session.foreign_alt_seen()
+        && session
+            .foreign_alt(value)
+            .is_ok_and(|info| info.is_some_and(|info| !info.owned))
+}
+
 enum CallBinding {
     Absent,
     NotCallable,
