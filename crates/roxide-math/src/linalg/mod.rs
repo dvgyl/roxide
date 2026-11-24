@@ -4,4 +4,5 @@ pub mod blas;
 pub mod complex;
 pub mod factor;
 pub mod linpack;
+pub mod linpack_capi;
 pub mod spectral;
