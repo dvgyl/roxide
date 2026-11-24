@@ -131,7 +131,13 @@ Tools that use the manifest:
 | Zero-length vectors | Return `Box<[T]>`'s aligned dangling pointer, which is non-NULL. |
 | Built-in ALTREP (compact sequences, wrappers, deferred strings) | `DATAPTR*` materializes into `AltObj.materialized` once. That buffer is a stable `Box`. `*_OR_NULL` returns NULL when not yet materialized. `*_GET_REGION`, `*_ELT`, `*_IS_SORTED` and `*_NO_NA` use the class methods. |
 | Pointer lifetime | Valid until GC frees the object, or until `R_resizeVector` goes past capacity. ADR-0017 invariant: **`roxide-gc` stays non-moving.** |
-| Foreign (C-defined) ALTREP classes (W3) | **Single-authority rule.** Engine-side materialization copies through C `Elt`/`Get_region` methods in read-only mode (§2.4) and never calls C `Dataptr` from engine paths. C-side `DATAPTR` calls the class `Dataptr` in full mode. After the engine materializes, the Roxide copy is the only authority and the class methods are no longer called. |
+| Foreign (C-defined) ALTREP classes (W3) | `AltObj` stores `AltKind::Foreign(ForeignAlt)`. The object starts Lazy with `materialized = None`. Materialization sets `materialized = Some` and makes the object Owned. The object stays Owned. |
+
+`roxide-value` never calls C. A read that needs a C method on a Lazy object returns `ValueError::ForeignAltrep { id, need }`. The evaluator calls the method before it borrows a `VecView` (§2.4).
+
+An `R_altrep_class_t { SEXP ptr }` holds an `EXTPTRSXP` descriptor. Its `tag` stores the class `Sym` and its `prot` stores the package `Sym`. Its `addr` stores the index in the `CtxExt` method table plus one. Roxide creates stable, rooted descriptors on demand for built-in classes such as `compact_intseq` and `wrap_integer`.
+
+Roxide seals the length after the first `Length` call. After materialization, Roxide owns the single Rust buffer and stops calling C class methods for that object. Direct writes to `data2` that bypass `DATAPTR` have no effect on the Owned buffer.
 
 ## 2. GC safety, protect stack, unwind safety, and reentrancy
 
@@ -245,8 +251,8 @@ T0 → C → Rf_eval → R → .Call → T1 → C2 → Rf_error
 ```rust
 enum Mode {
     Full(*mut Ctx),        // .Call, finalizers, callbacks: everything is allowed
-    Session(*mut RSession), // AltString::elt: allocation is allowed, eval is not
-    Heap(*const RHeap),     // AltVector::{elt, get_region} from &RHeap paths: reads only
+    Session(*mut RSession), // Session access permits allocation.
+    Heap(*const RHeap),     // Heap access permits reads.
     Released,               // C is running; the next API call re-enters with the published mode
 }
 ```
@@ -256,7 +262,8 @@ Rules:
 - **Publish and restore.** `call_foreign(ctx, …)` publishes a pointer derived from the caller's current `&mut Ctx` reborrow, sets `Released`, calls the trampoline, and restores the previous mode. The Rust caller sits above the setjmp point, so a jump never skips the restore.
 - **Per-call reborrow.** Each API call does `with_cx(min_mode)`: it reborrows `&mut *p` (or `&*p`) for the duration of that call only, and sets `Borrowed`. A second reborrow while `Borrowed` means a capi bug. It aborts with a diagnostic and never aliases.
 - **Callbacks into C.** An API function that calls back into C (for example `Rf_eval` → R → `.Call`) re-publishes from its **own** reborrow through `call_foreign`. Borrows therefore nest correctly under Stacked Borrows.
-- **Mode minimum.** Each manifest row declares `min_mode`. Calling an allocating function in `Heap` mode raises `R API function '<fn>' allocates and cannot run inside an ALTREP method called from a read-only context`.
+- **Mode minimum.** Each manifest row declares the `min_mode` for its C API function.
+- **Foreign ALTREP callbacks.** The evaluator calls `NativeHooks::altrep(&mut Ctx, AltOp)` before it borrows a `VecView`. All C ALTREP callbacks run inside `FrameKind::Method` with `Mode::Full`. A live `VecView` borrow prevents the mutable context borrow that the hook requires. The callback path needs no separate `Heap` or `Session` ceiling.
 - **Process singleton (ADR-0019).** Exactly one capi-enabled `Ctx` exists per process. After the first `dyn.load`, `NativeHooks` binds to that session. Another `Ctx` that calls `dyn.load` gets an error. **Compiled `R CMD INSTALL` uses subprocesses for the build and test-load steps** (§3.5). GNU R does the same.
 
 ### 2.5 Finalizers and weak references (W0 `roxide-gc` contract)

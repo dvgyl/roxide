@@ -248,7 +248,19 @@ All major architectural contracts and deviations from `docs/ARCHITECTURE.md` are
   - Track active C-API access in thread-local `Mode { Full, Session, Heap, Released }` with single-owner reborrowing per C entry point and immediate abort on main-thread double-borrow or unauthorized non-main-thread API calls (allowing read-only worker access only while the main thread is `Released`).
   - Move the unified ephemeron finalizer & `WEAKREFSXP` registry into `roxide-gc` (supporting both `FinalizerKind::RClosure(SexpId)` and `FinalizerKind::Native(usize)` while keeping `roxide-gc` `#![forbid(unsafe_code)]`). Finalizers drain strictly at evaluator safepoints (`Ctx::run_pending_finalizers`), never inside `collect_gc`.
   - Enforce GNU R's protect-stack limit (`50_000`), `unprotect_ptr`, and trampoline protect-mark restoration with exact stack-imbalance warnings.
-  - Enforce the single-authority rule for foreign ALTREP objects: `roxide-value` stores opaque `ForeignAltObj` (`class_id`, `base_type`, `data1`, `data2`) traced by GC while `roxide-capi` dispatches foreign method tables exclusively.
+
+### Wave 3 foreign ALTREP contract for seam C7
+
+A foreign ALTREP object stores `AltKind::Foreign(ForeignAlt)` in its `AltObj`. It starts in the Lazy state with `materialized = None`. Materialization changes it to the Owned state with `materialized = Some`. This transition occurs at most once.
+
+`roxide-value` never calls C. When a read of a Lazy foreign object needs a C method, it returns `ValueError::ForeignAltrep { id, need }`. The evaluator dispatches C ALTREP callbacks through `NativeHooks::altrep(&mut Ctx, AltOp)` before it borrows a `VecView`. Each callback runs inside `FrameKind::Method` with `Mode::Full`. The Rust borrow checker prevents C re-entry while a `VecView` is borrowed. The callback path needs no separate `Heap` or `Session` ceiling.
+
+An `R_altrep_class_t { SEXP ptr }` holds an `EXTPTRSXP` descriptor. Its `tag` is the class `Sym`, its `prot` is the package `Sym`, and its `addr` is the index in the `CtxExt` method table plus one. Roxide creates stable, rooted descriptors on demand for built-in classes such as `compact_intseq` and `wrap_integer`.
+
+Roxide differs from GNU R in two ways.
+
+- Roxide seals the length after the first `Length` call.
+- Once the object is Owned, Roxide owns the single Rust buffer and stops calling C class methods for that object. Direct writes to `data2` that bypass `DATAPTR` have no effect on the Owned buffer.
 
 ---
 
