@@ -9,13 +9,14 @@ use roxide_capi::cx::{with_ctx_entered, with_full, with_heap, with_session};
 use roxide_capi::globals::{R_NilValue, R_TrueValue};
 use roxide_capi::jump::{
     FrameKind, Rf_protect, Rf_unprotect, VoidFn, boundary, enter_trampoline, enter_trampoline_with,
+    set_altrep_resolver,
 };
 use roxide_eval::{
     ArgEval, Args, Arity, Call, Ctx, Dispatch, EvalResult, Module, PrimDef, PrimKind, Visibility,
 };
-use roxide_gc::GcPolicy;
+use roxide_gc::{GcPolicy, SexpId};
 use roxide_host::PureHost;
-use roxide_value::{GLOBAL_ENV, SEXP_NIL, SexpType, ValueApi};
+use roxide_value::{AltNeed, GLOBAL_ENV, SEXP_NIL, SexpType, ValueApi, ValueError};
 
 #[link(name = "roxide_capi_fixture", kind = "static")]
 unsafe extern "C" {
@@ -42,6 +43,10 @@ unsafe extern "C" {
     fn rx_test_utf8_long_error(data: *mut c_void);
     fn rx_test_big_print(data: *mut c_void);
     fn rx_test_double_continue(data: *mut c_void);
+}
+
+unsafe extern "C" {
+    fn rox_capi_alt_fill_int_elt(data: *mut c_void);
 }
 
 fn each_policy(mut test: impl FnMut(&mut Ctx)) {
@@ -106,6 +111,184 @@ fn method_restores_protections_silently_and_keeps_transient_storage() {
         });
         assert!(stderr.is_empty(), "{stderr}");
         assert_eq!(saved, 42);
+    });
+}
+
+#[repr(C)]
+struct FillIntElt {
+    fun: extern "C" fn(Sexp, isize) -> c_int,
+    x: Sexp,
+    len: isize,
+    out: *mut c_int,
+}
+
+extern "C" fn int_elt(x: Sexp, index: isize) -> c_int {
+    if x == R_TrueValue {
+        10 + index as c_int
+    } else {
+        0
+    }
+}
+
+#[test]
+fn bulk_int_elt_fills_the_buffer_in_one_method_frame() {
+    each_policy(|ctx| {
+        let mut out = [-1; 5];
+        let mut call = FillIntElt {
+            fun: int_elt,
+            x: R_TrueValue,
+            len: 4,
+            out: out.as_mut_ptr(),
+        };
+        // SAFETY: The call record matches the C layout and the buffer has four writable elements.
+        unsafe {
+            enter_trampoline_with(
+                ctx,
+                FrameKind::Method,
+                rox_capi_alt_fill_int_elt,
+                from_mut(&mut call).cast(),
+            )
+        }
+        .unwrap();
+        assert_eq!(out, [10, 11, 12, 13, -1]);
+    });
+}
+
+struct AltrepProbe {
+    id: SexpId,
+    need: AltNeed,
+    attempts: usize,
+    result: usize,
+}
+
+unsafe extern "C" fn probe_altrep(data: *mut c_void) {
+    // SAFETY: The caller supplies a live probe and an active trampoline.
+    unsafe {
+        let result = boundary(0, |ctx| {
+            let probe = &mut *data.cast::<AltrepProbe>();
+            probe.attempts += 1;
+            match probe.need {
+                AltNeed::Length => Ok(ctx.session().xlength(probe.id)?),
+                AltNeed::Payload => Ok(ctx.session().int(probe.id)?.iter().count()),
+            }
+        });
+        (*data.cast::<AltrepProbe>()).result = result;
+    }
+}
+
+fn seal_altrep_length(ctx: &mut Ctx, id: SexpId, _: AltNeed) -> EvalResult<()> {
+    ctx.session_mut().seal_foreign_alt_len(id, 3)?;
+    Ok(())
+}
+
+fn resolve_altrep_probe(ctx: &mut Ctx, id: SexpId, need: AltNeed) -> EvalResult<()> {
+    match need {
+        AltNeed::Length => seal_altrep_length(ctx, id, need),
+        AltNeed::Payload => {
+            let owned = ctx.session_mut().alloc_int_from(&[10, 11, 12])?;
+            ctx.session_mut().adopt_foreign_alt_payload(id, owned)?;
+            Ok(())
+        }
+    }
+}
+
+fn alloc_altrep_probe(ctx: &mut Ctx, need: AltNeed) -> AltrepProbe {
+    let session = ctx.session_mut();
+    let class = session.alloc_extptr(0, SEXP_NIL, SEXP_NIL).unwrap();
+    session.heap.protect(class);
+    let id = session
+        .alloc_foreign_alt(class, SexpType::Int, SEXP_NIL, SEXP_NIL)
+        .unwrap();
+    session.heap.unprotect(1).unwrap();
+    AltrepProbe {
+        id,
+        need,
+        attempts: 0,
+        result: 0,
+    }
+}
+
+#[test]
+fn boundary_retries_once_after_length_or_payload_becomes_available() {
+    each_policy(|ctx| {
+        set_altrep_resolver(ctx, Some(resolve_altrep_probe));
+        for need in [AltNeed::Length, AltNeed::Payload] {
+            let mut probe = alloc_altrep_probe(ctx, need);
+            // SAFETY: The probe stays live during the call.
+            unsafe { enter_trampoline(ctx, probe_altrep, from_mut(&mut probe).cast()) }.unwrap();
+            assert_eq!(probe.attempts, 2);
+            assert_eq!(probe.result, 3);
+        }
+    });
+}
+
+#[test]
+fn boundary_signals_an_error_when_the_payload_stays_lazy() {
+    each_policy(|ctx| {
+        for resolver in [
+            None,
+            Some(seal_altrep_length as roxide_capi::jump::AltrepResolver),
+        ] {
+            set_altrep_resolver(ctx, resolver);
+            let mut probe = alloc_altrep_probe(ctx, AltNeed::Payload);
+            let expected = ValueError::ForeignAltrep {
+                id: probe.id,
+                need: probe.need,
+            }
+            .to_string();
+            let msg = ctx
+                .with_native_error_handler(
+                    |ctx| {
+                        // SAFETY: The probe stays live during the call.
+                        unsafe {
+                            enter_trampoline(ctx, probe_altrep, from_mut(&mut probe).cast())?
+                        };
+                        Ok(SEXP_NIL)
+                    },
+                    condition_message,
+                )
+                .unwrap();
+            assert_eq!(probe.attempts, 1);
+            assert_eq!(message(ctx, msg), expected);
+        }
+    });
+}
+
+unsafe extern "C" fn probe_altrep_length_then_payload(data: *mut c_void) {
+    // SAFETY: The caller supplies a live probe and an active trampoline.
+    unsafe {
+        boundary((), |ctx| {
+            let probe = &mut *data.cast::<AltrepProbe>();
+            probe.attempts += 1;
+            ctx.session().xlength(probe.id)?;
+            ctx.session().int(probe.id)?;
+            Ok(())
+        });
+    }
+}
+
+#[test]
+fn boundary_signals_an_error_on_a_second_altrep_request() {
+    each_policy(|ctx| {
+        set_altrep_resolver(ctx, Some(resolve_altrep_probe));
+        let mut probe = alloc_altrep_probe(ctx, AltNeed::Length);
+        let stderr = capture(ctx, |ctx| {
+            // SAFETY: The probe stays live during the call.
+            let result = unsafe {
+                enter_trampoline(
+                    ctx,
+                    probe_altrep_length_then_payload,
+                    from_mut(&mut probe).cast(),
+                )
+            };
+            assert!(result.is_err());
+        });
+        assert_eq!(probe.attempts, 2);
+        let expected = ValueError::ForeignAltrep {
+            id: probe.id,
+            need: AltNeed::Payload,
+        };
+        assert_eq!(stderr, format!("Error: {expected}\n"));
     });
 }
 

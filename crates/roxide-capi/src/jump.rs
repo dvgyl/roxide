@@ -8,7 +8,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use roxide_eval::{Ctx, CtxExt, EvalResult, InternalError, Transfer, Unwind};
 use roxide_gc::{ProtectIndex, SexpId, Trace, Tracer};
-use roxide_value::{SEXP_NIL, SexpType, ValueApi};
+use roxide_value::{AltNeed, SEXP_NIL, SexpType, ValueApi, ValueError};
 
 use crate::abi::{Rboolean, Sexp};
 use crate::api::memory::{release_transient_frame, save_transient_frame};
@@ -111,13 +111,77 @@ fn catch_api_panic<R>(f: impl FnOnce() -> EvalResult<R>) -> EvalResult<R> {
     })
 }
 
+/// Resolve a foreign ALTREP length or payload request for a rooted object.
+pub type AltrepResolver = fn(&mut Ctx, SexpId, AltNeed) -> EvalResult<()>;
+
+#[derive(Default)]
+struct AltrepRetry(Option<AltrepResolver>);
+
+impl Trace for AltrepRetry {
+    fn trace(&self, _: &mut Tracer<'_>) {}
+}
+
+impl CtxExt for AltrepRetry {}
+
+/// Set the resolver for foreign ALTREP requests at the C API boundary.
+pub fn set_altrep_resolver(ctx: &mut Ctx, resolver: Option<AltrepResolver>) {
+    ctx.ext::<AltrepRetry>().0 = resolver;
+}
+
+fn altrep_ready(ctx: &Ctx, id: SexpId, need: AltNeed) -> EvalResult<bool> {
+    Ok(ctx
+        .session()
+        .foreign_alt(id)?
+        .is_some_and(|info| match need {
+            AltNeed::Length => info.len.is_some(),
+            AltNeed::Payload => info.owned,
+        }))
+}
+
+fn resolve_altrep(ctx: &mut Ctx, id: SexpId, need: AltNeed) -> EvalResult<bool> {
+    let Some(resolve) = ctx.ext::<AltrepRetry>().0 else {
+        return Ok(false);
+    };
+    if altrep_ready(ctx, id, need)? {
+        return Ok(false);
+    }
+    ctx.scoped(|ctx| {
+        ctx.session_mut()
+            .heap
+            .try_protect(id)
+            .map_err(|err| ctx.stop(SEXP_NIL, err.to_string()))?;
+        resolve(ctx, id, need)?;
+        altrep_ready(ctx, id, need)
+    })
+}
+
 #[inline(never)]
-fn run<R: Copy>(f: impl FnOnce(&mut Ctx) -> EvalResult<R>) -> Result<R, c_int> {
-    catch_api_panic(|| cx::with_full(f)).map_err(cx::pend)
+fn run<R: Copy>(mut f: impl FnMut(&mut Ctx) -> EvalResult<R>) -> Result<R, c_int> {
+    catch_api_panic(move || {
+        cx::with_full(move |ctx| {
+            let result = f(ctx);
+            let Err(Unwind::Value(ValueError::ForeignAltrep { id, need })) = result else {
+                return result;
+            };
+            let result = match resolve_altrep(ctx, id, need) {
+                Ok(true) => f(ctx),
+                Ok(false) => Err(ValueError::ForeignAltrep { id, need }.into()),
+                Err(err) => Err(err),
+            };
+            match result {
+                Err(Unwind::Value(err)) => Err(ctx.stop(SEXP_NIL, err.to_string())),
+                result => result,
+            }
+        })
+    })
+    .map_err(cx::pend)
 }
 
 /// Run one C API operation. On error, release Rust borrows and jump to the
 /// current foreign trampoline.
+///
+/// The operation can run twice if it requests a foreign ALTREP length or
+/// payload. Return that request before any effects that must occur only once.
 ///
 /// # Safety
 ///
@@ -126,7 +190,7 @@ fn run<R: Copy>(f: impl FnOnce(&mut Ctx) -> EvalResult<R>) -> Result<R, c_int> {
 #[inline(always)]
 pub unsafe fn boundary<R: Copy>(
     _default_on_jump: R,
-    f: impl FnOnce(&mut Ctx) -> EvalResult<R>,
+    f: impl FnMut(&mut Ctx) -> EvalResult<R>,
 ) -> R {
     match run(f) {
         Ok(value) => value,
@@ -693,7 +757,7 @@ unsafe fn formatted_condition(
     ptr: *const c_char,
     len: usize,
     name: &str,
-    signal: impl FnOnce(&mut Ctx, SexpId, &str) -> EvalResult<()>,
+    signal: fn(&mut Ctx, SexpId, &str) -> EvalResult<()>,
 ) -> c_int {
     run(|ctx| {
         let id = id(ctx, call, name)?;

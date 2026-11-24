@@ -4,6 +4,8 @@ fn main() {
     println!("cargo:rerun-if-changed=csrc/shim.cc");
     println!("cargo:rerun-if-changed=csrc/shim_va.c");
     println!("cargo:rerun-if-changed=csrc/dotcall.c");
+    println!("cargo:rerun-if-changed=csrc/altrep.c");
+    println!("cargo:rerun-if-changed=include");
 
     cc::Build::new()
         .std("c11")
@@ -12,6 +14,12 @@ fn main() {
         .file("csrc/shim_va.c")
         .file("csrc/dotcall.c")
         .compile("roxide_capi_va");
+    cc::Build::new()
+        .std("c11")
+        .include("include")
+        .flag_if_supported("-w")
+        .file("csrc/altrep.c")
+        .compile("roxide_capi_altrep");
     cc::Build::new()
         .cpp(true)
         .std("c++17")

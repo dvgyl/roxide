@@ -33,15 +33,16 @@ pub mod linpack;
 pub mod optim_integrate;
 
 use roxide_eval::{Ctx, EvalResult, Unwind};
-use roxide_value::{SEXP_NIL, Sym, ValueApi};
+use roxide_value::{SEXP_NIL, Sym, ValueApi, ValueError};
 
 use crate::{abi::Sexp, jump};
 
-unsafe fn api<R: Copy>(fallback: R, f: impl FnOnce(&mut Ctx) -> EvalResult<R>) -> R {
+unsafe fn api<R: Copy>(fallback: R, mut f: impl FnMut(&mut Ctx) -> EvalResult<R>) -> R {
     // SAFETY: All callers require an active native trampoline.
     unsafe {
-        jump::boundary(fallback, |ctx| {
+        jump::boundary(fallback, move |ctx| {
             ctx.scoped(|ctx| match f(ctx) {
+                request @ Err(Unwind::Value(ValueError::ForeignAltrep { .. })) => request,
                 Err(Unwind::Value(err)) => Err(ctx.stop(SEXP_NIL, err.to_string())),
                 result => result,
             })
