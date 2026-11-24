@@ -6,6 +6,7 @@
 //! and subprocess execution route through [`Host`] so tests and embeddings run
 //! deterministically without touching the host OS.
 
+mod forward;
 pub mod native;
 pub mod pure;
 
