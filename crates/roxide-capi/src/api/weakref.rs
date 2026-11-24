@@ -1,29 +1,12 @@
 //! Weak references and their finalizers.
 
-use std::collections::HashSet;
-
-use roxide_eval::{Ctx, CtxExt, EvalResult};
-use roxide_gc::{FinalizerKind, SexpId, Trace, Tracer};
+use roxide_eval::{Ctx, EvalResult};
+use roxide_gc::FinalizerKind;
 use roxide_value::{GLOBAL_ENV, SEXP_NIL};
 
 use super::extptr::{CFinalizer, closure_finalizer, native_finalizer};
 use super::vector::{allocating, api, id};
 use crate::abi::{Rboolean, Sexp};
-
-#[derive(Default)]
-struct FinalizedWeakRefs(HashSet<SexpId>);
-
-impl CtxExt for FinalizedWeakRefs {}
-impl Trace for FinalizedWeakRefs {
-    fn trace(&self, _: &mut Tracer<'_>) {}
-}
-
-fn clear_reference(ctx: &mut Ctx, x: SexpId) {
-    let mut cleared = std::mem::take(&mut ctx.ext::<FinalizedWeakRefs>().0);
-    cleared.retain(|&reference| ctx.session().heap.get(reference).is_ok());
-    cleared.insert(x);
-    ctx.ext::<FinalizedWeakRefs>().0 = cleared;
-}
 
 fn make(
     ctx: &mut Ctx,
@@ -40,6 +23,9 @@ fn make(
     };
     allocating(ctx, &[key, value, closure], |ctx| {
         let value = if key == SEXP_NIL { SEXP_NIL } else { value };
+        if let Some(kind) = finalizer {
+            crate::dll::remember_finalizer(ctx, key, kind)?;
+        }
         Ok(Sexp::from_id(ctx.session_mut().alloc_weakref(
             key,
             value,
@@ -66,17 +52,13 @@ api! {
     fn R_WeakRefKey(reference: Sexp) -> Sexp = Sexp::NULL; |ctx| {
         let x = id(ctx, reference, "R_WeakRefKey")?;
         let key = ctx.session().weakref_key(x)?;
-        let cleared = ctx.ext::<FinalizedWeakRefs>().0.contains(&x);
-        Ok(Sexp::from_id(if cleared { SEXP_NIL } else { key }))
+        Ok(Sexp::from_id(key))
     }
 
     /// Return the value associated with a live weak key.
     fn R_WeakRefValue(reference: Sexp) -> Sexp = Sexp::NULL; |ctx| {
         let x = id(ctx, reference, "R_WeakRefValue")?;
         let value = ctx.session().weakref_value(x)?;
-        if ctx.ext::<FinalizedWeakRefs>().0.contains(&x) {
-            return Ok(Sexp::from_id(SEXP_NIL));
-        }
         ctx.session_mut().heap.mark_immutable(value);
         Ok(Sexp::from_id(value))
     }
@@ -88,7 +70,7 @@ api! {
         let Some(entry) = ctx.session_mut().heap.remove_weakref(x) else {
             return Ok(());
         };
-        clear_reference(ctx, x);
+        ctx.session_mut().clear_weakref(x)?;
         let visible = ctx.is_visible();
         let result = ctx.scoped(|ctx| {
             ctx.protect(entry.key);

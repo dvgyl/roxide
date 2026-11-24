@@ -28,7 +28,7 @@ fn make(ctx: &mut Ctx, address: usize, tag: Sexp, protect: Sexp) -> EvalResult<S
 pub(super) fn native_finalizer(fun: CFinalizer) -> Option<FinalizerKind> {
     fun.map(|fun| FinalizerKind::Native {
         fun: fun as usize,
-        dll: 0,
+        dll: crate::dll::dll_id_for_addr(fun as usize),
     })
 }
 
@@ -57,6 +57,7 @@ fn register(
         ));
     }
     if let Some(kind) = kind {
+        crate::dll::remember_finalizer(ctx, target, kind)?;
         ctx.session_mut()
             .heap
             .register_finalizer(target, kind, onexit != 0);
