@@ -15,7 +15,11 @@ extern int rox_capi_warningcall_str(Sexp, const char *, size_t);
 extern int rox_capi_rprintf_str(const char *, size_t);
 extern int rox_capi_reprintf_str(const char *, size_t);
 
-enum { buffer_size = 8192, print_limit = 1024 * 1024 };
+enum {
+    buffer_size = 8192,
+    condition_limit = 64 * 1024,
+    print_limit = 64 * 1024 * 1024
+};
 
 enum output { error, error_call, warning, warning_call, standard_out, standard_err };
 
@@ -31,8 +35,11 @@ static int emit(enum output dest, Sexp call, const char *format, va_list args) {
     }
     char *buf = stack;
     size_t size = (size_t)length < sizeof(stack) ? (size_t)length : sizeof(stack) - 1;
-    if (length >= buffer_size && (dest == standard_out || dest == standard_err)) {
-        size_t capacity = (size_t)length < print_limit ? (size_t)length + 1 : print_limit;
+    if (length >= buffer_size) {
+        size_t max_cap = (dest == standard_out || dest == standard_err)
+                             ? (size_t)print_limit
+                             : (size_t)condition_limit;
+        size_t capacity = (size_t)length < max_cap ? (size_t)length + 1 : max_cap;
         char *heap = malloc(capacity);
         if (heap != NULL) {
             va_copy(copy, args);

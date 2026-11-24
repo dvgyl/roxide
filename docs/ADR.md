@@ -235,7 +235,8 @@ All major architectural contracts and deviations from `docs/ARCHITECTURE.md` are
 - **Decision:**
   - Every Rust→C call (`.Call`, `.External`, `.C`, `.Fortran`, package `R_init_*`, C finalizers, foreign ALTREP callbacks) enters through a small clean-room C++ trampoline (`crates/roxide-capi/csrc/shim.cc`) combining `sigsetjmp` with a `try { ... } catch (...)` wall so C++ exceptions never cross into Rust and are translated into R errors.
   - Every C→Rust entry point uses a panic-free `boundary()` helper that catches panics via `std::panic::catch_unwind`, records any `Unwind` in a depth-indexed pending-unwind slot, drops all Rust locals cleanly, and invokes a plain-old-frame `longjmp` tail (never using `extern "C-unwind"`).
-  - Support `R_UnwindProtect`, `R_MakeUnwindCont`, and `R_ContinueUnwind` cleanly via an `EXTPTRSXP` continuation token carrying the pending unwind depth, preserving C++ RAII cleanup semantics.
+  - Support `R_UnwindProtect`, `R_MakeUnwindCont`, and `R_ContinueUnwind` cleanly via a `LISTSXP` (`CONS(R_NilValue, R_NilValue)`) continuation token backed by a GC-traced Rust `UnwindConts` stack per token (allowing nested reuse of static tokens and matching `SETCAR(token, R_NilValue)` as used by `cpp11`), preserving C++ RAII cleanup semantics.
+  - Divergence note: `Rf_unprotect(n)` underflowing the active entry frame's protect floor raises an R error rather than silently popping Rust-owned outer roots, preventing heap corruption while matching GNU R's stack-imbalance reporting on normal `.Call`/`.External`/`.C` exit.
 
 ---
 

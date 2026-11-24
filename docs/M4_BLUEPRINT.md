@@ -228,7 +228,7 @@ T0 → C → Rf_eval → R → .Call → T1 → C2 → Rf_error
 | `R_ToplevelExec(fun, data)` | Save the handler stack and hide it, then call `fun` through a trampoline. On `JUMPED`, print the error and return `FALSE`. Restore the handler stack in all cases. |
 | `R_tryCatchError`, `R_tryCatch`, `R_withCallingErrorHandler` | Install a Rust-level handler frame, then call the C body through a trampoline. On error, call the C handler through a trampoline. |
 | `R_ExecWithCleanup(fun, data, clean, cdata)` | Trampoline `fun`, always trampoline `clean`, and re-raise the pending unwind if `fun` jumped. |
-| `R_MakeUnwindCont()` | Allocate an `EXTPTRSXP` token (class `"rx_unwind_cont"`). Its Rust payload slot holds `Option<Unwind>` and is traced through `CapiState`. |
+| `R_MakeUnwindCont()` | Allocate a `LISTSXP` (`CONS(R_NilValue, R_NilValue)`, matching GNU R `TYPEOF == 2` so `cpp11` `SETCAR(token, R_NilValue)` succeeds). Its Rust payload stack (`Vec<UnwindCont>`) lives in `UnwindConts` keyed by `SexpId` and is traced through `CtxExt`. |
 | `R_UnwindProtect(fun, data, cleanfun, cdata, cont)` | See below. |
 | `R_ContinueUnwind(cont)` | Take the `Unwind` from the token, store it as pending, then call `roxide_jump()`. |
 | Rust panic inside capi | Caught in `run` and converted to `Unwind::Internal` with an R error `internal error in Roxide C API: <msg>`. Exported functions are `extern "C"` (no unwind), so any panic that escapes aborts. It never causes undefined behaviour. |

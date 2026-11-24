@@ -6,7 +6,7 @@ use std::ptr::{from_mut, null_mut};
 use roxide_capi::abi::Sexp;
 use roxide_capi::cx::{with_ctx_entered, with_full, with_heap, with_session};
 use roxide_capi::globals::{R_NilValue, R_TrueValue};
-use roxide_capi::jump::{VoidFn, boundary, enter_trampoline};
+use roxide_capi::jump::{FrameKind, VoidFn, boundary, enter_trampoline, enter_trampoline_with};
 use roxide_eval::{
     ArgEval, Args, Arity, Call, Ctx, Dispatch, EvalResult, Module, PrimDef, PrimKind, Visibility,
 };
@@ -29,6 +29,16 @@ unsafe extern "C" {
     fn rx_test_unwind_protect(data: *mut c_void);
     fn rx_test_catch(data: *mut c_void);
     fn rx_test_toplevel(data: *mut c_void);
+    fn rx_test_make_cont(data: *mut c_void);
+    fn rx_test_callback_keeps_protect(data: *mut c_void);
+    fn rx_test_nested_token_reuse(data: *mut c_void);
+    fn rx_test_warning(data: *mut c_void);
+    fn rx_test_errorcall(data: *mut c_void);
+    fn rx_test_invalid_continue(data: *mut c_void);
+    fn rx_test_error_in_cleanup(data: *mut c_void);
+    fn rx_test_utf8_long_error(data: *mut c_void);
+    fn rx_test_big_print(data: *mut c_void);
+    fn rx_test_double_continue(data: *mut c_void);
 }
 
 fn each_policy(mut test: impl FnMut(&mut Ctx)) {
@@ -397,10 +407,315 @@ fn reborrows_context_and_formats_long_messages() {
             )
             .unwrap();
         let result = message(ctx, result);
-        assert_eq!(result.len(), 8191);
+        assert_eq!(result.len(), 999);
         assert!(result.bytes().all(|byte| byte == b'0'));
         assert_eq!(R_NilValue.to_id(), Some(SEXP_NIL));
+
+        // UTF-8 boundary truncation: 4-byte emojis truncated to <= 999 -> 996 valid UTF-8 bytes.
+        let utf8_msg = ctx
+            .with_native_error_handler(
+                |ctx| {
+                    // SAFETY: Fixture ignores data.
+                    unsafe { enter_trampoline(ctx, rx_test_utf8_long_error, null_mut())? };
+                    Ok(SEXP_NIL)
+                },
+                condition_message,
+            )
+            .unwrap();
+        let utf8_msg = message(ctx, utf8_msg);
+        assert_eq!(utf8_msg.len(), 996);
+        assert!(utf8_msg.chars().all(|c| c == '\u{1F600}'));
+
+        // options(warning.length = 200) -> 199 bytes.
+        ctx.run_script("wl", "options(warning.length = 200L)", GLOBAL_ENV, false)
+            .unwrap();
+        let short_msg = ctx
+            .with_native_error_handler(
+                |ctx| {
+                    // SAFETY: Fixture ignores data.
+                    unsafe { enter_trampoline(ctx, rx_test_long_error, null_mut())? };
+                    Ok(SEXP_NIL)
+                },
+                condition_message,
+            )
+            .unwrap();
+        assert_eq!(message(ctx, short_msg).len(), 199);
+
+        // Large Rprintf (> 1 MiB) is not truncated.
+        let (_, big) = ctx
+            .capture_streams(true, false, false, |ctx| {
+                // SAFETY: Fixture ignores data.
+                unsafe { enter_trampoline(ctx, rx_test_big_print, null_mut()) }
+            })
+            .unwrap();
+        assert_eq!(big.len(), 1200 * 1024);
     });
+}
+
+#[repr(C)]
+struct NestedReuse {
+    cont: Sexp,
+    depth: c_int,
+    fail_inner: bool,
+    cleanups: *mut c_int,
+}
+
+#[test]
+fn unwind_cont_is_listsxp_callbacks_keep_protects_and_nested_reuse_works() {
+    each_policy(|ctx| {
+        // P0-1: R_MakeUnwindCont() returns a LISTSXP (TYPEOF == 2).
+        let mut cont = Sexp::NULL;
+        // SAFETY: Fixture writes a single Sexp.
+        unsafe { enter_trampoline(ctx, rx_test_make_cont, from_mut(&mut cont).cast()) }.unwrap();
+        assert_eq!(
+            ctx.session().type_of(cont.to_id().unwrap()).unwrap(),
+            SexpType::List
+        );
+
+        // P0-2: Callbacks keep protections on normal return with zero imbalance warnings.
+        let stderr = capture(ctx, |ctx| {
+            // SAFETY: Fixture ignores data.
+            unsafe { enter_trampoline(ctx, rx_test_callback_keeps_protect, null_mut()) }.unwrap();
+        });
+        assert!(stderr.is_empty(), "{stderr}");
+
+        // P1-2: Sequential and nested reuse of the exact same static token.
+        let mut cleanups = 0 as c_int;
+        let mut ok_state = NestedReuse {
+            cont: Sexp::NULL,
+            depth: 1,
+            fail_inner: false,
+            cleanups: from_mut(&mut cleanups),
+        };
+        // SAFETY: Fixture uses ok_state only during the call.
+        unsafe {
+            enter_trampoline(
+                ctx,
+                rx_test_nested_token_reuse,
+                from_mut(&mut ok_state).cast(),
+            )
+        }
+        .unwrap();
+        assert_eq!(cleanups, 4); // 2 levels * 2 sequential calls
+
+        let mut err_cleanups = 0 as c_int;
+        let mut err_state = NestedReuse {
+            cont: Sexp::NULL,
+            depth: 1,
+            fail_inner: true,
+            cleanups: from_mut(&mut err_cleanups),
+        };
+        let msg = ctx
+            .with_native_error_handler(
+                |ctx| {
+                    // SAFETY: Fixture uses err_state only during the call.
+                    unsafe {
+                        enter_trampoline(
+                            ctx,
+                            rx_test_nested_token_reuse,
+                            from_mut(&mut err_state).cast(),
+                        )?;
+                    }
+                    Ok(SEXP_NIL)
+                },
+                condition_message,
+            )
+            .unwrap();
+        assert_eq!(message(ctx, msg), "nested reuse error");
+        assert_eq!(err_cleanups, 20); // both inner (+10) and outer (+10) cleanups ran
+    });
+}
+
+#[test]
+fn warnings_errorcall_bad_continue_cleanup_error_and_labels() {
+    each_policy(|ctx| {
+        // Rf_warning normal return with warn = 1 (immediate).
+        ctx.run_script("warn1", "options(warn = 1L)", GLOBAL_ENV, false)
+            .unwrap();
+        let stderr = capture(ctx, |ctx| {
+            // SAFETY: Fixture ignores data.
+            unsafe { enter_trampoline(ctx, rx_test_warning, null_mut()) }.unwrap();
+        });
+        assert!(stderr.contains("native warn 7"), "{stderr}");
+
+        // Rf_warning upgrades to error under warn = 2.
+        ctx.run_script("warn2", "options(warn = 2L)", GLOBAL_ENV, false)
+            .unwrap();
+        let promoted = ctx
+            .with_native_error_handler(
+                |ctx| {
+                    // SAFETY: Fixture ignores data.
+                    unsafe { enter_trampoline(ctx, rx_test_warning, null_mut())? };
+                    Ok(SEXP_NIL)
+                },
+                condition_message,
+            )
+            .unwrap();
+        assert!(message(ctx, promoted).contains("native warn 7"));
+        ctx.run_script("warn0", "options(warn = 0L)", GLOBAL_ENV, false)
+            .unwrap();
+
+        // Rf_errorcall passes call object through.
+        let sym = ctx.session_mut().intern("myfn").unwrap().as_sexp();
+        let mut call_sexp = Sexp::from_id(ctx.session_mut().cons(sym, SEXP_NIL, SEXP_NIL).unwrap());
+        ctx.session_mut().heap.protect(call_sexp.to_id().unwrap());
+        let errcall_msg = ctx
+            .with_native_error_handler(
+                |ctx| {
+                    // SAFETY: call_sexp stays live during the call.
+                    unsafe {
+                        enter_trampoline(ctx, rx_test_errorcall, from_mut(&mut call_sexp).cast())?;
+                    }
+                    Ok(SEXP_NIL)
+                },
+                condition_message,
+            )
+            .unwrap();
+        assert_eq!(message(ctx, errcall_msg), "call err 9");
+        ctx.session_mut().heap.unprotect(1).unwrap();
+
+        // Invalid and double R_ContinueUnwind raise clean R errors.
+        let inv_msg = ctx
+            .with_native_error_handler(
+                |ctx| {
+                    // SAFETY: Fixture ignores data.
+                    unsafe { enter_trampoline(ctx, rx_test_invalid_continue, null_mut())? };
+                    Ok(SEXP_NIL)
+                },
+                condition_message,
+            )
+            .unwrap();
+        assert!(
+            message(ctx, inv_msg).contains("R_ContinueUnwind"),
+            "{}",
+            message(ctx, inv_msg)
+        );
+        #[repr(C)]
+        struct DoubleContinue {
+            cont: Sexp,
+            phase: c_int,
+        }
+        let cont_id = ctx
+            .session_mut()
+            .cons(SEXP_NIL, SEXP_NIL, SEXP_NIL)
+            .unwrap();
+        ctx.session_mut().heap.protect(cont_id);
+        let mut dc = DoubleContinue {
+            cont: Sexp::from_id(cont_id),
+            phase: 0,
+        };
+        let first_msg = ctx
+            .with_native_error_handler(
+                |ctx| {
+                    // SAFETY: dc stays live for the duration of the call.
+                    unsafe {
+                        enter_trampoline(ctx, rx_test_double_continue, from_mut(&mut dc).cast())?;
+                    }
+                    Ok(SEXP_NIL)
+                },
+                condition_message,
+            )
+            .unwrap();
+        assert_eq!(message(ctx, first_msg), "native error 42");
+        dc.phase = 1;
+        let second_msg = ctx
+            .with_native_error_handler(
+                |ctx| {
+                    // SAFETY: dc.cont is protected and non-null.
+                    unsafe {
+                        enter_trampoline(ctx, rx_test_double_continue, from_mut(&mut dc).cast())?;
+                    }
+                    Ok(SEXP_NIL)
+                },
+                condition_message,
+            )
+            .unwrap();
+        ctx.session_mut().heap.unprotect(1).unwrap();
+        assert!(
+            message(ctx, second_msg).contains("R_ContinueUnwind"),
+            "{}",
+            message(ctx, second_msg)
+        );
+
+        // Rf_error inside a jump=1 cleanup replaces the error cleanly.
+        let clean_msg = ctx
+            .with_native_error_handler(
+                |ctx| {
+                    // SAFETY: Fixture ignores data.
+                    unsafe { enter_trampoline(ctx, rx_test_error_in_cleanup, null_mut())? };
+                    Ok(SEXP_NIL)
+                },
+                condition_message,
+            )
+            .unwrap();
+        assert_eq!(message(ctx, clean_msg), "cleanup error");
+
+        // Custom entry label (e.g. .External) appears in stack-imbalance warning.
+        let ext_stderr = capture(ctx, |ctx| {
+            // SAFETY: Fixture ignores data.
+            unsafe {
+                enter_trampoline_with(
+                    ctx,
+                    FrameKind::Entry { label: ".External" },
+                    rx_test_imbalance,
+                    null_mut(),
+                )
+            }
+            .unwrap();
+        });
+        assert_eq!(
+            ext_stderr.trim(),
+            "Warning: stack imbalance in '.External', 0 then 1"
+        );
+    });
+}
+
+#[test]
+fn worker_thread_can_read_heap_while_main_thread_released() {
+    each_policy(|ctx| {
+        let val = ctx.session_mut().scalar_int(12345).unwrap();
+        ctx.session_mut().heap.protect(val);
+        with_ctx_entered(ctx, || {
+            let handle = std::thread::spawn(move || {
+                with_heap(|heap| heap.get(val).is_ok() && heap.protect_depth() == 1)
+            });
+            assert!(handle.join().unwrap());
+        });
+        ctx.session_mut().heap.unprotect(1).unwrap();
+    });
+}
+
+unsafe extern "C" fn recurse_depth(data: *mut c_void) {
+    // SAFETY: Invoked inside an active trampoline.
+    unsafe {
+        boundary((), |ctx| {
+            let remaining = &mut *data.cast::<usize>();
+            if *remaining == 0 {
+                return Ok(());
+            }
+            *remaining -= 1;
+            let mut next = *remaining;
+            enter_trampoline(ctx, recurse_depth, from_mut(&mut next).cast())
+        });
+    }
+}
+
+#[test]
+fn trampoline_depth_limit_raises_r_error() {
+    let mut ctx = Ctx::new(Box::new(PureHost::new()), GcPolicy::default()).unwrap();
+    let mut depth = 300usize;
+    let msg = ctx
+        .with_native_error_handler(
+            |ctx| {
+                // SAFETY: depth stays live during the call.
+                unsafe { enter_trampoline(ctx, recurse_depth, from_mut(&mut depth).cast())? };
+                Ok(SEXP_NIL)
+            },
+            condition_message,
+        )
+        .unwrap();
+    assert_eq!(message(&ctx, msg), "native trampoline depth limit exceeded");
+    assert_eq!(ctx.session().heap.protect_depth(), 0);
 }
 
 unsafe extern "C" fn panic_in_api(_: *mut c_void) {

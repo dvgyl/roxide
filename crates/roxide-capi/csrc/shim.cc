@@ -26,13 +26,18 @@ thread_local int depth = 0;
 enum Status { ok, jumped, cpp_exception, depth_limit };
 }
 
-extern "C" int rox_capi_trampoline(Callback fn, void *arg, int *out_code,
-                                    char *cpp_err_buf, size_t cpp_err_cap) noexcept {
+extern "C" int rox_capi_trampoline(Callback fn, void *arg, int expected_depth,
+                                    int *out_code, char *cpp_err_buf,
+                                    size_t cpp_err_cap) noexcept {
+    if (depth != expected_depth) {
+        std::fputs("Roxide C API trampoline depth mismatch\n", stderr);
+        std::abort();
+    }
     if (depth == max_depth) {
         return depth_limit;
     }
     const int slot = depth++;
-    const int code = sigsetjmp(targets[slot], 1);
+    const int code = sigsetjmp(targets[slot], 0);
     if (code != 0) {
         depth = slot;
         *out_code = code;
@@ -130,6 +135,8 @@ Sexp R_UnwindProtect(Body fn, void *data, Cleanup clean, void *clean_data, Sexp 
 
 extern "C" {
 [[noreturn]] void Rf_error(const char *, ...);
+[[noreturn]] void Rf_errorcall(Sexp, const char *, ...);
+void Rf_warning(const char *, ...);
 void Rprintf(const char *, ...);
 void REprintf(const char *, ...);
 Sexp Rf_protect(Sexp);
@@ -291,6 +298,144 @@ void rx_test_toplevel(void *data) {
     auto *values = static_cast<int *>(data);
     values[0] = R_ToplevelExec(rx_test_error, nullptr);
     values[1] = R_ToplevelExec([](void *) {}, nullptr);
+}
+
+void rx_test_make_cont(void *data) {
+    *static_cast<Sexp *>(data) = R_MakeUnwindCont();
+}
+
+static Sexp rx_test_protect_body(void *) {
+    return Rf_protect(R_TrueValue);
+}
+
+static void rx_test_protect_void(void *) {
+    Rf_protect(R_TrueValue);
+}
+
+void rx_test_callback_keeps_protect(void *) {
+    Sexp cont = Rf_protect(R_MakeUnwindCont());
+    Sexp res = R_UnwindProtect(rx_test_protect_body, nullptr, nullptr, nullptr, cont);
+    (void)res;
+    Rf_unprotect(1); // unprotects value protected inside R_UnwindProtect body
+    int ok = R_ToplevelExec(rx_test_protect_void, nullptr);
+    (void)ok;
+    Rf_unprotect(1); // unprotects value protected inside R_ToplevelExec callback
+    Rf_unprotect(1); // unprotects cont
+}
+
+struct NestedReuse {
+    Sexp cont;
+    int depth;
+    bool fail_inner;
+    int *cleanups;
+};
+
+static void rx_test_nested_reuse_clean(void *data, int jumping) {
+    auto *state = static_cast<NestedReuse *>(data);
+    *state->cleanups += jumping ? 10 : 1;
+}
+
+static Sexp rx_test_nested_reuse_body(void *data) {
+    auto *state = static_cast<NestedReuse *>(data);
+    if (state->depth == 0) {
+        if (state->fail_inner) {
+            Rf_error("nested reuse error");
+        }
+        return R_TrueValue;
+    }
+    NestedReuse inner{state->cont, state->depth - 1, state->fail_inner, state->cleanups};
+    return R_UnwindProtect(
+        rx_test_nested_reuse_body, &inner, rx_test_nested_reuse_clean, &inner, state->cont);
+}
+
+void rx_test_nested_token_reuse(void *data) {
+    auto *state = static_cast<NestedReuse *>(data);
+    state->cont = Rf_protect(R_MakeUnwindCont());
+    // Sequential reuse + nested reuse on the exact same token.
+    R_UnwindProtect(rx_test_nested_reuse_body, state, rx_test_nested_reuse_clean, state, state->cont);
+    if (!state->fail_inner) {
+        R_UnwindProtect(
+            rx_test_nested_reuse_body, state, rx_test_nested_reuse_clean, state, state->cont);
+    }
+    Rf_unprotect(1);
+}
+
+void rx_test_warning(void *) {
+    Rf_warning("native warn %d", 7);
+}
+
+void rx_test_errorcall(void *data) {
+    Sexp call = *static_cast<Sexp *>(data);
+    Rf_errorcall(call, "call err %d", 9);
+}
+
+void rx_test_invalid_continue(void *) {
+    R_ContinueUnwind(R_NilValue);
+}
+
+static void rx_test_error_in_clean_cb(void *, int jumping) {
+    if (jumping) {
+        Rf_error("cleanup error");
+    }
+}
+
+void rx_test_error_in_cleanup(void *) {
+    Sexp cont = Rf_protect(R_MakeUnwindCont());
+    R_UnwindProtect(rx_test_catch_body, nullptr, rx_test_error_in_clean_cb, nullptr, cont);
+    Rf_unprotect(1);
+}
+
+void rx_test_utf8_long_error(void *) {
+    char buf[1200];
+    int n = 0;
+    while (n + 4 < 1100) {
+        buf[n++] = static_cast<char>(0xF0);
+        buf[n++] = static_cast<char>(0x9F);
+        buf[n++] = static_cast<char>(0x98);
+        buf[n++] = static_cast<char>(0x80);
+    }
+    buf[n] = '\0';
+    Rf_error("%s", buf);
+}
+
+void rx_test_big_print(void *) {
+    const size_t n = 1200 * 1024;
+    char *buf = static_cast<char *>(std::malloc(n + 1));
+    if (buf == nullptr) {
+        Rf_error("oom");
+    }
+    for (size_t i = 0; i < n; ++i) {
+        buf[i] = 'x';
+    }
+    buf[n] = '\0';
+    Rprintf("%s", buf);
+    std::free(buf);
+}
+
+struct DoubleContinue {
+    Sexp cont;
+    int phase;
+};
+
+void rx_test_double_continue(void *data) {
+    auto *dc = static_cast<DoubleContinue *>(data);
+    if (dc->phase != 0) {
+        R_ContinueUnwind(dc->cont);
+    }
+    sigjmp_buf target;
+    struct State {
+        sigjmp_buf *target;
+    } state{&target};
+    auto clean = [](void *d, int jumping) {
+        auto *s = static_cast<State *>(d);
+        if (jumping) {
+            siglongjmp(*s->target, 1);
+        }
+    };
+    if (sigsetjmp(target, 0) == 0) {
+        R_UnwindProtect(rx_test_catch_body, nullptr, clean, &state, dc->cont);
+    }
+    R_ContinueUnwind(dc->cont);
 }
 }
 #endif

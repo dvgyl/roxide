@@ -8,10 +8,10 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use roxide_eval::{Ctx, CtxExt, EvalResult, InternalError, Transfer, Unwind};
 use roxide_gc::{ProtectIndex, SexpId, Trace, Tracer};
-use roxide_value::{SEXP_NIL, SYM_CLASS, ValueApi};
+use roxide_value::{SEXP_NIL, SexpType, ValueApi};
 
 use crate::abi::{Rboolean, Sexp};
-use crate::cx::{self, ActiveFrame};
+use crate::cx::{self, ActiveFrame, Mode};
 use crate::globals::R_NilValue;
 
 /// Foreign callback with no return value.
@@ -22,6 +22,20 @@ pub type BodyFn = unsafe extern "C" fn(*mut c_void) -> Sexp;
 pub type CleanupFn = unsafe extern "C" fn(*mut c_void, Rboolean);
 /// Foreign handler that receives an R condition.
 pub type HandlerFn = unsafe extern "C" fn(Sexp, *mut c_void) -> Sexp;
+
+/// Kind of native trampoline frame controlling protect-stack handling on normal return.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameKind {
+    /// Foreign routine entry point (`.Call`, `.External`, `.C`, `.Fortran`, `R_init_*`).
+    /// Restores the protect stack on normal return and warns on imbalance.
+    Entry {
+        /// Display name reported in stack-imbalance warnings (e.g. `".Call"`).
+        label: &'static str,
+    },
+    /// Nested callback (`R_UnwindProtect` body/cleanup, `R_ToplevelExec`, `R_tryCatchError`).
+    /// Inherits the enclosing protect floor and keeps protections made before normal return.
+    Callback,
+}
 
 #[repr(C)]
 struct BodyCall {
@@ -59,6 +73,7 @@ unsafe extern "C" {
     fn rox_capi_trampoline(
         fun: VoidFn,
         data: *mut c_void,
+        expected_depth: c_int,
         out_code: *mut c_int,
         cpp_err_buf: *mut u8,
         cpp_err_cap: usize,
@@ -110,31 +125,52 @@ pub unsafe fn boundary<R: Copy>(
 ) -> R {
     match run(f) {
         Ok(value) => value,
-        // SAFETY: run has dropped the closure, borrows and owned values.
+        // SAFETY: run has dropped the closure, borrows and owned values, and
+        // verified that an active foreign trampoline sits directly below.
         Err(depth) => unsafe { rox_capi_longjmp(depth, 1) },
     }
 }
 
-/// Call a native void callback through a jump target and C++ exception handler.
+/// Call a native void callback through a `.Call` jump target and C++ exception handler.
 ///
 /// # Safety
 ///
 /// The callback and data must be valid for the call. The callback must obey
 /// the R API rules for non-local jumps and must not jump into Rust.
 pub unsafe fn enter_trampoline(ctx: &mut Ctx, fun: VoidFn, data: *mut c_void) -> EvalResult<()> {
-    let Some(frame) = ActiveFrame::push(&ctx.session().heap) else {
+    // SAFETY: Caller upholds callback and data validity.
+    unsafe { enter_trampoline_with(ctx, FrameKind::Entry { label: ".Call" }, fun, data) }
+}
+
+/// Call a native void callback through a jump target and C++ exception handler with
+/// explicit frame semantics (entry point vs nested callback).
+///
+/// # Safety
+///
+/// The callback and data must be valid for the call. The callback must obey
+/// the R API rules for non-local jumps and must not jump into Rust.
+pub unsafe fn enter_trampoline_with(
+    ctx: &mut Ctx,
+    kind: FrameKind,
+    fun: VoidFn,
+    data: *mut c_void,
+) -> EvalResult<()> {
+    let expected_depth = cx::depth() as c_int;
+    let inherit_floor = matches!(kind, FrameKind::Callback);
+    let Some(frame) = ActiveFrame::push(&ctx.session().heap, inherit_floor) else {
         return Err(ctx.signal_error_at(SEXP_NIL, "native trampoline depth limit exceeded"));
     };
     let depth = cx::depth();
     let mut jump_code = 0;
-    let mut exception = [0u8; 8192];
-    let status = cx::with_released(ctx, || {
+    let mut exception = [0u8; 512];
+    let status = cx::with_released(ctx, Mode::Full, || {
         // SAFETY: The caller supplies the callback and data. The output
         // buffers are live until the C++ trampoline returns.
         unsafe {
             rox_capi_trampoline(
                 fun,
                 data,
+                expected_depth,
                 &mut jump_code,
                 exception.as_mut_ptr(),
                 exception.len(),
@@ -142,29 +178,31 @@ pub unsafe fn enter_trampoline(ctx: &mut Ctx, fun: VoidFn, data: *mut c_void) ->
         }
     });
     let (mark, before) = frame.saved_mark();
-    let heap = &mut ctx.session_mut().heap;
-    let after = heap.protect_depth();
-    heap.unprotect_to(mark);
     let pending = frame.take_unwind();
     drop(frame);
-    ctx.ext::<UnwindConts>()
-        .0
-        .retain(|_, cont| cont.owner != depth);
+    ctx.ext::<UnwindConts>().drop_owner(depth);
 
     match status {
         0 => {
-            if before != after {
-                let _ = ctx.host().write_err(
-                    format!("Warning: stack imbalance in '.Call', {before} then {after}\n")
-                        .as_bytes(),
-                );
+            if let FrameKind::Entry { label } = kind {
+                let heap = &mut ctx.session_mut().heap;
+                let after = heap.protect_depth();
+                heap.unprotect_to(mark);
+                if before != after {
+                    let _ = ctx.host().write_err(
+                        format!("Warning: stack imbalance in '{label}', {before} then {after}\n")
+                            .as_bytes(),
+                    );
+                }
             }
             Ok(())
         }
         1 if jump_code == 1 => {
+            ctx.session_mut().heap.unprotect_to(mark);
             Err(pending.unwrap_or_else(|| internal("native jump without a pending unwind")))
         }
         2 => {
+            ctx.session_mut().heap.unprotect_to(mark);
             let bytes = exception.split(|&byte| byte == 0).next().unwrap_or(&[]);
             Err(ctx.signal_error_at(
                 SEXP_NIL,
@@ -174,7 +212,10 @@ pub unsafe fn enter_trampoline(ctx: &mut Ctx, fun: VoidFn, data: *mut c_void) ->
                 ),
             ))
         }
-        _ => Err(internal("invalid native trampoline status")),
+        _ => {
+            ctx.session_mut().heap.unprotect_to(mark);
+            Err(internal("invalid native trampoline status"))
+        }
     }
 }
 
@@ -187,8 +228,9 @@ fn call_body(ctx: &mut Ctx, fun: BodyFn, data: *mut c_void) -> EvalResult {
     // SAFETY: The C caller supplies the callback and data. The C++ adapter
     // uses this descriptor only while the trampoline is active.
     unsafe {
-        enter_trampoline(
+        enter_trampoline_with(
             ctx,
+            FrameKind::Callback,
             rox_capi_call_body,
             std::ptr::from_mut(&mut call).cast(),
         )?
@@ -346,49 +388,53 @@ struct UnwindCont {
 }
 
 #[derive(Default)]
-struct UnwindConts(HashMap<SexpId, UnwindCont>);
+struct UnwindConts {
+    tokens: HashMap<SexpId, Vec<UnwindCont>>,
+    /// Return values pinned across normal-return `R_UnwindProtect` cleanup callbacks
+    /// without perturbing the C protect stack.
+    pinned: Vec<SexpId>,
+}
+
+impl UnwindConts {
+    fn drop_owner(&mut self, owner: usize) {
+        self.tokens.retain(|_, stack| {
+            stack.retain(|cont| cont.owner != owner);
+            !stack.is_empty()
+        });
+    }
+}
 
 impl CtxExt for UnwindConts {}
 
 impl Trace for UnwindConts {
     fn trace(&self, tracer: &mut Tracer<'_>) {
-        for (&token, cont) in &self.0 {
+        for (&token, stack) in &self.tokens {
             tracer.edge(token);
-            if let Some(Unwind::Transfer { kind, .. }) = &cont.pending {
-                match *kind {
-                    Transfer::ExitingHandler { cond, .. } | Transfer::Return(cond) => {
-                        tracer.edge(cond);
+            for cont in stack {
+                if let Some(Unwind::Transfer { kind, .. }) = &cont.pending {
+                    match *kind {
+                        Transfer::ExitingHandler { cond, .. } | Transfer::Return(cond) => {
+                            tracer.edge(cond);
+                        }
+                        Transfer::Restart { restart, args } => {
+                            tracer.edge(restart);
+                            tracer.edge(args);
+                        }
+                        Transfer::Break | Transfer::Next => {}
                     }
-                    Transfer::Restart { restart, args } => {
-                        tracer.edge(restart);
-                        tracer.edge(args);
-                    }
-                    Transfer::Break | Transfer::Next => {}
                 }
             }
         }
+        tracer.edges(&self.pinned);
     }
-}
-
-fn token_tag() -> usize {
-    static TAG: u8 = 0;
-    std::ptr::from_ref(&TAG).addr()
 }
 
 fn make_cont(ctx: &mut Ctx) -> EvalResult {
     ctx.safepoint();
-    ctx.scoped(|ctx| {
-        let session = ctx.session_mut();
-        let token = session.alloc_extptr(token_tag(), SEXP_NIL, SEXP_NIL)?;
-        ctx.protect(token);
-        let session = ctx.session_mut();
-        let class = session.scalar_str("rx_unwind_cont")?;
-        session.set_attrib(token, SYM_CLASS, class)?;
-        Ok(token)
-    })
+    Ok(ctx.session_mut().cons(SEXP_NIL, SEXP_NIL, SEXP_NIL)?)
 }
 
-/// Allocate an external pointer that can hold a native unwind.
+/// Allocate a `LISTSXP` continuation token for `R_UnwindProtect` (`CONS(R_NilValue, R_NilValue)`).
 ///
 /// # Safety
 ///
@@ -410,13 +456,16 @@ pub unsafe extern "C" fn R_ContinueUnwind(cont: Sexp) -> ! {
     // SAFETY: The foreign caller must provide a trampoline.
     unsafe {
         boundary((), |ctx| {
-            let table = &mut ctx.ext::<UnwindConts>().0;
+            let table = &mut ctx.ext::<UnwindConts>().tokens;
             if let Some(token) = cont.to_id()
-                && let Some(entry) = table.get_mut(&token)
-                && entry.owner == cx::depth()
-                && let Some(unwind) = entry.pending.take()
+                && let Some(stack) = table.get_mut(&token)
+                && stack.last().is_some_and(|top| top.owner == cx::depth())
+                && let Some(unwind) = stack.last_mut().and_then(|top| top.pending.take())
             {
-                table.remove(&token);
+                stack.pop();
+                if stack.is_empty() {
+                    table.remove(&token);
+                }
                 return Err(unwind);
             }
             Err(ctx.stop(
@@ -439,26 +488,29 @@ unsafe extern "C" fn rox_capi_unwind_protect(call: *mut UnwindProtectCall) -> c_
                 make_cont(ctx)?
             } else {
                 let token = id(ctx, call.cont, "R_UnwindProtect")?;
-                if ctx.session().extptr_addr(token).ok() != Some(token_tag()) {
+                if ctx.session().type_of(token)? != SexpType::List {
                     return Err(ctx.stop(SEXP_NIL, "R_UnwindProtect: invalid continuation"));
                 }
                 token
             };
-            let table = &mut ctx.ext::<UnwindConts>().0;
-            if table.contains_key(&token) {
-                return Err(ctx.stop(SEXP_NIL, "R_UnwindProtect: continuation already active"));
-            }
-            table.insert(
-                token,
-                UnwindCont {
+            ctx.ext::<UnwindConts>()
+                .tokens
+                .entry(token)
+                .or_default()
+                .push(UnwindCont {
                     owner: cx::depth(),
                     pending: None,
-                },
-            );
+                });
             let result = call_body(ctx, fun, call.data);
             match result {
                 Ok(value) => {
-                    ctx.ext::<UnwindConts>().0.remove(&token);
+                    let tokens = &mut ctx.ext::<UnwindConts>().tokens;
+                    if let Some(stack) = tokens.get_mut(&token) {
+                        stack.pop();
+                        if stack.is_empty() {
+                            tokens.remove(&token);
+                        }
+                    }
                     call.result = Sexp::from_id(value);
                     if let Some(clean) = call.clean {
                         let mut cleanup = CleanupCall {
@@ -466,19 +518,25 @@ unsafe extern "C" fn rox_capi_unwind_protect(call: *mut UnwindProtectCall) -> c_
                             data: call.clean_data,
                             jumping: 0,
                         };
-                        ctx.scoped(|ctx| {
-                            ctx.protect(value);
-                            enter_trampoline(
-                                ctx,
-                                rox_capi_call_cleanup,
-                                std::ptr::from_mut(&mut cleanup).cast(),
-                            )
-                        })?;
+                        ctx.ext::<UnwindConts>().pinned.push(value);
+                        let clean_res = enter_trampoline_with(
+                            ctx,
+                            FrameKind::Callback,
+                            rox_capi_call_cleanup,
+                            std::ptr::from_mut(&mut cleanup).cast(),
+                        );
+                        ctx.ext::<UnwindConts>().pinned.pop();
+                        clean_res?;
                     }
                     Ok(0)
                 }
                 Err(unwind) => {
-                    let Some(entry) = ctx.ext::<UnwindConts>().0.get_mut(&token) else {
+                    let Some(entry) = ctx
+                        .ext::<UnwindConts>()
+                        .tokens
+                        .get_mut(&token)
+                        .and_then(|stack| stack.last_mut())
+                    else {
                         return Err(internal("native unwind continuation disappeared"));
                     };
                     entry.pending = Some(unwind);
@@ -507,17 +565,21 @@ pub unsafe extern "C" fn R_ToplevelExec(fun: Option<VoidFn>, data: *mut c_void) 
         boundary(0, |ctx| {
             let fun = checked_callback(ctx, fun, "R_ToplevelExec")?;
             ctx.with_native_toplevel(|ctx| {
-                let result = catch_api_panic(|| enter_trampoline(ctx, fun, data));
-                match &result {
+                let result =
+                    catch_api_panic(|| enter_trampoline_with(ctx, FrameKind::Callback, fun, data));
+                match result {
+                    Ok(()) => Ok(1),
+                    Err(quit @ Unwind::Quit { .. }) => Err(quit),
                     Err(Unwind::Internal(err)) => {
                         let _ = ctx.signal_error_at(SEXP_NIL, &err.message);
+                        Ok(0)
                     }
                     Err(Unwind::Value(err)) => {
                         let _ = ctx.signal_error_at(SEXP_NIL, &err.to_string());
+                        Ok(0)
                     }
-                    _ => {}
+                    Err(_) => Ok(0),
                 }
-                Ok(i32::from(result.is_ok()))
             })
         })
     }
@@ -550,8 +612,9 @@ pub unsafe extern "C" fn R_tryCatchError(
                         data: handler_data,
                         result: Sexp::NULL,
                     };
-                    enter_trampoline(
+                    enter_trampoline_with(
                         ctx,
+                        FrameKind::Callback,
                         rox_capi_call_handler,
                         std::ptr::from_mut(&mut call).cast(),
                     )?;
@@ -561,6 +624,38 @@ pub unsafe extern "C" fn R_tryCatchError(
             .map(Sexp::from_id)
         })
     }
+}
+
+fn warning_length_max_bytes(ctx: &mut Ctx) -> usize {
+    let raw = ctx
+        .option_value("warning.length")
+        .ok()
+        .flatten()
+        .and_then(|opt| match ctx.session().type_of(opt).ok()? {
+            SexpType::Int => ctx.session().int(opt).ok()?.iter().next().map(i64::from),
+            SexpType::Real => ctx
+                .session()
+                .real(opt)
+                .ok()?
+                .iter()
+                .next()
+                .filter(|v| v.is_finite())
+                .map(|v| v as i64),
+            _ => None,
+        })
+        .unwrap_or(1000);
+    (raw.clamp(100, 8170) as usize).saturating_sub(1)
+}
+
+fn truncate_utf8_bytes(text: &str, max_bytes: usize) -> &str {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
 }
 
 // The C shim releases its va_list and buffer before it jumps.
@@ -575,7 +670,10 @@ unsafe fn formatted_condition(
         let id = id(ctx, call, name)?;
         // SAFETY: The shim keeps these bytes readable until this function returns.
         let bytes = unsafe { std::slice::from_raw_parts(ptr.cast(), len) };
-        signal(ctx, id, &String::from_utf8_lossy(bytes))
+        let owned = String::from_utf8_lossy(bytes);
+        let max_bytes = warning_length_max_bytes(ctx);
+        let truncated = truncate_utf8_bytes(&owned, max_bytes);
+        signal(ctx, id, truncated)
     })
     .err()
     .unwrap_or(-1)

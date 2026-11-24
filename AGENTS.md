@@ -49,6 +49,14 @@ This workstation is a **16 GB RAM macOS arm64** machine.
 - Before adopting any external crate or third-party algorithm/data: verify its licence is compatible with `MIT OR Apache-2.0`, record it in `docs/PRIOR_ART.md`, add a short ADR in `docs/ADR.md`, and add attribution in `THIRD_PARTY_NOTICES.md` + `third_party/licences/`.
 - Maintain an automated licence scanner (`tools/measure/licence_scan.py`) and run it before committing new code or data.
 
+## Pstack and poteto mode
+
+Apply the full installed `pstack` skill suite (`poteto-mode`, `deslop`, `no-comments`, `unslop`, `architect`, `how`, `why`, `interrogate`, `thermo-nuclear-code-quality-review`, `figure-it-out`, and the `principle-*` skills) across Antigravity (`~/.gemini/config/skills/`), Codex (`~/.codex/skills/`), and Claude Code (`~/.claude/plugins/marketplaces/pstack-claude/plugins/pstack/skills/`) for every code change, refactor, review, and reply.
+
+- **Model routing takes precedence over `pstack`'s default Models table.** Never route to Fable 5.2, never use `max` effort, and never enable Codex fast mode. Use `gpt-6.2-sol` (`codex`, `high`) aggressively for implementation, refactoring sweeps, deslop/no-comments passes, and routine reviews, consult internal `gpt-6.2-astra` (`codex`, `high`) behind the scenes for formal semantics and numerical rigor, and reserve `claude-opus-5-5` (`claudeAgent_2`, `high`) and Gemini 4 Neon for architecture, high-risk reviews, and final decisions.
+- **Required discipline on every code change:** name the data shape first (`principle-model-the-domain`), validate at boundaries and trust internal types (`principle-boundary-discipline`, `principle-type-system-discipline`), subtract dead weight before adding (`principle-subtract-before-you-add`, `principle-laziness-protocol`), minimize reader load (`principle-minimize-reader-load`), pin behavior before refactoring and verify on real artifacts (`principle-prove-it-works`, `principle-test-behavior-not-implementation`, `principle-sequence-verifiable-units`), and run `deslop` and `no-comments` checks before committing.
+- **Writing discipline:** follow `unslop` on all replies, docs, and commit messages (short declarative sentences, no em-dash characters, no mid-sentence colons, concrete evidence on every claim, comments only for non-obvious why).
+
 ## Engineering standards
 
 - **Isolated `unsafe` discipline:** Every pure-Rust crate (`roxide-diag`, `roxide-syntax`, `roxide-host`, `roxide-value`, `roxide-eval`, `roxide-base`, `roxide-math`, `roxide-stats`, `roxide-methods`, `roxide-utils`, `roxide-graphics`, `roxide-cli`) MUST enforce `#![forbid(unsafe_code)]`. Audited `unsafe` is permitted **only** in the explicitly isolated low-level boundary crates (`roxide-capi` for the `libR` C ABI / dynamic library loading, and optionally a tiny audited GC/BLAS FFI module governed by ADRs).

@@ -548,7 +548,8 @@ impl Ctx {
         Ok(())
     }
 
-    pub(crate) fn option_value(&mut self, name: &str) -> EvalResult<Option<SexpId>> {
+    /// Look up an R session option (`getOption(name)`), returning built-in defaults if unset.
+    pub fn option_value(&mut self, name: &str) -> EvalResult<Option<SexpId>> {
         let tag = self.session.intern(name)?;
         if let Some(&(_, value)) = self.options.iter().find(|&&(key, _)| key == tag) {
             return Ok(Some(value));
@@ -557,6 +558,7 @@ impl Ctx {
             "digits" => self.session.scalar_int(self.opts.digits as i32)?,
             "scipen" => self.session.scalar_int(self.opts.scipen)?,
             "warn" => self.session.scalar_int(self.opts.warn)?,
+            "warning.length" => self.session.scalar_int(1000)?,
             "expressions" => self.session.scalar_int(self.opts.expressions as i32)?,
             "width" => self.session.scalar_int(self.opts.width as i32)?,
             "warnPartialMatchArgs" => self
