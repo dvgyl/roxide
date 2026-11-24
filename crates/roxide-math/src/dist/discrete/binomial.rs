@@ -99,7 +99,7 @@ pub fn qbinom(p: f64, size: f64, prob: f64, tail: Tail, flags: &mut Flags) -> f6
     if !size.is_finite()
         || size < 0.0
         || !(0.0..=1.0).contains(&prob)
-        || !valid_probability(p, tail)
+        || !probability_valid(p, tail)
     {
         return invalid(flags);
     }

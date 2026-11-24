@@ -21,6 +21,7 @@ pub use negative_binomial::{
 pub use poisson::{dpois, ppois, qpois, rpois};
 pub use rank::{dsignrank, dwilcox, psignrank, pwilcox, qsignrank, qwilcox, rsignrank, rwilcox};
 
+use super::{endpoints, invalid, on_scale, probability_valid, step, zero};
 use crate::core::{Flags, Tail};
 use crate::dist::normal::qnorm;
 use crate::special::aux::log1mexp;
@@ -32,27 +33,6 @@ const UPPER: Tail = Tail {
     lower: false,
     log: false,
 };
-
-fn invalid(flags: &mut Flags) -> f64 {
-    flags.set(Flags::NAN_PRODUCED);
-    f64::NAN
-}
-
-fn on_scale(lp: f64, log: bool) -> f64 {
-    if log { lp } else { lp.exp() }
-}
-
-fn zero(log: bool) -> f64 {
-    if log { -INF } else { 0.0 }
-}
-
-fn step(at_or_above: bool, tail: Tail) -> f64 {
-    if at_or_above == tail.lower {
-        on_scale(0.0, tail.log)
-    } else {
-        zero(tail.log)
-    }
-}
 
 fn integral(x: f64) -> bool {
     x.is_finite() && (x - x.round_ties_even()).abs() <= 1e-9 * x.abs().max(1.0)
@@ -75,24 +55,6 @@ fn count_floor(x: f64) -> f64 {
     (x + 1e-7).floor()
 }
 
-fn valid_probability(p: f64, tail: Tail) -> bool {
-    if tail.log {
-        p <= 0.0
-    } else {
-        (0.0..=1.0).contains(&p)
-    }
-}
-
-fn endpoints(p: f64, tail: Tail, min: f64, max: f64) -> Option<f64> {
-    if p == zero(tail.log) {
-        Some(if tail.lower { min } else { max })
-    } else if p == on_scale(0.0, tail.log) {
-        Some(if tail.lower { max } else { min })
-    } else {
-        None
-    }
-}
-
 fn lower_probability(p: f64, tail: Tail) -> f64 {
     match (tail.lower, tail.log) {
         (true, false) => p,
@@ -112,12 +74,7 @@ fn log_survival(p: f64, tail: Tail) -> f64 {
 }
 
 fn from_log(lp: f64, lower: bool, tail: Tail) -> f64 {
-    let lp = lp.clamp(-INF, 0.0);
-    match (lower == tail.lower, tail.log) {
-        (true, _) => on_scale(lp, tail.log),
-        (false, true) => log1mexp(-lp),
-        (false, false) => -lp.exp_m1(),
-    }
+    super::from_log(lp.clamp(-INF, 0.0), lower, tail)
 }
 
 fn cornish_fisher(p: f64, tail: Tail, mean: f64, sd: f64, skew: f64, flags: &mut Flags) -> f64 {

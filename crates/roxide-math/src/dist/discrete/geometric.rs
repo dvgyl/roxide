@@ -43,7 +43,7 @@ pub fn qgeom(p: f64, prob: f64, tail: Tail, flags: &mut Flags) -> f64 {
     if p.is_nan() || prob.is_nan() {
         return p + prob;
     }
-    if !valid(prob) || !valid_probability(p, tail) {
+    if !valid(prob) || !probability_valid(p, tail) {
         return invalid(flags);
     }
     if prob == 1.0 {

@@ -184,7 +184,7 @@ impl Parameters {
     }
 
     fn quantile(self, p: f64, tail: Tail, flags: &mut Flags) -> f64 {
-        if !valid_probability(p, tail) {
+        if !probability_valid(p, tail) {
             return invalid(flags);
         }
         if self.atom() {

@@ -136,10 +136,7 @@ fn quantile(p: f64, tail: Tail, table: Option<RankMasses>, flags: &mut Flags) ->
     let Some(table) = table else {
         return invalid(flags);
     };
-    if !p.is_finite() || !valid_probability(p, tail) {
-        return invalid(flags);
-    }
-    endpoints(p, tail, 0.0, table.max as f64).unwrap_or_else(|| table.quantile(p, tail))
+    table.quantile(p, tail)
 }
 
 /// Return the Wilcoxon rank sum mass at `x`.
@@ -188,7 +185,7 @@ pub fn qwilcox(p: f64, m: f64, n: f64, tail: Tail, flags: &mut Flags) -> f64 {
         return p + m + n;
     }
     let (m, n) = (m.round_ties_even(), n.round_ties_even());
-    if !positive_ranks(m) || !positive_ranks(n) || !p.is_finite() || !valid_probability(p, tail) {
+    if !positive_ranks(m) || !positive_ranks(n) || !p.is_finite() || !probability_valid(p, tail) {
         return invalid(flags);
     }
     if let Some(boundary) = endpoints(p, tail, 0.0, m * n) {
@@ -267,7 +264,7 @@ pub fn qsignrank(p: f64, n: f64, tail: Tail, flags: &mut Flags) -> f64 {
         return p + n;
     }
     let n = n.round_ties_even();
-    if !positive_ranks(n) || !p.is_finite() || !valid_probability(p, tail) {
+    if !positive_ranks(n) || !p.is_finite() || !probability_valid(p, tail) {
         return invalid(flags);
     }
     if let Some(boundary) = endpoints(p, tail, 0.0, n * (n + 1.0) / 2.0) {

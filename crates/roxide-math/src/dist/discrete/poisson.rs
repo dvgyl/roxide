@@ -62,7 +62,7 @@ pub fn qpois(p: f64, lambda: f64, tail: Tail, flags: &mut Flags) -> f64 {
     if p.is_nan() || lambda.is_nan() {
         return p + lambda;
     }
-    if lambda < 0.0 || !lambda.is_finite() || !valid_probability(p, tail) {
+    if lambda < 0.0 || !lambda.is_finite() || !probability_valid(p, tail) {
         return invalid(flags);
     }
     if lambda == 0.0 {

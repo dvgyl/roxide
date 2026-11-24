@@ -411,7 +411,7 @@ pub fn qhyper(p: f64, m: f64, n: f64, k: f64, tail: Tail, flags: &mut Flags) -> 
     let Some(urn) = Urn::new(m, n, k) else {
         return invalid(flags);
     };
-    if !p.is_finite() || !valid_probability(p, tail) {
+    if !p.is_finite() || !probability_valid(p, tail) {
         return invalid(flags);
     }
     if let Some(x) = endpoints(p, tail, urn.min(), urn.max()) {
