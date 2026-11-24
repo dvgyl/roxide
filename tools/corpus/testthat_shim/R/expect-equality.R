@@ -14,9 +14,10 @@ expect_equal <- function(object, expected, ..., tolerance = default_tolerance(),
                          info = NULL, label = expression_label(substitute(object)),
                          expected.label = expression_label(substitute(expected))) {
   actual <- object
-  result <- all.equal(expected, actual, ..., tolerance = tolerance)
+  target <- expected
+  result <- all.equal(target, actual, ..., tolerance = tolerance)
   expect(isTRUE(result), comparison_message(label, expected.label, result), info)
-  invisible(object)
+  invisible(actual)
 }
 
 expect_identical <- function(object, expected, ..., info = NULL,
@@ -41,6 +42,16 @@ same_set <- function(x, y) {
 expect_setequal <- function(object, expected) {
   expect(same_set(object, expected), "The sets have different elements.")
   invisible(object)
+}
+
+expect_contains <- function(x, y) {
+  expect(subset_of(y, x), "The first vector does not contain all values in the second vector.")
+  invisible(x)
+}
+
+expect_in <- function(x, y) {
+  expect(subset_of(x, y), "The second vector does not contain all values in the first vector.")
+  invisible(x)
 }
 
 expect_mapequal <- function(object, expected) {

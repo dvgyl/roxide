@@ -14,12 +14,15 @@ muffle_condition <- function(cond) {
 }
 
 check_condition <- function(object, kind, regexp, class, inherit, fixed, perl, ...,
-                            all = FALSE, info = NULL, label) {
+                            all = FALSE, info = NULL, label, absent = FALSE) {
   captured <- NULL
-  absent <- identical(regexp, NA) || identical(regexp, NA_character_)
+  if (identical(regexp, NA) || identical(regexp, NA_character_)) {
+    absent <- TRUE
+    regexp <- NULL
+  }
   handler <- function(cond) {
     if (!inherits(cond, kind) ||
-        !matches_condition(cond, if (absent) NULL else regexp, class, inherit, fixed, perl, ...)) {
+        !matches_condition(cond, regexp, class, inherit, fixed, perl, ...)) {
       return(invisible(NULL))
     }
     if (absent || is.null(captured) || all) {
@@ -29,8 +32,8 @@ check_condition <- function(object, kind, regexp, class, inherit, fixed, perl, .
   }
 
   value <- tryCatch(withCallingHandlers(object, condition = handler), error = function(cond) {
-    if (!inherits(cond, kind) ||
-        !matches_condition(cond, if (absent) NULL else regexp, class, inherit, fixed, perl, ...)) {
+    if ((absent && is_missing_optional_package(cond)) || !inherits(cond, kind) ||
+        !matches_condition(cond, regexp, class, inherit, fixed, perl, ...)) {
       stop(cond)
     }
     captured <<- cond
@@ -45,14 +48,32 @@ check_condition <- function(object, kind, regexp, class, inherit, fixed, perl, .
   invisible(if (absent) value else captured)
 }
 
+error_trace <- function(calls) {
+  # Remove the calling handler and the frames that signal the error.
+  n <- length(calls) - 1L
+  while (n > 0L) {
+    fn <- calls[[n]][[1L]]
+    if (!identical(fn, quote(.handleSimpleError)) && !identical(fn, quote(stop))) break
+    n <- n - 1L
+  }
+  list(call = calls[seq_len(n)])
+}
+
 expect_error <- function(object, regexp = NULL, class = NULL, ...,
                          fixed = FALSE, perl = FALSE, inherit = TRUE, info = NULL,
                          label = expression_label(substitute(object))) {
-  caught <- tryCatch(list(value = object), error = function(cond) {
-    if (inherits(cond, c("expectation", "skip"))) stop(cond)
+  absent <- identical(regexp, NA) || identical(regexp, NA_character_)
+  trace <- NULL
+  caught <- tryCatch(withCallingHandlers(list(value = object), error = function(cond) {
+    if (!absent && inherits(cond, "simpleError") && is.null(cond[["trace"]])) {
+      trace <<- error_trace(sys.calls())
+    }
+  }), error = function(cond) {
+    if (inherits(cond, c("expectation", "skip")) ||
+        (absent && is_missing_optional_package(cond))) stop(cond)
+    if (!is.null(trace)) cond$trace <- trace
     list(error = cond)
   })
-  absent <- identical(regexp, NA) || identical(regexp, NA_character_)
   cond <- caught$error
   ok <- if (absent) is.null(cond) else !is.null(cond) &&
     matches_condition(cond, regexp, class, inherit, fixed, perl, ...)
@@ -82,19 +103,24 @@ expect_condition <- function(object, regexp = NULL, class = NULL, ...,
                   all = all, info = info, label = label)
 }
 
-expect_no_error <- function(object, ..., class = NULL) {
-  check_condition(object, "error", NA, class, TRUE, FALSE, FALSE, ...,
-                  label = expression_label(substitute(object)))
+expect_no_error <- function(object, ..., message = NULL, class = NULL) {
+  check_condition(object, "error", message, class, TRUE, FALSE, FALSE, ...,
+                  label = expression_label(substitute(object)), absent = TRUE)
 }
 
-expect_no_warning <- function(object, ..., class = NULL) {
-  check_condition(object, "warning", NA, class, TRUE, FALSE, FALSE, ...,
-                  label = expression_label(substitute(object)))
+expect_no_warning <- function(object, ..., message = NULL, class = NULL) {
+  check_condition(object, "warning", message, class, TRUE, FALSE, FALSE, ...,
+                  label = expression_label(substitute(object)), absent = TRUE)
 }
 
-expect_no_message <- function(object, ..., class = NULL) {
-  check_condition(object, "message", NA, class, TRUE, FALSE, FALSE, ...,
-                  label = expression_label(substitute(object)))
+expect_no_message <- function(object, ..., message = NULL, class = NULL) {
+  check_condition(object, "message", message, class, TRUE, FALSE, FALSE, ...,
+                  label = expression_label(substitute(object)), absent = TRUE)
+}
+
+expect_no_condition <- function(object, ..., message = NULL, class = NULL) {
+  check_condition(object, "condition", message, class, TRUE, FALSE, FALSE, ...,
+                  label = expression_label(substitute(object)), absent = TRUE)
 }
 
 expect_silent <- function(object) {

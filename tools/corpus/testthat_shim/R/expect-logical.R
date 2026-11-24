@@ -63,6 +63,17 @@ expect_type <- function(object, type, info = NULL, label = expression_label(subs
   invisible(object)
 }
 
+expect_vector <- function(object, ptype = NULL, size = NULL) {
+  dims <- dim(object)
+  vector <- !is.null(object) && (is.atomic(object) || is.list(object))
+  actual_size <- if (is.null(dims)) length(object) else dims[[1L]]
+  same_type <- is.null(ptype) || (identical(typeof(object), typeof(ptype)) &&
+                                  identical(class(object), class(ptype)))
+  expect(vector && same_type && (is.null(size) || actual_size == size),
+         "Expected a vector with the specified type and size.")
+  invisible(object)
+}
+
 expect_s3_class <- function(object, class, exact = FALSE) {
   actual <- attr(object, "class")
   ok <- !isS4(object) && !is.null(actual) &&

@@ -48,10 +48,24 @@ capture_messages <- function(code) capture_condition_text(code, "message")
 capture_warnings <- function(code) capture_condition_text(code, "warning")
 evaluate_promise <- function(code) invisible(code)
 
-expect_snapshot <- function(...) skip("snapshots unsupported")
+setup <- function(code, env = new.env(parent = parent.frame())) {
+  invisible(eval(substitute(code), env))
+}
+
+teardown <- function(code, env = parent.frame()) {
+  register <- getOption("testthat.register_teardown")
+  if (is.null(register)) stop("Call teardown() during a test file.")
+  expr <- substitute(code)
+  force(env)
+  register(function() eval(expr, env))
+  invisible(NULL)
+}
+
+expect_snapshot <- function(...) skip("snapshot tests not supported by minimal shim")
 expect_snapshot_output <- expect_snapshot
 expect_snapshot_value <- expect_snapshot
 expect_snapshot_file <- expect_snapshot
 expect_snapshot_error <- expect_snapshot
 expect_snapshot_warning <- expect_snapshot
 expect_snapshot_message <- expect_snapshot
+announce_snapshot_file <- expect_snapshot

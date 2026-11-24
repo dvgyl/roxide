@@ -115,10 +115,19 @@ class Engine:
 
 def test_expression(source: Path, package: str, description: str) -> str:
     edition = re.search(r"^Config/testthat/edition:\s*([23])\s*$", description, re.M)
+    suggests = re.search(r"^Suggests:[ \t]*(.*(?:\n[ \t]+[^\n]*)*)", description, re.M)
+    optional = [] if suggests is None else [
+        dependency.strip().split()[0] for dependency in suggests[1].split(",")
+        if dependency.strip()
+    ]
+    optional_r = ", ".join(json.dumps(dependency) for dependency in optional)
     path = json.dumps(str(source / "tests" / "testthat"), ensure_ascii=False)
     name = json.dumps(package)
     setup = f"options(testthat.edition = {edition[1]}L); " if edition else ""
-    return f"library(testthat); {setup}test_dir({path}, package = {name})"
+    # Start each package with an initialized, repeatable random state.
+    return (f"library(testthat); {setup}set.seed(1L); "
+            f"options(testthat.optional_packages = c({optional_r})); "
+            f"test_dir({path}, package = {name})")
 
 
 def format_counts(counts: tuple[int, ...]) -> str:

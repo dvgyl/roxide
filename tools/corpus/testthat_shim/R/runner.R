@@ -9,21 +9,49 @@ restore_testing <- function(before) {
     Sys.setenv(TESTTHAT = before)
 }
 
-test_that <- function(desc, code) {
+run_test_block <- function(desc, expr, parent, group = FALSE) {
   reporter <- getOption("testthat.reporter")
   standalone <- is.null(reporter)
   if (standalone) {
     reporter <- new_reporter()
     before <- set_testing()
     on.exit(restore_testing(before), add = TRUE)
+    old <- options(testthat.reporter = reporter)
+    on.exit(options(old), add = TRUE)
   }
   file <- getOption("testthat.file", "<interactive>")
-  expr <- substitute(code)
-  env <- new.env(parent = parent.frame())
+  prefix <- getOption("testthat.description")
+  if (!is.null(prefix)) desc <- paste(prefix, desc, sep = " / ")
+  if (group) {
+    old_group <- options(testthat.description = desc)
+    on.exit(options(old_group), add = TRUE)
+  } else if (edition_get() >= 3L) {
+    local_reproducible_output()
+  }
 
-  if (edition_get() >= 3L) local_reproducible_output()
+  env <- new.env(parent = parent)
+  report_test_code(eval(expr, env), reporter, file, desc)
+  if (standalone) finish_report(reporter, TRUE)
+  invisible(NULL)
+}
+
+test_that <- function(desc, code) {
+  run_test_block(desc, substitute(code), parent.frame())
+}
+
+describe <- function(description, code) {
+  run_test_block(description, substitute(code), parent.frame(), group = TRUE)
+}
+
+it <- function(description, code = NULL) {
+  expr <- substitute(code)
+  if (is.null(expr)) expr <- quote(testthat::skip("Empty test."))
+  run_test_block(description, expr, parent.frame())
+}
+
+report_test_code <- function(code, reporter, file, desc, error_desc = desc, skip_desc = desc) {
   tryCatch(withCallingHandlers(
-    eval(expr, env),
+    code,
     expectation = function(e) {
       kind <- if (inherits(e, "expectation_success")) "pass" else "fail"
       report_result(reporter, kind, file, desc, conditionMessage(e))
@@ -35,36 +63,26 @@ test_that <- function(desc, code) {
     },
     message = muffle_condition
   ), skip = function(e) {
-    report_result(reporter, "skip", file, desc)
+    report_result(reporter, "skip", file, skip_desc)
   }, error = function(e) {
-    report_result(reporter, "fail", file, desc, conditionMessage(e))
+    kind <- if (is_missing_optional_package(e)) "skip" else "fail"
+    report_result(reporter, kind, file, error_desc, conditionMessage(e))
   })
-
-  if (standalone) finish_report(reporter, TRUE)
   invisible(NULL)
 }
 
 eval_test_file <- function(path, env, reporter) {
   file <- basename(path)
-  old <- options(testthat.file = file)
+  actions <- list()
+  register <- function(action) actions[[length(actions) + 1L]] <<- action
+  old <- options(testthat.file = file, testthat.register_teardown = register)
   on.exit(options(old), add = TRUE)
-  tryCatch(withCallingHandlers(
+  report_test_code(
     for (expr in parse(file = path, keep.source = FALSE)) eval(expr, env),
-    expectation = function(e) {
-      kind <- if (inherits(e, "expectation_success")) "pass" else "fail"
-      report_result(reporter, kind, file, "Top-level expectation", conditionMessage(e))
-      invokeRestart("continue_test")
-    },
-    warning = function(e) {
-      report_result(reporter, "warn", file, "File setup")
-      muffle_condition(e)
-    },
-    message = muffle_condition
-  ), skip = function(e) {
-    report_result(reporter, "skip", file, "File setup")
-  }, error = function(e) {
-    report_result(reporter, "fail", file, "File evaluation", conditionMessage(e))
-  })
+    reporter, file, "Top-level expectation",
+    error_desc = "File evaluation", skip_desc = "File setup"
+  )
+  for (action in actions) report_test_code(action(), reporter, file, "Teardown")
   invisible(NULL)
 }
 
@@ -82,7 +100,8 @@ run_test_files <- function(path, files, package, env, stop_on_failure, load_help
   if (is.null(env)) env <- if (is.null(package)) parent.frame() else asNamespace(package)
   shared <- new.env(parent = env)
   old <- options(testthat.reporter = reporter, testthat.path = getwd(),
-                 testthat.package = package, testthat.edition = edition_get())
+                 testthat.package = package, testthat.edition = edition_get(),
+                 testthat.description = NULL)
   on.exit(options(old), add = TRUE)
 
   if (load_helpers) {

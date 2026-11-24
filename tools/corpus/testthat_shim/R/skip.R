@@ -37,3 +37,8 @@ skip_if_not_installed <- function(pkg, minimum_version = NULL) {
 }
 
 skip_if_offline <- function(host = "captive.apple.com") skip("Network access is disabled")
+
+is_missing_optional_package <- function(cond) {
+  inherits(cond, "packageNotFoundError") &&
+    cond[["package"]] %in% getOption("testthat.optional_packages")
+}
