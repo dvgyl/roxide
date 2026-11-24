@@ -246,7 +246,6 @@ impl<'s> Lexer<'s> {
             });
         };
 
-        // Newlines
         if b == b'\r' {
             self.pos += 1;
             if self.peek() == Some(b'\n') {
@@ -265,7 +264,6 @@ impl<'s> Lexer<'s> {
             });
         }
 
-        // Comments
         if b == b'#' {
             while let Some(c) = self.peek() {
                 if c == b'\n' || c == b'\r' {
@@ -279,22 +277,18 @@ impl<'s> Lexer<'s> {
             });
         }
 
-        // Raw string literal: r"(...)" / R"--[...]--"
         if matches!(b, b'r' | b'R') && matches!(self.peek_at(1), Some(b'"' | b'\'')) {
             return self.lex_raw_string(start);
         }
 
-        // Quoted string literal
         if b == b'"' || b == b'\'' {
             return self.lex_string(start, b);
         }
 
-        // Backtick-quoted identifier
         if b == b'`' {
             return self.lex_backtick(start);
         }
 
-        // Numbers: digit or `.digit`
         if b.is_ascii_digit() || (b == b'.' && self.peek_at(1).is_some_and(|c| c.is_ascii_digit()))
         {
             return self.lex_number(start);
@@ -312,12 +306,10 @@ impl<'s> Lexer<'s> {
             return Ok(self.lex_ident_or_keyword(start));
         }
 
-        // Special infix `%...%`
         if b == b'%' {
             return self.lex_special(start);
         }
 
-        // Multi- and single-character operators & delimiters
         self.pos += 1;
         let kind = match b {
             b'(' => TokKind::LParen,

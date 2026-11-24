@@ -1,13 +1,16 @@
 //! Clean-room Pratt parser for GNU R 4.6.2.
 
-use std::{collections::HashSet, fmt};
+use std::fmt;
 
 use roxide_diag::{LineDirective, Span, SrcFileId};
 
-use crate::ast::{Arg, ArgName, Ast, Const, Node, NodeId, StrEncoding};
+use crate::ast::{Arg, ArgName, Ast, Const, Node, NodeId};
 use crate::lexer::{Lexer, TokKind, Token};
 use crate::literal::{decode_escaped, decode_string, parse_r_double, parse_r_int, symbol_name};
 use crate::ops::{self, Assoc, Prec};
+
+mod forms;
+mod pipe;
 
 /// Non-fatal parser warning (e.g. non-integer value with `L` suffix).
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -49,40 +52,18 @@ pub enum ParseStep {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Newlines {
+enum ExprContext {
     TopLevel,
     Block,
-    Ignore,
-}
-
-#[derive(Clone, Copy)]
-struct ExprContext {
-    newlines: Newlines,
-    allow_equals: bool,
+    Parens,
+    Arg,
 }
 
 impl ExprContext {
-    const TOP_LEVEL: Self = Self {
-        newlines: Newlines::TopLevel,
-        allow_equals: true,
-    };
-    const BLOCK: Self = Self {
-        newlines: Newlines::Block,
-        allow_equals: true,
-    };
-    const PAREN: Self = Self {
-        newlines: Newlines::Ignore,
-        allow_equals: true,
-    };
-    const ARGUMENT: Self = Self {
-        newlines: Newlines::Ignore,
-        allow_equals: false,
-    };
-
     fn body(self) -> Self {
-        Self {
-            allow_equals: true,
-            ..self
+        match self {
+            Self::Arg => Self::Parens,
+            other => other,
         }
     }
 }
@@ -231,9 +212,8 @@ impl<'s> Parser<'s> {
             .checked_sub(1)
             .map_or(0, |i| self.tokens[i].span.hi as usize);
         self.placeholders.clear();
-        match self.parse_expr(Prec(0), ExprContext::TOP_LEVEL) {
+        match self.parse_expr(Prec(0), ExprContext::TopLevel) {
             Ok(expr) => {
-                // Consume optional trailing `;` or newline separator.
                 self.skip_comments();
                 if matches!(self.peek_kind(), TokKind::Semi | TokKind::Newline) {
                     self.advance();
@@ -313,7 +293,7 @@ impl<'s> Parser<'s> {
     }
 
     fn skip_expr_trivia(&mut self, context: ExprContext) {
-        if context.newlines == Newlines::Ignore {
+        if matches!(context, ExprContext::Parens | ExprContext::Arg) {
             self.skip_newlines_and_comments();
         } else {
             self.skip_comments();
@@ -362,7 +342,7 @@ impl<'s> Parser<'s> {
             let Some((op_str, prec, assoc)) = self.peek_binary_op() else {
                 break;
             };
-            if prec < min_prec || (op_str == "=" && !context.allow_equals) {
+            if prec < min_prec || (op_str == "=" && context == ExprContext::Arg) {
                 break;
             }
 
@@ -390,11 +370,11 @@ impl<'s> Parser<'s> {
             let span = self.ast.span(lhs).merge(self.ast.span(rhs));
 
             lhs = match op_str {
-                "->" => self.make_binary_call("<-", op_tok.span, rhs, lhs, span),
-                "->>" => self.make_binary_call("<<-", op_tok.span, rhs, lhs, span),
-                "**" => self.make_binary_call("^", op_tok.span, lhs, rhs, span),
+                "->" => self.operand_call("<-", op_tok.span, [rhs, lhs], span),
+                "->>" => self.operand_call("<<-", op_tok.span, [rhs, lhs], span),
+                "**" => self.operand_call("^", op_tok.span, [lhs, rhs], span),
                 "|>" => self.desugar_pipe(lhs, rhs, span, placeholder_start)?,
-                _ => self.make_binary_call(op_str, op_tok.span, lhs, rhs, span),
+                _ => self.operand_call(op_str, op_tok.span, [lhs, rhs], span),
             };
         }
 
@@ -428,7 +408,7 @@ impl<'s> Parser<'s> {
         }
         let rhs = self.parse_prefix(context)?;
         let span = self.ast.span(lhs).merge(self.ast.span(rhs));
-        Ok(self.make_binary_call(self.slice(op.span), op.span, lhs, rhs, span))
+        Ok(self.operand_call(self.slice(op.span), op.span, [lhs, rhs], span))
     }
 
     fn parse_prefix(&mut self, context: ExprContext) -> Result<NodeId, ParseError> {
@@ -561,18 +541,12 @@ impl<'s> Parser<'s> {
                 self.skip_newlines_and_comments();
                 let rhs = self.parse_expr(prec, operand_context)?;
                 let span = tok.span.merge(self.ast.span(rhs));
-                let func = self.ast.push_node(Node::Sym(op_str.into()), tok.span);
-                let args = self.ast.push_args([Arg {
-                    name: None,
-                    value: Some(rhs),
-                    span: self.ast.span(rhs),
-                }]);
-                Ok(self.ast.push_node(Node::Call { func, args }, span))
+                Ok(self.operand_call(op_str, tok.span, [rhs], span))
             }
             TokKind::LParen => {
                 let open = self.advance();
                 self.skip_newlines_and_comments();
-                let inner = self.parse_expr(Prec(0), ExprContext::PAREN)?;
+                let inner = self.parse_expr(Prec(0), ExprContext::Parens)?;
                 self.skip_newlines_and_comments();
                 if self.peek_kind() != &TokKind::RParen {
                     return Err(ParseError {
@@ -582,13 +556,7 @@ impl<'s> Parser<'s> {
                 }
                 let close = self.advance();
                 let span = open.span.merge(close.span);
-                let func = self.ast.push_node(Node::Sym("(".into()), open.span);
-                let args = self.ast.push_args([Arg {
-                    name: None,
-                    value: Some(inner),
-                    span: self.ast.span(inner),
-                }]);
-                Ok(self.ast.push_node(Node::Call { func, args }, span))
+                Ok(self.operand_call("(", open.span, [inner], span))
             }
             TokKind::LBrace => self.parse_brace_block(),
             TokKind::Function | TokKind::Lambda => self.parse_function(context),
@@ -599,308 +567,10 @@ impl<'s> Parser<'s> {
             TokKind::Break | TokKind::Next => {
                 self.advance();
                 let name = self.slice(tok.span);
-                let func = self.ast.push_node(Node::Sym(name.into()), tok.span);
-                let args = self.ast.push_args([]);
-                Ok(self.ast.push_node(Node::Call { func, args }, tok.span))
+                Ok(self.operand_call(name, tok.span, [], tok.span))
             }
             _ => Err(self.unexpected()),
         }
-    }
-
-    fn parse_brace_block(&mut self) -> Result<NodeId, ParseError> {
-        let open = self.advance();
-        let mut stmts = Vec::new();
-        loop {
-            self.skip_trivia_and_separators();
-            if self.peek_kind() == &TokKind::RBrace {
-                let close = self.advance();
-                let span = open.span.merge(close.span);
-                let func = self.ast.push_node(Node::Sym("{".into()), open.span);
-                let args = self.ast.push_args(stmts);
-                return Ok(self.ast.push_node(Node::Call { func, args }, span));
-            }
-            if self.is_eof() {
-                return Err(ParseError {
-                    message: String::from("unexpected end of input"),
-                    span: self.current_span(),
-                });
-            }
-            let stmt = self.parse_expr(Prec(0), ExprContext::BLOCK)?;
-            let stmt_span = self.ast.span(stmt);
-            stmts.push(Arg {
-                name: None,
-                value: Some(stmt),
-                span: stmt_span,
-            });
-            self.skip_comments();
-            if matches!(self.peek_kind(), TokKind::Semi | TokKind::Newline) {
-                self.advance();
-            } else if self.peek_kind() != &TokKind::RBrace {
-                return Err(ParseError {
-                    message: format!("unexpected '{}'", self.current_text()),
-                    span: self.current_span(),
-                });
-            }
-        }
-    }
-
-    fn parse_function(&mut self, context: ExprContext) -> Result<NodeId, ParseError> {
-        let kw = self.advance();
-        if kw.kind == TokKind::Lambda {
-            self.skip_expr_trivia(context);
-        } else {
-            self.skip_newlines_and_comments();
-        }
-        if self.peek_kind() != &TokKind::LParen {
-            return Err(ParseError {
-                message: String::from("expected '(' after function"),
-                span: self.current_span(),
-            });
-        }
-        self.advance();
-        let mut formals = Vec::new();
-        let mut names = HashSet::new();
-        self.skip_newlines_and_comments();
-        if self.peek_kind() != &TokKind::RParen {
-            loop {
-                self.skip_newlines_and_comments();
-                let name_tok = self.advance();
-                let name_str: Box<str> = match name_tok.kind {
-                    TokKind::Symbol | TokKind::Backtick => self.decode_symbol(&name_tok)?,
-                    _ => {
-                        return Err(ParseError {
-                            message: String::from("expected formal parameter name"),
-                            span: name_tok.span,
-                        });
-                    }
-                };
-                if !names.insert(name_str.clone()) {
-                    return Err(ParseError {
-                        message: format!("repeated formal argument '{name_str}'"),
-                        span: name_tok.span,
-                    });
-                }
-                self.skip_newlines_and_comments();
-                let default = if self.peek_kind() == &TokKind::Eq {
-                    self.advance();
-                    self.skip_newlines_and_comments();
-                    Some(self.parse_expr(Prec(0), ExprContext::ARGUMENT)?)
-                } else {
-                    None
-                };
-                let fspan =
-                    default.map_or(name_tok.span, |d| name_tok.span.merge(self.ast.span(d)));
-                formals.push(Arg {
-                    name: Some(ArgName::Sym(name_str)),
-                    value: default,
-                    span: fspan,
-                });
-                self.skip_newlines_and_comments();
-                if self.peek_kind() == &TokKind::Comma {
-                    self.advance();
-                } else {
-                    break;
-                }
-            }
-        }
-        if self.peek_kind() != &TokKind::RParen {
-            return Err(ParseError {
-                message: String::from("expected ')' in function formals"),
-                span: self.current_span(),
-            });
-        }
-        self.advance();
-        self.skip_newlines_and_comments();
-        let body = self.parse_expr(ops::prec::EQ_ASSIGN, context.body())?;
-        let span = kw.span.merge(self.ast.span(body));
-        let formals_range = self.ast.push_args(formals);
-        Ok(self.ast.push_node(
-            Node::Function {
-                formals: formals_range,
-                body,
-                span,
-            },
-            span,
-        ))
-    }
-
-    fn parse_if(&mut self, context: ExprContext) -> Result<NodeId, ParseError> {
-        let kw = self.advance();
-        self.skip_newlines_and_comments();
-        if self.peek_kind() != &TokKind::LParen {
-            return Err(ParseError {
-                message: String::from("expected '(' after 'if'"),
-                span: self.current_span(),
-            });
-        }
-        self.advance();
-        let cond = self.parse_expr(Prec(0), ExprContext::ARGUMENT)?;
-        self.skip_newlines_and_comments();
-        if self.peek_kind() != &TokKind::RParen {
-            return Err(ParseError {
-                message: String::from("expected ')' after 'if' condition"),
-                span: self.current_span(),
-            });
-        }
-        self.advance();
-        self.skip_newlines_and_comments();
-        let then_branch = self.parse_expr(ops::prec::EQ_ASSIGN, context.body())?;
-
-        let mut args_vec = vec![
-            Arg {
-                name: None,
-                value: Some(cond),
-                span: self.ast.span(cond),
-            },
-            Arg {
-                name: None,
-                value: Some(then_branch),
-                span: self.ast.span(then_branch),
-            },
-        ];
-
-        let saved = self.cursor;
-        if context.newlines != Newlines::TopLevel {
-            self.skip_newlines_and_comments();
-        } else {
-            self.skip_comments();
-        }
-        let end_span = if self.peek_kind() == &TokKind::Else {
-            self.advance();
-            self.skip_newlines_and_comments();
-            let else_branch = self.parse_expr(ops::prec::EQ_ASSIGN, context.body())?;
-            let es = self.ast.span(else_branch);
-            args_vec.push(Arg {
-                name: None,
-                value: Some(else_branch),
-                span: es,
-            });
-            es
-        } else {
-            self.cursor = saved;
-            self.ast.span(then_branch)
-        };
-
-        let span = kw.span.merge(end_span);
-        let func = self.ast.push_node(Node::Sym("if".into()), kw.span);
-        let args = self.ast.push_args(args_vec);
-        Ok(self.ast.push_node(Node::Call { func, args }, span))
-    }
-
-    fn parse_while(&mut self, context: ExprContext) -> Result<NodeId, ParseError> {
-        let kw = self.advance();
-        self.skip_newlines_and_comments();
-        if self.peek_kind() != &TokKind::LParen {
-            return Err(ParseError {
-                message: String::from("expected '(' after 'while'"),
-                span: self.current_span(),
-            });
-        }
-        self.advance();
-        let cond = self.parse_expr(Prec(0), ExprContext::ARGUMENT)?;
-        self.skip_newlines_and_comments();
-        if self.peek_kind() != &TokKind::RParen {
-            return Err(ParseError {
-                message: String::from("expected ')' after 'while' condition"),
-                span: self.current_span(),
-            });
-        }
-        self.advance();
-        self.skip_newlines_and_comments();
-        let body = self.parse_expr(ops::prec::EQ_ASSIGN, context.body())?;
-        let span = kw.span.merge(self.ast.span(body));
-        let func = self.ast.push_node(Node::Sym("while".into()), kw.span);
-        let args = self.ast.push_args([
-            Arg {
-                name: None,
-                value: Some(cond),
-                span: self.ast.span(cond),
-            },
-            Arg {
-                name: None,
-                value: Some(body),
-                span: self.ast.span(body),
-            },
-        ]);
-        Ok(self.ast.push_node(Node::Call { func, args }, span))
-    }
-
-    fn parse_repeat(&mut self, context: ExprContext) -> Result<NodeId, ParseError> {
-        let kw = self.advance();
-        self.skip_newlines_and_comments();
-        let body = self.parse_expr(ops::prec::EQ_ASSIGN, context.body())?;
-        let span = kw.span.merge(self.ast.span(body));
-        let func = self.ast.push_node(Node::Sym("repeat".into()), kw.span);
-        let args = self.ast.push_args([Arg {
-            name: None,
-            value: Some(body),
-            span: self.ast.span(body),
-        }]);
-        Ok(self.ast.push_node(Node::Call { func, args }, span))
-    }
-
-    fn parse_for(&mut self, context: ExprContext) -> Result<NodeId, ParseError> {
-        let kw = self.advance();
-        self.skip_newlines_and_comments();
-        if self.peek_kind() != &TokKind::LParen {
-            return Err(ParseError {
-                message: String::from("expected '(' after 'for'"),
-                span: self.current_span(),
-            });
-        }
-        self.advance();
-        self.skip_newlines_and_comments();
-        let var_tok = self.advance();
-        let var_name: Box<str> = match var_tok.kind {
-            TokKind::Symbol | TokKind::Backtick => self.decode_symbol(&var_tok)?,
-            _ => {
-                return Err(ParseError {
-                    message: String::from("expected loop variable name"),
-                    span: var_tok.span,
-                });
-            }
-        };
-        let var_node = self.ast.push_node(Node::Sym(var_name), var_tok.span);
-        self.skip_newlines_and_comments();
-        if self.peek_kind() != &TokKind::In {
-            return Err(ParseError {
-                message: String::from("expected 'in' in 'for' loop"),
-                span: self.current_span(),
-            });
-        }
-        self.advance();
-        self.skip_newlines_and_comments();
-        let seq = self.parse_expr(Prec(0), ExprContext::ARGUMENT)?;
-        self.skip_newlines_and_comments();
-        if self.peek_kind() != &TokKind::RParen {
-            return Err(ParseError {
-                message: String::from("expected ')' in 'for' loop"),
-                span: self.current_span(),
-            });
-        }
-        self.advance();
-        self.skip_newlines_and_comments();
-        let body = self.parse_expr(ops::prec::EQ_ASSIGN, context.body())?;
-        let span = kw.span.merge(self.ast.span(body));
-        let func = self.ast.push_node(Node::Sym("for".into()), kw.span);
-        let args = self.ast.push_args([
-            Arg {
-                name: None,
-                value: Some(var_node),
-                span: var_tok.span,
-            },
-            Arg {
-                name: None,
-                value: Some(seq),
-                span: self.ast.span(seq),
-            },
-            Arg {
-                name: None,
-                value: Some(body),
-                span: self.ast.span(body),
-            },
-        ]);
-        Ok(self.ast.push_node(Node::Call { func, args }, span))
     }
 
     fn parse_call(&mut self, callee: NodeId) -> Result<NodeId, ParseError> {
@@ -981,14 +651,13 @@ impl<'s> Parser<'s> {
                 });
                 continue;
             }
-            // Check named argument `<sym|str|NULL> = [expr]`
             let named = self.try_parse_arg_name()?;
             if let Some((arg_name, name_span)) = named {
                 self.skip_newlines_and_comments();
                 let value = if self.peek_kind() == &TokKind::Comma || self.peek_kind() == &closing {
                     None
                 } else {
-                    Some(self.parse_expr(Prec(0), ExprContext::ARGUMENT)?)
+                    Some(self.parse_expr(Prec(0), ExprContext::Arg)?)
                 };
                 let span = value.map_or(name_span, |v| name_span.merge(self.ast.span(v)));
                 args.push(Arg {
@@ -997,7 +666,7 @@ impl<'s> Parser<'s> {
                     span,
                 });
             } else {
-                let expr = self.parse_expr(Prec(0), ExprContext::ARGUMENT)?;
+                let expr = self.parse_expr(Prec(0), ExprContext::Arg)?;
                 args.push(Arg {
                     name: None,
                     value: Some(expr),
@@ -1096,213 +765,22 @@ impl<'s> Parser<'s> {
         Some((text, prec, assoc))
     }
 
-    fn make_binary_call(
+    fn operand_call<const N: usize>(
         &mut self,
-        op: &str,
-        op_span: Span,
-        lhs: NodeId,
-        rhs: NodeId,
+        name: &str,
+        name_span: Span,
+        operands: [NodeId; N],
         span: Span,
     ) -> NodeId {
-        let func = self.ast.push_node(Node::Sym(op.into()), op_span);
-        let args = self.ast.push_args([
-            Arg {
-                name: None,
-                value: Some(lhs),
-                span: self.ast.span(lhs),
-            },
-            Arg {
-                name: None,
-                value: Some(rhs),
-                span: self.ast.span(rhs),
-            },
-        ]);
+        let func = self.ast.push_node(Node::Sym(name.into()), name_span);
+        let args = operands.map(|value| Arg {
+            name: None,
+            value: Some(value),
+            span: self.ast.span(value),
+        });
+        let args = self.ast.push_args(args);
         self.ast.push_node(Node::Call { func, args }, span)
     }
-
-    fn invalid_placeholder(&self, placeholder: NodeId) -> ParseError {
-        ParseError {
-            message: String::from("invalid use of pipe placeholder"),
-            span: self.ast.span(placeholder),
-        }
-    }
-
-    fn desugar_pipe(
-        &mut self,
-        lhs: NodeId,
-        rhs: NodeId,
-        span: Span,
-        placeholder_start: usize,
-    ) -> Result<NodeId, ParseError> {
-        let rhs_span = self.ast.span(rhs);
-        if self.placeholders.get(placeholder_start) == Some(&rhs)
-            || !matches!(
-                self.ast.node(rhs),
-                Node::Call { .. } | Node::Function { .. }
-            )
-        {
-            return Err(ParseError {
-                message: String::from("The pipe operator requires a function call as RHS"),
-                span: rhs_span,
-            });
-        }
-        let Node::Call { func, args } = self.ast.node(rhs).clone() else {
-            return Err(ParseError {
-                message: String::from("function 'function' not supported in RHS call of a pipe"),
-                span: rhs_span,
-            });
-        };
-        let pending = &self.placeholders[placeholder_start..];
-        let func_span = self.ast.span(func);
-        if pending.iter().any(|&id| {
-            let placeholder = self.ast.span(id);
-            func_span.lo <= placeholder.lo && placeholder.hi <= func_span.hi
-        }) {
-            return Err(ParseError {
-                message: String::from("pipe placeholder cannot be used in the RHS function"),
-                span: func_span,
-            });
-        }
-        if pending.len() > 1 {
-            return Err(ParseError {
-                message: String::from("pipe placeholder may only appear once"),
-                span: self.ast.span(pending[1]),
-            });
-        }
-
-        let mut arguments = self.ast.args(args).to_vec();
-        if let Some(&placeholder) = pending.first() {
-            if self.replace_extraction_root(rhs, lhs, placeholder) {
-                self.ast.set_span(rhs, span);
-                self.placeholders.truncate(placeholder_start);
-                return Ok(rhs);
-            }
-            let Some(arg) = arguments
-                .iter_mut()
-                .find(|arg| arg.value == Some(placeholder))
-            else {
-                return Err(self.invalid_placeholder(placeholder));
-            };
-            if arg.name.is_none() {
-                let prefix = &self.src[self.expression_start..rhs_span.lo as usize];
-                let line = 1 + prefix.bytes().filter(|&byte| byte == b'\n').count();
-                let column = prefix.rsplit('\n').next().map_or(1, |line| line.len() + 1);
-                let literal = Const::Str {
-                    bytes: Box::from(b"_".as_slice()),
-                    enc: StrEncoding::Native,
-                };
-                let span = arg.span;
-                arg.value = Some(self.ast.push_node(Node::Const(literal), span));
-                let args = self.ast.push_args(arguments);
-                self.error_call = Some(self.ast.push_node(Node::Call { func, args }, rhs_span));
-                return Err(ParseError {
-                    message: format!(
-                        "pipe placeholder can only be used as a named argument (<input>:{line}:{column})"
-                    ),
-                    span,
-                });
-            }
-            arg.value = Some(lhs);
-            self.placeholders.truncate(placeholder_start);
-        } else {
-            if let Node::Sym(name) = self.ast.node(func)
-                && pipe_forbids_insertion(name)
-            {
-                return Err(ParseError {
-                    message: format!("function '{name}' not supported in RHS call of a pipe"),
-                    span: rhs_span,
-                });
-            }
-            arguments.insert(
-                0,
-                Arg {
-                    name: None,
-                    value: Some(lhs),
-                    span: self.ast.span(lhs),
-                },
-            );
-        }
-        let args = self.ast.push_args(arguments);
-        Ok(self.ast.push_node(Node::Call { func, args }, span))
-    }
-
-    fn replace_extraction_root(&mut self, rhs: NodeId, lhs: NodeId, placeholder: NodeId) -> bool {
-        let mut node = rhs;
-        let mut chain = Vec::new();
-        while let Node::Call { func, args } = self.ast.node(node) {
-            if !matches!(self.ast.node(*func), Node::Sym(name) if matches!(name.as_ref(), "$" | "@" | "[" | "[["))
-            {
-                break;
-            }
-            let Some(target) = self
-                .ast
-                .args(args.clone())
-                .first()
-                .and_then(|arg| arg.value)
-            else {
-                break;
-            };
-            chain.push(node);
-            if target == placeholder {
-                self.ast.replace_arg(args.start, lhs);
-                let lhs_span = self.ast.span(lhs);
-                for extraction in chain {
-                    self.ast
-                        .set_span(extraction, lhs_span.merge(self.ast.span(extraction)));
-                }
-                return true;
-            }
-            node = target;
-        }
-        false
-    }
-}
-
-fn pipe_forbids_insertion(name: &str) -> bool {
-    matches!(
-        name,
-        "if" | "while"
-            | "for"
-            | "repeat"
-            | "function"
-            | "break"
-            | "next"
-            | "return"
-            | "{"
-            | "("
-            | "["
-            | "[["
-            | "$"
-            | "@"
-            | "::"
-            | ":::"
-            | "+"
-            | "-"
-            | "*"
-            | "/"
-            | "^"
-            | ":"
-            | "~"
-            | "?"
-            | "!"
-            | "&"
-            | "&&"
-            | "|"
-            | "||"
-            | "<"
-            | "<="
-            | ">"
-            | ">="
-            | "=="
-            | "!="
-            | "<-"
-            | "<<-"
-            | "="
-            | "|>"
-            | "%%"
-            | "%/%"
-            | "%*%"
-    )
 }
 
 fn collect_line_directives(src: &str, tokens: &[Token]) -> Vec<LineDirective> {
