@@ -2,6 +2,7 @@
 
 //! XDR v2 and v3 serialization for raw vectors, RDS files, and R workspaces.
 
+mod ascii;
 mod files;
 mod read;
 mod session;
@@ -130,7 +131,7 @@ fn limits(ctx: &mut Ctx) -> Limits {
     limits
 }
 
-fn flag(ctx: &mut Ctx, call: &Call, value: SexpId) -> EvalResult<bool> {
+pub(crate) fn flag(ctx: &mut Ctx, call: &Call, value: SexpId) -> EvalResult<bool> {
     let result = (|| {
         let (x, _) = ctx.session_mut().coerce(value, SexpType::Lgl)?;
         let view = ctx.session().lgl(x)?;
@@ -165,7 +166,7 @@ fn validate_format(ctx: &mut Ctx, call: &Call, ascii: SexpId) -> EvalResult<()> 
     Ok(())
 }
 
-fn path(ctx: &mut Ctx, call: &Call, value: SexpId) -> EvalResult<PathBuf> {
+pub(crate) fn path(ctx: &mut Ctx, call: &Call, value: SexpId) -> EvalResult<PathBuf> {
     let result = (|| {
         if let [ch] = ctx.session().str_slice(value)?
             && *ch != CharId::NA
@@ -338,6 +339,30 @@ impl Registry {
     ) -> impl Iterator<Item = SexpId> + 'a {
         std::iter::once(BASE_ENV).chain(packages.iter().map(|(_, ns, _)| *ns))
     }
+}
+
+pub(crate) fn write_compiler_file(
+    ctx: &mut Ctx,
+    call: &Call,
+    path: &Path,
+    value: SexpId,
+    ascii: bool,
+) -> EvalResult<()> {
+    let bytes = if ascii {
+        let limits = limits(ctx);
+        let result = Registry::for_write(ctx).and_then(|registry| {
+            write::encode_ascii_workspace(ctx.session_mut(), value, &limits, &registry)
+        });
+        checked(ctx, call, result)?
+    } else {
+        encode(ctx, call, value, 3, true)?
+    };
+    let result = files::write(ctx.host(), path, &bytes, Compression::None, None);
+    checked(ctx, call, result)
+}
+
+pub(crate) fn read_compiler_file(ctx: &mut Ctx, call: &Call, path: &Path) -> EvalResult {
+    read_file(ctx, call, path, true)
 }
 
 fn encode(

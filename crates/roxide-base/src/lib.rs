@@ -6,6 +6,7 @@
 //! `io_os`, `datetime`, `serialize`, `random`, `linalg`, `special`, `scan`,
 //! `dcf`) wired together solely through [`MODULES`].
 
+mod compiler;
 pub mod datetime;
 pub mod dcf;
 pub mod io_os;
@@ -52,6 +53,7 @@ pub const MODULES: &[&Module] = &[
     &scan::MODULE,
     &dcf::MODULE,
     &native::MODULE,
+    &compiler::BASE,
 ];
 
 /// Register all `roxide-base` primitives and clean-room R preludes on `ctx`.
@@ -59,5 +61,5 @@ pub fn register_all(ctx: &mut Ctx) -> Result<(), InternalError> {
     for module in MODULES {
         ctx.register_module(module)?;
     }
-    Ok(())
+    ctx.register_package(&compiler::PACKAGE)
 }

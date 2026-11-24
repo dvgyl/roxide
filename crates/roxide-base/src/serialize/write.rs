@@ -3,8 +3,9 @@ use std::collections::HashMap;
 use roxide_gc::SexpId;
 use roxide_host::Limits;
 use roxide_value::{
-    BASE_ENV, BASE_NAMESPACE, CharId, EMPTY_ENV, Elem, Encoding, GLOBAL_ENV, PromiseState,
-    RSession, SEXP_MISSING, SEXP_NIL, SEXP_UNBOUND, SexpType, Sym, ValueApi, VecView,
+    BASE_ENV, BASE_NAMESPACE, CharId, EMPTY_ENV, Elem, Encoding, GLOBAL_ENV, NA_INTEGER,
+    PromiseState, RSession, SEXP_MISSING, SEXP_NIL, SEXP_UNBOUND, SexpType, Sym, ValueApi, VecView,
+    is_na_real,
 };
 
 use super::{
@@ -28,6 +29,7 @@ pub(super) fn encode(
         value,
         version,
         workspace,
+        false,
         limits,
         registry,
     )
@@ -48,9 +50,27 @@ pub(super) fn encode_hook(
             hook,
             error: None,
         };
-        let result = encode_with_session(&mut session, value, version, false, limits, registry);
+        let result =
+            encode_with_session(&mut session, value, version, false, false, limits, registry);
         session.finish(result)
     })
+}
+
+pub(super) fn encode_ascii_workspace(
+    session: &mut RSession,
+    value: SexpId,
+    limits: &Limits,
+    registry: &Registry,
+) -> WireResult<Vec<u8>> {
+    encode_with_session(
+        &mut CodecSession::Plain(session),
+        value,
+        3,
+        true,
+        true,
+        limits,
+        registry,
+    )
 }
 
 fn encode_with_session(
@@ -58,6 +78,7 @@ fn encode_with_session(
     value: SexpId,
     version: u32,
     workspace: bool,
+    ascii: bool,
     limits: &Limits,
     registry: &Registry,
 ) -> WireResult<Vec<u8>> {
@@ -68,14 +89,19 @@ fn encode_with_session(
         bytes: Vec::new(),
         refs: HashMap::new(),
         reference_count: 0,
+        ascii,
         registry,
         version,
         limits,
     };
-    if workspace {
-        writer.push(if version == 2 { b"RDX2\n" } else { b"RDX3\n" })?;
+    if ascii {
+        writer.push(b"RDA3\nA\n")?;
+    } else {
+        if workspace {
+            writer.push(if version == 2 { b"RDX2\n" } else { b"RDX3\n" })?;
+        }
+        writer.push(b"X\n")?;
     }
-    writer.push(b"X\n")?;
     writer.word(version)?;
     writer.word(0x0004_0602)?;
     writer.word(if version == 2 {
@@ -85,13 +111,14 @@ fn encode_with_session(
     })?;
     if version == 3 {
         writer.word(5)?;
-        writer.push(b"UTF-8")?;
+        writer.string_bytes(b"UTF-8")?;
     }
     writer.item(session, value, 0)?;
     Ok(writer.bytes)
 }
 
 struct Writer<'a> {
+    ascii: bool,
     bytes: Vec<u8>,
     refs: HashMap<SexpId, u32>,
     reference_count: u32,
@@ -115,7 +142,43 @@ impl Writer<'_> {
     }
 
     fn word(&mut self, word: u32) -> WireResult<()> {
+        if self.ascii {
+            let n = word as i32;
+            if n == NA_INTEGER {
+                return self.push(b"NA\n");
+            }
+            return self.push(format!("{n}\n").as_bytes());
+        }
         self.push(&word.to_be_bytes())
+    }
+
+    fn real(&mut self, value: f64) -> WireResult<()> {
+        if self.ascii {
+            return match value {
+                x if is_na_real(x) => self.push(b"NA\n"),
+                x if x.is_nan() => self.push(b"NaN\n"),
+                f64::INFINITY => self.push(b"Inf\n"),
+                f64::NEG_INFINITY => self.push(b"-Inf\n"),
+                x => self.push(format!("{x:e}\n").as_bytes()),
+            };
+        }
+        self.push(&value.to_be_bytes())
+    }
+
+    fn string_bytes(&mut self, bytes: &[u8]) -> WireResult<()> {
+        if self.ascii {
+            for &byte in bytes {
+                if let Some(escape) = super::ascii::escape(byte) {
+                    self.push(&[b'\\', escape])?;
+                } else if byte.is_ascii_graphic() {
+                    self.push(&[byte])?;
+                } else {
+                    self.push(format!("\\{byte:03o}").as_bytes())?;
+                }
+            }
+            return self.push(b"\n");
+        }
+        self.push(bytes)
     }
 
     fn length(&mut self, len: usize) -> WireResult<()> {
@@ -307,15 +370,17 @@ impl Writer<'_> {
         }
         self.word(flags)?;
         match ty {
-            SexpType::Lgl => self.numeric(session.lgl(id)?, |x| x.raw().to_be_bytes())?,
-            SexpType::Int => self.numeric(session.int(id)?, i32::to_be_bytes)?,
-            SexpType::Real => self.numeric(session.real(id)?, f64::to_be_bytes)?,
+            SexpType::Lgl => {
+                self.numeric(session.lgl(id)?, |writer, x| writer.word(x.raw() as u32))?
+            }
+            SexpType::Int => self.numeric(session.int(id)?, |writer, x| writer.word(x as u32))?,
+            SexpType::Real => self.numeric(session.real(id)?, Self::real)?,
             SexpType::Cplx => {
                 let view = session.cplx(id)?;
                 self.length(view.len())?;
                 for x in view.iter() {
-                    self.push(&x.re.to_be_bytes())?;
-                    self.push(&x.im.to_be_bytes())?;
+                    self.real(x.re)?;
+                    self.real(x.im)?;
                 }
             }
             SexpType::Raw => {
@@ -324,7 +389,13 @@ impl Writer<'_> {
                     .as_slice()
                     .ok_or_else(|| invalid("cannot access raw vector bytes"))?;
                 self.length(bytes.len())?;
-                self.push(bytes)?;
+                if self.ascii {
+                    for byte in bytes {
+                        self.push(format!("{byte:02x}\n").as_bytes())?;
+                    }
+                } else {
+                    self.push(bytes)?;
+                }
             }
             SexpType::Str => {
                 let chars = session.str_slice(id)?;
@@ -350,7 +421,7 @@ impl Writer<'_> {
                     .ok_or_else(|| invalid("cannot write an unregistered primitive"))?
                     .as_bytes();
                 self.length(name.len())?;
-                self.push(name)?;
+                self.string_bytes(name)?;
             }
             SexpType::ExtPtr => {
                 let prot = session.extptr_prot(id)?;
@@ -372,14 +443,14 @@ impl Writer<'_> {
         Ok(())
     }
 
-    fn numeric<T: Elem, const N: usize>(
+    fn numeric<T: Elem>(
         &mut self,
         vector: VecView<'_, T>,
-        bytes: impl Fn(T) -> [u8; N],
+        write: impl Fn(&mut Self, T) -> WireResult<()>,
     ) -> WireResult<()> {
         self.length(vector.len())?;
         for elt in vector.iter() {
-            self.push(&bytes(elt))?;
+            write(self, elt)?;
         }
         Ok(())
     }
@@ -394,7 +465,7 @@ impl Writer<'_> {
         };
         self.word(SexpType::Char as u32 | flags)?;
         self.word(i32::try_from(bytes.len()).map_err(invalid)? as u32)?;
-        self.push(bytes)
+        self.string_bytes(bytes)
     }
 
     fn character(&mut self, session: &RSession, ch: CharId) -> WireResult<()> {
@@ -467,7 +538,7 @@ impl Writer<'_> {
         self.word(SexpType::Real as u32)?;
         self.word(3)?;
         for elt in [len, start, step] {
-            self.push(&elt.to_be_bytes())?;
+            self.real(elt)?;
         }
         self.word(NIL)
     }

@@ -267,9 +267,14 @@ fn test_at(
 }
 
 pub(super) fn typeof_(ctx: &mut Ctx, _: &Call, args: &mut Args) -> EvalResult {
-    let s = ctx.session_mut();
     let x = args.get(0);
-    Ok(s.scalar_str(s.type_of(x)?.type_name(s.is_s4(x)?))?)
+    let ty = if crate::compiler::source(ctx, x).is_some() {
+        Bcode
+    } else {
+        ctx.session().type_of(x)?
+    };
+    let s = ctx.session_mut();
+    Ok(s.scalar_str(ty.type_name(s.is_s4(x)?))?)
 }
 
 pub(super) fn storage_mode(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {

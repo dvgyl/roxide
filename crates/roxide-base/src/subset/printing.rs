@@ -97,6 +97,8 @@ fn print_default(
     } else if atomic(ty) {
         vector_limit(ctx, call, ctx.session().xlength(x)?, size_of::<String>())?;
         Some(print_vector(ctx.session_mut(), x, settings)?)
+    } else if let Some(output) = print_bytecode(ctx, x)? {
+        Some(output)
     } else {
         ctx.print_value_default(x, settings.fmt.digits)?;
         None
@@ -120,6 +122,32 @@ fn print_default(
         print_element(ctx, call, value, settings, &label, depth + 1)?;
     }
     Ok(())
+}
+
+fn print_bytecode(ctx: &mut Ctx, value: SexpId) -> EvalResult<Option<String>> {
+    if crate::compiler::source(ctx, value).is_some() {
+        return Ok(Some(format!("<bytecode: 0x{:x}>\n", value.to_bits())));
+    }
+    let Ok((formals, body, env)) = ctx.session().closure_parts(value) else {
+        return Ok(None);
+    };
+    let source = crate::compiler::source(ctx, body);
+    if source.is_none() && !roxide_eval::vm::is_compiled(ctx, value) {
+        return Ok(None);
+    }
+    let closure = if let Some(source) = source {
+        ctx.session_mut().alloc_closure(formals, source, env)?
+    } else {
+        value
+    };
+    let mut out = ctx.deparse_lines(closure, Default::default())?.join("\n");
+    let address = if source.is_some() { body } else { value };
+    let _ = write!(out, "\n<bytecode: 0x{:x}>\n", address.to_bits());
+    if env != roxide_value::GLOBAL_ENV {
+        out.push_str(&ctx.environment_label(env)?);
+        out.push('\n');
+    }
+    Ok(Some(out))
 }
 
 fn write_out(ctx: &mut Ctx, call: &Call, output: &str) -> EvalResult<()> {

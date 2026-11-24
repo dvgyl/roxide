@@ -1,11 +1,13 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::BufRead;
 
 use roxide_gc::SexpId;
 use roxide_host::Limits;
 use roxide_value::{
-    BASE_ENV, BASE_NAMESPACE, Binding, CharId, EMPTY_ENV, Encoding, GLOBAL_ENV, PromiseState,
-    RComplex, RLogical, RSession, SEXP_MISSING, SEXP_NIL, SEXP_UNBOUND, SexpType, Sym, ValueApi,
+    BASE_ENV, BASE_NAMESPACE, Binding, CharId, EMPTY_ENV, Encoding, GLOBAL_ENV, NA_INTEGER,
+    NA_REAL, PromiseState, RComplex, RLogical, RSession, SEXP_MISSING, SEXP_NIL, SEXP_UNBOUND,
+    SexpType, Sym, ValueApi,
 };
 
 use super::{
@@ -86,30 +88,42 @@ fn decode_from(
         binding_flags: HashMap::new(),
         env_parents: HashMap::new(),
         version: 0,
+        ascii: false,
         heap_start: session.heap.live_bytes(),
         limits,
         registry,
     };
     let workspace_version = if workspace {
+        let buffered = matches!(&reader.input, Input::Slice(_));
         match reader.take(5)? {
             b"RDX2\n" => Some(2),
             b"RDX3\n" => Some(3),
+            b"RDA3\n" if buffered => {
+                reader.ascii = true;
+                Some(3)
+            }
             _ => return Err(invalid("invalid R workspace header")),
         }
     } else {
         None
     };
-    if reader.take(2)? != b"X\n" {
-        return Err(invalid("invalid XDR stream header"));
+    let header = if reader.ascii { b"A\n" } else { b"X\n" };
+    if reader.take(2)? != header {
+        return Err(invalid(if reader.ascii {
+            "invalid ASCII stream header"
+        } else {
+            "invalid XDR stream header"
+        }));
     }
     reader.version = reader.word()?;
     if !matches!(reader.version, 2 | 3) || workspace_version.is_some_and(|v| v != reader.version) {
         return Err(invalid("unsupported serialization version"));
     }
-    reader.take(8)?;
+    reader.word()?;
+    reader.word()?;
     if reader.version == 3 {
         let len = reader.vector_len::<u8>(1)?;
-        reader.take(len)?;
+        reader.string_bytes(len)?;
     }
     let value = reader.item(session, 0)?;
     reader.check_heap(session)?;
@@ -123,6 +137,7 @@ enum Input<'a> {
 }
 
 struct Reader<'a, 'limits> {
+    ascii: bool,
     input: Input<'a>,
     remaining: usize,
     scratch: Vec<u8>,
@@ -167,7 +182,34 @@ impl Reader<'_, '_> {
         }
     }
 
+    fn line(&mut self) -> WireResult<&str> {
+        let Input::Slice(bytes) = &mut self.input else {
+            return Err(invalid("ASCII serialization requires a file buffer"));
+        };
+        let end = bytes
+            .iter()
+            .position(|&byte| byte == b'\n')
+            .ok_or_else(truncated)?;
+        let line = &bytes[..end];
+        *bytes = &bytes[end + 1..];
+        self.remaining = bytes.len();
+        std::str::from_utf8(line).map_err(invalid)
+    }
+
+    fn string_bytes(&mut self, len: usize) -> WireResult<Cow<'_, [u8]>> {
+        if self.ascii {
+            return super::ascii::decode_string(self.line()?.as_bytes(), len).map(Cow::Owned);
+        }
+        self.take(len).map(Cow::Borrowed)
+    }
+
     fn word(&mut self) -> WireResult<u32> {
+        if self.ascii {
+            return match self.line()? {
+                "NA" => Ok(NA_INTEGER as u32),
+                line => line.parse::<i32>().map(|n| n as u32).map_err(invalid),
+            };
+        }
         let b = self.take(4)?.try_into().map_err(invalid)?;
         Ok(u32::from_be_bytes(b))
     }
@@ -195,6 +237,7 @@ impl Reader<'_, '_> {
         if len > self.limits.max_vector_bytes / size_of::<T>() {
             return Err(invalid("serialized vector exceeds the allocation limit"));
         }
+        let width = if self.ascii { 1 } else { width };
         if len > self.remaining / width {
             return Err(match self.input {
                 Input::Slice(_) => truncated(),
@@ -205,6 +248,12 @@ impl Reader<'_, '_> {
     }
 
     fn f64(&mut self) -> WireResult<f64> {
+        if self.ascii {
+            return match self.line()? {
+                "NA" => Ok(NA_REAL),
+                line => line.parse().map_err(invalid),
+            };
+        }
         Ok(f64::from_be_bytes(
             self.take(8)?.try_into().map_err(invalid)?,
         ))
@@ -354,7 +403,16 @@ impl Reader<'_, '_> {
             }
             24 => {
                 let len = self.vector_len::<u8>(1)?;
-                session.alloc_raw_from(self.take(len)?)?
+                if self.ascii {
+                    let mut bytes = Vec::new();
+                    bytes.try_reserve_exact(len).map_err(invalid)?;
+                    for _ in 0..len {
+                        bytes.push(u8::from_str_radix(self.line()?, 16).map_err(invalid)?);
+                    }
+                    session.alloc_raw_from(&bytes)?
+                } else {
+                    session.alloc_raw_from(self.take(len)?)?
+                }
             }
             25 => {
                 let object = session.alloc_s4_object()?;
@@ -439,20 +497,20 @@ impl Reader<'_, '_> {
                 return Err(invalid("invalid serialized string length"));
             }
             self.check_vector::<u8>(len as usize, 1)?;
-            let bytes = self.take(len as usize)?;
+            let bytes = self.string_bytes(len as usize)?;
             let encoding = if flags & BYTES != 0 {
                 Encoding::Bytes
             } else if flags & LATIN1 != 0 {
                 Encoding::Latin1
             } else if flags & UTF8 != 0 {
-                if std::str::from_utf8(bytes).is_err() {
+                if std::str::from_utf8(&bytes).is_err() {
                     return Err(invalid("invalid UTF-8 in serialized character data"));
                 }
                 Encoding::Utf8
             } else {
                 Encoding::Native
             };
-            session.mk_char(bytes, encoding)?
+            session.mk_char(&bytes, encoding)?
         };
         if flags & ATTR != 0 {
             session.root(ch.as_sexp());
@@ -680,7 +738,8 @@ impl Reader<'_, '_> {
 
     fn primitive(&mut self, session: &mut CodecSession<'_, '_>, ty: u32) -> WireResult<SexpId> {
         let len = self.vector_len::<u8>(1)?;
-        let name = std::str::from_utf8(self.take(len)?).map_err(invalid)?;
+        let bytes = self.string_bytes(len)?;
+        let name = std::str::from_utf8(&bytes).map_err(invalid)?;
         let sym = session.intern(name)?;
         let expected = ty == SexpType::Special as u32;
         for env in Registry::envs(&self.registry.packages) {
