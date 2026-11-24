@@ -3,7 +3,7 @@
 //! Staged `libR` archive and launcher entry point (ADR-0020).
 //!
 //! Linked into `target/rhome/lib/libR.{dylib,so}` with an explicit manifest export list
-//! so compiled CRAN packages resolve all public R 4.6.2 C API symbols against Roxide.
+//! so compiled packages resolve the supported C API symbols against Roxide.
 
 use std::ffi::{CStr, c_char, c_int};
 
@@ -34,5 +34,6 @@ pub unsafe extern "C" fn roxide_main(argc: c_int, argv: *const *const c_char) ->
     if args.is_empty() {
         args.push(String::from("roxide"));
     }
-    std::panic::catch_unwind(|| roxide_cli::run_args(args) as c_int).unwrap_or(1)
+    std::panic::catch_unwind(|| roxide_cli::run_args_with(args, roxide_capi::hooks::install))
+        .unwrap_or(1)
 }
