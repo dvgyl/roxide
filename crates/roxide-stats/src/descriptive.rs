@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+mod aggregate;
 mod covariance;
 mod order;
 
@@ -24,8 +25,12 @@ pub const MODULE: Module = Module {
         internal("C_mad", 3, order::mad),
         internal("C_fivenum", 2, order::fivenum),
         internal("C_weighted_mean", 4, weighted_mean),
+        internal("C_aggregate_rows", 1, aggregate::rows),
     ],
-    prelude: include_str!("descriptive/prelude.R"),
+    prelude: concat!(
+        include_str!("descriptive/prelude.R"),
+        include_str!("descriptive/aggregate.R"),
+    ),
 };
 
 fn boolean(ctx: &mut Ctx, call: &Call, value: roxide_gc::SexpId) -> EvalResult<bool> {

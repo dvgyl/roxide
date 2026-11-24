@@ -1,0 +1,113 @@
+=== case: aggregate_formula_dot_and_pipe ===
+#@ tags: layer3,stats,aggregate
+#@ compare: exact
+flowers <- data.frame(
+    Sepal.Length = c(5.1, 4.9, 7, 6.4, 6.3, 5.8),
+    Sepal.Width = c(3.5, 3, 3.2, 3.2, 3.3, 2.7),
+    Petal.Length = c(1.4, 1.4, 4.7, 4.5, 6, 5.1),
+    Petal.Width = c(0.2, 0.2, 1.4, 1.5, 2.5, 1.9),
+    Species = factor(rep(c("setosa", "versicolor", "virginica"), each = 2L))
+)
+part <- function(x) mean(x >= 5)
+dput(stats::aggregate(. ~ Species, flowers, part))
+pipe <- function(.) aggregate(. ~ Species, ., function(x) mean(x >= 5))
+dput(pipe(flowers))
+
+=== case: aggregate_formula_frame ===
+#@ tags: layer3,stats,aggregate
+#@ compare: exact
+d <- data.frame(a = c(1L, NA, 3L, 4L, 5L), b = 6:10,
+                g = c("v", "v", "u", "u", NA), h = c(1L, 1L, 2L, 1L, 2L))
+dput(aggregate(cbind(a, b) ~ g + h, d, sum))
+dput(aggregate(cbind(low = a, high = b + 1L) ~ g + h, d, sum, subset = b > 6L))
+dput(aggregate(a ~ ., d, sum))
+dput(aggregate(. ~ I(h), d[c("a", "b", "h")], length))
+dput(aggregate(. ~ g, d, sum, na.action = na.pass))
+dput(aggregate(a ~ 1, d, range))
+dput(aggregate(as.formula("a ~ g"), d, sum))
+dput(aggregate(update(a ~ g, . ~ . + h), d, sum))
+tryCatch(aggregate(a ~ g, d, sum, na.action = na.fail),
+         error = function(e) cat(conditionMessage(e), "\n"))
+
+=== case: aggregate_order_and_empty_groups ===
+#@ tags: layer3,stats,aggregate
+#@ compare: exact
+d <- data.frame(value = 1:6)
+a <- ordered(c("b", "a", "b", "a", NA, "a"), levels = c("u", "b", "a"))
+b <- c(FALSE, TRUE, TRUE, TRUE, FALSE, NA)
+dput(aggregate(d, list(a, flag = b), "sum"))
+dput(aggregate(d, list(a, flag = b), sum, drop = FALSE))
+dput(aggregate(d, list(flag = b, a), sum, drop = FALSE))
+dput(aggregate(d, list(k = c(10, 1, 2, -1, NA_real_, NaN)), sum))
+dput(aggregate(d, list(k = rep(NA, 6)), sum))
+dput(aggregate(d, list(k = factor(rep(NA, 6), levels = c("a", "b"))), sum, drop = FALSE))
+dput(aggregate(1:5, list(g = c(4, 1, 4, 2, 1)), sum))
+
+=== case: aggregate_result_shapes ===
+#@ tags: layer3,stats,aggregate
+#@ compare: exact
+d <- data.frame(x = 1:4, y = 5:8)
+g <- list(g = factor(c("a", "b", "b", "a"), levels = c("c", "b", "a")))
+summary <- function(z, offset) c(low = min(z), high = max(z) + offset)
+out <- aggregate(d, g, summary, 1L, drop = FALSE)
+dput(names(out))
+dput(out$g)
+dput(out$x)
+dput(out$y)
+dput(aggregate(d, g, sum, simplify = FALSE, drop = FALSE))
+dput(aggregate(d, g, function(z) z[seq_len(max(z) %% 3L)]))
+dput(aggregate(d, g, function(z) NULL))
+dput(aggregate(d, g, function(z) factor(if (min(z) %% 2L) "odd" else "even")))
+out <- aggregate(d, g, function(z) as.Date("2020-01-01") + min(z))
+dput(out$x)
+dput(out$y)
+dput(aggregate(d, g, function(z) if (min(z) %% 2L) list(z[1L]) else z[2L]))
+out <- aggregate(d, g, function(z) list(low = min(z), high = max(z)), drop = FALSE)
+dput(out$x)
+dput(out$y)
+
+=== case: aggregate_dispatch_and_validation ===
+#@ tags: layer3,stats,aggregate
+#@ compare: exact
+report <- function(e) cat(conditionMessage(e), "\n")
+aggregate.example <- function(x, ...) "method"
+dput(aggregate(structure(1L, class = "example")))
+local({
+    summarize <- function(x) sum(x) + 2L
+    dput(aggregate(data.frame(x = 1:3), list(c(2, 1, 1)), "summarize"))
+})
+tryCatch(aggregate(data.frame(x = 1:2), c(1, 2), sum), error = report)
+tryCatch(aggregate(data.frame(x = 1:2), list(1), sum), error = report)
+tryCatch(aggregate(data.frame(x = integer()), list(integer()), sum), error = report)
+tryCatch(aggregate(~x, data.frame(x = 1L), length), error = report)
+dput(aggregate(ts(1:9, start = c(2000, 2), frequency = 4), nfrequency = 2L))
+dput(aggregate(ts(matrix(1:16, 8L), frequency = 4), ndeltat = 0.5, FUN = mean))
+
+=== case: stats_tier2_helpers ===
+#@ tags: layer3,stats,aggregate
+#@ compare: exact
+f <- factor(c("b", "a", "b", NA), levels = c("b", "a", "u"))
+x <- setNames(1:4, c("one", "two", "three", "four"))
+dput(ave(x, f))
+dput(ave(x, f, c(0L, 1L, 0L, 1L), FUN = sum))
+dput(ave(x, FUN = sum))
+dput(relevel(setNames(f, names(x)), "a"))
+show_reorder <- function(out) {
+    scores <- attr(out, "scores")
+    attr(out, "scores") <- NULL
+    dput(out)
+    dput(as.vector(scores))
+    dput(attributes(scores))
+}
+show_reorder(reorder(setNames(f, names(x)), c(8, 4, 2, 0)))
+show_reorder(reorder(ordered(f, levels = levels(f)), c(8, 4, 2, 0), decreasing = TRUE))
+show_reorder(reorder(c("z", "x", "a", "x"), c(4, NA, 0, NA)))
+show_reorder(reorder(character(), numeric()))
+dput(complete.cases(x, f))
+dput(setNames(1:3, c("a", "b", "c")))
+dput(setNames(nm = c("a", "b")))
+report <- function(e) cat(conditionMessage(e), "\n")
+tryCatch(relevel(ordered(f), "a"), error = report)
+tryCatch(relevel(x, "a"), error = report)
+tryCatch(relevel(f, "unknown"), error = report)
+tryCatch(reorder(f, x, FUN = range), error = report)
