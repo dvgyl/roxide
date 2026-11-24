@@ -8,10 +8,18 @@ pub mod compile;
 pub mod exec;
 pub mod guard;
 pub mod ir;
+mod iterator;
+mod jit;
+mod scalar;
+mod stack;
+mod subscript;
 
 pub use compile::compile_expr;
-pub use exec::run_body;
+pub use exec::{run_body, run_compiled};
 pub use ir::{CompiledCode, Op, Reg};
+pub use jit::is_compiled;
+
+pub(crate) use exec::try_loop;
 
 /// Return true if automatic JIT compilation is active at `level` (`level >= 1`).
 #[inline]

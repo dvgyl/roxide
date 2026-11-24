@@ -273,6 +273,9 @@ fn if_expr(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
 }
 
 fn for_loop(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    if let Some(result) = crate::vm::try_loop(ctx, call) {
+        return result;
+    }
     let var = ctx.sym_from_sexp(args.get(0))?;
     let mut sequence = ctx.eval(args.get(1), call.env)?;
     ctx.protect(sequence);
@@ -343,6 +346,9 @@ fn for_loop(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
 }
 
 fn while_loop(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    if let Some(result) = crate::vm::try_loop(ctx, call) {
+        return result;
+    }
     run_loop(ctx, call, args.get(1), |ctx| {
         let value = ctx.eval(args.get(0), call.env)?;
         ctx.truth(value, call.err_call())
@@ -350,6 +356,9 @@ fn while_loop(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
 }
 
 fn repeat_loop(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    if let Some(result) = crate::vm::try_loop(ctx, call) {
+        return result;
+    }
     run_loop(ctx, call, args.get(0), |_| Ok(true))
 }
 
