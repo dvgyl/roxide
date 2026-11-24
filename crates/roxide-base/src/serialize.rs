@@ -121,8 +121,10 @@ fn checked<T>(ctx: &mut Ctx, call: &Call, result: WireResult<T>) -> EvalResult<T
 fn limits(ctx: &mut Ctx) -> Limits {
     let expressions = ctx.opts().expressions;
     let mut limits = ctx.host().limits().clone();
-    // Pairlist tails use a loop. Bound native stack use for nested objects.
-    limits.max_expressions = limits.max_expressions.min(expressions).min(128);
+    // Pairlist tails use a loop. Scale nesting cap with the thread's configured stack budget
+    // (128 on small 2 MB test threads; up to 2048 on the 32 MB CLI thread).
+    let stack_cap = (ctx.stack_budget() / 4096).clamp(128, 2048);
+    limits.max_expressions = limits.max_expressions.min(expressions).min(stack_cap);
     limits
 }
 

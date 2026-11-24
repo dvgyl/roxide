@@ -51,7 +51,7 @@ new <- function(Class, ...) {
 initialize <- function(.Object, ...) .s4_initialize(.Object, list(...), parent.frame())
 
 setValidity <- function(Class, method, where = topenv(parent.frame())) {
-    invisible(.s4_validity_set(Class, method, where))
+    .s4_validity_set(Class, method, where)
 }
 
 getValidity <- function(ClassDef) ClassDef@validity

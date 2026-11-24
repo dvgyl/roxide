@@ -115,6 +115,17 @@ suppressMessages <- function(expr, classes = "message") {
     })
 }
 suppressPackageStartupMessages <- function(expr) suppressMessages(expr, "packageStartupMessage")
+print.condition <- function(x, ...) {
+    msg <- conditionMessage(x)
+    call <- conditionCall(x)
+    cl <- class(x)[1L]
+    if (!is.null(call)) {
+        cat("<", cl, " in ", deparse(call)[1L], ": ", msg, ">\n", sep = "")
+    } else {
+        cat("<", cl, ": ", msg, ">\n", sep = "")
+    }
+    invisible(x)
+}
 "#,
 };
 

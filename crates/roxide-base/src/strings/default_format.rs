@@ -118,7 +118,8 @@ fn fields(
     settings: &Settings,
     depth: usize,
 ) -> EvalResult<Vec<Option<String>>> {
-    if depth >= ctx.opts().expressions.min(128) {
+    let stack_cap = (ctx.stack_budget() / 4096).clamp(128, 2048);
+    if depth >= ctx.opts().expressions.min(stack_cap) {
         return Err(error(ctx, call, "evaluation nested too deeply"));
     }
     let s = ctx.session();

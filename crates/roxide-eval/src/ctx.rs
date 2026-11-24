@@ -892,6 +892,12 @@ impl Ctx {
         self.stack_budget = bytes;
     }
 
+    /// Return the configured evaluator stack budget in bytes.
+    #[must_use]
+    pub fn stack_budget(&self) -> usize {
+        self.stack_budget
+    }
+
     /// Install the stateless S4 dispatch hook.
     pub fn set_s4_hooks(&mut self, hooks: &'static dyn S4Hooks) {
         self.s4_hooks = Some(hooks);
