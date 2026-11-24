@@ -1,0 +1,65 @@
+/* SPDX-License-Identifier: MIT OR Apache-2.0 */
+#ifndef ROXIDE_R_EXT_CONSTANTS_H
+#define ROXIDE_R_EXT_CONSTANTS_H
+
+#include <float.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#ifndef M_E
+#define M_E 2.71828182845904523536
+#endif
+#ifndef M_LOG2E
+#define M_LOG2E 1.44269504088896340736
+#endif
+#ifndef M_LOG10E
+#define M_LOG10E 0.43429448190325182765
+#endif
+#ifndef M_LN2
+#define M_LN2 0.69314718055994530942
+#endif
+#ifndef M_LN10
+#define M_LN10 2.30258509299404568402
+#endif
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+#ifndef M_PI_2
+#define M_PI_2 1.57079632679489661923
+#endif
+#ifndef M_PI_4
+#define M_PI_4 0.78539816339744830962
+#endif
+#ifndef M_1_PI
+#define M_1_PI 0.31830988618379067154
+#endif
+#ifndef M_2_PI
+#define M_2_PI 0.63661977236758134308
+#endif
+#ifndef M_2_SQRTPI
+#define M_2_SQRTPI 1.12837916709551257390
+#endif
+#ifndef M_SQRT2
+#define M_SQRT2 1.41421356237309504880
+#endif
+#ifndef M_SQRT1_2
+#define M_SQRT1_2 0.70710678118654752440
+#endif
+#define M_SQRT_3 1.73205080756887729353
+#define M_SQRT_32 5.65685424949238019521
+#define M_LOG10_2 0.30102999566398119521
+#define M_2PI 6.28318530717958647693
+#define M_SQRT_PI 1.77245385090551602730
+#define M_1_SQRT_2PI 0.39894228040143267794
+#define M_SQRT_2dPI 0.79788456080286535588
+#define M_LN_SQRT_PI 0.57236494292470008707
+#define M_LN_SQRT_2PI 0.91893853320467274178
+#define M_LN_SQRT_PId2 0.22579135264472743236
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif
