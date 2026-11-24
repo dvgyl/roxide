@@ -1,0 +1,176 @@
+=== case: tier2_utils_archive_round_trip ===
+#@ tags: layer3,utils,archive
+#@ compare: exact
+local({
+    old <- setwd(tempdir())
+    on.exit(setwd(old))
+    dir.create("input")
+    dir.create("input/empty")
+    dir.create("input/nested")
+    writeLines("three", "input/nested/c")
+    writeLines("one", "input/a")
+    writeLines("two", "input/b")
+    for (mode in c("none", "gzip", "bzip2", "xz", "zstd")) {
+        archive <- tempfile()
+        out <- tempfile()
+        stopifnot(utils::tar(archive, "input", compression = mode, tar = "internal") == 0L)
+        stopifnot(identical(utils::untar(archive, list = TRUE, tar = "internal"),
+                            c("input/a", "input/b", "input/empty/", "input/nested/", "input/nested/c")))
+        stopifnot(utils::untar(archive, files = "input/b", exdir = out, tar = "internal") == 0L)
+        stopifnot(identical(readLines(file.path(out, "input/b")), "two"),
+                  !file.exists(file.path(out, "input/a")))
+        stopifnot(utils::untar(archive, exdir = out, tar = "internal") == 0L)
+        stopifnot(dir.exists(file.path(out, "input/empty")))
+    }
+})
+cat("Archive checks passed\n")
+
+=== case: tier2_utils_namespace_and_s3 ===
+#@ tags: layer3,utils,namespace,s3
+#@ compare: exact
+waveGeneric <- function(x) UseMethod("waveGeneric")
+waveGeneric.waveClass <- function(x) 42L
+waveBinding <- 17L
+stopifnot(identical(utils::packageName(asNamespace("utils")), "utils"),
+          is.null(utils::packageName(globalenv())),
+          isTRUE(utils::hasName(list(wave = 1L), "wave")),
+          identical(utils::getFromNamespace("hasName", "utils"), utils::hasName),
+          identical(utils::getFromNamespace("hasName", pos = "package:utils"), utils::hasName),
+          identical(utils::getS3method("waveGeneric", "waveClass"), waveGeneric.waveClass),
+          is.null(utils::getS3method("waveGeneric", "absent", optional = TRUE)),
+          utils::isS3method("waveGeneric.waveClass"),
+          !utils::isS3method("print.waveMissingClass"),
+          identical(utils::isS3stdGeneric(waveGeneric), c(waveGeneric = TRUE)),
+          identical(as.character(utils::methods(waveGeneric)), "waveGeneric.waveClass"),
+          identical(as.character(utils::methods(class = "waveClass")), "waveGeneric.waveClass"),
+          identical(utils::find("waveBinding"), ".GlobalEnv"),
+          identical(utils::find("waveBinding", numeric = TRUE), c(.GlobalEnv = 1L)),
+          identical(utils::apropos("^waveBinding$", where = TRUE), setNames("waveBinding", "1")))
+where <- utils::getAnywhere("waveBinding")
+stopifnot(identical(where$objs, list(.GlobalEnv = 17L)),
+          identical(where$where, ".GlobalEnv"),
+          identical(where$visible, TRUE),
+          identical(where$dups, FALSE))
+missing.binding <- utils::getAnywhere(waveMissingBinding)
+stopifnot(identical(missing.binding$name, "waveMissingBinding"),
+          identical(missing.binding$where, character()))
+ns <- asNamespace("utils")
+stopifnot(identical(names(formals(utils::assignInNamespace)), c("x", "value", "ns", "pos", "envir")))
+stopifnot(identical(names(formals(utils::assignInMyNamespace)), c("x", "value")))
+cat("Namespace checks passed\n")
+
+=== case: tier2_utils_package_tools ===
+#@ tags: layer3,utils,packages
+#@ compare: exact
+stopifnot(identical(names(formals(utils::install.packages)),
+    c("pkgs", "lib", "repos", "contriburl", "method", "available", "destdir", "dependencies",
+      "type", "configure.args", "configure.vars", "clean", "Ncpus", "verbose", "libs_only",
+      "INSTALL_opts", "quiet", "keep_outputs", "...")))
+env <- new.env()
+env$waveExample <- function(x) x + 1L
+root <- tempfile()
+dir.create(root)
+invisible(suppressMessages(utils::package.skeleton("waveTest", list = "waveExample",
+                                                    environment = env, path = root)))
+pkg <- file.path(root, "waveTest")
+stopifnot(dir.exists(file.path(pkg, "R")), dir.exists(file.path(pkg, "man")),
+          file.exists(file.path(pkg, "DESCRIPTION"), file.path(pkg, "NAMESPACE"),
+                      file.path(pkg, "Read-and-delete-me")),
+          identical(unname(read.dcf(file.path(pkg, "DESCRIPTION"))[1L, "Package"]), "waveTest"))
+target <- new.env()
+for (file in list.files(file.path(pkg, "R"), full.names = TRUE)) sys.source(file, target)
+stopifnot(identical(target$waveExample(2L), 3L))
+installed <- utils::installed.packages(lib.loc = root, fields = "WaveExample")
+stopifnot(is.character(installed), is.matrix(installed),
+          all(c("Package", "LibPath", "Version", "Priority", "Depends", "Imports", "LinkingTo",
+                "Suggests", "Enhances", "License", "License_is_FOSS", "License_restricts_use",
+                "OS_type", "MD5sum", "NeedsCompilation", "Built", "WaveExample") %in% colnames(installed)))
+cat("Package tool checks passed\n")
+
+=== case: tier2_datasets_exports ===
+#@ tags: layer3,datasets
+#@ compare: exact
+stopifnot(identical(dim(datasets::iris), c(150L, 5L)),
+          identical(names(datasets::iris), c("Sepal.Length", "Sepal.Width", "Petal.Length", "Petal.Width", "Species")),
+          identical(levels(datasets::iris$Species), c("setosa", "versicolor", "virginica")),
+          identical(dim(datasets::mtcars), c(32L, 11L)),
+          identical(attr(datasets::mtcars, "row.names")[1L], "Mazda RX4"),
+          identical(datasets::cars$speed[1L], 4),
+          identical(datasets::women$height[15L], 72),
+          identical(datasets::pressure$pressure[19L], 806),
+          identical(attr(datasets::BOD, "reference"), "A1.4, p. 270"),
+          identical(datasets::state.abb[1L], "AL"),
+          identical(datasets::state.name[50L], "Wyoming"),
+          identical(class(datasets::state.region), "factor"),
+          identical(levels(datasets::state.division)[9L], "Pacific"))
+cat("Dataset checks passed\n")
+
+=== case: tier2_install_local_packages ===
+#@ tags: layer3,utils,native,packages
+#@ compare: exact
+local({
+    root <- tempfile("wave package ")
+    dir.create(root)
+    oracle <- Sys.getenv("ROXIDE_ORACLE_RSCRIPT")
+    if (!is.null(R.version$nickname) && nzchar(oracle) &&
+        grepl("/R.framework/", R.home(), fixed = TRUE) &&
+        !startsWith(R.home(), "/Library/Frameworks/")) {
+        # Run the relocated GNU R installer through its Rscript launcher.
+        old.home <- R.home()
+        on.exit(Sys.setenv(R_HOME = old.home))
+        home <- file.path(tempdir(), "install-home")
+        dir.create(file.path(home, "bin"), recursive = TRUE)
+        paths <- list.files(old.home, full.names = TRUE)
+        paths <- paths[basename(paths) != "bin"]
+        stopifnot(all(file.symlink(paths, file.path(home, basename(paths)))))
+        paths <- list.files(file.path(old.home, "bin"), full.names = TRUE)
+        paths <- paths[basename(paths) != "R"]
+        stopifnot(all(file.symlink(paths, file.path(home, "bin", basename(paths)))))
+        wrapper <- file.path(home, "bin", "R")
+        install <- shQuote(paste("Sys.setenv(R_HOME = Sys.getenv('ROXIDE_TEST_R_HOME'));",
+                                 "tools:::.install_packages(commandArgs(TRUE)[-1L], no.q = TRUE)"))
+        writeLines(c("#!/bin/sh", paste0("export ROXIDE_TEST_R_HOME=", shQuote(home)),
+                     'export R_HOME="$ROXIDE_TEST_R_HOME"',
+                     'export DYLD_FALLBACK_LIBRARY_PATH="$R_HOME/lib"',
+                     'if [ "$1" = CMD ] && [ "$2" = INSTALL ]; then',
+                     "  shift 2",
+                     paste("  exec", shQuote(oracle), "--vanilla -e", install, 'install "$@"'),
+                     "fi", paste("exec", shQuote(commandArgs()[[1L]]), '"$@"')),
+                   wrapper)
+        Sys.chmod(wrapper, "0755")
+        Sys.setenv(R_HOME = home)
+    }
+    source <- file.path(root, "waveTest")
+    dir.create(source)
+    dir.create(file.path(source, "R"))
+    writeLines(c("Package: waveTest", "Version: 1.0", "Title: Local Package",
+                 "Description: Check local package installation.",
+                 "Author: Test Author", "Maintainer: Test Author <test@example.org>",
+                 "License: MIT"), file.path(source, "DESCRIPTION"))
+    writeLines("export(waveExample)", file.path(source, "NAMESPACE"))
+    writeLines(c("waveExample <- function() 42L",
+                 'waveSet <- function() utils::assignInMyNamespace("waveExample", function() 44L)'),
+               file.path(source, "R", "example.R"))
+    first <- file.path(root, "first")
+    second <- file.path(root, "second")
+    dir.create(first)
+    dir.create(second)
+    utils::install.packages(source, lib = first, repos = NULL, type = "source", quiet = TRUE)
+    stopifnot(file.exists(file.path(first, "waveTest", "DESCRIPTION")))
+    archive <- file.path(root, "waveTest.tar.gz")
+    old <- setwd(root)
+    tryCatch(utils::tar(archive, "waveTest", compression = "gzip", tar = "internal"),
+             finally = setwd(old))
+    utils::install.packages(archive, lib = second, repos = NULL, type = "source", quiet = TRUE)
+    packages <- utils::installed.packages(lib.loc = second)
+    stopifnot(identical(unname(packages["waveTest", "Version"]), "1.0"))
+    ns <- loadNamespace("waveTest", lib.loc = second)
+    stopifnot(identical(utils::getFromNamespace("waveExample", ns)(), 42L))
+    was.locked <- bindingIsLocked("waveExample", ns)
+    utils::assignInNamespace("waveExample", function() 43L, ns)
+    stopifnot(identical(utils::getFromNamespace("waveExample", ns)(), 43L))
+    utils::getFromNamespace("waveSet", ns)()
+    stopifnot(identical(utils::getFromNamespace("waveExample", ns)(), 44L),
+              identical(bindingIsLocked("waveExample", ns), was.locked))
+})
+cat("Local installation checks passed\n")

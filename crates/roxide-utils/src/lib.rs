@@ -2,6 +2,8 @@
 
 //! Clean-room GNU R 4.6.2 `utils` and `tools` packages split into disjoint submodules.
 
+mod archive;
+pub mod datasets;
 pub mod inspect;
 pub mod pkgutils;
 pub mod str;
@@ -17,6 +19,9 @@ pub const UTILS_MODULES: &[&Module] = &[
     &str::MODULE,
     &inspect::MODULE,
     &pkgutils::MODULE,
+    &archive::MODULE,
+    &pkgutils::PACKAGE_TOOLS,
+    &pkgutils::NAMESPACE_TOOLS,
 ];
 
 /// Submodules registered into `namespace:tools`.

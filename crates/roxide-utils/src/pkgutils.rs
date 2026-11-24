@@ -17,7 +17,17 @@ pub const MODULE: Module = Module {
     prelude: include_str!("pkgutils.R"),
 };
 
-const fn internal(name: &'static str, n: usize, fun: PrimFn) -> PrimDef {
+pub(crate) const PACKAGE_TOOLS: Module = Module {
+    prims: &[],
+    prelude: include_str!("package_tools.R"),
+};
+
+pub(crate) const NAMESPACE_TOOLS: Module = Module {
+    prims: &[],
+    prelude: include_str!("namespace_tools.R"),
+};
+
+pub(crate) const fn internal(name: &'static str, n: usize, fun: PrimFn) -> PrimDef {
     PrimDef {
         name,
         fun,

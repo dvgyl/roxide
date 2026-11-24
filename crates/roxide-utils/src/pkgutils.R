@@ -43,18 +43,20 @@ modifyList <- function(x, val, keep.null = FALSE) {
     }
     x
 }
-.rox_package_env <- function(ns, pkg, lib.loc) {
-    if (is.environment(ns)) ns else
-        if (is.null(ns)) loadNamespace(pkg, lib.loc = lib.loc) else loadNamespace(ns)
+.rox_namespace <- function(ns) {
+    if (is.environment(ns)) ns else asNamespace(ns)
 }
 getFromNamespace <- function(x, ns, pos = -1, envir = as.environment(pos)) {
-    ns <- if (missing(ns)) sub("^package:", "", environmentName(envir)) else ns
-    ns <- .rox_package_env(ns, NULL, NULL)
-    get(x, envir = ns, inherits = FALSE)
+    if (exists("getFromNamespace", envir = baseenv(), inherits = FALSE))
+        return(base::getFromNamespace(x, ns = ns, pos = pos, envir = envir))
+    if (missing(ns)) ns <- sub("^package:", "", environmentName(envir))
+    get(x, envir = .rox_namespace(ns), inherits = FALSE)
 }
 assignInNamespace <- function(x, value, ns, pos = -1, envir = as.environment(pos)) {
-    ns <- if (missing(ns)) sub("^package:", "", environmentName(envir)) else ns
-    ns <- .rox_package_env(ns, NULL, NULL)
+    if (exists("assignInNamespace", envir = baseenv(), inherits = FALSE))
+        return(invisible(base::assignInNamespace(x, value, ns = ns, pos = pos, envir = envir)))
+    if (missing(ns)) ns <- sub("^package:", "", environmentName(envir))
+    ns <- .rox_namespace(ns)
     locked <- bindingIsLocked(x, ns)
     if (locked) {
         unlockBinding(x, ns)
@@ -170,7 +172,7 @@ installed.packages <- function(lib.loc = NULL, priority = NULL, noCache = FALSE,
                                subarch = .Platform$r_arch, ...) {
     defaults <- c("Package", "LibPath", "Version", "Priority", "Depends", "Imports", "LinkingTo",
                   "Suggests", "Enhances", "License", "License_is_FOSS", "License_restricts_use",
-                  "OS_type", "MD5sum", "NeedsCompilation", "Built", "Published")
+                  "OS_type", "Archs", "MD5sum", "NeedsCompilation", "Built", "Published")
     columns <- unique(c(defaults, fields))
     include.base <- is.null(lib.loc) || .Library %in% lib.loc
     if (is.null(lib.loc)) lib.loc <- if (exists(".libPaths", envir = baseenv())) .libPaths() else .Library
@@ -190,6 +192,7 @@ installed.packages <- function(lib.loc = NULL, priority = NULL, noCache = FALSE,
             records[[length(records) + 1L]] <- list(Package = pkg, Version = "4.6.2",
                                                      LibPath = .Library, Priority = "base")
     }
+    if ("high" %in% priority) priority <- c(priority, "base", "recommended")
     if (!is.null(priority)) records <- Filter(function(r) r$Priority %in% priority, records)
     out <- matrix(NA_character_, nrow = length(records), ncol = length(columns))
     for (i in seq_along(records)) out[i, ] <- vapply(columns, function(nm) {
