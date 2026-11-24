@@ -128,26 +128,83 @@ fn normalize(
     paths: impl IntoIterator<Item = PathBuf>,
     home: PathBuf,
 ) -> Vec<PathBuf> {
+    let home = ctx.host().canonicalize(&home).unwrap_or(home);
     let mut unique = BTreeSet::new();
     let mut result = Vec::new();
     for path in paths {
-        if !ctx
-            .host()
-            .metadata(&path, true)
-            .is_ok_and(|meta| meta.is_dir)
+        let path = ctx.host().canonicalize(&path).unwrap_or(path);
+        if path != home
+            && !ctx
+                .host()
+                .metadata(&path, true)
+                .is_ok_and(|meta| meta.is_dir)
         {
             continue;
         }
-        let path = ctx.host().canonicalize(&path).unwrap_or(path);
         if unique.insert(path.clone()) {
             result.push(path);
         }
     }
-    let home = ctx.host().canonicalize(&home).unwrap_or(home);
     if unique.insert(home.clone()) {
         result.push(home);
     }
     result
+}
+
+pub(super) fn available_packages(
+    ctx: &mut Ctx,
+    call: &Call,
+    args: &mut Args,
+) -> EvalResult<SexpId> {
+    let locations = args.get(0);
+    let paths = if locations == SEXP_NIL {
+        libraries(ctx)?
+    } else {
+        if ctx.session().type_of(locations)? != roxide_value::SexpType::Str {
+            return Err(ctx.stop(call.err_call(), "invalid 'file' argument"));
+        }
+        names(ctx, locations)?
+            .into_iter()
+            .flatten()
+            .filter(|path| !path.is_empty())
+            .map(|path| expand_path(ctx, &path))
+            .collect()
+    };
+    let home = r_home_dir(ctx).join("library");
+    let home = ctx.host().canonicalize(&home).unwrap_or(home);
+    let mut seen = BTreeSet::new();
+    let mut packages = Vec::new();
+    for path in paths {
+        let path = ctx.host().canonicalize(&path).unwrap_or(path);
+        let mut installed = BTreeSet::new();
+        if path == home {
+            installed.insert("base".to_owned());
+            installed.extend(
+                ctx.ns_records()
+                    .iter()
+                    .filter(|record| record.builtin)
+                    .map(|record| record.name.clone()),
+            );
+        }
+        if let Ok(entries) = ctx.host().read_dir(&path) {
+            for entry in entries {
+                if !entry.name.starts_with('.')
+                    && ctx
+                        .host()
+                        .metadata(&entry.path.join("Meta/package.rds"), true)
+                        .is_ok()
+                {
+                    installed.insert(entry.name);
+                }
+            }
+        }
+        packages.extend(
+            installed
+                .into_iter()
+                .filter(|name| seen.insert(name.clone())),
+        );
+    }
+    strings(ctx, packages.iter().map(String::as_str))
 }
 
 pub(crate) fn libraries(ctx: &mut Ctx) -> EvalResult<Vec<PathBuf>> {

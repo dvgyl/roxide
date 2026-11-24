@@ -11,7 +11,7 @@ use roxide_gc::{SexpId, Trace, Tracer};
 use roxide_value::{BASE_ENV, BASE_NAMESPACE, EMPTY_ENV, SEXP_NIL, ValueApi};
 
 use crate::description::{Description, read_text, valid_package};
-use crate::library::{find, libraries, package_path, version_check};
+use crate::library::{find, libraries, package_path, search_label, version_check};
 use crate::nsfile::NsSpec;
 
 use self::values::*;
@@ -184,17 +184,12 @@ fn load_new(
                 name,
             ],
         )?;
-        let pkg_s = ctx.session_mut().scalar_str(name)?;
-        let ev_s = ctx.session_mut().scalar_str("onLoad")?;
-        let lib_s = ctx
-            .session_mut()
-            .scalar_str(&path.parent().unwrap_or(&path).to_string_lossy())?;
-        base_call(ctx, ".rx_run_user_hooks", &[pkg_s, ev_s, lib_s])?;
         imports::export(ctx, ns, imports, &spec)?;
         ctx.session_mut().env_lock_all_bindings(ns)?;
         ctx.session_mut().env_set_locked(ns, true)?;
         ctx.session_mut().env_lock_all_bindings(imports)?;
         ctx.session_mut().env_set_locked(imports, true)?;
+        run_user_hooks(ctx, name, "onLoad", &path.to_string_lossy())?;
         Ok(ns)
     })();
     if result.is_err() {
@@ -453,6 +448,7 @@ pub(crate) fn attach(
             .unwrap_or(Path::new(""))
             .to_string_lossy();
         if let Err(error) = call_hook(ctx, ns, ".onAttach", &[lib.as_ref(), &name]) {
+            ctx.protect_eval_result(&Err(error.clone()));
             if let Some(index) = ctx.search_path()?.iter().position(|&item| item == env) {
                 ctx.search_detach(index + 1)?;
             }
@@ -460,7 +456,25 @@ pub(crate) fn attach(
         }
         ctx.session_mut().env_lock_all_bindings(env)?;
         ctx.session_mut().env_set_locked(env, true)?;
+        let path = path.as_deref().unwrap_or(Path::new("")).to_string_lossy();
+        run_user_hooks(ctx, &name, "attach", &path)?;
         Ok(env)
+    })
+}
+
+fn run_user_hooks(ctx: &mut Ctx, name: &str, event: &str, path: &str) -> EvalResult<()> {
+    ctx.scoped(|ctx| {
+        let package = ctx.session_mut().scalar_str(name)?;
+        ctx.protect(package);
+        if matches!(event, "attach" | "onUnload") {
+            named(ctx, package, &["name"])?;
+        }
+        let event = ctx.session_mut().scalar_str(event)?;
+        ctx.protect(event);
+        let path = ctx.session_mut().scalar_str(path)?;
+        ctx.protect(path);
+        base_call(ctx, ".rx_run_user_hooks", &[package, event, path])?;
+        Ok(())
     })
 }
 
@@ -511,30 +525,42 @@ fn call_cleanup_hook(
     })
 }
 
-pub(crate) fn detach_at(ctx: &mut Ctx, pos: usize) -> EvalResult<Option<String>> {
+pub(crate) fn detach_at(ctx: &mut Ctx, pos: usize, unload_requested: bool) -> EvalResult<SexpId> {
     let search = ctx.search_path()?;
-    let env = search.get(pos.wrapping_sub(1)).copied();
+    let env = search
+        .get(pos.wrapping_sub(1))
+        .copied()
+        .ok_or_else(|| ctx.stop(SEXP_NIL, "invalid 'pos' argument"))?;
     let name = ctx
         .ns_records()
         .iter()
-        .find(|rec| rec.attached.is_some() && rec.attached == env)
+        .find(|rec| rec.attached == Some(env))
         .map(|rec| rec.name.clone());
-    if let Some(name) = &name
-        && let Some(ns) = ctx.ns_lookup(name)
-    {
-        let path = package_path(ctx, name);
-        let path = path.as_deref().unwrap_or(Path::new("")).to_string_lossy();
-        call_cleanup_hook(ctx, ns, ".onDetach", name, path.as_ref())?;
-        if let Some(env) = env {
-            let Some(index) = ctx.search_path()?.iter().position(|&item| item == env) else {
-                return Ok(Some(name.clone()));
-            };
-            ctx.search_detach(index + 1)?;
+    ctx.scoped(|ctx| {
+        ctx.protect(env);
+        if let Some(name) = name
+            && let Some(ns) = ctx.ns_lookup(&name)
+        {
+            ctx.protect(ns);
+            let path = package_path(ctx, &name);
+            let path = path.as_deref().unwrap_or(Path::new("")).to_string_lossy();
+            run_user_hooks(ctx, &name, "detach", &path)?;
+            call_cleanup_hook(ctx, ns, ".onDetach", &name, &path)?;
+            if let Some(index) = ctx.search_path()?.iter().position(|&item| item == env) {
+                ctx.search_detach(index + 1)?;
+            }
+            if unload_requested {
+                unload(ctx, &name)?;
+            }
+            return Ok(SEXP_NIL);
         }
-    } else {
         ctx.search_detach(pos)?;
-    }
-    Ok(name)
+        ctx.session_mut().env_set_enclos(env, BASE_ENV)?;
+        if search_label(ctx, env)?.starts_with("package:") {
+            return Ok(SEXP_NIL);
+        }
+        Ok(env)
+    })
 }
 
 pub(crate) fn unload(ctx: &mut Ctx, name: &str) -> EvalResult<()> {
@@ -550,7 +576,7 @@ pub(crate) fn unload(ctx: &mut Ctx, name: &str) -> EvalResult<()> {
             && let Some(index) = ctx.search_path()?.iter().position(|&item| item == env)
         {
             ctx.protect(env);
-            detach_at(ctx, index + 1)?;
+            detach_at(ctx, index + 1, false)?;
         }
         let other: Vec<_> = ctx
             .ns_records()
@@ -575,6 +601,7 @@ pub(crate) fn unload(ctx: &mut Ctx, name: &str) -> EvalResult<()> {
         }
         let path = package_path(ctx, name);
         let path = path.as_deref().unwrap_or(Path::new("")).to_string_lossy();
+        run_user_hooks(ctx, name, "onUnload", &path)?;
         call_cleanup_hook(ctx, record.ns, ".onUnload", name, path.as_ref())?;
         uncache_methods_metadata(ctx, record.ns)?;
         ctx.ns_unregister(name);

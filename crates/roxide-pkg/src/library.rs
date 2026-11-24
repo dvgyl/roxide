@@ -7,10 +7,12 @@ use std::collections::BTreeSet;
 
 use roxide_eval::{Args, Call, Ctx, EvalResult, Module, Visibility::*};
 use roxide_gc::SexpId;
-use roxide_value::{EMPTY_ENV, NA_INTEGER, SEXP_NIL, SexpType, ValueApi};
+use roxide_value::{
+    BASE_ENV, BASE_NAMESPACE, EMPTY_ENV, GLOBAL_ENV, NA_INTEGER, SEXP_NIL, SexpType, ValueApi,
+};
 
 use crate::description::{Description, is_windows};
-use crate::loader::{attach as attach_ns, detach_at, load, namespace_version, unload, values::*};
+use crate::loader::{attach as attach_ns, detach_at, load, namespace_version, values::*};
 
 pub(crate) use paths::{find, libraries, package_path, selected_libraries};
 pub(crate) use version::{check_dependency, version_check};
@@ -31,8 +33,10 @@ pub const MODULE: Module = Module {
         internal("C_rx_version_format", 1, version::format, On),
         internal("C_rx_library", 8, library, On),
         internal("C_rx_library_info", 2, paths::library_info, On),
+        internal("C_rx_packages", 1, paths::available_packages, On),
         internal("C_rx_attach", 4, attach, Off),
         internal("C_rx_detach", 4, detach, Off),
+        internal("C_rx_format_environment", 1, format_environment, On),
         internal("C_rx_sys_info", 0, sys_info, On),
         internal("C_rx_platform_id", 0, platform_id, On),
         internal("C_rx_platform", 0, platform, On),
@@ -78,7 +82,7 @@ getHook <- function(hookName) {
 setHook <- function(hookName, value, action = c("append", "prepend", "replace")) {
     action <- match.arg(action)
     if (is.null(value)) {
-        if (exists(hookName, envir = .userHooksEnv, inherits = FALSE)) {
+        if (identical(action, "replace") && exists(hookName, envir = .userHooksEnv, inherits = FALSE)) {
             rm(list = hookName, envir = .userHooksEnv)
         }
         return(invisible(NULL))
@@ -89,12 +93,10 @@ setHook <- function(hookName, value, action = c("append", "prepend", "replace"))
     assign(hookName, combined, envir = .userHooksEnv)
     invisible(NULL)
 }
-.rx_run_user_hooks <- function(pkgname, event, libpath = "") {
+.rx_run_user_hooks <- function(pkgname, event, pkgpath) {
     hooks <- getHook(packageEvent(pkgname, event))
     for (hook in hooks) {
-        if (is.function(hook)) {
-            hook(pkgname, libpath)
-        }
+        try(hook(pkgname, pkgpath))
     }
     invisible(NULL)
 }
@@ -126,6 +128,10 @@ library <- function(package, help, pos = 2, lib.loc = NULL, character.only = FAL
     if (logical.return) return(!identical(result, FALSE))
     invisible(result)
 }
+.packages <- function(all.available = FALSE, lib.loc = NULL) {
+    if (all.available) return(.Internal(C_rx_packages(lib.loc)))
+    substring(grep("^package:", search(), value = TRUE), 9L)
+}
 require <- function(package, lib.loc = NULL, quietly = FALSE, warn.conflicts = TRUE,
                     character.only = FALSE, mask.ok, exclude, include.only,
                     attach.required = missing(include.only)) {
@@ -147,12 +153,16 @@ use <- function(package, include.only) {
         FALSE
     }))
 }
-attach <- function(what, pos = 2L, name = deparse(substitute(what)), warn.conflicts = TRUE)
+attach <- function(what, pos = 2L, name = {
+    expr <- substitute(what)
+    if (is.symbol(expr)) as.character(expr) else deparse1(expr, backtick = FALSE)
+}, warn.conflicts = TRUE)
     invisible(.Internal(C_rx_attach(what, pos, name, warn.conflicts)))
 detach <- function(name, pos = 2L, unload = FALSE, character.only = FALSE, force = FALSE) {
     target <- if (missing(name)) pos else if (character.only) name else substitute(name)
     invisible(.Internal(C_rx_detach(target, pos, unload, force)))
 }
+format.environment <- function(x, ...) .Internal(C_rx_format_environment(x))
 "#,
 };
 
@@ -254,14 +264,21 @@ fn attach(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult<SexpId> {
     let pos = usize::try_from(integer(ctx, args.get(1))?).unwrap_or(0);
     let name = string(ctx, args.get(2))?;
     if name.is_empty() {
-        return Err(ctx.stop(call.err_call(), "'name' must be non-empty"));
+        return Err(ctx.stop(call.err_call(), "invalid 'name' argument"));
+    }
+    if pos == 1 {
+        return Err(ctx.stop(
+            call.err_call(),
+            "'pos=1' is not possible and has been warned about for years",
+        ));
     }
     ctx.scoped(|ctx| {
         let env = ctx.session_mut().alloc_env(EMPTY_ENV)?;
         ctx.protect(env);
         match ctx.session().type_of(source)? {
             SexpType::Env => {
-                for (sym, binding) in ctx.session().env_entries(source)? {
+                for (sym, mut binding) in ctx.session().env_entries(source)? {
+                    binding.locked = false;
                     ctx.session_mut().env_define_binding(env, sym, binding)?;
                 }
             }
@@ -300,6 +317,35 @@ fn attach(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult<SexpId> {
         }
         Ok(env)
     })
+}
+
+fn format_environment(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult<SexpId> {
+    let env = args.get(0);
+    if ctx.session().type_of(env)? != SexpType::Env {
+        return Err(ctx.stop(call.err_call(), "'x' must be an environment"));
+    }
+    let name = match env {
+        BASE_ENV => "base".to_owned(),
+        BASE_NAMESPACE => "namespace:base".to_owned(),
+        EMPTY_ENV => "R_EmptyEnv".to_owned(),
+        GLOBAL_ENV => "R_GlobalEnv".to_owned(),
+        _ => {
+            if let Some(name) = ctx.namespace_name(env) {
+                format!("namespace:{name}")
+            } else if let Some(record) = ctx
+                .ns_records()
+                .iter()
+                .find(|rec| rec.attached == Some(env))
+            {
+                format!("package:{}", record.name)
+            } else {
+                format!("0x{:x}", env.to_bits())
+            }
+        }
+    };
+    Ok(ctx
+        .session_mut()
+        .scalar_str(&format!("<environment: {name}>"))?)
 }
 
 fn check_conflicts(
@@ -406,11 +452,7 @@ fn detach(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult<SexpId> {
             }
         }
     }
-    let package = detach_at(ctx, pos)?;
-    if unload_requested && let Some(name) = package {
-        unload(ctx, &name)?;
-    }
-    Ok(SEXP_NIL)
+    detach_at(ctx, pos, unload_requested)
 }
 
 pub(crate) fn environment_at(ctx: &mut Ctx, position: SexpId) -> EvalResult<SexpId> {

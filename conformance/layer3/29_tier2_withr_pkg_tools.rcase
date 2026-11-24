@@ -1,0 +1,141 @@
+=== case: withr_package_discovery ===
+#@ tags: layer3,package-loader,withr
+#@ compare: exact
+attached <- search()[startsWith(search(), "package:")]
+dput(identical(base::.packages(), substring(attached, 9L)))
+dput(identical(.packages(lib.loc = 1L), .packages()))
+dput(all(c("base", "tools") %in% .packages(TRUE, R.home("library"))))
+dput(all(c("base", "tools") %in% .packages(TRUE)))
+dput(.packages(TRUE, character()))
+first <- file.path(tempdir(), "first")
+second <- file.path(tempdir(), "second")
+for (lib in c(first, second)) {
+    for (pkg in if (identical(lib, first)) c("rxz", "rxb") else c("rxa", "rxb")) {
+        meta <- file.path(lib, pkg, "Meta")
+        dir.create(meta, recursive = TRUE)
+        saveRDS(NULL, file.path(meta, "package.rds"))
+    }
+}
+dir.create(file.path(first, "rxsource"))
+writeLines("Package: rxsource", file.path(first, "rxsource", "DESCRIPTION"))
+dput(.packages(TRUE, c(first, second)))
+dput(.packages(TRUE, c(second, first)))
+
+=== case: withr_libpaths_suffix_order ===
+#@ tags: layer3,package-loader,withr
+#@ compare: exact
+old <- .libPaths()
+first <- file.path(tempdir(), "first")
+last <- file.path(tempdir(), "last")
+dir.create(first)
+dir.create(last)
+home <- R.home("library")
+.libPaths(c(first, home), include.site = FALSE)
+paths <- .libPaths()
+.libPaths(c(paths, last, home), include.site = FALSE)
+dput(identical(.libPaths(), c(paths, normalizePath(last))))
+dput(basename(.libPaths()))
+.libPaths(old)
+
+=== case: withr_plain_environment_attachment ===
+#@ tags: layer3,package-loader,withr
+#@ compare: exact
+e <- new.env()
+e$rx_value <- 1L
+lockBinding("rx_value", e)
+name <- format(e)
+path <- search()
+attached <- withVisible(attach(e, name = name))
+dput(c(attached$visible, identical(e, attached$value), search()[2L] == name,
+       environmentName(attached$value) == name, identical(rx_value, 1L),
+       bindingIsLocked("rx_value", attached$value)))
+e2 <- new.env()
+assign("non syntax", e2)
+attach(`non syntax`)
+dput(search()[2L])
+detach(pos = 2L)
+detached <- withVisible(detach(name, character.only = TRUE))
+dput(c(detached$visible, identical(detached$value, attached$value), identical(search(), path)))
+
+=== case: withr_namespace_attachment ===
+#@ tags: layer3,package-loader,withr
+#@ compare: exact
+ns <- asNamespace("tools")
+name <- format(ns)
+dput(name)
+path <- search()
+attached <- attach(ns, name = name, warn.conflicts = FALSE)
+dput(c(search()[2L] == name, is.function(.check_packages), identical(SIGINT, 2L),
+       identical(attached, ns), "tools" %in% .packages()))
+dput(identical(detach(name, character.only = TRUE, unload = TRUE), attached))
+dput(c(identical(search(), path), isNamespaceLoaded("tools"), identical(asNamespace("tools"), ns)))
+
+=== case: withr_library_user_hooks ===
+#@ tags: layer3,package-loader,withr
+#@ compare: exact
+pkg <- "rxhooks"
+path <- file.path(tempdir(), pkg)
+dir.create(file.path(path, "Meta"), recursive = TRUE)
+dir.create(file.path(path, "R"))
+writeLines(c("Package: rxhooks", "Version: 1.0"), file.path(path, "DESCRIPTION"))
+writeLines("export(answer)", file.path(path, "NAMESPACE"))
+writeLines(c("answer <- 1L",
+             ".onLoad <- function(...) cat('package load\n')",
+             ".onAttach <- function(...) cat('package attach\n')",
+             ".onDetach <- function(...) cat('package detach\n')",
+             ".onUnload <- function(...) cat('package unload\n')"), file.path(path, "R", pkg))
+saveRDS(list(Built = list(R = getRversion(), Platform = R.version$platform, OStype = .Platform$OS.type),
+             DESCRIPTION = c(Package = pkg, Version = "1.0")), file.path(path, "Meta", "package.rds"))
+hook <- function(event) {
+    force(event)
+    function(name, path) {
+        cat(event, basename(path), isNamespaceLoaded(name), name %in% .packages(),
+            is.null(names(name)), environmentIsLocked(asNamespace(name)), "\n")
+    }
+}
+attach_event <- packageEvent(pkg, "att")
+dput(attach_event)
+dput(length(getHook(attach_event)))
+setHook(attach_event, function(...) cat("discarded\n"))
+setHook(attach_event, hook("attach"), action = "replace")
+setHook(attach_event, function(...) cat("first attach hook\n"), action = "prepend")
+setHook(attach_event, NULL)
+dput(length(getHook(attach_event)))
+for (event in c("onLoad", "detach", "onUnload")) setHook(packageEvent(pkg, event), hook(event))
+library(rxhooks, lib.loc = tempdir())
+detach("package:rxhooks", unload = TRUE)
+dput(isNamespaceLoaded(pkg))
+setHook(attach_event, NULL, action = "replace")
+dput(length(getHook(attach_event)))
+
+=== case: withr_tools_makevars_and_signals ===
+#@ tags: layer3,package-loader,withr
+#@ compare: exact
+home <- file.path(tempdir(), "home")
+config <- file.path(home, ".R")
+dir.create(config, recursive = TRUE)
+Sys.setenv(HOME = home, R_USER = home)
+Sys.unsetenv("R_MAKEVARS_USER")
+plain <- file.path(config, "Makevars")
+platform <- file.path(config, paste0("Makevars-", R.version$platform))
+dput(tools::makevars_user())
+invisible(file.create(file.path(config, "Makevars-4.6")))
+dput(tools::makevars_user())
+invisible(file.create(plain))
+dput(identical(tools::makevars_user(), plain))
+invisible(file.create(platform))
+dput(identical(tools::makevars_user(), platform))
+Sys.setenv(R_MAKEVARS_USER = plain, R_MAKEVARS_SITE = plain)
+dput(c(identical(tools::makevars_user(), plain), identical(tools::makevars_site(), plain)))
+Sys.setenv(R_MAKEVARS_USER = "~/.R/Makevars", R_MAKEVARS_SITE = "~/.R/Makevars")
+dput(c(tools::makevars_user(), tools::makevars_site()))
+Sys.setenv(R_MAKEVARS_USER = file.path(config, "missing"), R_MAKEVARS_SITE = "")
+dput(tools::makevars_user())
+dput(tools::makevars_site())
+Sys.setenv(R_MAKEVARS_USER = "")
+dput(tools::makevars_user())
+dput(c(tools::SIGHUP, tools::SIGINT, tools::SIGQUIT, tools::SIGKILL, tools::SIGTERM))
+if (Sys.info()[["sysname"]] %in% c("Darwin", "Linux", "FreeBSD")) {
+    dput(c(tools::SIGSTOP, tools::SIGTSTP, tools::SIGCONT, tools::SIGCHLD, tools::SIGUSR1, tools::SIGUSR2))
+}
+dput(c(is.function(tools:::.check_packages), ".check_packages" %in% getNamespaceExports("tools")))

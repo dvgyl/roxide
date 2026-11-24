@@ -8,6 +8,7 @@ pub mod inspect;
 pub mod pkgutils;
 pub mod str;
 pub mod table_io;
+mod tools_build;
 pub mod tools_license;
 pub mod tools_rd;
 
@@ -26,7 +27,11 @@ pub const UTILS_MODULES: &[&Module] = &[
 ];
 
 /// Submodules registered into `namespace:tools`.
-pub const TOOLS_MODULES: &[&Module] = &[&tools_rd::MODULE, &tools_license::MODULE];
+pub const TOOLS_MODULES: &[&Module] = &[
+    &tools_rd::MODULE,
+    &tools_license::MODULE,
+    &tools_build::MODULE,
+];
 
 /// Package descriptor for `utils` (attached on `search()` as `package:utils`).
 pub const UTILS_PACKAGE: Package = Package {
