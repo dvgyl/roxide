@@ -5,64 +5,15 @@ use std::fmt;
 
 use crate::id::{MAX_GENERATION, SexpId};
 
+mod ephemeron;
+mod protect;
+
+use ephemeron::Ephemeron;
+pub use ephemeron::{Finalizer, FinalizerKind, SweepOutcome, WeakRefEntry};
+pub use protect::{DEFAULT_PROTECT_LIMIT, ProtectIndex, ProtectMark};
+
 /// Saturated copy-on-modify reference count ceiling (sticky once reached).
 pub const REFCNT_MAX: u8 = 7;
-
-/// Default maximum protect-stack depth matching GNU R 4.6.2 (`R_PPSSIZE = 50000`, ADR-0019).
-pub const DEFAULT_PROTECT_LIMIT: usize = 50_000;
-
-/// Callback kind attached to a GC finalizer or weak reference (ADR-0019).
-///
-/// Native C finalizer pointers are stored as `(fun, dll)` addresses/ids so `roxide-gc` keeps
-/// `#![forbid(unsafe_code)]` while allowing `dyn.unload` to purge finalizers targeting an
-/// unloading DLL before `dlclose`.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum FinalizerKind {
-    /// R closure finalizer (`reg.finalizer`, `R_RegisterFinalizerEx`, `R_MakeWeakRef`).
-    RClosure(SexpId),
-    /// Native C finalizer function pointer (`R_RegisterCFinalizerEx`, `R_MakeWeakRefC`).
-    Native {
-        /// Function pointer address (`R_CFinalizer_t`).
-        fun: usize,
-        /// Owning DLL handle identifier (`0` if built-in / non-unloadable).
-        dll: u32,
-    },
-}
-
-/// Result returned by [`Marked::sweep_outcome`].
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct SweepOutcome {
-    /// Collection statistics.
-    pub stats: GcStats,
-    /// `WEAKREFSXP` handles whose keys became unreachable during this cycle and must be cleared.
-    pub cleared_weakrefs: Vec<SexpId>,
-}
-
-/// Registered ephemeron finalizer entry.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Finalizer {
-    /// Finalized object handle (`ENVSXP` or `EXTPTRSXP`).
-    pub target: SexpId,
-    /// Callback to invoke after `target` becomes unreachable.
-    pub kind: FinalizerKind,
-    /// Whether this finalizer should also run at session exit.
-    pub onexit: bool,
-}
-
-/// Registered ephemeron weak-reference entry (`WEAKREFSXP`).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct WeakRefEntry {
-    /// Handle of the `WEAKREFSXP` object itself.
-    pub weakref: SexpId,
-    /// Weakly held key (`ENVSXP` or `EXTPTRSXP`).
-    pub key: SexpId,
-    /// Value kept alive while `key` is reachable.
-    pub value: SexpId,
-    /// Optional finalizer triggered when `key` becomes unreachable.
-    pub finalizer: Option<FinalizerKind>,
-    /// Whether `finalizer` should also run at session exit.
-    pub onexit: bool,
-}
 
 /// Errors returned by [`Heap`] operations (never panics on stale handles or limits).
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -124,30 +75,6 @@ impl fmt::Display for HeapError {
 }
 
 impl std::error::Error for HeapError {}
-
-/// Index into the protect stack returned by [`Heap::protect`] for [`Heap::reprotect`].
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct ProtectIndex(usize);
-
-impl ProtectIndex {
-    /// Construct a [`ProtectIndex`] from a raw stack offset (for C `PROTECT_INDEX` interop).
-    #[inline]
-    #[must_use]
-    pub const fn from_raw(raw: usize) -> Self {
-        Self(raw)
-    }
-
-    /// Return the raw protect-stack offset (for C `PROTECT_INDEX` interop).
-    #[inline]
-    #[must_use]
-    pub const fn as_raw(self) -> usize {
-        self.0
-    }
-}
-
-/// Saved depth of the protect stack for scoped restoration via [`Heap::unprotect_to`].
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct ProtectMark(usize);
 
 /// Collection scheduling policy.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -224,6 +151,14 @@ impl<'a> Tracer<'a> {
         }
     }
 
+    fn trace_slots<T: Trace>(&mut self, slots: &[Slot<T>]) {
+        while let Some(idx) = self.worklist.pop() {
+            if let Some(obj) = slots[idx as usize].value.as_ref() {
+                obj.trace(self);
+            }
+        }
+    }
+
     /// Mark a slice of referenced handles.
     #[inline]
     pub fn edges(&mut self, ids: &[SexpId]) {
@@ -241,6 +176,19 @@ struct Slot<T> {
     value: Option<T>,
 }
 
+impl<T> Slot<T> {
+    fn retire_slot(&mut self) -> bool {
+        self.value = None;
+        self.bytes = 0;
+        self.refcnt = 0;
+        if self.generation == MAX_GENERATION {
+            return false;
+        }
+        self.generation += 1;
+        true
+    }
+}
+
 /// Generational-slot mark-sweep GC heap.
 pub struct Heap<T: Trace + HeapSize> {
     slots: Vec<Slot<T>>,
@@ -250,8 +198,7 @@ pub struct Heap<T: Trace + HeapSize> {
     protect_stack: Vec<SexpId>,
     protect_limit: usize,
     precious: HashMap<SexpId, u32>,
-    finalizers: Vec<Finalizer>,
-    weakrefs: Vec<WeakRefEntry>,
+    ephemerons: Vec<Ephemeron>,
     pending_finalizers: Vec<Finalizer>,
     policy: GcPolicy,
     live_bytes: usize,
@@ -282,8 +229,7 @@ impl<T: Trace + HeapSize> Heap<T> {
             protect_stack: Vec::new(),
             protect_limit: DEFAULT_PROTECT_LIMIT,
             precious: HashMap::new(),
-            finalizers: Vec::new(),
-            weakrefs: Vec::new(),
+            ephemerons: Vec::new(),
             pending_finalizers: Vec::new(),
             policy,
             live_bytes: 0,
@@ -470,185 +416,6 @@ impl<T: Trace + HeapSize> Heap<T> {
         }
     }
 
-    /// Push a handle onto the protect stack.
-    pub fn protect(&mut self, id: SexpId) -> ProtectIndex {
-        let idx = self.protect_stack.len();
-        self.protect_stack.push(id);
-        ProtectIndex(idx)
-    }
-
-    /// Push a handle onto the protect stack, enforcing [`Heap::protect_limit`] (`Rf_protect`).
-    pub fn try_protect(&mut self, id: SexpId) -> Result<ProtectIndex, HeapError> {
-        if self.protect_stack.len() >= self.protect_limit {
-            return Err(HeapError::ProtectStackOverflow {
-                limit: self.protect_limit,
-            });
-        }
-        Ok(self.protect(id))
-    }
-
-    /// Configured protect-stack depth ceiling (`R_PPSSIZE`).
-    #[must_use]
-    pub fn protect_limit(&self) -> usize {
-        self.protect_limit
-    }
-
-    /// Update the configured protect-stack depth ceiling.
-    pub fn set_protect_limit(&mut self, limit: usize) {
-        self.protect_limit = limit;
-    }
-
-    /// Replace an existing protect stack entry (`REPROTECT`).
-    pub fn reprotect(&mut self, at: ProtectIndex, id: SexpId) {
-        if let Some(entry) = self.protect_stack.get_mut(at.0) {
-            *entry = id;
-        }
-    }
-
-    /// Pop `n` entries from the protect stack.
-    pub fn unprotect(&mut self, n: usize) -> Result<(), HeapError> {
-        let available = self.protect_stack.len();
-        if n > available {
-            return Err(HeapError::ProtectStackUnderflow {
-                requested: n,
-                available,
-            });
-        }
-        self.protect_stack.truncate(available - n);
-        Ok(())
-    }
-
-    /// Remove the topmost occurrence of `id` from the protect stack (`UNPROTECT_PTR`).
-    pub fn unprotect_ptr(&mut self, id: SexpId) -> Result<(), HeapError> {
-        self.unprotect_ptr_from(id, 0)
-    }
-
-    /// Remove the topmost occurrence of `id` at or above `min_depth` on the protect stack.
-    ///
-    /// Prevents nested C frames from unprotecting roots owned by enclosing trampoline frames.
-    pub fn unprotect_ptr_from(&mut self, id: SexpId, min_depth: usize) -> Result<(), HeapError> {
-        let start = min_depth.min(self.protect_stack.len());
-        let Some(rel) = self.protect_stack[start..]
-            .iter()
-            .rposition(|&entry| entry == id)
-        else {
-            return Err(HeapError::ProtectPtrNotFound(id));
-        };
-        self.protect_stack.remove(start + rel);
-        Ok(())
-    }
-
-    /// Register a weak-keyed ephemeron finalizer for `target` (`reg.finalizer` / `R_Register*Finalizer*`).
-    pub fn register_finalizer(&mut self, target: SexpId, kind: FinalizerKind, onexit: bool) {
-        self.finalizers.push(Finalizer {
-            target,
-            kind,
-            onexit,
-        });
-    }
-
-    /// Register a `WEAKREFSXP` ephemeron entry tracked across GC cycles.
-    pub fn register_weakref(&mut self, entry: WeakRefEntry) {
-        self.weakrefs.push(entry);
-    }
-
-    /// Remove and return the registered ephemeron entry for `weakref` (`R_RunWeakRefFinalizer`).
-    pub fn remove_weakref(&mut self, weakref: SexpId) -> Option<WeakRefEntry> {
-        let pos = self.weakrefs.iter().position(|w| w.weakref == weakref)?;
-        Some(self.weakrefs.remove(pos))
-    }
-
-    /// Retain only finalizers satisfying `keep` across registered finalizers, weakref finalizers,
-    /// and the pending queue (used before `dlclose` in `dyn.unload`, ADR-0019).
-    pub fn retain_finalizers(&mut self, keep: impl Fn(FinalizerKind) -> bool) {
-        self.finalizers.retain(|f| keep(f.kind));
-        self.pending_finalizers.retain(|f| keep(f.kind));
-        for wr in &mut self.weakrefs {
-            if let Some(kind) = wr.finalizer
-                && !keep(kind)
-            {
-                wr.finalizer = None;
-            }
-        }
-    }
-
-    /// Return true if dead finalizers are queued awaiting execution at a safepoint.
-    #[must_use]
-    pub fn has_pending_finalizers(&self) -> bool {
-        !self.pending_finalizers.is_empty()
-    }
-
-    /// Drain all queued GC finalizers in LIFO/FIFO order for safepoint execution.
-    pub fn drain_pending_finalizers(&mut self) -> Vec<Finalizer> {
-        std::mem::take(&mut self.pending_finalizers)
-    }
-
-    /// Extract all `onexit = true` finalizers (and any already-queued finalizers) for session exit.
-    pub fn take_exit_finalizers(&mut self) -> Vec<Finalizer> {
-        let mut out = std::mem::take(&mut self.pending_finalizers);
-        let mut keep_fin = Vec::with_capacity(self.finalizers.len());
-        for fin in self.finalizers.drain(..) {
-            if fin.onexit {
-                out.push(fin);
-            } else {
-                keep_fin.push(fin);
-            }
-        }
-        self.finalizers = keep_fin;
-        let mut keep_wr = Vec::with_capacity(self.weakrefs.len());
-        for wr in self.weakrefs.drain(..) {
-            if wr.onexit
-                && let Some(kind) = wr.finalizer
-            {
-                out.push(Finalizer {
-                    target: wr.key,
-                    kind,
-                    onexit: true,
-                });
-            } else {
-                keep_wr.push(wr);
-            }
-        }
-        self.weakrefs = keep_wr;
-        out
-    }
-
-    /// Record the current protect stack depth.
-    #[must_use]
-    pub fn protect_mark(&self) -> ProtectMark {
-        ProtectMark(self.protect_stack.len())
-    }
-
-    /// Restore the protect stack depth to a previous [`ProtectMark`].
-    pub fn unprotect_to(&mut self, mark: ProtectMark) {
-        if mark.0 <= self.protect_stack.len() {
-            self.protect_stack.truncate(mark.0);
-        }
-    }
-
-    /// Current protect stack depth.
-    #[must_use]
-    pub fn protect_depth(&self) -> usize {
-        self.protect_stack.len()
-    }
-
-    /// Add one reference in the precious multiset (`R_PreserveObject`).
-    pub fn preserve(&mut self, id: SexpId) {
-        let count = self.precious.entry(id).or_insert(0);
-        *count = count.saturating_add(1);
-    }
-
-    /// Remove one reference from the precious multiset (`R_ReleaseObject`).
-    pub fn release(&mut self, id: SexpId) {
-        if let Some(count) = self.precious.get_mut(&id) {
-            if *count <= 1 {
-                self.precious.remove(&id);
-            } else {
-                *count -= 1;
-            }
-        }
-    }
-
     /// Return whether a safepoint should trigger collection under the active [`GcPolicy`].
     #[must_use]
     pub fn wants_collection(&self) -> bool {
@@ -673,49 +440,16 @@ impl<T: Trace + HeapSize> Heap<T> {
     /// Phase 1 of collection: iteratively mark all objects reachable from permanent slots,
     /// the protect stack, the precious set, and `roots`.
     pub fn mark<'h>(&'h mut self, roots: &dyn RootSet) -> Marked<'h, T> {
-        let len = self.slots.len();
-        let mut marked = vec![false; len];
+        let mut marked = vec![false; self.slots.len()];
         let mut worklist = Vec::new();
 
-        // Seed permanent objects.
-        for (idx, slot) in self.slots.iter().enumerate() {
-            if slot.permanent && slot.value.is_some() {
-                marked[idx] = true;
-                worklist.push(idx as u32);
-            }
-        }
-
-        // Seed protect stack, precious set, and caller-provided roots.
-        {
-            let mut tracer = Tracer {
-                marked: &mut marked,
-                worklist: &mut worklist,
-                generations: &self.generations,
-            };
-            tracer.edges(&self.protect_stack);
-            for &id in self.precious.keys() {
-                tracer.edge(id);
-            }
-            for fin in &self.pending_finalizers {
-                tracer.edge(fin.target);
-                if let FinalizerKind::RClosure(fun) = fin.kind {
-                    tracer.edge(fun);
-                }
-            }
-            roots.trace_roots(&mut tracer);
-        }
-
-        // Iterative gray-stack mark traversal (safe for deeply nested pairlists and cycles).
-        while let Some(idx) = worklist.pop() {
-            if let Some(obj) = self.slots[idx as usize].value.as_ref() {
-                let mut tracer = Tracer {
-                    marked: &mut marked,
-                    worklist: &mut worklist,
-                    generations: &self.generations,
-                };
-                obj.trace(&mut tracer);
-            }
-        }
+        let mut tracer = Tracer {
+            marked: &mut marked,
+            worklist: &mut worklist,
+            generations: &self.generations,
+        };
+        self.seed_roots(roots, &mut tracer);
+        tracer.trace_slots(&self.slots);
 
         Marked {
             heap: self,
@@ -723,6 +457,26 @@ impl<T: Trace + HeapSize> Heap<T> {
             ephemerons_resolved: false,
             cleared_weakrefs: Vec::new(),
         }
+    }
+
+    fn seed_roots(&self, roots: &dyn RootSet, tracer: &mut Tracer<'_>) {
+        for (idx, slot) in self.slots.iter().enumerate() {
+            if slot.permanent && slot.value.is_some() {
+                tracer.marked[idx] = true;
+                tracer.worklist.push(idx as u32);
+            }
+        }
+        tracer.edges(&self.protect_stack);
+        for &id in self.precious.keys() {
+            tracer.edge(id);
+        }
+        for fin in &self.pending_finalizers {
+            tracer.edge(fin.target);
+            if let Some(fun) = fin.kind.closure() {
+                tracer.edge(fun);
+            }
+        }
+        roots.trace_roots(tracer);
     }
 
     fn check_limit(&self, additional: usize) -> Result<(), HeapError> {
@@ -782,115 +536,13 @@ impl<T: Trace + HeapSize> Marked<'_, T> {
     /// until their finalizer callback runs.
     pub fn mark_transitive(&mut self, id: SexpId) {
         let mut worklist = Vec::new();
-        {
-            let mut tracer = Tracer {
-                marked: &mut self.marked,
-                worklist: &mut worklist,
-                generations: &self.heap.generations,
-            };
-            tracer.edge(id);
-        }
-        while let Some(idx) = worklist.pop() {
-            if let Some(obj) = self.heap.slots[idx as usize].value.as_ref() {
-                let mut tracer = Tracer {
-                    marked: &mut self.marked,
-                    worklist: &mut worklist,
-                    generations: &self.heap.generations,
-                };
-                obj.trace(&mut tracer);
-            }
-        }
-    }
-
-    /// Run ephemeron fixpoint marking for all registered finalizers and `WEAKREFSXP` entries,
-    /// partition dead targets before resurrecting them for finalization, and retain cleared
-    /// weakref handles inside [`Marked`] for [`Marked::sweep_outcome`].
-    ///
-    /// Idempotent within a single collection cycle.
-    pub fn resolve_ephemerons(&mut self) {
-        if self.ephemerons_resolved {
-            return;
-        }
-        self.ephemerons_resolved = true;
-
-        // 1. Ephemeron fixpoint: live keys keep their values and R closure callbacks alive
-        //    without allowing a callback/value alone to keep its key alive.
-        loop {
-            let mut changed = false;
-            let fin_len = self.heap.finalizers.len();
-            for i in 0..fin_len {
-                let fin = self.heap.finalizers[i];
-                if self.is_marked(fin.target)
-                    && let FinalizerKind::RClosure(fun) = fin.kind
-                    && !self.is_marked(fun)
-                {
-                    self.mark_transitive(fun);
-                    changed = true;
-                }
-            }
-            let wr_len = self.heap.weakrefs.len();
-            for i in 0..wr_len {
-                let wr = self.heap.weakrefs[i];
-                if self.is_marked(wr.key) {
-                    if !self.is_marked(wr.value) {
-                        self.mark_transitive(wr.value);
-                        changed = true;
-                    }
-                    if let Some(FinalizerKind::RClosure(fun)) = wr.finalizer
-                        && !self.is_marked(fun)
-                    {
-                        self.mark_transitive(fun);
-                        changed = true;
-                    }
-                }
-            }
-            if !changed {
-                break;
-            }
-        }
-
-        // 2. Partition all newly unreachable targets BEFORE resurrecting any of them,
-        //    so one dead finalizer's closure cannot mask another dead target in the same cycle.
-        let mut dead_fins = Vec::new();
-        let mut alive_fins = Vec::with_capacity(self.heap.finalizers.len());
-        let old_fins = std::mem::take(&mut self.heap.finalizers);
-        for fin in old_fins {
-            if self.is_marked(fin.target) {
-                alive_fins.push(fin);
-            } else {
-                dead_fins.push(fin);
-            }
-        }
-        self.heap.finalizers = alive_fins;
-
-        let mut dead_weakrefs = Vec::new();
-        let mut alive_wrs = Vec::with_capacity(self.heap.weakrefs.len());
-        let old_wrs = std::mem::take(&mut self.heap.weakrefs);
-        for wr in old_wrs {
-            if self.is_marked(wr.key) {
-                alive_wrs.push(wr);
-            } else {
-                dead_weakrefs.push(wr.weakref);
-                if let Some(kind) = wr.finalizer {
-                    dead_fins.push(Finalizer {
-                        target: wr.key,
-                        kind,
-                        onexit: wr.onexit,
-                    });
-                }
-            }
-        }
-        self.heap.weakrefs = alive_wrs;
-
-        // 3. Resurrect targets and R callbacks for newly queued finalizers so they survive sweep.
-        for &fin in &dead_fins {
-            self.mark_transitive(fin.target);
-            if let FinalizerKind::RClosure(fun) = fin.kind {
-                self.mark_transitive(fun);
-            }
-        }
-        self.heap.pending_finalizers.extend(dead_fins);
-        self.cleared_weakrefs = dead_weakrefs;
+        let mut tracer = Tracer {
+            marked: &mut self.marked,
+            worklist: &mut worklist,
+            generations: &self.heap.generations,
+        };
+        tracer.edge(id);
+        tracer.trace_slots(&self.heap.slots);
     }
 
     /// Sweep all unmarked non-permanent slots, bump generations, and return [`GcStats`].
@@ -917,18 +569,11 @@ impl<T: Trace + HeapSize> Marked<'_, T> {
                 live_objects += 1;
                 live_bytes = live_bytes.saturating_add(slot.bytes);
             } else {
-                slot.value = None;
-                slot.bytes = 0;
-                slot.refcnt = 0;
-                freed += 1;
-                if slot.generation < MAX_GENERATION {
-                    slot.generation += 1;
-                    self.heap.generations[idx] = slot.generation;
+                if slot.retire_slot() {
                     self.heap.free_list.push(idx as u32);
-                } else {
-                    // Slot retired permanently once max generation is reached.
-                    self.heap.generations[idx] = MAX_GENERATION;
                 }
+                self.heap.generations[idx] = slot.generation;
+                freed += 1;
             }
         }
 
@@ -986,14 +631,12 @@ mod tests {
         let b = heap.alloc(Node { edges: vec![a] }).unwrap();
         heap.get_mut(a).unwrap().edges.push(b);
 
-        // Protect `a`: cycle stays live.
         let mark = heap.protect_mark();
         heap.protect(a);
         let stats1 = heap.mark(&EmptyRoots).sweep();
         assert_eq!(stats1.freed_objects, 0);
         assert_eq!(stats1.live_objects, 3);
 
-        // Unprotect `a`: unreachable cycle `a <-> b` is freed; permanent survives.
         heap.unprotect_to(mark);
         let stats2 = heap.mark(&EmptyRoots).sweep();
         assert_eq!(stats2.freed_objects, 2);
@@ -1057,7 +700,6 @@ mod tests {
             .unwrap();
         heap.register_finalizer(target, FinalizerKind::RClosure(fin_closure), false);
 
-        // Protect target: closure stays alive via ephemeron fixpoint.
         let mark = heap.protect_mark();
         heap.protect(target);
         let out1 = heap.mark(&EmptyRoots).sweep_outcome();
@@ -1065,8 +707,6 @@ mod tests {
         assert!(!heap.has_pending_finalizers());
         assert!(heap.get(fin_closure).is_ok());
 
-        // Drop target: even though fin_closure references target, target is dead,
-        // queued once, and resurrected until pending finalizers are drained.
         heap.unprotect_to(mark);
         let out2 = heap.mark(&EmptyRoots).sweep_outcome();
         assert_eq!(out2.stats.freed_objects, 0);
@@ -1074,7 +714,6 @@ mod tests {
         assert!(heap.get(target).is_ok());
         assert!(heap.get(fin_closure).is_ok());
 
-        // Drain finalizers and sweep again: both target and closure are freed.
         let drained = heap.drain_pending_finalizers();
         assert_eq!(drained.len(), 1);
         assert_eq!(drained[0].target, target);
@@ -1083,7 +722,6 @@ mod tests {
         assert_eq!(out3.stats.freed_objects, 2);
         assert_eq!(heap.get(target).err(), Some(HeapError::Stale(target)));
 
-        // retain_finalizers purges native finalizers for an unloading DLL across all lists.
         let t2 = heap.alloc(Node { edges: vec![] }).unwrap();
         heap.register_finalizer(
             t2,
@@ -1095,5 +733,58 @@ mod tests {
         );
         heap.retain_finalizers(|k| !matches!(k, FinalizerKind::Native { dll: 7, .. }));
         assert!(heap.take_exit_finalizers().is_empty());
+    }
+    #[test]
+    fn preserves_weakref_flags_and_finalizer_order() {
+        let mut heap = Heap::new(GcPolicy::Torture);
+        let key = heap.alloc(Node { edges: vec![] }).unwrap();
+        let weakref = heap.alloc(Node { edges: vec![] }).unwrap();
+        let weak_callback = FinalizerKind::Native { fun: 1, dll: 0 };
+        let standalone = FinalizerKind::Native { fun: 2, dll: 0 };
+        let mut entry = WeakRefEntry {
+            weakref,
+            key,
+            value: key,
+            finalizer: None,
+            onexit: true,
+        };
+
+        heap.register_weakref(entry);
+        assert_eq!(heap.remove_weakref(weakref), Some(entry));
+
+        entry.finalizer = Some(weak_callback);
+        heap.register_weakref(entry);
+        heap.retain_finalizers(|kind| kind != weak_callback);
+        assert_eq!(
+            heap.remove_weakref(weakref),
+            Some(WeakRefEntry {
+                finalizer: None,
+                ..entry
+            })
+        );
+
+        heap.register_weakref(entry);
+        heap.register_finalizer(key, standalone, true);
+        assert_eq!(
+            heap.take_exit_finalizers()
+                .into_iter()
+                .map(|fin| fin.kind)
+                .collect::<Vec<_>>(),
+            [standalone, weak_callback]
+        );
+
+        heap.register_weakref(entry);
+        heap.register_finalizer(key, standalone, false);
+        assert_eq!(
+            heap.mark(&EmptyRoots).sweep_outcome().cleared_weakrefs,
+            [weakref]
+        );
+        assert_eq!(
+            heap.drain_pending_finalizers()
+                .into_iter()
+                .map(|fin| fin.kind)
+                .collect::<Vec<_>>(),
+            [standalone, weak_callback]
+        );
     }
 }
