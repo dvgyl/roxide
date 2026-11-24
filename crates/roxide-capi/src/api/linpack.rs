@@ -1,3 +1,5 @@
+//! LINPACK Fortran C API wrappers (`R_ext/Linpack.h`).
+
 use std::ffi::c_int;
 use std::ops::Range;
 use std::ptr;
