@@ -8,7 +8,7 @@ use roxide_value::SEXP_NIL;
 
 use crate::abi::Rboolean;
 use crate::api::{extptr::DlFunc, vector::api};
-use crate::dll::{self, Dll, Interface, Registry, Routine};
+use crate::dll::{self, CallableEntry, Dll, Interface, Registry, Routine};
 
 /// Registration entry for `R_CMethodDef` or `R_FortranMethodDef`.
 #[repr(C)]
@@ -52,7 +52,7 @@ unsafe fn collect<T>(
     ctx: &mut Ctx,
     table: *const T,
     kind: Interface,
-    dll: u32,
+    owner: u32,
     fields: impl Fn(&T) -> (*const c_char, DlFunc, c_int),
     routines: &mut Vec<Routine>,
 ) -> EvalResult<()> {
@@ -82,8 +82,8 @@ unsafe fn collect<T>(
             name: label,
             addr: fun as usize,
             registration: Some((kind, arity)),
-            dll,
-            code_dll: dll::dll_id_for_addr(fun as usize),
+            owner,
+            code_owner: dll::code_owner(ctx, fun as usize, owner),
         });
     }
     Err(ctx.stop(
@@ -93,7 +93,10 @@ unsafe fn collect<T>(
 }
 
 fn function(address: usize) -> DlFunc {
-    // SAFETY: Registration or symbol lookup supplied a non-null C function address.
+    if address == 0 {
+        return None;
+    }
+    // SAFETY: Registration or symbol lookup supplied this non-null C function address.
     Some(unsafe { std::mem::transmute::<usize, unsafe extern "C" fn() -> *mut c_void>(address) })
 }
 
@@ -140,7 +143,9 @@ api! {
         dll::embedding(ctx)
     }
 
-    /// Find the address of a native routine. A NULL or empty package searches all DLLs.
+    #[doc = "Find the address of a native routine. A NULL or empty package searches all DLLs.
+
+The public headers declare `R_RegisteredNativeSymbol` as an opaque, incomplete type. This function leaves the optional `symbol` pointer untouched."]
     fn R_FindSymbol(routine: *const c_char, package: *const c_char, _symbol: *mut c_void) -> DlFunc = None; |ctx| {
         let routine = name(ctx, routine)?;
         let package = if package.is_null() { None } else { Some(name(ctx, package)?) };
@@ -155,26 +160,24 @@ api! {
             return Err(ctx.stop(SEXP_NIL, "cannot register a NULL callable function"));
         };
         let address = fun as usize;
-        let owner = dll::dll_id_for_addr(address);
-        ctx.ext::<Registry>().callables.insert(key, (address, owner));
+        let owner = dll::code_owner(ctx, address, 0);
+        ctx.ext::<Registry>().callables.insert(key, CallableEntry { address, owner });
         Ok(())
     }
 
     /// Find a callable function, loading the package namespace on demand.
     fn R_GetCCallable(package: *const c_char, routine: *const c_char) -> DlFunc = None; |ctx| {
         let key = (name(ctx, package)?, name(ctx, routine)?);
-        if let Some(&(address, _)) = ctx.ext::<Registry>().callables.get(&key) {
-            return Ok(function(address));
+        if let Some(entry) = ctx.ext::<Registry>().callables.get(&key) {
+            return Ok(function(entry.address));
         }
         let loaded = ctx.with_native_toplevel(|ctx| ctx.with_native_error_handler(
             |ctx| ctx.load_namespace(&key.0, SEXP_NIL),
             |_, _| Ok(SEXP_NIL),
         ));
-        if let Err(quit @ roxide_eval::Unwind::Quit { .. }) = loaded {
-            return Err(quit);
-        }
-        if let Some(&(address, _)) = ctx.ext::<Registry>().callables.get(&key) {
-            return Ok(function(address));
+        loaded?;
+        if let Some(entry) = ctx.ext::<Registry>().callables.get(&key) {
+            return Ok(function(entry.address));
         }
         Err(ctx.stop(SEXP_NIL, format!("function '{}' not provided by package '{}'", key.1, key.0)))
     }

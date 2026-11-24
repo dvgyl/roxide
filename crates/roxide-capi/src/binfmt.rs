@@ -2,15 +2,27 @@
 
 //! Check shared-library dependencies before loading a native image.
 
+use std::ffi::OsStr;
 use std::fmt;
+use std::io::{self, Read, Seek, SeekFrom};
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
 
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum Error<'a> {
+const CPU: u32 = if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+    0x0100_0007
+} else {
+    0x0100_000c
+};
+const MAX_METADATA_SIZE: u64 = 16 * 1024 * 1024;
+
+#[derive(Debug)]
+pub(crate) enum Error {
     Invalid,
-    Foreign(&'a [u8]),
+    Foreign(Vec<u8>),
+    Read(io::Error),
 }
 
-impl fmt::Display for Error<'_> {
+impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Invalid => f.write_str("invalid or unsupported shared-library format"),
@@ -19,253 +31,302 @@ impl fmt::Display for Error<'_> {
                 "foreign R dependency '{}'; reinstall from source with Roxide",
                 String::from_utf8_lossy(name)
             ),
+            Self::Read(err) => err.fmt(f),
         }
     }
 }
 
-pub(crate) fn check<'a>(data: &'a [u8], libr: Option<&[u8]>) -> Result<(), Error<'a>> {
-    let dependencies = if data.starts_with(b"\x7fELF") {
-        elf(data)
-    } else {
-        mach(universal_slice(data).ok_or(Error::Invalid)?)
-    }
-    .ok_or(Error::Invalid)?;
-    for name in dependencies {
+pub(crate) fn check(
+    file: &mut (impl Read + Seek),
+    len: u64,
+    libr: Option<&Path>,
+    canonicalize: impl Fn(&Path) -> Option<PathBuf>,
+) -> Result<(), Error> {
+    let image = Region { offset: 0, len };
+    let magic = image.part(0, 4)?.read(file)?;
+    let elf_image = magic == b"\x7fELF";
+    let dependency = |name: &[u8]| {
         let base = name.rsplit(|b| *b == b'/').next().unwrap_or(name);
+        let framework = name
+            .split(|b| *b == b'/')
+            .any(|part| part == b"R.framework");
         let r_library = (base.starts_with(b"libR.") && base.ends_with(b".dylib"))
             || base == b"libR.dylib"
             || base == b"libR.so"
             || base.starts_with(b"libR.so.");
-        if name
-            .windows(b"R.framework".len())
-            .any(|w| w == b"R.framework")
-            || base.starts_with(b"libRblas")
+        let path = Path::new(OsStr::from_bytes(name));
+        let allowed_runtime = || {
+            libr.is_some_and(|libr| {
+                (elf_image && name == b"libR.so")
+                    || (path.is_absolute() && canonicalize(path).as_deref() == Some(libr))
+            })
+        };
+        if base.starts_with(b"libRblas")
             || base.starts_with(b"libRlapack")
-            || (r_library && Some(name) != libr)
+            || ((framework || r_library) && !allowed_runtime())
         {
-            return Err(Error::Foreign(name));
+            return Err(Error::Foreign(name.to_vec()));
         }
+        Ok(())
+    };
+    if elf_image {
+        elf(file, image, dependency)
+    } else {
+        mach_image(file, image, &magic, dependency)
     }
-    Ok(())
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Region {
+    offset: u64,
+    len: u64,
+}
+
+impl Region {
+    fn part(self, offset: u64, len: u64) -> Result<Self, Error> {
+        if offset.checked_add(len).is_none_or(|end| end > self.len) {
+            return Err(Error::Invalid);
+        }
+        Ok(Self {
+            offset: self.offset + offset,
+            len,
+        })
+    }
+
+    fn read(self, file: &mut (impl Read + Seek)) -> Result<Vec<u8>, Error> {
+        if self.len > MAX_METADATA_SIZE {
+            return Err(Error::Invalid);
+        }
+        let mut bytes = vec![0; self.len as usize];
+        file.seek(SeekFrom::Start(self.offset))
+            .map_err(Error::Read)?;
+        file.read_exact(&mut bytes).map_err(Error::Read)?;
+        Ok(bytes)
+    }
 }
 
 #[derive(Clone, Copy)]
-struct Image<'a> {
+struct Words<'a> {
     bytes: &'a [u8],
     le: bool,
 }
 
-impl Image<'_> {
-    fn u16(self, at: usize) -> Option<u16> {
-        let bytes = range(self.bytes, at, 2)?.try_into().ok()?;
-        Some(if self.le {
-            u16::from_le_bytes(bytes)
-        } else {
-            u16::from_be_bytes(bytes)
-        })
+impl Words<'_> {
+    fn read<const N: usize>(self, at: usize) -> Result<[u8; N], Error> {
+        let mut bytes = self
+            .bytes
+            .get(at..at + N)
+            .and_then(|bytes| <[u8; N]>::try_from(bytes).ok())
+            .ok_or(Error::Invalid)?;
+        if !self.le {
+            bytes.reverse();
+        }
+        Ok(bytes)
     }
 
-    fn u32(self, at: usize) -> Option<u32> {
-        let bytes = range(self.bytes, at, 4)?.try_into().ok()?;
-        Some(if self.le {
-            u32::from_le_bytes(bytes)
-        } else {
-            u32::from_be_bytes(bytes)
-        })
+    fn u16(self, at: usize) -> Result<u16, Error> {
+        Ok(u16::from_le_bytes(self.read(at)?))
     }
 
-    fn u64(self, at: usize) -> Option<u64> {
-        let bytes = range(self.bytes, at, 8)?.try_into().ok()?;
-        Some(if self.le {
-            u64::from_le_bytes(bytes)
-        } else {
-            u64::from_be_bytes(bytes)
-        })
+    fn u32(self, at: usize) -> Result<u32, Error> {
+        Ok(u32::from_le_bytes(self.read(at)?))
+    }
+
+    fn u64(self, at: usize) -> Result<u64, Error> {
+        Ok(u64::from_le_bytes(self.read(at)?))
     }
 }
 
-fn range(bytes: &[u8], start: usize, len: usize) -> Option<&[u8]> {
-    bytes.get(start..start.checked_add(len)?)
+fn c_string(bytes: &[u8], offset: usize) -> Result<&[u8], Error> {
+    let tail = bytes.get(offset..).ok_or(Error::Invalid)?;
+    let end = tail
+        .iter()
+        .position(|&byte| byte == 0)
+        .ok_or(Error::Invalid)?;
+    if end == 0 {
+        return Err(Error::Invalid);
+    }
+    Ok(&tail[..end])
 }
 
-fn c_string(bytes: &[u8], offset: usize) -> Option<&[u8]> {
-    let tail = bytes.get(offset..)?;
-    let end = tail.iter().position(|&byte| byte == 0)?;
-    (end > 0).then(|| &tail[..end])
-}
-
-fn universal_slice(bytes: &[u8]) -> Option<&[u8]> {
-    let (le, wide) = match bytes.get(..4)? {
+fn mach_image(
+    file: &mut (impl Read + Seek),
+    image: Region,
+    magic: &[u8],
+    dependency: impl Fn(&[u8]) -> Result<(), Error>,
+) -> Result<(), Error> {
+    let (le, wide) = match magic {
         [0xca, 0xfe, 0xba, 0xbe] => (false, false),
         [0xbe, 0xba, 0xfe, 0xca] => (true, false),
         [0xca, 0xfe, 0xba, 0xbf] => (false, true),
         [0xbf, 0xba, 0xfe, 0xca] => (true, true),
-        _ => return Some(bytes),
+        _ => return mach(file, image, None, &dependency),
     };
-    let image = Image { bytes, le };
+    let count = image.part(4, 4)?.read(file)?;
+    let count = u64::from(Words { bytes: &count, le }.u32(0)?);
     let stride = if wide { 32 } else { 20 };
-    let len = (image.u32(4)? as usize).checked_mul(stride)?;
-    let mut selected = None;
-    let cpu = if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
-        0x0100_0007
-    } else {
-        0x0100_000c
-    };
-    for entry in range(bytes, 8, len)?.chunks_exact(stride) {
-        let entry = Image { bytes: entry, le };
+    let table = image.part(8, count * stride)?.read(file)?;
+    let mut found = false;
+    for entry in table.chunks_exact(stride as usize) {
+        let entry = Words { bytes: entry, le };
         let (start, size) = if wide {
-            (
-                usize::try_from(entry.u64(8)?).ok()?,
-                usize::try_from(entry.u64(16)?).ok()?,
-            )
+            (entry.u64(8)?, entry.u64(16)?)
         } else {
-            (entry.u32(8)? as usize, entry.u32(12)? as usize)
+            (u64::from(entry.u32(8)?), u64::from(entry.u32(12)?))
         };
-        let slice = range(bytes, start, size)?;
-        if entry.u32(0)? == cpu {
-            // Reject images with ambiguous CPU subtypes. The loader could select either.
-            if selected.replace(slice).is_some() {
-                return None;
-            }
-            let le = match slice.get(..4)? {
-                [0xcf, 0xfa, 0xed, 0xfe] => true,
-                [0xfe, 0xed, 0xfa, 0xcf] => false,
-                _ => return None,
-            };
-            if (Image { bytes: slice, le }).u32(4)? != cpu {
-                return None;
-            }
+        let slice = image.part(start, size)?;
+        if entry.u32(0)? == CPU {
+            mach(file, slice, Some(CPU), &dependency)?;
+            found = true;
         }
     }
-    selected
+    if !found {
+        return Err(Error::Invalid);
+    }
+    Ok(())
 }
 
-fn mach(bytes: &[u8]) -> Option<Vec<&[u8]>> {
-    let le = match bytes.get(..4)? {
+fn mach(
+    file: &mut (impl Read + Seek),
+    image: Region,
+    cpu: Option<u32>,
+    dependency: &impl Fn(&[u8]) -> Result<(), Error>,
+) -> Result<(), Error> {
+    let header = image.part(0, 32)?.read(file)?;
+    let le = match header[..4] {
         [0xcf, 0xfa, 0xed, 0xfe] => true,
         [0xfe, 0xed, 0xfa, 0xcf] => false,
-        _ => return None,
+        _ => return Err(Error::Invalid),
     };
-    let header = Image { bytes, le };
-    if !matches!(header.u32(12)?, 6 | 8) {
-        return None;
+    let header = Words { bytes: &header, le };
+    if !matches!(header.u32(12)?, 6 | 8) || cpu.is_some_and(|cpu| header.u32(4).ok() != Some(cpu)) {
+        return Err(Error::Invalid);
     }
-    let mut commands = range(bytes, 32, header.u32(20)? as usize)?;
-    let mut needed = Vec::new();
+    let commands = image.part(32, u64::from(header.u32(20)?))?.read(file)?;
+    let mut commands = commands.as_slice();
     for _ in 0..header.u32(16)? {
-        let command = Image {
+        let command = Words {
             bytes: commands,
             le,
         };
         let size = command.u32(4)? as usize;
         if size < 8 || !size.is_multiple_of(8) {
-            return None;
+            return Err(Error::Invalid);
         }
-        let (bytes, rest) = commands.split_at_checked(size)?;
+        let (bytes, rest) = commands.split_at_checked(size).ok_or(Error::Invalid)?;
+        let command = Words { bytes, le };
         if matches!(
             command.u32(0)?,
             0xc | 0x8000_0018 | 0x8000_001f | 0x20 | 0x8000_0023
         ) {
             let offset = command.u32(8)? as usize;
             if offset < 24 {
-                return None;
+                return Err(Error::Invalid);
             }
-            needed.push(c_string(bytes, offset)?);
+            dependency(c_string(bytes, offset)?)?;
         }
         commands = rest;
     }
-    commands.is_empty().then_some(needed)
+    if !commands.is_empty() {
+        return Err(Error::Invalid);
+    }
+    Ok(())
 }
 
-fn elf(bytes: &[u8]) -> Option<Vec<&[u8]>> {
-    let le = match *bytes.get(5)? {
+fn elf(
+    file: &mut (impl Read + Seek),
+    image: Region,
+    dependency: impl Fn(&[u8]) -> Result<(), Error>,
+) -> Result<(), Error> {
+    let header = image.part(0, 64)?.read(file)?;
+    let le = match header[5] {
         1 => true,
         2 => false,
-        _ => return None,
+        _ => return Err(Error::Invalid),
     };
-    let image = Image { bytes, le };
-    if bytes.get(4..7)? != [2, bytes[5], 1] || image.u16(16)? != 3 || image.u32(20)? != 1 {
-        return None;
+    let header = Words { bytes: &header, le };
+    if header.bytes[4] != 2 || header.bytes[6] != 1 || header.u16(16)? != 3 || header.u32(20)? != 1
+    {
+        return Err(Error::Invalid);
     }
-    let stride = usize::from(image.u16(54)?);
-    let count = usize::from(image.u16(56)?);
+    let stride = u64::from(header.u16(54)?);
+    let count = u64::from(header.u16(56)?);
     if stride != 56 || count == 0xffff {
-        return None;
+        return Err(Error::Invalid);
     }
-    let headers = range(
-        bytes,
-        usize::try_from(image.u64(32)?).ok()?,
-        stride.checked_mul(count)?,
-    )?;
+    let headers = image.part(header.u64(32)?, stride * count)?.read(file)?;
     let mut loads = Vec::new();
     let mut dynamic = None;
-    for bytes_of_header in headers.chunks_exact(stride) {
-        let ph = Image {
-            bytes: bytes_of_header,
-            le,
-        };
+    for bytes in headers.chunks_exact(stride as usize) {
+        let ph = Words { bytes, le };
         let segment_type = ph.u32(0)?;
         if matches!(segment_type, 1 | 2) {
-            let segment = range(
-                bytes,
-                usize::try_from(ph.u64(8)?).ok()?,
-                usize::try_from(ph.u64(32)?).ok()?,
-            )?;
+            let segment = image.part(ph.u64(8)?, ph.u64(32)?)?;
             let address = ph.u64(16)?;
-            if ph.u64(32)? > ph.u64(40)? || address.checked_add(ph.u64(40)?).is_none() {
-                return None;
+            let memory_size = ph.u64(40)?;
+            if segment.len > memory_size || address.checked_add(memory_size).is_none() {
+                return Err(Error::Invalid);
             }
             if segment_type == 1 {
                 loads.push((address, segment));
             } else if dynamic.replace((address, segment)).is_some() {
-                return None;
+                return Err(Error::Invalid);
             }
         }
     }
-    let mapped = |address: u64, size: usize| {
-        let mut matches = loads.iter().filter_map(|&(base, segment)| {
-            range(
-                segment,
-                usize::try_from(address.checked_sub(base)?).ok()?,
-                size,
-            )
-        });
-        let found = matches.next()?;
-        matches.next().is_none().then_some(found)
+    let mapped = |address: u64, size: u64| {
+        let mut matches = loads
+            .iter()
+            .filter_map(|&(base, segment)| segment.part(address.checked_sub(base)?, size).ok());
+        let found = matches.next().ok_or(Error::Invalid)?;
+        if matches.next().is_some() {
+            return Err(Error::Invalid);
+        }
+        Ok(found)
     };
-    let (dynamic_address, entries) = dynamic?;
-    if !std::ptr::eq(mapped(dynamic_address, entries.len())?, entries) {
-        return None;
+    let (address, entries) = dynamic.ok_or(Error::Invalid)?;
+    if mapped(address, entries.len)? != entries {
+        return Err(Error::Invalid);
     }
+    let entries = entries.read(file)?;
     let mut needed = Vec::new();
-    let mut address: Option<u64> = None;
+    let mut address = None;
     let mut size = None;
     for bytes in entries.as_chunks::<16>().0 {
-        let entry = Image { bytes, le };
+        let entry = Words { bytes, le };
         let value = entry.u64(8)?;
         match entry.u64(0)? {
-            0 if needed.is_empty() => return Some(Vec::new()),
+            0 if needed.is_empty() => return Ok(()),
             0 => {
-                let address = address?;
-                let size = size?;
-                let strings_table = mapped(address, size)?;
-                return needed
-                    .into_iter()
-                    .map(|offset| c_string(strings_table, offset))
-                    .collect();
+                let strings = mapped(address.ok_or(Error::Invalid)?, size.ok_or(Error::Invalid)?)?
+                    .read(file)?;
+                for offset in needed {
+                    dependency(c_string(&strings, offset)?)?;
+                }
+                return Ok(());
             }
-            1 => needed.push(usize::try_from(value).ok()?),
-            5 if address.replace(value).is_some() => return None,
-            10 if size.replace(usize::try_from(value).ok()?).is_some() => return None,
+            1 => needed.push(usize::try_from(value).map_err(|_| Error::Invalid)?),
+            5 if address.replace(value).is_some() => return Err(Error::Invalid),
+            10 if size.replace(value).is_some() => return Err(Error::Invalid),
             _ => {}
         }
     }
-    None
+    Err(Error::Invalid)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn check(bytes: &[u8], libr: Option<&[u8]>) -> Result<(), Error> {
+        let libr = libr.map(|name| Path::new(OsStr::from_bytes(name)));
+        super::check(
+            &mut io::Cursor::new(bytes),
+            bytes.len() as u64,
+            libr,
+            |path| Some(path.to_path_buf()),
+        )
+    }
 
     fn thin(name: &[u8], command: u32) -> Vec<u8> {
         let size = (24 + name.len() + 1).next_multiple_of(8);
@@ -291,14 +352,24 @@ mod tests {
         data
     }
 
-    fn fat(thin: &[u8]) -> Vec<u8> {
-        let mut data = vec![0; 28];
+    fn fat(slices: &[&[u8]]) -> Vec<u8> {
+        let mut data = vec![0; 8 + 20 * slices.len()];
         data[..4].copy_from_slice(&[0xca, 0xfe, 0xba, 0xbe]);
-        let cpu = u32::from_le_bytes(thin[4..8].try_into().unwrap());
-        for (at, word) in [(4, 1), (8, cpu), (16, 28), (20, thin.len() as u32)] {
-            data[at..at + 4].copy_from_slice(&word.to_be_bytes());
+        data[4..8].copy_from_slice(&(slices.len() as u32).to_be_bytes());
+        for (index, thin) in slices.iter().enumerate() {
+            let cpu = u32::from_le_bytes(thin[4..8].try_into().unwrap());
+            let offset = data.len() as u32;
+            let at = 8 + index * 20;
+            for (at, word) in [
+                (at, cpu),
+                (at + 4, index as u32),
+                (at + 8, offset),
+                (at + 12, thin.len() as u32),
+            ] {
+                data[at..at + 4].copy_from_slice(&word.to_be_bytes());
+            }
+            data.extend_from_slice(thin);
         }
-        data.extend_from_slice(thin);
         data
     }
 
@@ -337,44 +408,64 @@ mod tests {
         let foreign = b"/Library/Frameworks/R.framework/Versions/4.6/Resources/lib/libR.dylib";
         for command in [0xc, 0x8000_0018, 0x8000_001f, 0x20, 0x8000_0023] {
             let bytes = thin(foreign, command);
-            assert_eq!(check(&bytes, None), Err(Error::Foreign(foreign)));
-            assert_eq!(check(&fat(&bytes), None), Err(Error::Foreign(foreign)));
+            assert!(matches!(check(&bytes, None), Err(Error::Foreign(name)) if name == foreign));
+            assert!(
+                matches!(check(&fat(&[&bytes]), None), Err(Error::Foreign(name)) if name == foreign)
+            );
         }
         let canonical = b"/roxide/lib/libR.dylib";
-        assert_eq!(check(&thin(canonical, 0xc), Some(canonical)), Ok(()));
-        assert_eq!(
+        assert!(check(&thin(canonical, 0xc), Some(canonical)).is_ok());
+        assert!(matches!(
             check(&thin(b"@rpath/libR.dylib", 0xc), Some(canonical)),
-            Err(Error::Foreign(b"@rpath/libR.dylib"))
-        );
-        assert_eq!(
-            check(&fat(&thin(b"/usr/lib/libSystem.B.dylib", 0xc)), None),
-            Ok(())
+            Err(Error::Foreign(name)) if name == b"@rpath/libR.dylib"
+        ));
+        let ordinary = thin(b"/usr/lib/OtherR.framework/libSystem.B.dylib", 0xc);
+        assert!(check(&fat(&[&ordinary, &ordinary]), None).is_ok());
+        let other = thin(foreign, 0xc);
+        assert!(
+            matches!(check(&fat(&[&ordinary, &other]), None), Err(Error::Foreign(name)) if name == foreign)
         );
     }
 
     #[test]
     fn elf_checks_dependencies_without_section_headers() {
-        assert_eq!(check(&elf_fixture(b"libc.so.6"), None), Ok(()));
+        assert!(check(&elf_fixture(b"libc.so.6"), None).is_ok());
         for name in [
             b"libR.so.4".as_slice(),
             b"libRblas.so",
             b"libRlapack.so",
             b"/gnu/libR.so",
         ] {
-            assert_eq!(check(&elf_fixture(name), None), Err(Error::Foreign(name)));
+            assert!(
+                matches!(check(&elf_fixture(name), None), Err(Error::Foreign(dep)) if dep == name)
+            );
         }
         let canonical = b"/roxide/lib/libR.so";
-        assert_eq!(check(&elf_fixture(canonical), Some(canonical)), Ok(()));
+        assert!(check(&elf_fixture(canonical), Some(canonical)).is_ok());
+        assert!(check(&elf_fixture(b"libR.so"), Some(canonical)).is_ok());
+        assert!(matches!(
+            check(&elf_fixture(b"libR.so"), None),
+            Err(Error::Foreign(_))
+        ));
+        let linked = elf_fixture(b"/alias/libR.so");
+        assert!(
+            super::check(
+                &mut io::Cursor::new(&linked),
+                linked.len() as u64,
+                Some(Path::new("/roxide/lib/libR.so")),
+                |path| (path == Path::new("/alias/libR.so")).then(|| "/roxide/lib/libR.so".into())
+            )
+            .is_ok()
+        );
     }
 
     #[test]
     fn rejects_truncated_images_and_handles_arbitrary_mutations() {
         let mach = thin(b"libSystem.dylib", 0xc);
-        for bytes in [&mach, &fat(&mach), &elf_fixture(b"libc.so.6")] {
+        for bytes in [&mach, &fat(&[&mach]), &elf_fixture(b"libc.so.6")] {
             for end in 0..bytes.len() {
-                assert_eq!(
-                    check(&bytes[..end], None),
-                    Err(Error::Invalid),
+                assert!(
+                    matches!(check(&bytes[..end], None), Err(Error::Invalid)),
                     "prefix {end}"
                 );
             }

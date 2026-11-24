@@ -26,12 +26,16 @@ fn make(
         if let Some(kind) = finalizer {
             crate::dll::remember_finalizer(ctx, key, kind)?;
         }
-        Ok(Sexp::from_id(ctx.session_mut().alloc_weakref(
-            key,
-            value,
-            finalizer,
-            onexit != 0,
-        )?))
+        let reference = ctx
+            .session_mut()
+            .alloc_weakref(key, value, finalizer, onexit != 0)?;
+        if let Some(kind) = finalizer
+            && onexit != 0
+            && key != SEXP_NIL
+        {
+            crate::dll::track_exit_finalizer(ctx, reference, kind);
+        }
+        Ok(Sexp::from_id(reference))
     })
 }
 
@@ -45,7 +49,8 @@ api! {
 
     /// Make a weak reference with an optional C finalizer.
     fn R_MakeWeakRefC(key: Sexp, value: Sexp, finalizer: CFinalizer, onexit: Rboolean) -> Sexp = Sexp::NULL; |ctx| {
-        make(ctx, key, value, native_finalizer(finalizer), onexit)
+        let kind = native_finalizer(ctx, finalizer);
+        make(ctx, key, value, kind, onexit)
     }
 
     /// Return the live weak key or R NULL.

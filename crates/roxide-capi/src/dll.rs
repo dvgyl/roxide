@@ -2,7 +2,6 @@
 
 use std::collections::HashMap;
 use std::ffi::{CStr, c_char, c_int, c_void};
-use std::io::Read;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -15,6 +14,7 @@ use roxide_value::{
     CharId, Encoding, RLogical, RSession, SEXP_NIL, SYM_CLASS, SYM_NAMES, ValueApi,
 };
 
+use crate::jump::{FrameKind, enter_trampoline_with};
 use crate::{binfmt, dotcall};
 
 static NEXT_ID: AtomicU32 = AtomicU32::new(1);
@@ -32,7 +32,6 @@ const LIBR: &str = if cfg!(target_os = "macos") {
 } else {
     "libR.so"
 };
-const MAX_IMAGE_SIZE: u64 = 256 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Interface {
@@ -43,12 +42,23 @@ pub(crate) enum Interface {
 }
 
 impl Interface {
-    const ALL: [(Self, &'static str); 4] = [
-        (Self::C, ".C"),
-        (Self::Call, ".Call"),
-        (Self::Fortran, ".Fortran"),
-        (Self::External, ".External"),
-    ];
+    const ALL: [Self; 4] = [Self::C, Self::Call, Self::Fortran, Self::External];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::C => ".C",
+            Self::Call => ".Call",
+            Self::Fortran => ".Fortran",
+            Self::External => ".External",
+        }
+    }
+
+    pub(crate) fn label(kind: NativeCallKind) -> &'static str {
+        match kind {
+            NativeCallKind::External2 => ".External2",
+            _ => Self::from(kind).name(),
+        }
+    }
 
     fn class(self) -> &'static str {
         match self {
@@ -76,8 +86,24 @@ pub(crate) struct Routine {
     pub name: String,
     pub addr: usize,
     pub registration: Option<(Interface, c_int)>,
-    pub dll: u32,
-    pub code_dll: u32,
+    pub owner: u32,
+    pub code_owner: u32,
+}
+
+struct RegisteredSymbol {
+    routine: Routine,
+    with_registration: bool,
+    pointer: SexpId,
+}
+
+pub(crate) struct CallableEntry {
+    pub address: usize,
+    pub owner: u32,
+}
+
+struct ExitFinalizer {
+    owner: u32,
+    reference: SexpId,
 }
 
 struct Image {
@@ -109,7 +135,7 @@ pub(crate) struct Dll {
     image: Option<Image>,
     info: SexpId,
     references: [SexpId; 2],
-    symbols: Vec<(Routine, bool, SexpId)>,
+    symbols: Vec<RegisteredSymbol>,
     unloading: bool,
 }
 
@@ -123,8 +149,17 @@ impl Dll {
     }
 
     fn entry(&self, prefix: &str) -> Option<usize> {
-        let address = self.symbol(&format!("{prefix}_{}", self.name))?;
-        (image_path(address)? == self.image.as_ref()?.owner.path).then_some(address)
+        let path = &self.image.as_ref()?.owner.path;
+        let find = |name: &str| {
+            let address = self.symbol(&format!("{prefix}_{name}"))?;
+            (image_path(address)? == *path).then_some(address)
+        };
+        find(self.name.as_str()).or_else(|| {
+            self.name
+                .contains('.')
+                .then(|| self.name.replace('.', "_"))
+                .and_then(|name| find(&name))
+        })
     }
 
     fn symbol(&self, name: &str) -> Option<usize> {
@@ -136,17 +171,19 @@ impl Dll {
             self.image
                 .as_ref()?
                 .library
-                .get::<unsafe extern "C" fn()>(name.as_bytes())
+                .get::<*mut c_void>(name.as_bytes())
         }
         .ok()
-        .map(|symbol| *symbol as usize)
+        .and_then(|symbol| (!symbol.is_null()).then(|| symbol.expose_provenance()))
     }
 }
 
 #[derive(Default)]
 pub(crate) struct Registry {
     pub dlls: Vec<Dll>,
-    pub callables: HashMap<(String, String), (usize, u32)>,
+    pub callables: HashMap<(String, String), CallableEntry>,
+    active_owner: u32,
+    exit_finalizers: Vec<ExitFinalizer>,
     finalizer_owners: HashMap<(SexpId, usize), u32>,
     finalizer_prune_at: usize,
     session: Arc<()>,
@@ -208,8 +245,8 @@ impl Registry {
                     name: name.into(),
                     addr,
                     registration: None,
-                    dll: dll.id,
-                    code_dll: dll_id_for_addr(addr),
+                    owner: dll.id,
+                    code_owner: image_owner(addr).unwrap_or(dll.id),
                 });
             }
         }
@@ -220,8 +257,8 @@ impl Registry {
         self.dlls
             .iter()
             .flat_map(|dll| &dll.symbols)
-            .find(|(_, _, pointer)| *pointer == object)
-            .map(|(routine, _, _)| routine.clone())
+            .find(|entry| entry.pointer == object)
+            .map(|entry| entry.routine.clone())
     }
 }
 
@@ -231,9 +268,12 @@ impl Trace for Registry {
         for dll in &self.dlls {
             tracer.edge(dll.info);
             tracer.edges(&dll.references);
-            for (_, _, pointer) in &dll.symbols {
-                tracer.edge(*pointer);
+            for entry in &dll.symbols {
+                tracer.edge(entry.pointer);
             }
+        }
+        for entry in &self.exit_finalizers {
+            tracer.edge(entry.reference);
         }
     }
 }
@@ -251,7 +291,7 @@ unsafe extern "C" {
 }
 
 fn image_path(address: usize) -> Option<PathBuf> {
-    let mut info = std::mem::MaybeUninit::<DlAddr>::uninit();
+    let mut info = std::mem::MaybeUninit::<DlAddr>::zeroed();
     // SAFETY: dladdr looks up the address without dereferencing it and initializes info on success.
     if unsafe {
         dladdr(
@@ -262,25 +302,57 @@ fn image_path(address: usize) -> Option<PathBuf> {
     {
         return None;
     }
-    // SAFETY: The loader returned a live image and a NUL-terminated file name.
+    // SAFETY: The fields are zero-initialized and dladdr returned success.
     let path = unsafe { info.assume_init().path };
     if path.is_null() {
         return None;
     }
+    // SAFETY: The loader owns the live image and returned a NUL-terminated path.
     let bytes = unsafe { CStr::from_ptr(path) }.to_bytes();
     Some(PathBuf::from(std::ffi::OsStr::from_bytes(bytes)))
 }
 
-pub(crate) fn dll_id_for_addr(address: usize) -> u32 {
-    image_path(address).map_or(0, |path| {
-        OWNERS
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .images
-            .iter()
-            .find(|(owner, _)| *owner == path)
-            .map_or(0, |(_, id)| *id)
+fn image_owner(address: usize) -> Option<u32> {
+    let path = image_path(address)?;
+    OWNERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .images
+        .iter()
+        .find(|(owner, _)| *owner == path)
+        .map(|(_, id)| *id)
+}
+
+pub(crate) fn code_owner(ctx: &mut Ctx, address: usize, owner: u32) -> u32 {
+    image_owner(address).unwrap_or_else(|| {
+        let active = ctx.ext::<Registry>().active_owner;
+        if active == 0 { owner } else { active }
     })
+}
+
+pub(crate) fn with_owner<T>(
+    ctx: &mut Ctx,
+    owner: u32,
+    run: impl FnOnce(&mut Ctx) -> EvalResult<T>,
+) -> EvalResult<T> {
+    if owner == 0 {
+        return run(ctx);
+    }
+    let previous = std::mem::replace(&mut ctx.ext::<Registry>().active_owner, owner);
+    let result = run(ctx);
+    ctx.ext::<Registry>().active_owner = previous;
+    result
+}
+
+pub(crate) fn track_exit_finalizer(ctx: &mut Ctx, reference: SexpId, kind: FinalizerKind) {
+    if let FinalizerKind::Native { dll, .. } = kind
+        && dll != 0
+    {
+        ctx.ext::<Registry>().exit_finalizers.push(ExitFinalizer {
+            owner: dll,
+            reference,
+        });
+    }
 }
 
 pub(crate) fn remember_finalizer(
@@ -291,20 +363,27 @@ pub(crate) fn remember_finalizer(
     let FinalizerKind::Native { fun, dll } = kind else {
         return Ok(());
     };
-    if target == SEXP_NIL || dll == 0 {
+    if target == SEXP_NIL {
         return Ok(());
     }
     let registry = ctx.ext::<Registry>();
     if registry.finalizer_owners.len() >= registry.finalizer_prune_at {
         let mut owners = std::mem::take(&mut registry.finalizer_owners);
         owners.retain(|(target, _), _| ctx.session().heap.get(*target).is_ok());
+        let mut exit = std::mem::take(&mut ctx.ext::<Registry>().exit_finalizers);
+        exit.retain(|entry| {
+            ctx.session()
+                .weakref_key(entry.reference)
+                .is_ok_and(|key| key != SEXP_NIL)
+        });
         let registry = ctx.ext::<Registry>();
+        registry.exit_finalizers = exit;
         registry.finalizer_prune_at = owners.len().saturating_mul(2).max(256);
         registry.finalizer_owners = owners;
     }
     let owners = &mut ctx.ext::<Registry>().finalizer_owners;
     // The evaluator passes only the target and address, even for a batch it has
-    // already taken out of the heap. Preserve the original owner across reloads.
+    // already taken out of the heap. Keep the owner until the DLL is unloaded.
     if owners.get(&(target, fun)).is_some_and(|&old| old != dll) {
         return Err(ctx.stop(
             SEXP_NIL,
@@ -317,10 +396,10 @@ pub(crate) fn remember_finalizer(
 
 pub(crate) fn run_finalizer(ctx: &mut Ctx, address: usize, target: SexpId) -> EvalResult<()> {
     let registry = ctx.ext::<Registry>();
-    if registry
-        .finalizer_owners
-        .get(&(target, address))
-        .is_some_and(|&id| !registry.dlls.iter().any(|dll| dll.id == id))
+    let Some(&owner) = registry.finalizer_owners.get(&(target, address)) else {
+        return Ok(());
+    };
+    if (owner != 0 && !registry.dlls.iter().any(|dll| dll.id == owner))
         || image_path(address).is_none()
     {
         return Ok(());
@@ -330,12 +409,14 @@ pub(crate) fn run_finalizer(ctx: &mut Ctx, address: usize, target: SexpId) -> Ev
             .heap
             .try_protect(target)
             .map_err(|err| ctx.stop(SEXP_NIL, err.to_string()))?;
-        dotcall::void_entry(
-            ctx,
-            address,
-            crate::abi::Sexp::from_id(target).0,
-            "finalizer",
-        )
+        with_owner(ctx, owner, |ctx| {
+            dotcall::void_entry(
+                ctx,
+                address,
+                crate::abi::Sexp::from_id(target).0,
+                "finalizer",
+            )
+        })
     })
 }
 
@@ -357,53 +438,96 @@ fn allowed_libr(ctx: &mut Ctx) -> Option<PathBuf> {
     (host.canonicalize(&runtime).ok()? == canonical).then_some(canonical)
 }
 
+fn load_error(
+    ctx: &mut Ctx,
+    call: SexpId,
+    path: &Path,
+    reason: impl std::fmt::Display,
+) -> roxide_eval::Unwind {
+    ctx.stop(
+        call,
+        format!(
+            "unable to load shared object '{}':\n  {reason}",
+            path.display()
+        ),
+    )
+}
+
 fn validate_image(ctx: &mut Ctx, path: &Path, call: SexpId) -> EvalResult<()> {
-    let failed = |ctx: &mut Ctx, reason: &dyn std::fmt::Display| {
-        ctx.stop(
-            call,
-            format!(
-                "unable to load shared object '{}': {reason}",
-                path.display()
-            ),
-        )
-    };
-    let metadata = std::fs::metadata(path).map_err(|err| failed(ctx, &err))?;
+    // Read metadata from the same native file system that dlopen uses.
+    let metadata = std::fs::metadata(path).map_err(|err| load_error(ctx, call, path, err))?;
     if !metadata.is_file() {
-        return Err(failed(ctx, &"shared library must be a regular file"));
+        return Err(load_error(
+            ctx,
+            call,
+            path,
+            "shared library must be a regular file",
+        ));
     }
-    if metadata.len() > MAX_IMAGE_SIZE {
-        return Err(failed(ctx, &"shared-library file exceeds the size limit"));
-    }
-    let file = std::fs::File::open(path).map_err(|err| failed(ctx, &err))?;
-    let mut bytes = Vec::new();
-    file.take(MAX_IMAGE_SIZE + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|err| failed(ctx, &err))?;
-    if bytes.len() as u64 > MAX_IMAGE_SIZE {
-        return Err(failed(ctx, &"shared-library file exceeds the size limit"));
-    }
+    let mut file = std::fs::File::open(path).map_err(|err| load_error(ctx, call, path, err))?;
+    let len = file
+        .metadata()
+        .map_err(|err| load_error(ctx, call, path, err))?
+        .len();
     let libr = allowed_libr(ctx);
-    binfmt::check(&bytes, libr.as_deref().map(|p| p.as_os_str().as_bytes()))
-        .map_err(|err| failed(ctx, &err))
+    let host = ctx.host();
+    binfmt::check(&mut file, len, libr.as_deref(), |path| {
+        host.canonicalize(path).ok()
+    })
+    .map_err(|err| load_error(ctx, call, path, err))
+}
+
+struct OpenImage<'a> {
+    path: &'a Path,
+    flags: c_int,
+    result: Option<Result<Library, libloading::Error>>,
+}
+
+unsafe extern "C" fn open_image(data: *mut c_void) {
+    // SAFETY: load keeps the descriptor live while the trampoline runs the loader.
+    let data = unsafe { &mut *data.cast::<OpenImage<'_>>() };
+    // SAFETY: The caller requested native code execution and validated the dependencies.
+    // Loader callbacks must return normally while the OS loader holds its internal locks.
+    data.result = Some(unsafe { Library::open(Some(data.path), data.flags) });
+}
+
+unsafe extern "C" fn close_image(data: *mut c_void) {
+    // SAFETY: close keeps the descriptor live while the trampoline runs the loader.
+    let library = unsafe { &mut *data.cast::<Option<Library>>() };
+    drop(library.take());
+}
+
+fn close(ctx: &mut Ctx, image: Image) -> EvalResult<()> {
+    let Image { library, owner } = image;
+    let mut library = Some(library);
+    with_owner(ctx, owner.id, |ctx| {
+        // SAFETY: close_image only accesses this descriptor during the trampoline call.
+        unsafe {
+            enter_trampoline_with(
+                ctx,
+                FrameKind::Entry { label: "dlclose" },
+                close_image,
+                std::ptr::from_mut(&mut library).cast(),
+            )
+        }
+    })
 }
 
 pub(crate) fn load(ctx: &mut Ctx, path: &Path, local: bool, now: bool, call: SexpId) -> EvalResult {
-    let path = ctx.host().canonicalize(path).map_err(|err| {
-        ctx.stop(
-            call,
-            format!("unable to load shared object '{}': {err}", path.display()),
-        )
-    })?;
-    if let Some(dll) = ctx.ext::<Registry>().by_path(&path) {
-        return Ok(dll.info);
-    }
+    let path = ctx
+        .host()
+        .canonicalize(path)
+        .map_err(|err| load_error(ctx, call, path, err))?;
     validate_image(ctx, &path, call)?;
+    if ctx.ext::<Registry>().by_path(&path).is_some() {
+        unload(ctx, &path, call)?;
+    }
     let name = path
         .file_stem()
         .and_then(|s| s.to_str())
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| ctx.stop(call, "invalid shared-library name"))?
-        .replace('.', "_");
+        .ok_or_else(|| load_error(ctx, call, &path, "invalid shared-library name"))?
+        .to_owned();
     let id = NEXT_ID
         .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
         .map_err(|_| ctx.stop(call, "shared-library ID limit exceeded"))?;
@@ -414,40 +538,69 @@ pub(crate) fn load(ctx: &mut Ctx, path: &Path, local: bool, now: bool, call: Sex
             drop(owners);
             return Err(ctx.stop(call, "another R session owns native library loading"));
         }
+        if owners.images.iter().any(|(image, _)| *image == path) {
+            drop(owners);
+            return Err(load_error(
+                ctx,
+                call,
+                &path,
+                "shared library is already loading or closing",
+            ));
+        }
         owners.session = session;
         owners.images.push((path.clone(), id));
         ImageOwner { path, id }
     };
     let flags =
         (if local { RTLD_LOCAL } else { RTLD_GLOBAL }) | (if now { RTLD_NOW } else { RTLD_LAZY });
-    // SAFETY: The caller requests native code execution. The dependency check precedes dlopen.
-    let library = unsafe { Library::open(Some(&owner.path), flags) }.map_err(|err| {
-        ctx.stop(
-            call,
-            format!(
-                "unable to load shared object '{}': {err}",
-                owner.path.display()
-            ),
-        )
-    })?;
-    let image = Image { library, owner };
-    let dll = make_dll(ctx, id, name, Some(image), local)?;
+    let dll = make_dll(ctx, id, name, Some(&owner.path), local)?;
     let result = dll.info;
-    let init = dll.entry("R_init");
     let handle = dll.handle().addr();
     ctx.ext::<Registry>().dlls.push(dll);
-    if let Some(init) = init
-        && let Err(err) = dotcall::void_entry(ctx, init, handle, "R_init")
-    {
+    let mut data = OpenImage {
+        path: &owner.path,
+        flags,
+        result: None,
+    };
+    let loaded = with_owner(ctx, id, |ctx| {
+        // SAFETY: open_image only accesses this descriptor during the trampoline call.
+        unsafe {
+            enter_trampoline_with(
+                ctx,
+                FrameKind::Entry { label: "dlopen" },
+                open_image,
+                std::ptr::from_mut(&mut data).cast(),
+            )?;
+        }
+        data.result
+            .take()
+            .ok_or_else(|| load_error(ctx, call, data.path, "loader returned no result"))?
+            .map_err(|err| load_error(ctx, call, data.path, err))
+    });
+    let initialized = loaded.and_then(|library| {
+        let dll = ctx.ext::<Registry>().get(id).ok_or_else(|| {
+            roxide_eval::Unwind::Internal(roxide_eval::InternalError {
+                message: "missing DLL registry entry".into(),
+            })
+        })?;
+        dll.image = Some(Image { library, owner });
+        if let Some(init) = dll.entry("R_init") {
+            with_owner(ctx, id, |ctx| {
+                dotcall::void_entry(ctx, init, handle, "R_init")
+            })?;
+        }
+        Ok(())
+    });
+    if let Err(err) = initialized {
         if let Some(dll) = ctx.ext::<Registry>().get(id) {
             dll.unloading = true;
         }
         ctx.scoped(|ctx| {
             ctx.protect_eval_result(&Err(err.clone()));
             ctx.run_pending_finalizers();
-            remove(ctx, id)
+            let _ = remove(ctx, id);
+            Err::<(), _>(err)
         })?;
-        return Err(err);
     }
     Ok(result)
 }
@@ -457,8 +610,13 @@ pub(crate) fn unload(ctx: &mut Ctx, path: &Path, call: SexpId) -> EvalResult<()>
         .host()
         .canonicalize(path)
         .unwrap_or_else(|_| path.to_path_buf());
-    // A C callable can be active in a different DLL from the current trampoline.
-    if crate::cx::depth() != 0 || ctx.ext::<Registry>().dlls.iter().any(|dll| dll.unloading) {
+    // Dispatch can signal a warning before it calls the resolved native address.
+    // A warning handler must not unload that address.
+    let registry = ctx.ext::<Registry>();
+    if crate::cx::depth() != 0
+        || registry.active_owner != 0
+        || registry.dlls.iter().any(|dll| dll.unloading)
+    {
         return Err(ctx.stop(
             call,
             "cannot unload a shared library while native code or DLL unload is active",
@@ -475,31 +633,70 @@ pub(crate) fn unload(ctx: &mut Ctx, path: &Path, call: SexpId) -> EvalResult<()>
     let handle = dll.handle().addr();
     let callback = dll.entry("R_unload");
     if let Some(callback) = callback
-        && let Err(err) = dotcall::void_entry(ctx, callback, handle, "R_unload")
+        && let Err(err) = with_owner(ctx, id, |ctx| {
+            dotcall::void_entry(ctx, callback, handle, "R_unload")
+        })
     {
         if let Some(dll) = ctx.ext::<Registry>().get(id) {
             dll.unloading = false;
         }
         return Err(err);
     }
+    run_dll_exit_finalizers(ctx, id);
     ctx.run_pending_finalizers();
     remove(ctx, id)
 }
 
-fn remove(ctx: &mut Ctx, id: u32) -> EvalResult<()> {
+fn run_dll_exit_finalizers(ctx: &mut Ctx, owner: u32) {
+    let references: Vec<_> = ctx
+        .ext::<Registry>()
+        .exit_finalizers
+        .extract_if(.., |entry| entry.owner == owner)
+        .map(|entry| entry.reference)
+        .collect();
+    let visible = ctx.is_visible();
+    let _ = ctx.scoped(|ctx| {
+        let mut callbacks = Vec::new();
+        for reference in references {
+            let Some(entry) = ctx.session_mut().heap.remove_weakref(reference) else {
+                continue;
+            };
+            let _ = ctx.session_mut().clear_weakref(reference);
+            if let Some(FinalizerKind::Native { fun, .. }) = entry.finalizer {
+                ctx.protect(entry.key);
+                callbacks.push((fun, entry.key));
+            }
+        }
+        for (address, target) in callbacks.into_iter().rev() {
+            let _ = run_finalizer(ctx, address, target);
+        }
+        Ok(())
+    });
+    ctx.set_visible(visible);
+}
+
+fn purge_callbacks(ctx: &mut Ctx, id: u32) {
     ctx.session_mut()
         .heap
         .retain_finalizers(|kind| !matches!(kind, FinalizerKind::Native { dll, .. } if dll == id));
+    let registry = ctx.ext::<Registry>();
+    registry.callables.retain(|_, entry| entry.owner != id);
+    registry.finalizer_owners.retain(|_, owner| *owner != id);
+    registry.exit_finalizers.retain(|entry| entry.owner != id);
+}
+
+fn remove(ctx: &mut Ctx, id: u32) -> EvalResult<()> {
+    purge_callbacks(ctx, id);
     let registry = ctx.ext::<Registry>();
     let mut pointers = Vec::new();
     for dll in &mut registry.dlls {
         if dll.id == id {
             pointers.extend(dll.references);
         }
-        dll.routines.retain(|routine| routine.code_dll != id);
-        dll.symbols.retain(|(routine, _, pointer)| {
-            if dll.id == id || routine.code_dll == id {
-                pointers.push(*pointer);
+        dll.routines.retain(|routine| routine.code_owner != id);
+        dll.symbols.retain(|entry| {
+            if dll.id == id || entry.routine.code_owner == id {
+                pointers.push(entry.pointer);
                 false
             } else {
                 true
@@ -513,10 +710,14 @@ fn remove(ctx: &mut Ctx, id: u32) -> EvalResult<()> {
         }
     }
     let registry = ctx.ext::<Registry>();
-    registry.callables.retain(|_, (_, owner)| *owner != id);
-    let index = registry.dlls.iter().position(|dll| dll.id == id);
-    let removed = index.map(|index| registry.dlls.remove(index));
-    drop(removed);
+    if let Some(index) = registry.dlls.iter().position(|dll| dll.id == id)
+        && let Some(image) = registry.dlls.remove(index).image
+    {
+        let closed = close(ctx, image);
+        // A destructor can register callbacks while dlclose is active.
+        purge_callbacks(ctx, id);
+        closed?;
+    }
     status
 }
 
@@ -524,14 +725,14 @@ fn make_dll(
     ctx: &mut Ctx,
     id: u32,
     name: String,
-    image: Option<Image>,
+    path: Option<&Path>,
     local: bool,
 ) -> EvalResult<Dll> {
     ctx.scoped(|ctx| {
         let mut dll = Dll {
             id,
             name,
-            image,
+            image: None,
             dynamic: id != 0,
             force: false,
             routines: Vec::new(),
@@ -549,11 +750,7 @@ fn make_dll(
         let session = ctx.session_mut();
         let name = session.scalar_str(&dll.name)?;
         session.list_set(info, 0, name)?;
-        let path = dll
-            .image
-            .as_ref()
-            .map(|image| image.owner.path.to_string_lossy())
-            .unwrap_or_default();
+        let path = path.map(Path::to_string_lossy).unwrap_or_default();
         let path = session.scalar_str(&path)?;
         session.list_set(info, 1, path)?;
         let dynamic = session.scalar_lgl(RLogical::from_raw(i32::from(dll.dynamic)))?;
@@ -613,15 +810,15 @@ fn set_class(session: &mut RSession, value: SexpId, names: &[&str]) -> EvalResul
 }
 
 fn symbol_info(ctx: &mut Ctx, routine: &Routine, registered_pointer: bool) -> EvalResult {
-    let Some(dll) = ctx.ext::<Registry>().get(routine.dll) else {
+    let Some(dll) = ctx.ext::<Registry>().get(routine.owner) else {
         return Err(ctx.stop(SEXP_NIL, "shared library was unloaded"));
     };
     let info = dll.info;
     let cached = dll
         .symbols
         .iter()
-        .find(|(entry, registered, _)| entry == routine && *registered == registered_pointer)
-        .map(|(_, _, pointer)| *pointer);
+        .find(|entry| entry.routine == *routine && entry.with_registration == registered_pointer)
+        .map(|entry| entry.pointer);
     let pointer = if let Some(pointer) = cached {
         pointer
     } else {
@@ -633,9 +830,12 @@ fn symbol_info(ctx: &mut Ctx, routine: &Routine, registered_pointer: bool) -> Ev
         let session = ctx.session_mut();
         let pointer = session.alloc_extptr(routine.addr, SEXP_NIL, info)?;
         set_class(session, pointer, &[class])?;
-        if let Some(dll) = ctx.ext::<Registry>().get(routine.dll) {
-            dll.symbols
-                .push((routine.clone(), registered_pointer, pointer));
+        if let Some(dll) = ctx.ext::<Registry>().get(routine.owner) {
+            dll.symbols.push(RegisteredSymbol {
+                routine: routine.clone(),
+                with_registration: registered_pointer,
+                pointer,
+            });
         }
         pointer
     };
@@ -706,8 +906,8 @@ pub(crate) fn registered_routines(
     };
     let routines = dll.routines.clone();
     let session = ctx.session_mut();
-    let result = named_list(session, &Interface::ALL.map(|(_, name)| name))?;
-    for (i, (kind, _)) in Interface::ALL.into_iter().enumerate() {
+    let result = named_list(session, &Interface::ALL.map(Interface::name))?;
+    for (i, kind) in Interface::ALL.into_iter().enumerate() {
         let selected: Vec<_> = routines
             .iter()
             .filter(|routine| {

@@ -36,16 +36,6 @@ unsafe extern "C" {
     fn rox_capi_call_ptrs(data: *mut c_void);
 }
 
-fn label(kind: NativeCallKind) -> &'static str {
-    match kind {
-        NativeCallKind::Call => ".Call",
-        NativeCallKind::External => ".External",
-        NativeCallKind::External2 => ".External2",
-        NativeCallKind::C => ".C",
-        NativeCallKind::Fortran => ".Fortran",
-    }
-}
-
 pub(crate) fn void_entry(
     ctx: &mut Ctx,
     address: usize,
@@ -137,13 +127,14 @@ fn resolve(
             return routine.ok_or_else(|| {
                 ctx.stop(
                     call,
-                    match package {
-                        Some(package) => format!(
-                            "\"{name}\" not available for .{}() for package \"{package}\"",
-                            kind.entry_name()
-                        ),
-                        None => format!("C symbol name \"{name}\" not in load table"),
-                    },
+                    format!(
+                        r#"{} symbol name "{name}" not in load table"#,
+                        if kind == Interface::Fortran {
+                            "Fortran"
+                        } else {
+                            "C"
+                        }
+                    ),
                 )
             });
         }
@@ -176,17 +167,6 @@ fn resolve(
     }
 }
 
-impl Interface {
-    fn entry_name(self) -> &'static str {
-        match self {
-            Self::Call => "Call",
-            Self::External => "External",
-            Self::C => "C",
-            Self::Fortran => "Fortran",
-        }
-    }
-}
-
 pub(crate) struct Invocation<'a> {
     pub kind: NativeCallKind,
     pub symbol: SexpId,
@@ -210,9 +190,12 @@ pub(crate) fn dispatch(ctx: &mut Ctx, request: Invocation<'_>) -> EvalResult {
         call,
     } = request;
     let interface = Interface::from(kind);
-    let label = label(kind);
+    let label = Interface::label(kind);
     let site = call.err_call();
     ctx.scoped(|ctx| {
+        if args.len() > MAX_ARGS {
+            return Err(ctx.stop(site, "too many arguments in foreign function call"));
+        }
         for value in [symbol, op, env, call.expr, site]
             .into_iter()
             .chain(args.values().iter().copied())
@@ -221,12 +204,6 @@ pub(crate) fn dispatch(ctx: &mut Ctx, request: Invocation<'_>) -> EvalResult {
                 .heap
                 .try_protect(value)
                 .map_err(|err| ctx.stop(site, err.to_string()))?;
-        }
-        if args.len() > MAX_ARGS {
-            return Err(ctx.stop(
-                site,
-                format!("too many arguments in foreign function call (maximum {MAX_ARGS})"),
-            ));
         }
         let routine = resolve(
             ctx,
@@ -237,25 +214,21 @@ pub(crate) fn dispatch(ctx: &mut Ctx, request: Invocation<'_>) -> EvalResult {
         )?;
         if let Some((registered, arity)) = routine.registration {
             if registered != interface {
-                return Err(ctx.stop(
-                    site,
-                    format!("'{0}' is not registered for {label}", routine.name),
-                ));
+                return Err(ctx.stop(site, "NULL value passed as symbol address"));
             }
             if arity >= 0 && args.len() != arity as usize {
                 return Err(ctx.stop(
                     site,
                     format!(
-                        "Incorrect number of arguments ({}) passed to '{}' which expects {}",
+                        "Incorrect number of arguments ({}), expecting {arity} for '{}'",
                         args.len(),
-                        routine.name,
-                        arity
+                        routine.name
                     ),
                 ));
             }
         }
 
-        match kind {
+        dll::with_owner(ctx, routine.code_owner, |ctx| match kind {
             NativeCallKind::Call => call_sexp(ctx, routine.addr, args.values(), label, site),
             NativeCallKind::External | NativeCallKind::External2 => {
                 let mut pairlist = SEXP_NIL;
@@ -285,7 +258,7 @@ pub(crate) fn dispatch(ctx: &mut Ctx, request: Invocation<'_>) -> EvalResult {
                 dotc.is_some_and(|opts| opts.naok),
                 site,
             ),
-        }
+        })
     })
 }
 
@@ -300,31 +273,28 @@ struct Guarded<T: Copy> {
 }
 
 impl<T: Copy> Guarded<T> {
-    fn new(ctx: &mut Ctx, values: &[T], call: SexpId) -> EvalResult<Self> {
-        let size = std::mem::size_of_val(values);
-        let layout = size
-            .checked_add(GUARD * 2)
-            .and_then(|len| Layout::from_size_align(len, GUARD.max(align_of::<T>())).ok())
-            .filter(|_| GUARD.is_multiple_of(align_of::<T>()))
-            .ok_or_else(|| ctx.stop(call, "invalid foreign argument buffer size"))?;
-        // SAFETY: layout is valid and has space for both guards and the entire slice.
-        let base = NonNull::new(unsafe { alloc(layout) })
-            .ok_or_else(|| ctx.stop(call, "cannot allocate foreign argument buffer"))?;
+    fn new(len: usize, mut value: impl FnMut(usize) -> T) -> Option<Self> {
+        const { assert!(GUARD.is_multiple_of(align_of::<T>())) };
+        let size = size_of::<T>().checked_mul(len)?;
+        let layout = Layout::from_size_align(size.checked_add(GUARD * 2)?, GUARD).ok()?;
+        // SAFETY: The layout has space for both guards and the payload.
+        let base = NonNull::new(unsafe { alloc(layout) })?;
         let buffer = Self {
             base,
             layout,
-            len: values.len(),
+            len,
             element: std::marker::PhantomData,
         };
-        // SAFETY: The ranges are in the allocation and the payload is aligned.
+        // SAFETY: All writes are inside the allocation and the payload is aligned.
         unsafe {
             base.as_ptr().write_bytes(SENTINEL, GUARD);
-            buffer
-                .data()
-                .copy_from_nonoverlapping(values.as_ptr(), values.len());
+            let data = buffer.data();
+            for index in 0..len {
+                data.add(index).write(value(index));
+            }
             base.as_ptr().add(GUARD + size).write_bytes(SENTINEL, GUARD);
         }
-        Ok(buffer)
+        Some(buffer)
     }
 
     fn data(&self) -> *mut T {
@@ -337,17 +307,21 @@ impl<T: Copy> Guarded<T> {
         unsafe { std::slice::from_raw_parts(self.data(), self.len) }
     }
 
-    fn intact(&self) -> bool {
+    fn damaged_guard(&self) -> Option<&'static str> {
         let back = self.layout.size() - GUARD;
         // SAFETY: The constructor initialized both guard ranges.
         unsafe {
-            [self.base.as_ptr(), self.base.as_ptr().add(back)]
-                .into_iter()
-                .all(|ptr| {
-                    std::slice::from_raw_parts(ptr, GUARD)
-                        .iter()
-                        .all(|&b| b == SENTINEL)
-                })
+            [
+                (self.base.as_ptr(), "under-run"),
+                (self.base.as_ptr().add(back), "over-run"),
+            ]
+            .into_iter()
+            .find(|&(ptr, _)| {
+                std::slice::from_raw_parts(ptr, GUARD)
+                    .iter()
+                    .any(|&b| b != SENTINEL)
+            })
+            .map(|(_, label)| label)
         }
     }
 }
@@ -389,8 +363,10 @@ impl Buffer {
     ) -> EvalResult<Self> {
         macro_rules! numeric {
             ($read:ident, $kind:ident, $bad:expr, $message:literal) => {{
-                let values: Vec<_> = ctx.session().$read(value)?.iter().collect();
-                if !naok && values.iter().copied().any($bad) {
+                let values = ctx.session().$read(value)?;
+                let buffer = Guarded::new(values.len(), |i| values.get(i))
+                    .ok_or_else(|| ctx.stop(call, "cannot allocate foreign argument buffer"))?;
+                if !naok && buffer.values().iter().copied().any($bad) {
                     return Err(ctx.stop(
                         call,
                         format!(
@@ -399,7 +375,7 @@ impl Buffer {
                         ),
                     ));
                 }
-                Self::$kind(Guarded::new(ctx, &values, call)?)
+                Self::$kind(buffer)
             }};
         }
         Ok(match ctx.session().type_of(value)? {
@@ -413,23 +389,29 @@ impl Buffer {
                 "complex NA/NaN/Inf"
             ),
             SexpType::Raw => {
-                let values: Vec<_> = ctx.session().raw(value)?.iter().collect();
-                Self::Raw(Guarded::new(ctx, &values, call)?)
+                let values = ctx.session().raw(value)?;
+                Self::Raw(
+                    Guarded::new(values.len(), |i| values.get(i))
+                        .ok_or_else(|| ctx.stop(call, "cannot allocate foreign argument buffer"))?,
+                )
             }
             SexpType::Vec => {
-                let values = ctx
-                    .session()
-                    .list_slice(value)?
-                    .iter()
-                    .copied()
-                    .map(Sexp::from_id)
-                    .collect::<Vec<_>>();
-                Self::List(Guarded::new(ctx, &values, call)?)
+                let values = ctx.session().list_slice(value)?;
+                Self::List(
+                    Guarded::new(values.len(), |i| Sexp::from_id(values[i]))
+                        .ok_or_else(|| ctx.stop(call, "cannot allocate foreign argument buffer"))?,
+                )
             }
             SexpType::Str => {
                 let len = ctx.session().xlength(value)?;
                 if fortran {
-                    if len != 1 {
+                    if len > 1 {
+                        ctx.warning_at(
+                            call,
+                            "only the first string in a char vector used in .Fortran",
+                        )?;
+                    }
+                    if len == 0 {
                         return Err(
                             ctx.stop(call, "character argument to .Fortran must have length one")
                         );
@@ -439,11 +421,9 @@ impl Buffer {
                 let text = (0..len)
                     .map(|i| text(ctx, value, i, false, call))
                     .collect::<EvalResult<Vec<_>>>()?;
-                let pointers = text.iter().map(|item| item.data.data()).collect::<Vec<_>>();
-                Self::Strings {
-                    pointers: Guarded::new(ctx, &pointers, call)?,
-                    text,
-                }
+                let pointers = Guarded::new(text.len(), |i| text[i].data.data())
+                    .ok_or_else(|| ctx.stop(call, "cannot allocate foreign argument buffer"))?;
+                Self::Strings { pointers, text }
             }
             _ => return Err(ctx.stop(call, format!("invalid foreign function argument {index}"))),
         })
@@ -462,18 +442,18 @@ impl Buffer {
         }
     }
 
-    fn intact(&self) -> bool {
+    fn damaged_guard(&self) -> Option<&'static str> {
         match self {
-            Self::Logical(buf) => buf.intact(),
-            Self::Integer(buf) => buf.intact(),
-            Self::Real(buf) => buf.intact(),
-            Self::Complex(buf) => buf.intact(),
-            Self::Raw(buf) => buf.intact(),
-            Self::List(buf) => buf.intact(),
-            Self::Strings { pointers, text } => {
-                pointers.intact() && text.iter().all(|item| item.data.intact())
-            }
-            Self::FortranString(text) => text.data.intact(),
+            Self::Logical(buf) => buf.damaged_guard(),
+            Self::Integer(buf) => buf.damaged_guard(),
+            Self::Real(buf) => buf.damaged_guard(),
+            Self::Complex(buf) => buf.damaged_guard(),
+            Self::Raw(buf) => buf.damaged_guard(),
+            Self::List(buf) => buf.damaged_guard(),
+            Self::Strings { pointers, text } => pointers
+                .damaged_guard()
+                .or_else(|| text.iter().find_map(|item| item.data.damaged_guard())),
+            Self::FortranString(text) => text.data.damaged_guard(),
         }
     }
 
@@ -523,15 +503,17 @@ fn text(
     call: SexpId,
 ) -> EvalResult<Text> {
     let original = ctx.session_mut().str_get(value, index)?;
-    let mut bytes = ctx.session().char_bytes(original)?.to_vec();
-    if fortran {
-        bytes.resize(255, 0);
-    }
-    bytes.push(0);
-    Ok(Text {
-        data: Guarded::new(ctx, &bytes, call)?,
-        original,
+    let bytes = ctx.session().char_bytes(original)?;
+    let len = if fortran { 255 } else { bytes.len() };
+    let data = Guarded::new(len + 1, |i| {
+        if i < len {
+            bytes.get(i).copied().unwrap_or(0)
+        } else {
+            0
+        }
     })
+    .ok_or_else(|| ctx.stop(call, "cannot allocate foreign argument buffer"))?;
+    Ok(Text { data, original })
 }
 
 impl Text {
@@ -565,7 +547,7 @@ fn copy_call(
     naok: bool,
     call: SexpId,
 ) -> EvalResult {
-    let label = label(kind);
+    let label = Interface::label(kind);
     let buffers = args
         .values()
         .iter()
@@ -586,11 +568,15 @@ fn copy_call(
         *slot = buffer.pointer();
     }
     call_ptrs(ctx, routine.addr, buffers.len(), pointers, label)?;
-    if let Some(index) = buffers.iter().position(|buffer| !buffer.intact()) {
+    if let Some((index, damage)) = buffers
+        .iter()
+        .enumerate()
+        .find_map(|(index, buffer)| buffer.damaged_guard().map(|damage| (index, damage)))
+    {
         return Err(ctx.stop(
             call,
             format!(
-                "array over-run in {label}(\"{}\") argument {}",
+                "array {damage} in {label}(\"{}\") argument {}",
                 routine.name,
                 index + 1
             ),

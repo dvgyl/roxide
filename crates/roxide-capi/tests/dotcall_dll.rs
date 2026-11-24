@@ -2,17 +2,18 @@
 
 use std::ffi::{c_char, c_void};
 use std::fs;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use roxide_capi::abi::Sexp;
-use roxide_capi::api::{coerce, extptr, pairlist, sym, vector, weakref};
+use roxide_capi::api::{coerce, eval, extptr, memory, pairlist, sym, vector, weakref};
 use roxide_capi::{globals, hooks, jump, register};
 use roxide_eval::{Args, Call, Ctx, DotCOpts, EvalResult, NamespaceLoader, NativeCallKind};
 use roxide_gc::{GcPolicy, SexpId};
-use roxide_host::PureHost;
+use roxide_host::NativeHost;
 use roxide_value::{
     CharId, GLOBAL_ENV, NA_INTEGER, PrimId, RComplex, RLogical, SEXP_NIL, SYM_NAMES, ValueApi,
 };
@@ -23,6 +24,17 @@ const FIXTURE: &str = r#"
 #include <R_ext/Rdynload.h>
 
 static int *events;
+static SEXP preserved;
+
+__attribute__((constructor)) static void initialize_image(void) {
+    preserved = Rf_ScalarInteger(97);
+    R_PreserveObject(preserved);
+}
+__attribute__((destructor)) static void release_image(void) {
+    R_ReleaseObject(preserved);
+    if (events) events[2]++;
+}
+static SEXP preserved_value(void) { return preserved; }
 static SEXP zero(void) { return Rf_ScalarInteger(42); }
 static SEXP sum2(SEXP a, SEXP b) {
     SEXP result = PROTECT(Rf_ScalarInteger(INTEGER(a)[0] + INTEGER(b)[0]));
@@ -55,6 +67,7 @@ static SEXP external2(SEXP call, SEXP op, SEXP args, SEXP rho) {
 static void mutate(int *value, double *other) { *value += 3; *other += 0.5; }
 static void ignore(void *value) { (void)value; }
 static void text(char **value) { value[0][0] = 'Y'; }
+static void f_text(char *value) { value[0] = 'Y'; }
 static void over(unsigned char *value) { value[1] = 0; }
 static void under(unsigned char *value) { value[-1] = 0; }
 void dynamic_value_(int *value) { *value += 10; }
@@ -82,14 +95,18 @@ static SEXP make_ext(void) {
     UNPROTECT(1);
     return result;
 }
+static SEXP add_non_exit(SEXP target) {
+    R_RegisterCFinalizerEx(target, finalize, FALSE);
+    return R_NilValue;
+}
 static SEXP make_weak(SEXP key) {
     return R_MakeWeakRefC(key, R_NilValue, finalize, TRUE);
 }
 static SEXP enable_dynamic(void) {
-    DllInfo *dll = R_getDllInfo("wave_test");
+    DllInfo *dll = R_getDllInfo("wave.test");
     if (!dll || !R_getEmbeddingDllInfo() || R_useDynamicSymbols(dll, TRUE))
         Rf_error("wrong DLL registration state");
-    if (!R_forceSymbols(dll, FALSE) || !R_FindSymbol("zero", "wave_test", NULL))
+    if (!R_forceSymbols(dll, FALSE) || !R_FindSymbol("zero", "wave.test", NULL))
         Rf_error("wrong symbol lookup state");
     return R_NilValue;
 }
@@ -101,6 +118,8 @@ static const R_CallMethodDef call[] = {
     {"counters", (DL_FUNC)counters, 1}, {"make_ext", (DL_FUNC)make_ext, 0},
     {"make_weak", (DL_FUNC)make_weak, 1}, {"enable_dynamic", (DL_FUNC)enable_dynamic, 0},
     {"finalizer_address", (DL_FUNC)finalizer_address, 0},
+    {"preserved_value", (DL_FUNC)preserved_value, 0},
+    {"add_non_exit", (DL_FUNC)add_non_exit, 1},
     {NULL, NULL, 0}
 };
 static const R_ExternalMethodDef ext[] = {
@@ -112,7 +131,8 @@ static const R_CMethodDef c[] = {
     {"under", (DL_FUNC)under, 1, NULL}, {NULL, NULL, 0, NULL}
 };
 static const R_FortranMethodDef fortran[] = {
-    {"f_mutate", (DL_FUNC)mutate, 2, NULL}, {"f_over", (DL_FUNC)over, 1, NULL}, {NULL, NULL, 0, NULL}
+    {"f_mutate", (DL_FUNC)mutate, 2, NULL}, {"f_over", (DL_FUNC)over, 1, NULL},
+    {"f_text", (DL_FUNC)f_text, 1, NULL}, {NULL, NULL, 0, NULL}
 };
 
 void R_init_wave_test(DllInfo *info) {
@@ -121,9 +141,10 @@ void R_init_wave_test(DllInfo *info) {
     R_forceSymbols(info, TRUE);
     R_RegisterCCallable("wave", "callable", (DL_FUNC) zero);
     R_RegisterCCallable("wave", "callable", (DL_FUNC) callable);
+    R_RegisterCCallable("wave", "borrowed", (DL_FUNC) R_GetCurrentEnv);
 }
 void R_unload_wave_test(DllInfo *info) {
-    if (info != R_getDllInfo("wave_test")) Rf_error("wrong unload handle");
+    if (info != R_getDllInfo("wave.test")) Rf_error("wrong unload handle");
     if (events) events[1]++;
 }
 "#;
@@ -180,6 +201,24 @@ fn compile(temp: &Temp) -> PathBuf {
     clang.args(["-shared", "-fPIC"]);
     if cfg!(target_os = "macos") {
         clang.args(["-undefined", "dynamic_lookup"]);
+        let stub = temp.0.join("link-stub.dylib");
+        let alias = temp.0.join("libR.dylib");
+        let output = Command::new("clang")
+            .args(["-dynamiclib", "-x", "c", "/dev/null", "-install_name"])
+            .arg(&alias)
+            .arg("-o")
+            .arg(&stub)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        clang
+            .args(["-Xlinker", "-weak_library", "-Xlinker"])
+            .arg(&stub);
+        std::os::unix::fs::symlink(std::env::current_exe().unwrap(), alias).unwrap();
     }
     let output = clang
         .arg("-I")
@@ -203,6 +242,9 @@ fn ffi_addresses() -> Vec<(&'static str, usize)> {
     }
     let mut symbols = address![
         coerce::Rf_ScalarInteger,
+        eval::R_GetCurrentEnv,
+        memory::R_PreserveObject,
+        memory::R_ReleaseObject,
         vector::INTEGER,
         jump::Rf_protect,
         jump::Rf_unprotect,
@@ -237,7 +279,7 @@ fn hooks(ctx: &Ctx) -> &'static dyn roxide_eval::NativeHooks {
 
 fn info(ctx: &mut Ctx, name: &str) -> SexpId {
     let result = hooks(ctx)
-        .get_native_symbol_info(ctx, name, Some("wave_test"), true, SEXP_NIL)
+        .get_native_symbol_info(ctx, name, Some("wave.test"), true, SEXP_NIL)
         .unwrap();
     ctx.protect(result);
     result
@@ -261,7 +303,7 @@ fn invoke(
         kind,
         symbol,
         args,
-        Some("wave_test"),
+        Some("wave.test"),
         opts,
         SEXP_NIL,
         GLOBAL_ENV,
@@ -272,7 +314,7 @@ fn invoke(
 fn call(ctx: &mut Ctx, name: &str, values: &[SexpId]) -> EvalResult {
     ctx.scoped(|ctx| {
         let symbol =
-            hooks(ctx).get_native_symbol_info(ctx, name, Some("wave_test"), true, SEXP_NIL)?;
+            hooks(ctx).get_native_symbol_info(ctx, name, Some("wave.test"), true, SEXP_NIL)?;
         let args = Args::from_pairs(values.iter().map(|&v| (None, v)).collect());
         invoke(ctx, NativeCallKind::Call, symbol, &args, None)
     })
@@ -294,28 +336,38 @@ fn message(ctx: &mut Ctx, action: impl FnOnce(&mut Ctx) -> EvalResult) -> String
 struct LazyLoader;
 impl NamespaceLoader for LazyLoader {
     fn load(&self, ctx: &mut Ctx, name: &str, _: SexpId) -> EvalResult {
-        if name == "wave" {
-            return call(ctx, "install_callable", &[]);
+        match name {
+            "wave" => call(ctx, "install_callable", &[]),
+            "interrupted" => Err(roxide_eval::Unwind::TopLevel),
+            _ => Err(ctx.stop(SEXP_NIL, "package unavailable")),
         }
-        Err(ctx.stop(SEXP_NIL, "package unavailable"))
     }
 }
 
 unsafe extern "C" fn get_callable(data: *mut c_void) {
     // SAFETY: lookup_callable passes a live descriptor and an active trampoline.
     unsafe {
-        let (name, result) = &mut *data.cast::<(&'static std::ffi::CStr, Sexp)>();
-        if let Some(fun) = register::R_GetCCallable(c"wave".as_ptr(), name.as_ptr()) {
+        let ((package, name), result) =
+            &mut *data.cast::<((&'static std::ffi::CStr, &'static std::ffi::CStr), Sexp)>();
+        if let Some(fun) = register::R_GetCCallable(package.as_ptr(), name.as_ptr()) {
             *result = Sexp(fun() as usize);
         }
     }
 }
 
-fn lookup_callable(ctx: &mut Ctx, name: &'static std::ffi::CStr) -> EvalResult {
-    let mut result = (name, Sexp::NULL);
+fn lookup_package_callable(
+    ctx: &mut Ctx,
+    package: &'static std::ffi::CStr,
+    name: &'static std::ffi::CStr,
+) -> EvalResult {
+    let mut result = ((package, name), Sexp::NULL);
     // SAFETY: get_callable uses the descriptor only while the trampoline is active.
     unsafe { jump::enter_trampoline(ctx, get_callable, std::ptr::from_mut(&mut result).cast())? };
     Ok(result.1.to_id().unwrap())
+}
+
+fn lookup_callable(ctx: &mut Ctx, name: &'static std::ffi::CStr) -> EvalResult {
+    lookup_package_callable(ctx, c"wave", name)
 }
 
 fn int(ctx: &Ctx, value: SexpId) -> i32 {
@@ -343,37 +395,57 @@ fn sexp_calls(ctx: &mut Ctx) {
     let args = Args::from_pairs(vec![(None, one), (None, two)]);
     let result = invoke(ctx, NativeCallKind::Call, address, &args, None).unwrap();
     assert_eq!(int(ctx, result), 3);
-    assert!(
+    assert_eq!(
         message(ctx, |ctx| invoke(
             ctx,
             NativeCallKind::C,
             address,
             &args,
             None
-        ))
-        .contains("not registered for .C")
+        )),
+        "NULL value passed as symbol address"
     );
-    assert!(
+    assert_eq!(
         message(ctx, |ctx| invoke(
             ctx,
             NativeCallKind::Call,
             address,
             &Args::default(),
             None
-        ))
-        .contains("expects 2")
+        )),
+        "Incorrect number of arguments (0), expecting 2 for 'sum2'"
     );
     let many = Args::from_pairs(vec![(None, one); 66]);
-    assert!(
+    assert_eq!(
         message(ctx, |ctx| invoke(
             ctx,
             NativeCallKind::Call,
             address,
             &many,
             None
-        ))
-        .contains("maximum 65")
+        )),
+        "too many arguments in foreign function call"
     );
+
+    let missing = keep(ctx, |ctx| ctx.session_mut().scalar_str("absent").unwrap());
+    for (kind, language) in [
+        (NativeCallKind::Call, "C"),
+        (NativeCallKind::External, "C"),
+        (NativeCallKind::External2, "C"),
+        (NativeCallKind::C, "C"),
+        (NativeCallKind::Fortran, "Fortran"),
+    ] {
+        assert_eq!(
+            message(ctx, |ctx| invoke(
+                ctx,
+                kind,
+                missing,
+                &Args::default(),
+                None
+            )),
+            format!(r#"{language} symbol name "absent" not in load table"#)
+        );
+    }
 
     let null = info(ctx, "null_pointer");
     ctx.opts_mut().warn = 2;
@@ -515,6 +587,36 @@ fn copy_calls(ctx: &mut Ctx) {
     let text = ctx.session_mut().str_get(text, 0).unwrap();
     assert_eq!(ctx.session().char_bytes(text).unwrap(), b"Yes");
 
+    let strings = keep(ctx, |ctx| {
+        let session = ctx.session_mut();
+        let yes = session
+            .mk_char(b"yes", roxide_value::Encoding::Utf8)
+            .unwrap();
+        let no = session
+            .mk_char(b"no", roxide_value::Encoding::Utf8)
+            .unwrap();
+        session.alloc_str_from(&[yes, no]).unwrap()
+    });
+    let f_text = info(ctx, "f_text");
+    let args = one_arg(strings);
+    ctx.opts_mut().warn = 2;
+    assert_eq!(
+        message(ctx, |ctx| invoke(
+            ctx,
+            NativeCallKind::Fortran,
+            f_text,
+            &args,
+            None
+        )),
+        "(converted from warning) only the first string in a char vector used in .Fortran"
+    );
+    ctx.opts_mut().warn = 0;
+    let result = invoke(ctx, NativeCallKind::Fortran, f_text, &args, None).unwrap();
+    let text = ctx.session().list_get(result, 0).unwrap();
+    assert_eq!(ctx.session().xlength(text).unwrap(), 1);
+    let ch = ctx.session_mut().str_get(text, 0).unwrap();
+    assert_eq!(ctx.session().char_bytes(ch).unwrap(), b"Yes");
+
     for (kind, name, expected) in [
         (
             NativeCallKind::C,
@@ -524,7 +626,7 @@ fn copy_calls(ctx: &mut Ctx) {
         (
             NativeCallKind::C,
             "under",
-            "array over-run in .C(\"under\") argument 1",
+            "array under-run in .C(\"under\") argument 1",
         ),
         (
             NativeCallKind::Fortran,
@@ -562,11 +664,13 @@ fn rejected_images(ctx: &mut Ctx, temp: &Temp) {
         (&bytes[..50], "invalid or unsupported shared-library format"),
     ] {
         fs::write(&path, image).unwrap();
-        assert!(
-            message(ctx, |ctx| hooks(ctx)
-                .dyn_load(ctx, &path, true, true, SEXP_NIL))
-            .contains(expected)
-        );
+        let failure = message(ctx, |ctx| {
+            hooks(ctx).dyn_load(ctx, &path, true, true, SEXP_NIL)
+        });
+        assert!(failure.starts_with(&format!(
+            "unable to load shared object '{}':\n  {expected}",
+            path.display()
+        )));
     }
 }
 
@@ -575,23 +679,47 @@ fn exercise(policy: GcPolicy) {
     let _guard = NATIVE_SESSION.lock().unwrap_or_else(|e| e.into_inner());
     let temp = Temp::new();
     let library = compile(&temp);
-    let mut events = [0i32; 2];
-    let mut host = PureHost::new();
-    for name in ["wave.test.so", "foreign.so"] {
-        host.insert_file(temp.0.join(name), Vec::new());
-    }
-    let mut ctx = Ctx::new(Box::new(host), policy).unwrap();
+    // Keep the debug payload sparse. It must not affect dependency validation.
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&library)
+        .unwrap()
+        .set_len(257 * 1024 * 1024)
+        .unwrap();
+    let mut events = [0i32; 3];
+    let mut ctx = Ctx::new(Box::new(NativeHost::new()), policy).unwrap();
     hooks::install(&mut ctx);
     let native = hooks(&ctx);
     rejected_images(&mut ctx, &temp);
+    if cfg!(target_os = "macos") {
+        ctx.host().set_env_var("ROXIDE_LIBR_PATH", None).unwrap();
+        assert!(
+            message(&mut ctx, |ctx| native
+                .dyn_load(ctx, &library, true, true, SEXP_NIL))
+            .contains("foreign R dependency")
+        );
+        let alias = temp.0.join("libR.dylib");
+        ctx.host()
+            .set_env_var("ROXIDE_LIBR_PATH", Some(alias.as_os_str().as_bytes()))
+            .unwrap();
+    }
 
     ctx.scoped(|ctx| {
         let dll = native.dyn_load(ctx, &library, true, true, SEXP_NIL)?;
         let dlls = native.get_loaded_dlls(ctx)?;
         assert_eq!(ctx.session().list_get(dlls, 0)?, dll);
+        let names = ctx.session().attr(dlls, SYM_NAMES);
+        let name = ctx.session_mut().str_get(names, 0)?;
+        assert_eq!(ctx.session().char_bytes(name)?, b"wave.test");
+        let name = ctx.session().list_get(dll, 0)?;
+        let name = ctx.session_mut().str_get(name, 0)?;
+        assert_eq!(ctx.session().char_bytes(name)?, b"wave.test");
+        ctx.collect_gc();
+        let preserved = call(ctx, "preserved_value", &[])?;
+        assert_eq!(int(ctx, preserved), 97);
         let tables = native.get_dll_registered_routines(ctx, dll, true, SEXP_NIL)?;
         let calls = ctx.session().list_get(tables, 1)?;
-        assert_eq!(ctx.session().xlength(calls)?, 13);
+        assert_eq!(ctx.session().xlength(calls)?, 15);
         let dynamic = ctx.session().list_get(dll, 2)?;
         assert_eq!(
             ctx.session().lgl(dynamic)?.iter().next(),
@@ -600,7 +728,7 @@ fn exercise(policy: GcPolicy) {
         assert!(!native.is_loaded(
             ctx,
             "dynamic_value",
-            Some("wave_test"),
+            Some("wave.test"),
             Some(NativeCallKind::Fortran)
         )?);
         let zero_name = keep(ctx, |ctx| ctx.session_mut().scalar_str("zero").unwrap());
@@ -613,7 +741,7 @@ fn exercise(policy: GcPolicy) {
         assert!(native.is_loaded(
             ctx,
             "DYNAMIC_VALUE",
-            Some("wave_test"),
+            Some("wave.test"),
             Some(NativeCallKind::Fortran)
         )?);
         let mangled = keep(ctx, |ctx| {
@@ -628,9 +756,14 @@ fn exercise(policy: GcPolicy) {
 
         let value = call(ctx, "use_callable", &[])?;
         assert_eq!(int(ctx, value), 91);
+        assert_eq!(lookup_callable(ctx, c"borrowed")?, GLOBAL_ENV);
         ctx.set_namespace_loader(&LazyLoader);
         let value = lookup_callable(ctx, c"lazy")?;
         assert_eq!(int(ctx, value), 91);
+        assert!(matches!(
+            lookup_package_callable(ctx, c"interrupted", c"lazy"),
+            Err(roxide_eval::Unwind::TopLevel)
+        ));
         assert_eq!(
             message(ctx, |ctx| lookup_callable(ctx, c"missing")),
             "function 'missing' not provided by package 'wave'"
@@ -649,16 +782,32 @@ fn exercise(policy: GcPolicy) {
         let weak = call(ctx, "make_weak", &[live])?;
         ctx.protect(weak);
 
+        let non_exit = keep(ctx, |ctx| {
+            ctx.session_mut()
+                .alloc_extptr(0, SEXP_NIL, SEXP_NIL)
+                .unwrap()
+        });
+        call(ctx, "add_non_exit", &[non_exit])?;
         call(ctx, "make_ext", &[])?;
         ctx.collect_gc();
-        assert_eq!(events, [0, 0]);
+        assert_eq!(events, [0, 0, 0]);
 
         let old = info(ctx, "zero");
         let address = ctx.session().list_get(old, 1)?;
         let dll_handle = ctx.session().list_get(dll, 4)?;
         let id = ctx.session().extptr_addr(dll_handle)?;
-        native.dyn_unload(ctx, &library, SEXP_NIL)?;
-        assert_eq!(events, [1, 1]);
+        let reloaded = native.dyn_load(ctx, &library, true, false, SEXP_NIL)?;
+        // Two live exit callbacks and one queued callback all ran before dlclose.
+        assert_eq!(events, [3, 1, 1]);
+        assert_eq!(ctx.session().weakref_key(weak)?, SEXP_NIL);
+        let dlls = native.get_loaded_dlls(ctx)?;
+        let names = ctx.session().attr(dlls, SYM_NAMES);
+        let mut matching = 0;
+        for i in 0..ctx.session().xlength(names)? {
+            let name = ctx.session_mut().str_get(names, i)?;
+            matching += usize::from(ctx.session().char_bytes(name)? == b"wave.test");
+        }
+        assert_eq!(matching, 1);
         assert_eq!(ctx.session().extptr_addr(address)?, 0);
         assert_eq!(ctx.session().extptr_addr(dll_handle)?, 0);
         assert!(
@@ -671,25 +820,33 @@ fn exercise(policy: GcPolicy) {
             ))
             .contains("NULL value passed as symbol address")
         );
-        assert_eq!(
-            message(ctx, |ctx| lookup_callable(ctx, c"callable")),
-            "function 'callable' not provided by package 'wave'"
-        );
-
-        let reloaded = native.dyn_load(ctx, &library, false, false, SEXP_NIL)?;
         let handle = ctx.session().list_get(reloaded, 4)?;
         assert!(ctx.session().extptr_addr(handle)? > id);
         call(ctx, "counters", &[ptr])?;
         native.run_c_finalizer(ctx, callback, live)?;
-        assert_eq!(events, [1, 1]);
+        assert_eq!(events, [3, 1, 1]);
+        // Register the same callback on the surviving object in the new DLL.
+        call(ctx, "add_non_exit", &[non_exit])?;
         native.dyn_unload(ctx, &library, SEXP_NIL)?;
+        for (symbol, expected) in [
+            (
+                c"callable",
+                "function 'callable' not provided by package 'wave'",
+            ),
+            (
+                c"borrowed",
+                "function 'borrowed' not provided by package 'wave'",
+            ),
+        ] {
+            assert_eq!(message(ctx, |ctx| lookup_callable(ctx, symbol)), expected);
+        }
         Ok(())
     })
     .unwrap();
 
     ctx.collect_gc();
     ctx.run_pending_finalizers();
-    assert_eq!(events, [1, 2]);
+    assert_eq!(events, [3, 2, 2]);
     assert_eq!(ctx.session().heap.protect_depth(), 0);
 }
 

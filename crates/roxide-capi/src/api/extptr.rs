@@ -25,10 +25,10 @@ fn make(ctx: &mut Ctx, address: usize, tag: Sexp, protect: Sexp) -> EvalResult<S
     })
 }
 
-pub(super) fn native_finalizer(fun: CFinalizer) -> Option<FinalizerKind> {
+pub(super) fn native_finalizer(ctx: &mut Ctx, fun: CFinalizer) -> Option<FinalizerKind> {
     fun.map(|fun| FinalizerKind::Native {
         fun: fun as usize,
-        dll: crate::dll::dll_id_for_addr(fun as usize),
+        dll: crate::dll::code_owner(ctx, fun as usize, 0),
     })
 }
 
@@ -58,9 +58,17 @@ fn register(
     }
     if let Some(kind) = kind {
         crate::dll::remember_finalizer(ctx, target, kind)?;
-        ctx.session_mut()
-            .heap
-            .register_finalizer(target, kind, onexit != 0);
+        if onexit != 0 && matches!(kind, FinalizerKind::Native { dll, .. } if dll != 0) {
+            // Keep a weak-reference handle so DLL unload can take this finalizer alone.
+            let reference = ctx
+                .session_mut()
+                .alloc_weakref(target, SEXP_NIL, Some(kind), true)?;
+            crate::dll::track_exit_finalizer(ctx, reference, kind);
+        } else {
+            ctx.session_mut()
+                .heap
+                .register_finalizer(target, kind, onexit != 0);
+        }
     }
     Ok(())
 }
@@ -137,12 +145,14 @@ api! {
 
     /// Register a C finalizer for garbage collection.
     fn R_RegisterCFinalizer(x: Sexp, finalizer: CFinalizer) -> () = (); |ctx| {
-        register(ctx, x, native_finalizer(finalizer), 0)
+        let kind = native_finalizer(ctx, finalizer);
+        register(ctx, x, kind, 0)
     }
 
     /// Register a C finalizer for garbage collection and optionally for session exit.
     fn R_RegisterCFinalizerEx(x: Sexp, finalizer: CFinalizer, onexit: Rboolean) -> () = (); |ctx| {
-        register(ctx, x, native_finalizer(finalizer), onexit)
+        let kind = native_finalizer(ctx, finalizer);
+        register(ctx, x, kind, onexit)
     }
 
     /// Register an R closure as a garbage collection finalizer.
