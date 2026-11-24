@@ -96,12 +96,19 @@ pub(crate) fn install_lazy_data(
                     }
                     "R" | "r" => {
                         let text = crate::description::read_text(ctx, &file.path)?;
-                        ctx.run_script(
+                        let previous = ctx.host().cwd().ok();
+                        let data_dir = source.join("data");
+                        let _ = ctx.host().set_cwd(&data_dir);
+                        let run = ctx.run_script(
                             &file.path.to_string_lossy(),
                             text.trim_start_matches('\u{feff}'),
                             env,
                             false,
-                        )?;
+                        );
+                        if let Some(dir) = previous {
+                            let _ = ctx.host().set_cwd(&dir);
+                        }
+                        run?;
                     }
                     _ => {
                         let path = ctx.session_mut().scalar_str(&file.path.to_string_lossy())?;

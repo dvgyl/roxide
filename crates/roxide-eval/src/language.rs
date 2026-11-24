@@ -1080,8 +1080,12 @@ fn as_call(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
 
 fn bquote(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     let matched = ctx.match_names(args, &["expr", "where", "splice"], call.err_call())?;
-    let env = ctx.eval_arg(args, &matched, 1, call, call.env)?;
-    ctx.require_env(env, call.err_call())?;
+    let target = ctx.eval_arg(args, &matched, 1, call, call.env)?;
+    let env = match ctx.session.type_of(target)? {
+        SexpType::Env => target,
+        SexpType::Vec | SexpType::List | SexpType::Nil => ctx.data_env(target, call.env)?,
+        _ => return Err(ctx.stop(call.err_call(), "invalid 'where' argument")),
+    };
     ctx.protect(env);
     let splice = ctx.eval_flag(args, &matched, 2, call, false)?;
     let expr = ctx.matched_arg(args, &matched, 0).unwrap_or(SEXP_MISSING);
@@ -1176,9 +1180,17 @@ fn match_arg(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
         let expr = ctx.session.cons_parts(call.expr)?.1;
         let raw = Args::from_pairs(ctx.session.pairlist_iter(expr).collect());
         let raw = ctx.matched_arg(&raw, &matched, 0).unwrap_or(SEXP_MISSING);
-        let sym = ctx.sym_from_sexp(raw)?;
+        let Ok(sym) = ctx.sym_from_sexp(raw) else {
+            return Err(ctx.stop(
+                call.err_call(),
+                "argument \"choices\" is missing, with no default",
+            ));
+        };
         let Some(frame) = ctx.frame(call.env) else {
-            return Err(ctx.stop(call.err_call(), "'choices' is missing"));
+            return Err(ctx.stop(
+                call.err_call(),
+                "argument \"choices\" is missing, with no default",
+            ));
         };
         let (formals, _, _) = ctx.session.closure_parts(frame.fun)?;
         let default = ctx
@@ -1193,11 +1205,16 @@ fn match_arg(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
         Some(several) => ctx.truth(several, call.err_call())?,
         None => false,
     };
+    if ctx.session.type_of(choices)? != SexpType::Str {
+        return Err(ctx.stop(call.err_call(), "'choices' must be a character vector"));
+    }
     let choices = ctx.session.str_slice(choices)?.to_vec();
     let values = if value == SEXP_NIL {
         Vec::new()
-    } else {
+    } else if ctx.session.type_of(value)? == SexpType::Str {
         ctx.session.str_slice(value)?.to_vec()
+    } else {
+        return Err(ctx.stop(call.err_call(), "'arg' must be NULL or a character vector"));
     };
     if value == SEXP_NIL || (!several && values == choices) {
         return Ok(ctx
@@ -1206,6 +1223,9 @@ fn match_arg(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     }
     if !several && values.len() != 1 {
         return Err(ctx.stop(call.err_call(), "'arg' must be of length 1"));
+    }
+    if several && values.is_empty() {
+        return Err(ctx.stop(call.err_call(), "'arg' must be of length >= 1"));
     }
     let mut selected = Vec::new();
     for value in values {

@@ -191,7 +191,15 @@ fn execute(ctx: &mut Ctx, options: &Options) -> i32 {
     let result = script(ctx, options);
     match result {
         Ok(()) => 0,
-        Err(Unwind::Quit { status, .. }) => status,
+        Err(Unwind::Quit {
+            status, run_last, ..
+        }) => {
+            if run_last {
+                ctx.run_exit_finalizers();
+                let _ = ctx.flush_stream_sinks();
+            }
+            status
+        }
         Err(error) => {
             let detail = match error {
                 Unwind::Internal(error) => Some(error.to_string()),
@@ -263,6 +271,8 @@ fn script(ctx: &mut Ctx, options: &Options) -> EvalResult<()> {
             false,
         )?;
     }
+    ctx.run_exit_finalizers();
+    let _ = ctx.flush_stream_sinks();
     Ok(())
 }
 
