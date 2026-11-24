@@ -24,12 +24,12 @@ pub(in crate::api) enum Access {
 
 pub(in crate::api) fn materialize(ctx: &mut Ctx, x: SexpId, access: Access) -> EvalResult<()> {
     let info = foreign(ctx, x)?;
-    if info.owned {
-        return Ok(());
-    }
     let methods = class(ctx, info.class)?.methods;
     if !matches!(access, Access::Evaluate) && !methods.has_dataptr() {
         return Err(missing_pointer(ctx, x));
+    }
+    if info.owned {
+        return Ok(());
     }
     ctx.scoped(|ctx| {
         protect(ctx, x)?;

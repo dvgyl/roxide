@@ -142,7 +142,17 @@ fn foreign_vectors_move_the_dense_buffer_for_all_seven_types() {
         assert_eq!(s.foreign_alt(x).unwrap().unwrap().len, Some(1));
         assert!(s.foreign_alt(x).unwrap().unwrap().owned);
         assert_eq!(s.data_ptr_ro(x).unwrap(), before);
-        assert_eq!(s.data_ptr_rw(x).unwrap(), before);
+        assert!(!s.foreign_alt_is_dirty(x).unwrap());
+        if matches!(ty, SexpType::Str | SexpType::Vec) {
+            assert!(matches!(
+                s.data_ptr_rw(x),
+                Err(ValueError::TypeMismatch { .. })
+            ));
+            assert!(!s.foreign_alt_is_dirty(x).unwrap());
+        } else {
+            assert_eq!(s.data_ptr_rw(x).unwrap(), before);
+            assert!(s.foreign_alt_is_dirty(x).unwrap());
+        }
         assert_eq!(s.alt_is_sorted(x).unwrap(), Sortedness::Unknown);
         assert!(!s.alt_no_na(x).unwrap());
         assert!(!s.adopt_foreign_alt_payload(x, SEXP_NIL).unwrap());
@@ -348,4 +358,19 @@ fn builtin_class_names_match_r_for_sequences_and_wrappers() {
         Some(("compact_realseq", "base"))
     );
     assert!(!s.foreign_alt_seen());
+}
+
+#[test]
+fn writable_slice_borrows_mark_owned_foreign_altrep_dirty() {
+    let mut s = session();
+    let cls = class(&mut s);
+    let x = s
+        .alloc_foreign_alt(cls, SexpType::Int, SEXP_NIL, SEXP_NIL)
+        .unwrap();
+    let dense = s.alloc_int_from(&[1, 2, 3]).unwrap();
+    assert!(s.adopt_foreign_alt_payload(x, dense).unwrap());
+    assert!(!s.foreign_alt_is_dirty(x).unwrap());
+    s.int_dataptr_mut(x).unwrap()[0] = 99;
+    assert!(s.foreign_alt_is_dirty(x).unwrap());
+    assert_eq!(s.int(x).unwrap().to_vec(), [99, 2, 3]);
 }

@@ -42,8 +42,8 @@ impl RSession {
     /// Return `(raw_address, element_len)` for writable direct buffer access (`INTEGER`, `REAL`,
     /// `LOGICAL`, `COMPLEX`, `RAW`).
     ///
-    /// This also exposes owned foreign ALTREP buffers. Use `str_set` and `list_set` to
-    /// change character and list elements so the heap can update reference counts.
+    /// Rejects character and list vectors so reference counts and `CHARSXP` invariants cannot be
+    /// bypassed; use `str_set` and `list_set` instead. Marks owned foreign ALTREP vectors dirty.
     pub fn data_ptr_rw(&mut self, x: SexpId) -> Result<(usize, usize), ValueError> {
         let obj = self.heap.get(x)?;
         if let Body::Alt(alt) = &obj.body
@@ -74,40 +74,38 @@ impl RSession {
                 _ => {}
             }
         }
-        let obj = self.heap.get_mut(x)?;
-        let mismatch = obj.type_mismatch("atomic vector");
-        match &mut obj.body {
-            Body::Lgl(v) => Ok((v.as_mut_slice().as_mut_ptr() as usize, v.len())),
-            Body::Int(v) => Ok((v.as_mut_slice().as_mut_ptr() as usize, v.len())),
-            Body::Real(v) => Ok((v.as_mut_slice().as_mut_ptr() as usize, v.len())),
-            Body::Cplx(v) => Ok((v.as_mut_slice().as_mut_ptr() as usize, v.len())),
-            Body::Raw(v) => Ok((v.as_mut_slice().as_mut_ptr() as usize, v.len())),
-            Body::Alt(alt) => match &mut alt.materialized {
-                Some(AltMaterialized::Lgl(v)) => {
-                    Ok((v.as_mut_slice().as_mut_ptr() as usize, v.len()))
-                }
-                Some(AltMaterialized::Int(v)) => {
-                    Ok((v.as_mut_slice().as_mut_ptr() as usize, v.len()))
-                }
-                Some(AltMaterialized::Real(v)) => {
-                    Ok((v.as_mut_slice().as_mut_ptr() as usize, v.len()))
-                }
-                Some(AltMaterialized::Cplx(v)) => {
-                    Ok((v.as_mut_slice().as_mut_ptr() as usize, v.len()))
-                }
-                Some(AltMaterialized::Raw(v)) => {
-                    Ok((v.as_mut_slice().as_mut_ptr() as usize, v.len()))
-                }
-                Some(AltMaterialized::Str(v)) if matches!(alt.kind, AltKind::Foreign(_)) => {
-                    Ok((v.as_mut_slice().as_mut_ptr() as usize, v.len()))
-                }
-                Some(AltMaterialized::List(v)) => {
-                    Ok((v.as_mut_slice().as_mut_ptr() as usize, v.len()))
-                }
-                _ => Err(mismatch),
-            },
-            _ => Err(mismatch),
-        }
+        let ptr = {
+            let obj = self.heap.get_mut(x)?;
+            let mismatch = obj.type_mismatch("atomic vector");
+            match &mut obj.body {
+                Body::Lgl(v) => (v.as_mut_slice().as_mut_ptr() as usize, v.len()),
+                Body::Int(v) => (v.as_mut_slice().as_mut_ptr() as usize, v.len()),
+                Body::Real(v) => (v.as_mut_slice().as_mut_ptr() as usize, v.len()),
+                Body::Cplx(v) => (v.as_mut_slice().as_mut_ptr() as usize, v.len()),
+                Body::Raw(v) => (v.as_mut_slice().as_mut_ptr() as usize, v.len()),
+                Body::Alt(alt) => match &mut alt.materialized {
+                    Some(AltMaterialized::Lgl(v)) => {
+                        (v.as_mut_slice().as_mut_ptr() as usize, v.len())
+                    }
+                    Some(AltMaterialized::Int(v)) => {
+                        (v.as_mut_slice().as_mut_ptr() as usize, v.len())
+                    }
+                    Some(AltMaterialized::Real(v)) => {
+                        (v.as_mut_slice().as_mut_ptr() as usize, v.len())
+                    }
+                    Some(AltMaterialized::Cplx(v)) => {
+                        (v.as_mut_slice().as_mut_ptr() as usize, v.len())
+                    }
+                    Some(AltMaterialized::Raw(v)) => {
+                        (v.as_mut_slice().as_mut_ptr() as usize, v.len())
+                    }
+                    _ => return Err(mismatch),
+                },
+                _ => return Err(mismatch),
+            }
+        };
+        self.mark_foreign_alt_dirty(x)?;
+        Ok(ptr)
     }
 
     /// Allocate a resizable vector with logical length `len` and pinned capacity `max_len`

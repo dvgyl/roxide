@@ -46,9 +46,7 @@ pub(crate) fn c_dataptr(ctx: &mut Ctx, x: SexpId, writable: Rboolean) -> EvalRes
     materialize(ctx, x, access)?;
     let s = ctx.session_mut();
     let (addr, _) = if writable != 0 {
-        let data = s.data_ptr_rw(x)?;
-        s.mark_foreign_alt_dirty(x)?;
-        data
+        s.data_ptr_rw(x)?
     } else {
         s.data_ptr_ro(x)?
     };

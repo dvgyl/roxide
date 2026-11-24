@@ -590,6 +590,7 @@ macro_rules! atomic_dataptr {
                 if self.heap.maybe_shared(x) {
                     return Err(ValueError::Shared(x));
                 }
+                self.mark_foreign_alt_dirty(x)?;
                 Ok(self.$prepare(x)?.as_mut_slice())
             }
         }
