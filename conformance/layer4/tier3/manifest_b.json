@@ -1,0 +1,206 @@
+{
+  "packages": [
+    {
+      "package": "glue",
+      "version": "1.8.1",
+      "license": "MIT",
+      "sha256": "1c55905d3efc3d5c199ceb0bd12218e97f0d4c64df6038ff41ecef415478a122",
+      "url": "https://cran.r-project.org/src/contrib/glue_1.8.1.tar.gz",
+      "needs_compilation": true,
+      "depends": [
+        "R (>= 4.1)"
+      ],
+      "imports": [
+        "methods"
+      ],
+      "linking_to": [],
+      "test_runner": "shim",
+      "bundled_licenses": {}
+    },
+    {
+      "package": "rlang",
+      "version": "1.3.0",
+      "license": "MIT",
+      "sha256": "80aa537d49e72265f443a15e8936128af583caa5e572086518b503cbf064279c",
+      "url": "https://cran.r-project.org/src/contrib/rlang_1.3.0.tar.gz",
+      "needs_compilation": true,
+      "depends": [
+        "R (>= 4.0.0)"
+      ],
+      "imports": [
+        "utils"
+      ],
+      "linking_to": [],
+      "test_runner": "shim",
+      "bundled_licenses": {
+        "xxHash": "BSD_2_clause"
+      }
+    },
+    {
+      "package": "cli",
+      "version": "3.0.1",
+      "license": "MIT",
+      "sha256": "d89a25b6cd760e157605676e104ce65473a7d8d64c289efdd9640e949968b4fd",
+      "url": "https://cran.r-project.org/src/contrib/Archive/cli/cli_3.0.1.tar.gz",
+      "needs_compilation": true,
+      "depends": [
+        "R (>= 2.10)"
+      ],
+      "imports": [
+        "glue",
+        "utils"
+      ],
+      "linking_to": [],
+      "test_runner": "shim",
+      "bundled_licenses": {}
+    },
+    {
+      "package": "lifecycle",
+      "version": "1.0.2",
+      "license": "MIT",
+      "sha256": "7b3f3c8ef9c068c5db396b353d62185d9ed02a69b787c7769d24595769a25a63",
+      "url": "https://cran.r-project.org/src/contrib/Archive/lifecycle/lifecycle_1.0.2.tar.gz",
+      "needs_compilation": false,
+      "depends": [
+        "R (>= 3.4)"
+      ],
+      "imports": [
+        "glue",
+        "rlang (>= 1.0.5)"
+      ],
+      "linking_to": [],
+      "test_runner": "shim",
+      "bundled_licenses": {}
+    },
+    {
+      "package": "cpp11",
+      "version": "0.5.5",
+      "license": "MIT",
+      "sha256": "72486beb0605c1229bf3d422cd536224af8dc09bd389a3116f62f4c7705c62f4",
+      "url": "https://cran.r-project.org/src/contrib/cpp11_0.5.5.tar.gz",
+      "needs_compilation": false,
+      "depends": [
+        "R (>= 4.0.0)"
+      ],
+      "imports": [],
+      "linking_to": [],
+      "test_runner": "shim",
+      "bundled_licenses": {
+        "fmt": "MIT"
+      }
+    },
+    {
+      "package": "crayon",
+      "version": "1.5.3",
+      "license": "MIT",
+      "sha256": "3e74a0685541efb5ea763b92cfd5c859df71c46b0605967a0b5dbb7326e9da69",
+      "url": "https://cran.r-project.org/src/contrib/crayon_1.5.3.tar.gz",
+      "needs_compilation": false,
+      "depends": [],
+      "imports": [
+        "grDevices",
+        "methods",
+        "utils"
+      ],
+      "linking_to": [],
+      "test_runner": "shim",
+      "bundled_licenses": {}
+    },
+    {
+      "package": "prettyunits",
+      "version": "1.2.0",
+      "license": "MIT",
+      "sha256": "f059f27e2a5c82e351fe05b87ad712f7afc273c651450453f59d99af5deeacea",
+      "url": "https://cran.r-project.org/src/contrib/prettyunits_1.2.0.tar.gz",
+      "needs_compilation": false,
+      "depends": [
+        "R(>= 2.10)"
+      ],
+      "imports": [],
+      "linking_to": [],
+      "test_runner": "shim",
+      "bundled_licenses": {}
+    },
+    {
+      "package": "lobstr",
+      "version": "1.2.2",
+      "license": "MIT",
+      "sha256": "31c094077c4cc3b6e9da14f4e4486fd45f45f5fe91514ed40bd282ccefbf640f",
+      "url": "https://cran.r-project.org/src/contrib/lobstr_1.2.2.tar.gz",
+      "needs_compilation": true,
+      "depends": [
+        "R (>= 3.6.0)"
+      ],
+      "imports": [
+        "crayon",
+        "methods",
+        "prettyunits",
+        "rlang (>= 1.0.0)"
+      ],
+      "linking_to": [
+        "cpp11 (>= 0.4.2)"
+      ],
+      "test_runner": "shim",
+      "bundled_licenses": {}
+    },
+    {
+      "package": "R6",
+      "version": "2.6.1",
+      "license": "MIT",
+      "sha256": "59c6eba8b1b912eb7e104f65053235604be853425ee67c152ac4e86a1f2073b4",
+      "url": "https://cran.r-project.org/src/contrib/R6_2.6.1.tar.gz",
+      "needs_compilation": false,
+      "depends": [
+        "R (>= 3.6)"
+      ],
+      "imports": [],
+      "linking_to": [],
+      "test_runner": "shim",
+      "bundled_licenses": {}
+    },
+    {
+      "package": "ps",
+      "version": "1.9.3",
+      "license": "MIT",
+      "sha256": "7b227f0627709a2073daf960ac612a0b87d03e18f7dd5c1938048ed440ef2e68",
+      "url": "https://cran.r-project.org/src/contrib/ps_1.9.3.tar.gz",
+      "needs_compilation": true,
+      "depends": [
+        "R (>= 3.4)"
+      ],
+      "imports": [
+        "utils"
+      ],
+      "linking_to": [],
+      "test_runner": "shim",
+      "bundled_licenses": {
+        "psutil": "BSD_3_clause"
+      }
+    },
+    {
+      "package": "processx",
+      "version": "3.10.0",
+      "license": "MIT",
+      "sha256": "3c032ceb1233ef7359d30590800b6a8313386ce5753fde29643e595f5a4331d0",
+      "url": "https://cran.r-project.org/src/contrib/processx_3.10.0.tar.gz",
+      "needs_compilation": true,
+      "depends": [
+        "R (>= 3.4.0)"
+      ],
+      "imports": [
+        "ps (>= 1.9.3)",
+        "R6",
+        "utils"
+      ],
+      "linking_to": [],
+      "test_runner": "shim",
+      "bundled_licenses": {}
+    }
+  ],
+  "license_notes": {
+    "cli": "Version 3.0.1 precedes the addition of code under public domain dedications outside the allowlist.",
+    "vctrs": "Current releases include MPL-2.0 files. Older releases tested against the allowlist require digest or declare GPL-3.",
+    "purrr": "Permissive releases require vctrs. Version 0.3.5 declares GPL-3.",
+    "tibble": "Version 3.3.1 no longer imports fansi, which declares GPL-2 or GPL-3. It still requires vctrs and pillar. Pillar imports utf8. Older tibble releases can require Rcpp, which declares GPL."
+  }
+}

@@ -1,0 +1,89 @@
+{
+  "packages": [
+    {
+      "package": "fastmap",
+      "version": "1.2.0",
+      "license": "MIT",
+      "sha256": "b1da04a2915d1d057f3c2525e295ef15016a64e6667eac83a14641bbd83b9246",
+      "url": "https://cran.r-project.org/src/contrib/fastmap_1.2.0.tar.gz",
+      "needs_compilation": true,
+      "depends": [],
+      "imports": [],
+      "linking_to": [],
+      "test_runner": "shim",
+      "bundled_licenses": {
+        "hopscotch_map": "MIT"
+      }
+    },
+    {
+      "package": "glue",
+      "version": "1.8.1",
+      "license": "MIT",
+      "sha256": "1c55905d3efc3d5c199ceb0bd12218e97f0d4c64df6038ff41ecef415478a122",
+      "url": "https://cran.r-project.org/src/contrib/glue_1.8.1.tar.gz",
+      "needs_compilation": true,
+      "depends": [
+        "R (>= 4.1)"
+      ],
+      "imports": [
+        "methods"
+      ],
+      "linking_to": [],
+      "test_runner": "shim",
+      "bundled_licenses": {}
+    },
+    {
+      "package": "magrittr",
+      "version": "2.0.5",
+      "license": "MIT",
+      "sha256": "3f5b5b1d4e6d12807a95c50b6c88cb1d8af2c5eb5213f08bfe58f278eca2ed23",
+      "url": "https://cran.r-project.org/src/contrib/magrittr_2.0.5.tar.gz",
+      "needs_compilation": true,
+      "depends": [
+        "R (>= 3.4.0)"
+      ],
+      "imports": [],
+      "linking_to": [],
+      "test_runner": "shim",
+      "bundled_licenses": {}
+    },
+    {
+      "package": "jsonlite",
+      "version": "2.0.0",
+      "license": "MIT",
+      "sha256": "75eb910c82b350ec33f094779da0f87bff154c232e4ae39c9896a9b89f3ac82d",
+      "url": "https://cran.r-project.org/src/contrib/jsonlite_2.0.0.tar.gz",
+      "needs_compilation": true,
+      "depends": [
+        "methods"
+      ],
+      "imports": [],
+      "linking_to": [],
+      "test_runner": "shim",
+      "bundled_licenses": {
+        "YAJL": "ISC",
+        "Hostap Base64": "BSD_3_clause",
+        "modp_numtoa": "MIT"
+      }
+    },
+    {
+      "package": "yaml",
+      "version": "2.3.12",
+      "license": "BSD_3_clause",
+      "sha256": "80ccf3dde851133ef3e333b818a817c296c6ccdacfc4709cd466995289cd556c",
+      "url": "https://cran.r-project.org/src/contrib/yaml_2.3.12.tar.gz",
+      "needs_compilation": true,
+      "depends": [],
+      "imports": [],
+      "linking_to": [],
+      "test_runner": "shim",
+      "bundled_licenses": {
+        "libyaml": "MIT",
+        "Syck": "MIT"
+      }
+    }
+  ],
+  "license_notes": {
+    "utf8": "Version 1.2.6 bundles Unicode data under the Unicode data licence, which is outside the allowlist."
+  }
+}
