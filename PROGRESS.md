@@ -11,7 +11,7 @@
 | **M1 — Complete R 4.6.2 Language Core & `base` Foundation** | **Completed (174 / 174 = 100%)** | Full R 4.6.2 syntax/`deparse`, cycle-safe GC + copy-on-modify + ALTREP, 4-state lazy promises/NSE/conditions/S3/active bindings, complete `roxide-base` (`ops`, `subset`, `strings`, `datetime`, `io_os`, `serialize` XDR v2/v3), **174/174 Layer 1 byte-for-byte parity** (normal & `ROXIDE_GC_TORTURE=1`), **100% cross-engine `.rds`/`.RData` roundtrip parity**, all cross-model review P0/P1/P2 findings closed |
 | **M2 — Clean-Room `roxide-math`, `roxide-stats` & `roxide-utils`** | **Completed (293 / 293 = 100%)** | 12-crate `#![forbid(unsafe_code)]` workspace (0 new deps), ADRs 0009–0011, 100% bit-exact PRNG across all 7 uniform generators + all 22 distribution RNGs (incl. R 4.6.2 large-$N$ `rhyper`), full `d/p/q/r*` continuous/discrete/noncentral/Tukey & special/Bessel functions, LINPACK/LAPACK-parity `qr`/`svd`/`eigen`/`chol`/`solve`/complex/FFT, `stats` (`formula`/`terms`/`model.matrix`/`lm`/`glm`/11 `htest`/`optim`/`nlminb`/`nlm`/`uniroot`/`integrate`/`ts`/`multivar`/`density`/`loess`), `utils` (`read.table`/`str`/`head`/`tail`/`capture.output`/`sessionInfo`/`dump`/`dput`), `base::dcf`, `tools` (`parse_Rd`/`Rd2txt`/`analyze_license`), **293/293 Layer 2 parity** + all W10A–W10E peer-review hardening waves closed |
 | **M3 — S4 (`methods`), Graphics & Pure-R Packages** | **Completed (186 / 186 Layer 3 + 2,341 / 2,341 Tier-2 CRAN = 0 fail)** | 15-crate `#![forbid(unsafe_code)]` workspace (0 new deps), ADRs 0012–0016; full S4 + Reference Classes (`setRefClass`, Pareto-dominance multiple-dispatch resolver, ephemeron GC `reg.finalizer`/`gc()`), `roxide-pkg` (`R CMD INSTALL`, `R CMD BATCH`, `sysdata`/`LazyData`, S4/refhook XDR, cross-engine GNU R 4.6.2 bytecode interop), complete `grDevices` + `graphics` + `grid` (headless PDF 1.4, SVG 1.1, PNG, BMP, JPEG, TIFF devices + 115 analytical HCL palettes), clean-room `datasets` + `utils::tar`/`untar` + `stats::aggregate`/`ave`/`reorder` + `tools`, **186/186 Layer 3 parity (normal & `ROXIDE_GC_TORTURE=1`)**, **653/653 total Layers 1–3**, bootstrap GC torture, **0 failures / 0 warnings across all 6 pinned MIT Tier-2 CRAN packages (`R6`, `withr`, `crayon`, `praise`, `magrittr 1.5`, `zeallot`) + `testthat_shim` (2,341 pass)**, and 6-package Tier-2 GC-torture smoke |
-| **M4 — R 4.6.2 Public C API (`roxide-capi`), Compiled CRAN & Perf** | **In Progress (`M4 W0` Contracts)** | Architecture blueprint complete (`docs/M4_BLUEPRINT.md`); isolated `unsafe` `libR` ABI, `SexpId` handle ABI, pinned `RVec` buffers, C/C++ unwind trampoline, compiled CRAN ladder, bytecode VM, fuzzing |
+| **M4 — R 4.6.2 Public C API (`roxide-capi`), Compiled CRAN & Perf** | **In Progress (Checkpoint `29026cd`, Wave 5 Ready)** | 17-crate workspace (`485/485` `api,data` exports, `651/831` `api,eapi,data`, `164/164` ABI probe); full foreign ALTREP (Seams C1-C7 + 62 exports + Opus 5.5 FFI/GC audit closed); bytecode VM/JIT + `compiler` package + bidirectional `.Rc`; refactoring Waves R1-R3 completed (1 file >1,000 lines left); Tier-3a `yaml`/`magrittr`/`glue` 100% pass, Tier-3b `glue`/`crayon`/`R6` 100% pass and `ps`/`processx`/`cpp11`/`rlang`/`cli` native DLLs compiled and linked; remaining Tier-3a/3b root causes triaged and ready for Wave 5 |
 
 ## Differential Oracle Scoreboard (Live GNU R 4.6.2)
 
@@ -107,3 +107,37 @@
 | **Total** | **2,360 pass / 11 fail** | **2,341 pass / 0 fail / 0 warn** | **100% 0-fail + Tier-2 GC-torture smoke OK** |
 
 *\*GNU R 4.6.2 fails 11 Cairo/XQuartz device tests on this headless macOS workstation; `zeallot`'s 5 skips are optional `codetools` tests.*
+
+### Milestone 4 Progress (Checkpoint at `29026cd`)
+
+#### C API, Foreign ALTREP, Bytecode VM/JIT & Refactoring
+
+| Area | Status | Evidence |
+| --- | --- | --- |
+| Public C API exports (`libR.dylib`) | **Complete** | `485/485` `api,data` present, `0` missing, `0` kind mismatches, `0` unexpected; `651/831` `api,eapi,data` (`728` total exports incl. all 62 ALTREP exports + `Rf_ucstoutf8`) |
+| ABI probe (`tools/capi/abi_probe.py`) | **Complete** | `164/164` constants and struct layouts match GNU R 4.6.2 |
+| C/C++ fixtures (`tools/capi/run_fixtures.py`) | **6/7 verified; 7th fixed at `a40d46d`** | `01` through `06` pass byte-for-byte under default and `ROXIDE_GC_TORTURE=1`; `07_altrep` `.Call` fix landed in `a40d46d` and awaits next release restage |
+| Wave 3 Foreign ALTREP (Seams C1-C7 + 62 exports) | **Complete** | Full C callback adapters, v3 `Serialized_state` / `Unserialize` / `UnserializeEX`, `roxide-base` fast paths (`12/12` `foreign_altrep_base`), Opus 5.5 FFI/GC review (1 P0, 6 P1, 8 P2) closed through `108ddb1` |
+| Wave 2-V2 Bytecode VM/JIT + `compiler` | **Complete** | Direct `VmStack`, unified `RealArithOp`, `ROXIDE_JIT=0` == `ROXIDE_JIT=3`, full `compiler` package with bidirectional `.Rc` (`7/7` `compiler_parity`), Opus 5.5 review closed |
+| Workspace refactoring Waves R1-R3 | **Complete (99%)** | All 17 crates modularized; only `crates/roxide-base/src/io_os/connection.rs` (`1,016` lines) remains over 1,000 lines |
+| Amortized vector growth contract (`29026cd`) | **Complete** | Added `RSession::grow_vector_geometric` (`27/27` `roxide-value` tests pass), ready for `roxide-base/src/subset/replacement.rs` |
+
+#### Tier-3a & Tier-3b Compiled CRAN Baseline (Staged at `c0993e8`, before Wave 5)
+
+| Tier | Package | Result on Staged Release | Triaged Wave 5 Action |
+| --- | --- | --- | --- |
+| 3a | `yaml 2.3.12` | **309 pass, 0 fail, 0 err (5/5 files)** | Done |
+| 3a | `magrittr 2.0.5` | **75 pass, 0 fail, 0 err (9/9 files)** | Done |
+| 3a | `glue 1.8.1` | **197 pass, 0 fail, 0 err (8/8 files)** | Done |
+| 3a | `fastmap 1.2.0` | 246 pass, 0 fail, 1 timeout (`test-queue.R`) | Wire `grow_vector_geometric` + list `[<-` overwrite + `base::log2` |
+| 3a | `jsonlite 2.0.0` | 1,115 pass, 17 fail | Fix absent `row.names` setter (12), `base::expression` + `as.list` names (2), `value_promise(SEXP_MISSING)` (1), `datasets::state.x77` (1); `volcano` pending provenance |
+| 3b | `glue 1.8.1` | **202 pass, 0 fail (8/8 files)** | Done |
+| 3b | `crayon 1.5.3` | **508 pass, 0 fail (11/11 files)** | Done |
+| 3b | `R6 2.6.1` | **625 pass, 0 fail (12/12 files)** | Done |
+| 3b | `ps 1.9.3` | `ps.so` + `bin/px` loaded; 82 pass, 48 fail | `utils::getSrcref` (27), `rlang` load (14), `tools_rd.rs` `as.character` fix (3), file-unit runner (2), `list > POSIXct` (1) |
+| 3b | `processx 3.10.0` | `processx.so` + `client.so` loaded; 148 pass, 117 fail | `utils::getSrcref` (73), helper/Suggests tracking (8), `base::.makeMessage` (6), `base::.mapply` (3), `topenv(fn)` (2) |
+| 3b | `cpp11 0.5.5` | Installed and loaded; 12 pass, 12 fail | Missing optional Suggests classification + `tools::package_native_routine_registration_skeleton` |
+| 3b | `rlang 1.3.0` | `rlang.so` compiled and linked; stopped in `.onLoad` | Reject literal blank `.Call` slots during arg eval and pass evaluated `SEXP_MISSING` through |
+| 3b | `cli 3.6.6` | `cli.so` compiled and linked (`105/105` symbols); stopped at namespace build | Add `utils::getParseData`, `utils::getSrcref`, `utils::getSrcLines` |
+| 3b | `prettyunits 1.2.0` | Stopped at namespace build | Add `base::expression` special primitive |
+| 3b | `lifecycle`, `lobstr` | `lobstr.so` compiled and linked; blocked on `rlang` load | Unblocked by `rlang` `.Call` fix |
