@@ -81,11 +81,6 @@ fn character_scalar(ctx: &mut Ctx, call: &Call, value: SexpId, name: &str) -> Ev
     }
 }
 
-fn package(ctx: &mut Ctx, call: &Call, value: SexpId) -> EvalResult<Option<String>> {
-    let name = character_scalar(ctx, call, value, "PACKAGE")?;
-    Ok((!name.is_empty()).then_some(name))
-}
-
 fn logical(ctx: &mut Ctx, call: &Call, value: SexpId, name: &str) -> EvalResult<bool> {
     let (value, _) = ctx.session_mut().coerce(value, SexpType::Lgl)?;
     let values = ctx.session().lgl(value)?;

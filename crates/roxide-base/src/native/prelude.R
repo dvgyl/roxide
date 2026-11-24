@@ -8,6 +8,22 @@ is.loaded <- function(symbol, PACKAGE = "", type = "")
     .Internal(rox_is_loaded(symbol, PACKAGE, type))
 
 getNativeSymbolInfo <- function(name, PACKAGE = "", unlist = TRUE, withRegistrationInfo = FALSE) {
+    if (is.list(name)) {
+        name <- vapply(name, function(x) {
+            value <- as.character(x)
+            if (length(value) != 1L) stop("invalid 'name' argument")
+            value
+        }, "", USE.NAMES = FALSE)
+    }
+    if (inherits(PACKAGE, "DLLInfoReference")) {
+        for (dll in getLoadedDLLs()) {
+            if (identical(dll[["info"]], PACKAGE)) {
+                PACKAGE <- dll
+                break
+            }
+        }
+        if (inherits(PACKAGE, "DLLInfoReference")) stop("DLLInfoReference is not loaded")
+    }
     if (inherits(PACKAGE, "DLLInfo")) PACKAGE <- PACKAGE[["name"]]
     .Internal(rox_native_symbol_info(name, PACKAGE, unlist, withRegistrationInfo))
 }
@@ -41,13 +57,12 @@ getDLLRegisteredRoutines.character <- function(dll, addNames = TRUE) {
     dlls <- structure(list(), class = "DLLInfoList")
     function(new) {
         if (missing(new)) return(dlls)
-        old <- dlls
         dlls <<- structure(new, class = "DLLInfoList")
-        invisible(old)
+        invisible(dlls)
     }
 })()
 
-library.dynam <- function(chname, package, lib.loc = NULL, verbose = getOption("verbose"),
+library.dynam <- function(chname, package, lib.loc, verbose = getOption("verbose"),
                           file.ext = .Platform$dynlib.ext, ...) {
     if (missing(chname)) return(.dynLibs())
     path <- normalizePath(file.path(find.package(package, lib.loc), "libs", paste0(chname, file.ext)),
@@ -89,7 +104,7 @@ print.DLLInfo <- function(x, ...) {
     cat("DLL name: ", x[["name"]], "\n", sep = "")
     path <- x[["path"]]
     if (nchar(path) + 10L > getOption("width", 80L))
-        cat("Filename:\n        ", path, "\n", sep = "")
+        cat("Filename:\n      ", path, "\n", sep = "")
     else
         cat("Filename: ", path, "\n", sep = "")
     cat("Dynamic lookup: ", x[["dynamicLookup"]], "\n", sep = "")
@@ -102,7 +117,7 @@ print.DLLInfoList <- function(x, ...) {
         print(data.frame(Filename = vapply(dlls, function(dll) dll[["path"]], ""),
                          Dynamic.Lookup = vapply(dlls, function(dll) dll[["dynamicLookup"]], TRUE),
                          row.names = names(dlls)), ...)
-    } else cat("\n")
+    }
     invisible(x)
 }
 

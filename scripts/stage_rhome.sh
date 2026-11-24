@@ -23,7 +23,7 @@ esac
 LIB_SRC="${CARGO_TARGET_DIR:-$ROOT/target}/$PROFILE/libroxide_libr.a"
 flags_file="$LIB_SRC.native-static-libs"
 if [ "${ROXIDE_SKIP_BUILD:-0}" != 1 ] || [ ! -f "$LIB_SRC" ] || [ ! -s "$flags_file" ]; then
-  if ! cargo_output="$(cargo rustc --color never -p roxide-libr --lib ${cargo_profile[@]+"${cargo_profile[@]}"} -- --print native-static-libs 2>&1)"; then
+  if ! cargo_output="$(bash scripts/cargo_slot.sh cargo rustc --color never -p roxide-libr --lib ${cargo_profile[@]+"${cargo_profile[@]}"} -- --print native-static-libs 2>&1)"; then
     printf '%s\n' "$cargo_output" >&2
     exit 1
   fi
@@ -35,10 +35,8 @@ import sys
 prefix = "note: native-static-libs: "
 for line in sys.stdin:
     if line.startswith(prefix):
-        flags = iter(shlex.split(line.removeprefix(prefix)))
-        units = (tuple([flag, next(flags)]) if flag in {"-framework", "-weak_framework", "-L", "-l"}
-                 else (flag,) for flag in flags)
-        print(*(flag for unit in dict.fromkeys(units) for flag in unit), sep="\n")
+        for flag in shlex.split(line.removeprefix(prefix)):
+            print(flag)
         break
 else:
     sys.exit("Cargo did not report native static libraries")
@@ -153,6 +151,14 @@ if [ -f share/make/shlib.mk ]; then
 fi
 
 opt_flags="-g -O2 -Wall${arch[*]:+ ${arch[*]}}"
+fc="${FC-$(command -v gfortran || true)}"
+flibs="${FLIBS-}"
+if [ "${FLIBS+x}" != x ] && [ -n "$fc" ]; then
+  runtime="$("$fc" "-print-file-name=libgfortran.$LIBR_EXT" 2>/dev/null || true)"
+  if [[ "$runtime" = */* && -f "$runtime" ]]; then
+    flibs="-L\"$(dirname "$runtime")\" -lgfortran"
+  fi
+fi
 {
   cat <<MAKE
 R_HOME = $RHOME
@@ -160,7 +166,7 @@ R_INCLUDE_DIR = $RHOME/include
 R_SHARE_DIR = $RHOME/share
 CC = ${CC:-clang}
 CXX = ${CXX:-clang++}
-FC = ${FC-$(command -v gfortran || true)}
+FC = $fc
 AR = ${AR:-ar}
 RANLIB = ${RANLIB:-ranlib}
 AWK = ${AWK:-awk}
@@ -181,7 +187,7 @@ SHLIB_CXXLDFLAGS = $SHLIB_LDFLAGS
 LIBR = -L"\$(R_HOME)/lib" -lR
 BLAS_LIBS = $BLAS_LIBS
 LAPACK_LIBS = $LAPACK_LIBS
-FLIBS = ${FLIBS:-}
+FLIBS = $flibs
 MAKE
   for version in 11 14 17 20 23 26; do
     cat <<MAKE
