@@ -52,7 +52,8 @@ pub const MODULE: Module = Module {
             ..internal("rox_print_difftime", elapsed::print_elapsed, 2)
         },
     ],
-    prelude: r#"
+    prelude: concat!(
+        r#"
 as.Date <- function(x, ...) UseMethod("as.Date")
 as.Date.default <- function(x, ...) .Internal(rox_date(x, NULL, NULL, "UTC", FALSE))
 as.Date.Date <- function(x, ...) x
@@ -134,6 +135,8 @@ format.difftime <- function(x, ...) .Internal(rox_format_difftime(x))
 print.difftime <- function(x, digits = getOption("digits"), ...)
     .Internal(rox_print_difftime(x, digits))
 "#,
+        include_str!("datetime/vector.R")
+    ),
 };
 
 const fn internal(name: &'static str, fun: PrimFn, count: usize) -> PrimDef {

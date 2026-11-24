@@ -14,6 +14,11 @@ pub(crate) const MODULE: Module = Module {
         internal("rox_duplicated", sets::duplicated, 4),
         internal("rox_unlist", unlist::unlist, 3),
         internal("rox_expression_vector", expression_vector, 1),
+        internal(
+            "rox_row_names_info",
+            crate::ops::attributes::row_names_info,
+            2,
+        ),
         internal("rox_transform_row_names", transform_row_names, 2),
     ],
     prelude: concat!(include_str!("tier_a.R"), include_str!("data_frame.R")),

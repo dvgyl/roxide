@@ -1,7 +1,8 @@
 use roxide_eval::{Args, Call, Ctx, EvalResult};
 use roxide_gc::SexpId;
 use roxide_value::{
-    CharId, NA_INTEGER, RLogical, RSession, SEXP_MISSING, SEXP_NIL, SexpType, ValueApi,
+    BASE_NAMESPACE, CharId, NA_INTEGER, RLogical, RSession, SEXP_MISSING, SEXP_NIL, SexpType,
+    ValueApi,
 };
 
 use crate::ops::attributes::{has_class, row_count};
@@ -474,21 +475,46 @@ fn subset_frame(ctx: &mut Ctx, call: &Call, x: SexpId, subs: &[SexpId], drop: bo
     let s = ctx.session_mut();
     let actual_rows = s.attr_row_names(x)?;
     let nrow = row_count(s, x)?;
-    let row_labels = s.coerce(actual_rows, SexpType::Str)?.0;
+    ctx.protect(actual_rows);
     let mut row_ids = None;
     if let Some(rows) = rows.filter(|&v| v != SEXP_MISSING) {
-        let labels = chars(ctx.session(), row_labels).to_vec();
+        let s = ctx.session_mut();
+        let row_labels = s.coerce(actual_rows, SexpType::Str)?.0;
+        let labels = chars(s, row_labels).to_vec();
         let idx = indices(ctx, call, rows, nrow, &labels, IndexPolicy::PadMissing)?;
         row_ids = Some(idx.iter().map(|i| i.pos).collect::<Vec<_>>());
     }
+    let row_subscript = match (rows, &row_ids) {
+        (Some(rows), Some(ids)) if ctx.session().type_of(rows)? == SexpType::Str => {
+            let positions = ids
+                .iter()
+                .map(|i| i.map_or(NA_INTEGER, |i| (i + 1) as i32))
+                .collect::<Vec<_>>();
+            let index = ctx.session_mut().alloc_int_from(&positions)?;
+            ctx.protect(index);
+            Some(index)
+        }
+        (Some(rows), Some(_)) => Some(rows),
+        _ => None,
+    };
     let mut out = Vec::new();
     for &i in &positions {
         let col = ctx.session().list_get(x, i)?;
-        out.push(if let Some(ref ids) = row_ids {
-            selected(ctx, col, ids)?
+        let value = if let Some(index) = row_subscript {
+            let mut args = vec![(None, col), (None, index)];
+            let s = ctx.session_mut();
+            if has_class(s, col, "data.frame") || attr(s, col, "dim") != SEXP_NIL {
+                let drop = s.intern("drop")?;
+                let keep = s.scalar_lgl(RLogical::FALSE)?;
+                args.push((None, SEXP_MISSING));
+                args.push((Some(drop), keep));
+            }
+            ctx.call_function("[", &args, BASE_NAMESPACE)?
         } else {
             col
-        });
+        };
+        ctx.protect(value);
+        out.push(value);
     }
     if drop && out.len() == 1 {
         return Ok(out[0]);

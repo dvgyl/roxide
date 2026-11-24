@@ -407,48 +407,47 @@ pub(super) fn do_call(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult
     if ctx.session().type_of(env)? != SexpType::Env {
         return Err(error(ctx, call, "'envir' must be an environment"));
     }
-    let f = function(ctx, call, what, env)?;
-    ctx.protect(f);
+    let head = if let Some(name) = string(ctx.session(), what) {
+        ctx.session_mut().intern(&name)?.as_sexp()
+    } else if ctx.session().type_of(what)? == SexpType::Sym {
+        what
+    } else {
+        function(ctx, call, what, env)?
+    };
+    ctx.protect(head);
     let quote = flag(ctx, quote, false)?;
-    let s = ctx.session();
-    let mut pairs = match s.type_of(values)? {
-        SexpType::Nil => vec![],
-        SexpType::Vec => {
-            let names = names(s, values)
-                .iter()
-                .map(|&v| {
-                    if v == CharId::NA || v == CharId::BLANK {
-                        None
-                    } else {
-                        Some(crate::ops::common::text(s, v))
-                    }
-                })
-                .collect::<Vec<_>>();
-            let vals = s.list_slice(values)?.to_vec();
-            let mut pairs = Vec::with_capacity(vals.len());
-            for (i, v) in vals.into_iter().enumerate() {
-                let n = names
-                    .get(i)
-                    .and_then(Option::as_deref)
-                    .map(|n| ctx.session_mut().intern(n))
-                    .transpose()?;
-                pairs.push((n, v));
-            }
-            pairs
-        }
+    let s = ctx.session_mut();
+    let len = match s.type_of(values)? {
+        SexpType::Nil => 0,
+        SexpType::Vec => s.xlength(values)?,
         _ => return Err(error(ctx, call, "second argument must be a list")),
     };
-    if !quote && ctx.session().type_of(f)? != SexpType::Special {
-        for (_, value) in &mut pairs {
-            if matches!(
-                ctx.session().type_of(*value)?,
-                SexpType::Sym | SexpType::Lang | SexpType::Prom
-            ) {
-                *value = ctx.eval(*value, env)?;
-                ctx.protect(*value);
+    let mut tail = SEXP_NIL;
+    let quote = if quote {
+        let namespace = s.intern("::")?.as_sexp();
+        let base = s.intern("base")?.as_sexp();
+        let quote = s.intern("quote")?.as_sexp();
+        let args = s.cons(quote, SEXP_NIL, SEXP_NIL)?;
+        let args = s.cons(base, args, SEXP_NIL)?;
+        Some(s.lcons(namespace, args, SEXP_NIL)?)
+    } else {
+        None
+    };
+    for i in (0..len).rev() {
+        let mut value = s.list_get(values, i)?;
+        let tag = match names(s, values).get(i).copied() {
+            Some(id) if id != CharId::NA && id != CharId::BLANK => {
+                let name = crate::ops::common::text(s, id);
+                s.intern(&name)?.as_sexp()
             }
+            _ => SEXP_NIL,
+        };
+        if let Some(quote) = quote {
+            let arg = s.cons(value, SEXP_NIL, SEXP_NIL)?;
+            value = s.lcons(quote, arg, SEXP_NIL)?;
         }
+        tail = s.cons(value, tail, tag)?;
     }
-    let call = Call { env, ..*call };
-    invoke(ctx, &call, f, &pairs)
+    let inner = s.lcons(head, tail, SEXP_NIL)?;
+    ctx.eval(inner, env)
 }

@@ -101,6 +101,15 @@ pub const MODULE: Module = Module {
             Dispatch::Internal("rep"),
             On
         ),
+        PrimDef {
+            name: "rep.int",
+            fun: sequence::rep_int,
+            kind: PrimKind::Internal,
+            args: ArgEval::Eval,
+            arity: Exact(2),
+            dispatch: Dispatch::Internal("rep.int"),
+            visibility: Visibility::On,
+        },
         primitive!("rev", sequence::rev),
         primitive!("sort", sequence::sort),
         primitive!("order", sequence::order),
@@ -116,7 +125,6 @@ pub const MODULE: Module = Module {
         primitive!("ncol", containers::ncol),
         primitive!("factor", containers::factor),
         primitive!("ordered", containers::ordered),
-        primitive!("data.frame", containers::data_frame),
         primitive!("lapply", apply::lapply),
         primitive!("sapply", apply::sapply),
         primitive!("vapply", apply::vapply),
@@ -125,6 +133,7 @@ pub const MODULE: Module = Module {
         primitive!("do.call", apply::do_call),
     ],
     prelude: r#"
+rep.int <- function(x, times) .Internal(rep.int(x, times))
 `[.AsIs` <- function(x, ...) {
     y <- NextMethod("[")
     class(y) <- c("AsIs", attr(y, "class", exact = TRUE))

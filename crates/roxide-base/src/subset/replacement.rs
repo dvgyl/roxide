@@ -1,11 +1,13 @@
 use roxide_eval::{Args, Call, Ctx, EvalResult};
 use roxide_gc::SexpId;
-use roxide_value::{CharId, NA_INTEGER, RLogical, SEXP_MISSING, SEXP_NIL, SexpType, ValueApi};
+use roxide_value::{
+    BASE_NAMESPACE, CharId, NA_INTEGER, RLogical, SEXP_MISSING, SEXP_NIL, SexpType, ValueApi,
+};
 
 use crate::ops::attributes::{has_class, row_count};
 use crate::ops::common::{
-    atomic, attr, ch, chars, concatenate, copy_attrs, element, error, gather, names, rank,
-    set_names, string, tag, text, vector_limit,
+    atomic, attr, ch, chars, concatenate, copy_attrs, count, element, error, gather, names, number,
+    rank, set, set_names, string, tag, text, vector_limit,
 };
 
 use super::index::{
@@ -120,6 +122,7 @@ fn replacement_args(ctx: &Ctx, args: &Args) -> (Vec<SexpId>, SexpId) {
 
 pub(super) fn replace_one(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     let x = ctx.session_mut().unshare(args.get(0))?;
+    ctx.protect(x);
     let (subs, value) = replacement_args(ctx, args);
     let Some(&sub) = subs.first() else {
         return Err(error(ctx, call, "no index specified"));
@@ -236,7 +239,16 @@ fn replace_single_column_or_item(
 ) -> EvalResult {
     let value = if value != SEXP_NIL && has_class(ctx.session(), x, "data.frame") {
         let rows = row_count(ctx.session_mut(), x)?;
-        recycle_column(ctx, call, value, rows)?
+        let value = recycle_column(ctx, call, value, rows)?;
+        ctx.protect(value);
+        let s = ctx.session_mut();
+        if atomic(s.type_of(value)?) && attr(s, value, "names") != SEXP_NIL {
+            let value = s.shallow_duplicate(value)?;
+            set(s, value, "names", SEXP_NIL)?;
+            value
+        } else {
+            value
+        }
     } else {
         value
     };
@@ -244,22 +256,27 @@ fn replace_single_column_or_item(
 }
 
 fn recycle_column(ctx: &mut Ctx, call: &Call, value: SexpId, rows: usize) -> EvalResult {
-    let n = ctx.session().xlength(value)?;
+    let n = ctx.call_function("NROW", &[(None, value)], BASE_NAMESPACE)?;
+    let n = number(ctx.session_mut(), n)?;
+    let n = count(ctx, call, n)?;
     if n == rows {
         return Ok(value);
     }
-    if n == 0 || n > rows || !rows.is_multiple_of(n) {
+    let dim = ctx.call_function("dim", &[(None, value)], BASE_NAMESPACE)?;
+    if dim != SEXP_NIL || n == 0 || n > rows || !rows.is_multiple_of(n) {
         return Err(error(
             ctx,
             call,
             format!("replacement has {n} rows, data has {rows}"),
         ));
     }
-    vector_limit(ctx, call, rows, size_of::<Option<usize>>())?;
-    selected(
-        ctx,
-        value,
-        &(0..rows).map(|i| Some(i % n)).collect::<Vec<_>>(),
+    let s = ctx.session_mut();
+    let length_out = s.intern("length.out")?;
+    let length = s.alloc_int_from(&[rows as i32])?;
+    ctx.call_function(
+        "rep",
+        &[(None, value), (Some(length_out), length)],
+        BASE_NAMESPACE,
     )
 }
 

@@ -1,8 +1,51 @@
 
+I <- function(x) {
+    class(x) <- unique(c("AsIs", attr(x, "class", exact = TRUE)))
+    x
+}
+
 as.data.frame <- function(x, row.names = NULL, optional = FALSE, ...)
     UseMethod("as.data.frame")
 
-.frame_auto_rows <- function(n) if (n == 0L) integer() else c(NA_integer_, -n)
+.set_row_names <- function(n) if (n > 0L) c(NA_integer_, -n) else integer()
+
+row.names <- function(x) UseMethod("row.names")
+row.names.default <- function(x) rownames(x)
+row.names.data.frame <- function(x) as.character(attr(x, "row.names", exact = TRUE))
+
+`row.names<-` <- function(x, value) UseMethod("row.names<-")
+`row.names<-.default` <- function(x, value) {
+    rownames(x) <- value
+    x
+}
+`row.names<-.data.frame` <- function(x, value) {
+    n <- nrow(x)
+    if (is.null(value)) {
+        value <- .set_row_names(n)
+    } else {
+        if (length(value) != n) stop("invalid 'row.names' length")
+        if (!is.integer(value)) value <- as.character(value)
+        if (anyDuplicated(value)) {
+            duplicates <- sort(unique(value[duplicated(value)]))
+            kind <- if (length(duplicates) == 1L) "value" else "values"
+            warning("non-unique ", kind, " when setting 'row.names': ",
+                    paste(paste0("‘", duplicates, "’"), collapse = ", "))
+            stop("duplicate 'row.names' are not allowed")
+        }
+        if (anyNA(value)) stop("missing values in 'row.names' are not allowed")
+    }
+    attr(x, "row.names") <- value
+    x
+}
+.row_names_info <- function(x, type = 1L) .Internal(rox_row_names_info(x, type))
+
+data.frame <- function(..., row.names = NULL, check.rows = FALSE, check.names = TRUE,
+                       fix.empty.names = TRUE, stringsAsFactors = FALSE) {
+    x <- list(...)
+    expressions <- as.list(substitute(list(...)))[-1L]
+    .frame_list(x, expressions, row.names, missing(row.names), check.rows,
+                check.names, fix.empty.names, stringsAsFactors)
+}
 
 as.data.frame.NULL <- function(x, row.names = NULL, optional = FALSE, ...)
     structure(list(), names = character(), row.names = integer(), class = "data.frame")
@@ -27,18 +70,18 @@ as.data.frame.data.frame <- function(x, row.names = NULL, ...) {
     x
 }
 
-.frame_vector <- function(x, row.names, optional, nm, stringsAsFactors = FALSE) {
+.frame_vector <- function(x, row.names, optional, nm, stringsAsFactors = FALSE, keep.names = FALSE) {
     n <- length(x)
     if (is.null(row.names)) {
         labels <- names(x)
         row.names <- if (!n) character() else if (length(labels) && !anyDuplicated(labels)) {
             labels
-        } else .frame_auto_rows(n)
+        } else .set_row_names(n)
     } else if (!(is.character(row.names) || is.integer(row.names)) || length(row.names) != n) {
         stop("'row.names' is not a character or integer vector of length ", n)
     }
     if (stringsAsFactors) x <- factor(x)
-    names(x) <- NULL
+    if (!keep.names) names(x) <- NULL
     columns <- list(x)
     if (!optional) names(columns) <- nm
     structure(columns, row.names = row.names, class = "data.frame")
@@ -76,14 +119,12 @@ as.data.frame.POSIXlt <- function(x, row.names = NULL, optional = FALSE, ...)
 as.data.frame.AsIs <- function(x, row.names = NULL, optional = FALSE, ...) {
     if (length(dim(x)) == 2L) {
         labels <- rownames(x)
-        if (is.null(labels)) labels <- .frame_auto_rows(nrow(x))
+        if (is.null(labels)) labels <- .set_row_names(nrow(x))
         columns <- list(x)
         if (!optional) names(columns) <- "x"
         return(structure(columns, class = "data.frame", row.names = labels))
     }
-    result <- .frame_vector(x, row.names, optional, deparse1(substitute(x)))
-    result[[1L]] <- x
-    result
+    .frame_vector(x, row.names, optional, deparse1(substitute(x)), keep.names = TRUE)
 }
 
 as.data.frame.matrix <- function(x, row.names = NULL, optional = FALSE, make.names = TRUE, ...,
@@ -102,7 +143,7 @@ as.data.frame.matrix <- function(x, row.names = NULL, optional = FALSE, make.nam
             stop("duplicate 'row.names' are not allowed")
         }
     }
-    if (is.null(row.names)) row.names <- .frame_auto_rows(n)
+    if (is.null(row.names)) row.names <- .set_row_names(n)
     else if (!is.integer(row.names)) row.names <- as.character(row.names)
     columns <- lapply(seq_len(p), function(i) {
         if (stringsAsFactors && is.character(x)) {
@@ -150,11 +191,6 @@ as.data.frame.list <- function(x, row.names = NULL, optional = FALSE, ..., cut.n
                                col.names = names(x), fix.empty.names = TRUE,
                                new.names = !missing(col.names), check.names = !optional,
                                stringsAsFactors = FALSE) {
-    if (!length(x)) {
-        if (is.null(row.names)) row.names <- integer()
-        else row.names <- .frame_list_rows(row.names, length(row.names))
-        return(structure(list(), names = character(), row.names = row.names, class = "data.frame"))
-    }
     if (new.names || is.null(names(x))) {
         if (is.null(col.names)) col.names <- rep("", length(x))
         names(x) <- col.names
@@ -164,7 +200,21 @@ as.data.frame.list <- function(x, row.names = NULL, optional = FALSE, ..., cut.n
         width <- max(6L, as.integer(cut.names))
         long <- which(!is.na(input_names) & nchar(input_names) > width)
         input_names[long] <- paste0(substr(input_names[long], 1L, width - 6L), " ...")
+        names(x) <- input_names
     }
+    .frame_list(x, x, row.names, is.null(row.names),
+                FALSE, check.names, fix.empty.names, stringsAsFactors)
+}
+
+.frame_list <- function(x, fallback, row.names, infer.rows, check.rows, check.names,
+                        fix.empty.names, stringsAsFactors) {
+    if (!length(x)) {
+        if (is.null(row.names)) row.names <- integer()
+        else row.names <- .frame_list_rows(row.names, length(row.names))
+        return(structure(list(), names = character(), row.names = row.names, class = "data.frame"))
+    }
+    input_names <- names(x)
+    if (is.null(input_names)) input_names <- rep("", length(x))
     frames <- lapply(x, function(column)
         as.data.frame(column, optional = TRUE, stringsAsFactors = stringsAsFactors))
     sizes <- vapply(frames, nrow, 0L)
@@ -179,13 +229,13 @@ as.data.frame.list <- function(x, row.names = NULL, optional = FALSE, ..., cut.n
 
     columns <- list()
     labels <- character()
-    inferred_rows <- NULL
+    inferred_rows <- inferred_names <- NULL
     for (i in seq_along(frames)) {
         frame <- frames[[i]]
         num_cols <- length(frame)
         label <- input_names[[i]]
         if (!is.na(label) && !nzchar(label) && fix.empty.names) {
-            label <- deparse1(x[[i]])
+            label <- deparse1(fallback[[i]])
         }
         inner <- names(frame)
         if (num_cols == 1L && is.null(inner)) {
@@ -195,28 +245,25 @@ as.data.frame.list <- function(x, row.names = NULL, optional = FALSE, ..., cut.n
             if (!is.na(input_names[[i]]) && nzchar(input_names[[i]]))
                 inner <- paste(input_names[[i]], inner, sep = ".")
         }
-        raw_rows <- .Internal(rox_transform_row_names(frame, sizes[[i]]))
-        compact <- is.integer(raw_rows) && length(raw_rows) == 2L &&
-                   is.na(raw_rows[[1L]]) && !is.na(raw_rows[[2L]])
-        automatic <- compact && raw_rows[[2L]] < 0L
-        if (is.null(row.names) && is.null(inferred_rows) && sizes[[i]] && !automatic) {
-            if (sizes[[i]] < n) {
-                warning("row names were found from a short variable and have been discarded")
-                inferred_rows <- .frame_auto_rows(n)
-            } else {
-                inferred_rows <- if (compact) raw_rows else .frame_list_rows(raw_rows, n)
+        if (infer.rows && sizes[[i]] && .row_names_info(frame) >= 0L &&
+            (is.null(inferred_rows) || check.rows)) {
+            current <- attr(frame, "row.names", exact = TRUE)
+            if (check.rows) {
+                current_names <- as.character(current)
+                if (is.null(inferred_names)) inferred_names <- current_names
+                else if (!identical(inferred_names, current_names))
+                    stop("mismatch of row names in arguments of 'data.frame', item ", i)
+            }
+            if (is.null(inferred_rows)) {
+                if (sizes[[i]] < n) {
+                    warning("row names were found from a short variable and have been discarded")
+                    inferred_rows <- .set_row_names(n)
+                } else inferred_rows <- .frame_list_rows(current, n)
             }
         }
         for (j in seq_len(num_cols)) {
             value <- frame[[j]]
-            if (sizes[[i]] < n) {
-                repeated <- rep(value, length.out = n)
-                if (inherits(value, "Date") || inherits(value, "POSIXct")) {
-                    class(repeated) <- class(value)
-                    attr(repeated, "tzone") <- attr(value, "tzone", exact = TRUE)
-                }
-                value <- repeated
-            }
+            if (sizes[[i]] < n) value <- rep(value, length.out = n)
             columns[[length(columns) + 1L]] <- value
         }
         labels <- c(labels, inner)
@@ -233,7 +280,7 @@ as.data.frame.list <- function(x, row.names = NULL, optional = FALSE, ..., cut.n
         row.names <- columns[[position]]
         columns[position] <- NULL
     }
-    if (is.null(row.names)) row.names <- if (is.null(inferred_rows)) .frame_auto_rows(n) else inferred_rows
+    if (is.null(row.names)) row.names <- if (is.null(inferred_rows)) .set_row_names(n) else inferred_rows
     else row.names <- .frame_list_rows(row.names, n)
     structure(columns, class = "data.frame", row.names = row.names)
 }
@@ -273,7 +320,7 @@ as.data.frame.table <- function(x, row.names = NULL, ..., responseName = "Freq",
     }
     columns[[length(columns)]] <- as.vector(x)
     names(columns) <- make.names(c(labels, responseName), unique = TRUE)
-    if (is.null(row.names)) row.names <- .frame_auto_rows(length(x))
+    if (is.null(row.names)) row.names <- .set_row_names(length(x))
     else row.names <- .frame_list_rows(row.names, length(x))
     structure(columns, class = "data.frame", row.names = row.names)
 }

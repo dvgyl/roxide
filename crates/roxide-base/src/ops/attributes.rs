@@ -375,15 +375,39 @@ pub(super) fn set_dim(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult
     replace_attr(ctx, call, x, "dim", value)
 }
 
+fn compact_rows(s: &RSession, rows: SexpId) -> Option<i32> {
+    let v = s.int(rows).ok()?;
+    (v.len() == 2 && v.get(0) == NA_INTEGER && v.get(1) != NA_INTEGER).then(|| v.get(1))
+}
+
+/// Get the number of rows, including for data frames with compact row names.
 pub(crate) fn row_count(s: &mut RSession, x: SexpId) -> Result<usize, roxide_value::ValueError> {
     let rows = get(s, x, "row.names");
-    if s.type_of(rows)? == Int {
-        let v = s.int(rows)?;
-        if v.len() == 2 && v.get(0) == NA_INTEGER && v.get(1) != NA_INTEGER {
-            return Ok(v.get(1).unsigned_abs() as usize);
-        }
+    if let Some(n) = compact_rows(s, rows) {
+        return Ok(n.unsigned_abs() as usize);
     }
     s.xlength(rows)
+}
+
+/// Get raw row names, a signed count, or an unsigned count for `.row_names_info`.
+pub(crate) fn row_names_info(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    let x = args.get(0);
+    let s = ctx.session_mut();
+    let ty = common::number(s, args.get(1))?.trunc();
+    let rows = get(s, x, "row.names");
+    if ty == 0.0 {
+        return Ok(rows);
+    }
+    if ty != 1.0 && ty != 2.0 {
+        return Err(error(ctx, call, "invalid 'type' argument"));
+    }
+    let count = match compact_rows(s, rows) {
+        Some(n) => n,
+        None => i32::try_from(s.xlength(rows)?)
+            .map_err(|_| error(ctx, call, "too many rows in data frame"))?,
+    };
+    let count = if ty == 2.0 { count.abs() } else { count };
+    Ok(ctx.session_mut().alloc_int_from(&[count])?)
 }
 
 fn axis_names(ctx: &mut Ctx, x: SexpId, axis: usize) -> EvalResult {

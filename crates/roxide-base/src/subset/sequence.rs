@@ -233,34 +233,94 @@ pub(super) fn rep(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
             let (v, _) = s.coerce(times, SexpType::Real)?;
             s.real(v)?.to_vec()
         };
-        let mul = if repeats.len() == 1 {
-            count(ctx, call, repeats[0])?
-        } else {
-            1
-        };
-        if repeats.len() != 1 && repeats.len() != base {
-            return Err(error(ctx, call, "invalid 'times' argument"));
-        }
-        if repeats.len() == 1 {
-            let len = base.saturating_mul(mul);
-            vector_limit(ctx, call, len, size_of::<Option<usize>>())?;
-            (0..len).map(|i| Some((i % base) / each)).collect()
-        } else {
-            let mut out = Vec::new();
-            for (i, r) in repeats.into_iter().enumerate() {
-                let repeats = count(ctx, call, r)?;
-                vector_limit(
-                    ctx,
-                    call,
-                    out.len().saturating_add(repeats),
-                    size_of::<Option<usize>>(),
-                )?;
-                out.extend(std::iter::repeat_n(Some(i / each), repeats));
-            }
-            out
-        }
+        repeat_positions(ctx, call, n, each, &repeats)?
     };
     selected(ctx, x, &positions)
+}
+
+fn repeat_positions(
+    ctx: &mut Ctx,
+    call: &Call,
+    n: usize,
+    each: usize,
+    times: &[f64],
+) -> EvalResult<Vec<Option<usize>>> {
+    let base = n.saturating_mul(each);
+    let repeat_count = |ctx: &mut Ctx, repeat: f64| {
+        count(ctx, call, repeat.trunc()).map_err(|_| error(ctx, call, "invalid 'times' value"))
+    };
+    if let [times] = times {
+        let len = base.saturating_mul(repeat_count(ctx, *times)?);
+        vector_limit(ctx, call, len, size_of::<Option<usize>>())?;
+        return Ok((0..len).map(|i| Some((i % base) / each)).collect());
+    }
+    if times.len() != base {
+        return Err(error(ctx, call, "invalid 'times' value"));
+    }
+    let mut positions = Vec::new();
+    for (i, &repeat) in times.iter().enumerate() {
+        let repeats = repeat_count(ctx, repeat)?;
+        vector_limit(
+            ctx,
+            call,
+            positions.len().saturating_add(repeats),
+            size_of::<Option<usize>>(),
+        )?;
+        positions.extend(std::iter::repeat_n(Some(i / each), repeats));
+    }
+    Ok(positions)
+}
+
+/// Repeat a vector without its names. Keep factor levels and class.
+pub(super) fn rep_int(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    let [x, times] = [args.get(0), args.get(1)];
+    let ty = ctx.session().type_of(x)?;
+    if !atomic(ty) && !matches!(ty, SexpType::Vec | SexpType::Expr | SexpType::Nil) {
+        return Err(error(
+            ctx,
+            call,
+            format!(
+                "attempt to replicate an object of type '{}'",
+                ty.type_name(false)
+            ),
+        ));
+    }
+    let ty_times = ctx.session().type_of(times)?;
+    if !atomic(ty_times) && !matches!(ty_times, SexpType::Vec | SexpType::Expr) {
+        return Err(error(
+            ctx,
+            call,
+            format!(
+                "invalid type ({}) for 'times' (must be a vector)",
+                ty_times.type_name(false)
+            ),
+        ));
+    }
+    let s = ctx.session_mut();
+    let n = s.xlength(x)?;
+    if !atomic(ty_times) && s.xlength(times)? == 1 {
+        return Err(error(ctx, call, "invalid 'times' value"));
+    }
+    let (times, warnings) = s.coerce(times, SexpType::Real)?;
+    let repeats = s.real(times)?.to_vec();
+    if warnings.na_introduced {
+        ctx.warn_now(call.err_call(), "NAs introduced by coercion")?;
+    }
+    if warnings.imaginary_discarded {
+        ctx.warn_now(call.err_call(), "imaginary parts discarded in coercion")?;
+    }
+    let positions = repeat_positions(ctx, call, n, 1, &repeats)?;
+    if ty == SexpType::Nil {
+        let operation = if repeats.len() == 1 { "rep3" } else { "rep2" };
+        return Err(error(
+            ctx,
+            call,
+            format!("unimplemented type 'NULL' in '{operation}'\n"),
+        ));
+    }
+    let result = selected(ctx, x, &positions)?;
+    crate::ops::common::set(ctx.session_mut(), result, "names", SEXP_NIL)?;
+    Ok(result)
 }
 
 pub(super) fn rev(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
