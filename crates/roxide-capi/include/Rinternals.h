@@ -35,6 +35,7 @@ _Static_assert(sizeof(SEXP) == 8, "Roxide requires 64-bit pointers");
 #define R_LEN_T_MAX INT_MAX
 #define R_SHORT_LEN_MAX R_LEN_T_MAX
 #define R_XLEN_T_MAX 4503599627370496LL
+#define R_PRIdXLEN_T "td"
 #define LONG_VECTOR_SUPPORT
 
 #define NILSXP 0

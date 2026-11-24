@@ -1,7 +1,7 @@
 //! Character string interning, encoding, UTF-8 translation, and `STRING_ELT`.
 
 use std::borrow::Cow;
-use std::ffi::{CStr, c_char, c_int};
+use std::ffi::{CStr, c_char, c_int, c_uint};
 use std::io::Write;
 use std::ptr::null;
 
@@ -18,6 +18,38 @@ const CE_NATIVE: c_int = 0;
 const CE_UTF8: c_int = 1;
 const CE_LATIN1: c_int = 2;
 const CE_BYTES: c_int = 3;
+
+/// Encode a code point as GNU R does, with up to six bytes.
+///
+/// Return the number of encoded bytes. A nonzero code point adds a NUL
+/// terminator. A zero code point writes a single NUL byte and returns one.
+///
+/// # Safety
+/// `s` must have space for the encoded bytes and any terminator. Seven
+/// writable bytes are sufficient for all inputs.
+#[allow(non_snake_case)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Rf_ucstoutf8(s: *mut c_char, c: c_uint) -> usize {
+    let mut code = if c > 0x7fff_ffff { 0xfffd } else { c };
+    let (len, lead) = match code {
+        0..=0x7f => (1, 0x00),
+        0x80..=0x7ff => (2, 0xc0),
+        0x800..=0xffff => (3, 0xe0),
+        0x1_0000..=0x1f_ffff => (4, 0xf0),
+        0x20_0000..=0x3ff_ffff => (5, 0xf8),
+        _ => (6, 0xfc),
+    };
+    let mut bytes = [0u8; 7];
+    for byte in bytes[1..len].iter_mut().rev() {
+        *byte = 0x80 | (code as u8 & 0x3f);
+        code >>= 6;
+    }
+    bytes[0] = lead | code as u8;
+    let written = len + usize::from(c != 0);
+    // SAFETY: The caller supplies a writable buffer for these bytes.
+    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), s.cast(), written) };
+    len
+}
 
 pub(crate) unsafe fn c_text<'a>(
     ctx: &mut Ctx,
