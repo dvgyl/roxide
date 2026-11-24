@@ -136,3 +136,8 @@ fn blend(dst: &mut [u8; 4], src: [u8; 4], area: f64) {
         *component = multiply(source, coverage).saturating_add(multiply(*component, remaining));
     }
 }
+
+/// Composite a premultiplied pixel on white for formats without alpha.
+pub(super) fn rgb_on_white([r, g, b, a]: [u8; 4]) -> [u8; 3] {
+    [r, g, b].map(|component| component.saturating_add(255 - a))
+}

@@ -224,7 +224,7 @@ dev.new <- function(..., noRStudioGD = FALSE) {
 }
 dev.size <- function(units = c("in", "cm", "px")) {
     units <- .gd_choice(units, c("in", "cm", "px"))
-    scale <- if (units == "in") 1 else if (units == "cm") 2.54 else 72
+    scale <- if (units == "in") 1 else if (units == "cm") 2.54 else 0
     .Internal(C_gd_dev_size(scale))
 }
 graphics.off <- function() invisible(.Internal(C_gd_graphics_off()))

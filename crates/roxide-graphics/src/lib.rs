@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-//! Clean-room GNU R 4.6.2 `grDevices`, `graphics`, and `grid` engine with headless PDF/SVG/PNG devices (ADR-0015).
+//! Clean-room GNU R 4.6.2 `grDevices`, `graphics`, and `grid` engine with headless vector and raster devices (ADR-0015).
 
 pub mod devices;
 pub mod engine;

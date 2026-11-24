@@ -1,10 +1,15 @@
 //! Raster device state and conversion from device points to pixels.
 
+mod bmp;
 mod fill;
+mod jpeg;
 mod png;
 mod stroke;
+mod tiff;
 
-use roxide_host::{Host, HostError, HostResult};
+use std::io::{BufWriter, Write as _};
+
+use roxide_host::{Host, HostError, HostResult, OpenMode};
 
 use super::{
     metrics,
@@ -13,20 +18,63 @@ use super::{
 use crate::engine::{Device, DeviceSpec, GContext, LineEnd, LineJoin, Rect, Rgba};
 use fill::Frame;
 
-pub(super) struct PngDevice {
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Format {
+    Png,
+    Bmp,
+    Jpeg { quality: u8 },
+    Tiff,
+}
+
+impl Format {
+    pub(super) fn name(self) -> &'static str {
+        match self {
+            Self::Png => "png",
+            Self::Bmp => "bmp",
+            Self::Jpeg { .. } => "jpeg",
+            Self::Tiff => "tiff",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Png => "PNG",
+            Self::Bmp => "BMP",
+            Self::Jpeg { .. } => "JPEG",
+            Self::Tiff => "TIFF",
+        }
+    }
+}
+
+pub(super) struct Spec {
+    pub(super) filename: String,
+    pub(super) width: u32,
+    pub(super) height: u32,
+    pub(super) ppi: f64,
+    pub(super) has_resolution: bool,
+    pub(super) pointsize: f64,
+    pub(super) bg: Rgba,
+    pub(super) name: String,
+    pub(super) format: Format,
+}
+
+pub(super) struct RasterDevice {
     file: PageName,
     frame: Frame,
+    bg: Rgba,
     ppi: f64,
+    has_resolution: bool,
     scale: f64,
     pointsize: f64,
     name: String,
+    format: Format,
     index: usize,
     started: bool,
     closed: bool,
 }
 
-impl PngDevice {
-    pub(super) fn open(max_bytes: usize, spec: &DeviceSpec) -> Result<Self, String> {
+impl RasterDevice {
+    pub(super) fn open_png(max_bytes: usize, spec: &DeviceSpec) -> Result<Self, String> {
         let DeviceSpec::Png {
             filename,
             width_px,
@@ -39,27 +87,66 @@ impl PngDevice {
         else {
             return Err("invalid PNG device specification".into());
         };
-        let (width, height) = (*width_px, *height_px);
-        if width == 0 || height == 0 || width > i32::MAX as u32 || height > i32::MAX as u32 {
-            return Err("invalid PNG dimensions".into());
+        Self::open(
+            max_bytes,
+            Spec {
+                filename: filename.clone(),
+                width: *width_px,
+                height: *height_px,
+                ppi: *res,
+                has_resolution: true,
+                pointsize: *pointsize,
+                bg: *bg,
+                name: device_name.clone(),
+                format: Format::Png,
+            },
+        )
+    }
+
+    pub(super) fn open(max_bytes: usize, spec: Spec) -> Result<Self, String> {
+        let Spec {
+            filename,
+            width,
+            height,
+            ppi,
+            has_resolution,
+            pointsize,
+            bg,
+            name,
+            format,
+        } = spec;
+        let label = format.label();
+        let max_dimension = if matches!(format, Format::Jpeg { .. }) {
+            u32::from(u16::MAX)
+        } else {
+            i32::MAX as u32
+        };
+        if width == 0 || height == 0 || width > max_dimension || height > max_dimension {
+            return Err(format!("invalid {label} dimensions"));
         }
-        if !res.is_finite()
-            || *res <= 0.0
-            || *res / 0.0254 > f64::from(u32::MAX)
+        if !ppi.is_finite()
+            || ppi <= 0.0
+            || ppi / 0.0254 > f64::from(u32::MAX)
             || !pointsize.is_finite()
-            || *pointsize <= 0.0
+            || pointsize <= 0.0
         {
-            return Err("invalid PNG resolution or pointsize".into());
+            return Err(format!("invalid {label} resolution or pointsize"));
         }
         let count = (width as usize)
             .checked_mul(height as usize)
             .filter(|count| *count <= max_bytes / 4)
-            .ok_or("PNG framebuffer exceeds the host vector limit")?;
-        let file = PageName::new(filename, true)?;
+            .ok_or_else(|| format!("{label} framebuffer exceeds the host vector limit"))?;
+        match format {
+            Format::Bmp => bmp::image_size(width, height),
+            Format::Tiff => tiff::image_size(width, height),
+            _ => Ok(0),
+        }
+        .map_err(|error| error.to_string())?;
+        let file = PageName::new(&filename, true)?;
         let mut pixels = Vec::new();
         pixels
             .try_reserve_exact(count)
-            .map_err(|_| "cannot allocate PNG framebuffer")?;
+            .map_err(|_| format!("cannot allocate {label} framebuffer"))?;
         pixels.resize(count, [0; 4]);
         let mut frame = Frame {
             width,
@@ -67,14 +154,17 @@ impl PngDevice {
             pixels,
             clip: Rect::normalized(0.0, 0.0, 0.0, 0.0),
         };
-        frame.reset(*bg);
+        frame.reset(bg);
         Ok(Self {
             file,
             frame,
-            ppi: *res,
-            scale: res / 72.0,
-            pointsize: *pointsize,
-            name: device_name.clone(),
+            bg,
+            ppi,
+            has_resolution,
+            scale: ppi / 72.0,
+            pointsize,
+            name,
+            format,
             index: 1,
             started: false,
             closed: false,
@@ -82,8 +172,18 @@ impl PngDevice {
     }
 
     fn flush(&self, host: &mut dyn Host) -> HostResult<()> {
-        let file = png::encode(&self.frame, self.ppi).map_err(HostError::from_io)?;
-        output::write(host, &self.file.at(self.index), &file)
+        let name = self.file.at(self.index);
+        let path = output::path(host, &name);
+        let mut file = BufWriter::new(host.open(&path, OpenMode::write_truncate())?);
+        let density = self.has_resolution.then_some(self.ppi);
+        match self.format {
+            Format::Bmp => bmp::encode(&mut file, &self.frame, self.ppi),
+            Format::Jpeg { quality } => jpeg::encode(&mut file, &self.frame, density, quality),
+            Format::Tiff => tiff::encode(&mut file, &self.frame, density),
+            Format::Png => png::encode(&mut file, &self.frame, self.ppi),
+        }
+        .and_then(|()| file.flush())
+        .map_err(HostError::from_io)
     }
 
     fn point(&self, (x, y): Point) -> Point {
@@ -102,7 +202,7 @@ impl PngDevice {
     }
 }
 
-impl Device for PngDevice {
+impl Device for RasterDevice {
     fn framebuffer_bytes(&self) -> usize {
         self.frame.pixels.capacity() * size_of::<[u8; 4]>()
     }
@@ -115,6 +215,14 @@ impl Device for PngDevice {
             f64::from(self.frame.width) / self.ppi,
             f64::from(self.frame.height) / self.ppi,
         )
+    }
+
+    fn size_px(&self) -> (f64, f64) {
+        (f64::from(self.frame.width), f64::from(self.frame.height))
+    }
+
+    fn initial_background(&self) -> Option<Rgba> {
+        Some(self.bg)
     }
 
     fn new_page(&mut self, host: &mut dyn Host, bg: Rgba) -> HostResult<()> {

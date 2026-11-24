@@ -131,14 +131,14 @@ pub(super) fn size(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     if ctx.ext::<GraphicsExt>().current == 1 {
         open_default_device(ctx)?;
     }
-    let Some((width, height)) = ctx
-        .ext::<GraphicsExt>()
-        .active()
-        .map(|slot| slot.device.size_in())
-    else {
+    let Some(slot) = ctx.ext::<GraphicsExt>().active() else {
         return Err(ctx.stop(call.err_call(), "no active device"));
     };
-    Ok(ctx
-        .session_mut()
-        .alloc_real_from(&[width * unit, height * unit])?)
+    let (width, height) = if unit == 0.0 {
+        slot.device.size_px()
+    } else {
+        let (width, height) = slot.device.size_in();
+        (width * unit, height * unit)
+    };
+    Ok(ctx.session_mut().alloc_real_from(&[width, height])?)
 }

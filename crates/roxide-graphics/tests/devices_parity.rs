@@ -577,7 +577,7 @@ fn live_r_cairo_png_and_svg() {
 }
 
 #[test]
-fn png_devices_share_and_release_framebuffer_budget() {
+fn raster_devices_share_and_release_framebuffer_budget() {
     let host = NativeHost::with_limits(Limits {
         max_vector_bytes: 1 << 20,
         ..Limits::default()
@@ -592,12 +592,104 @@ fn png_devices_share_and_release_framebuffer_budget() {
         fail <- tryCatch(png("/tmp/b.png", 400, 400), error = function(e) conditionMessage(e))
         stopifnot(identical(fail, "PNG framebuffer exceeds the host vector limit"),
                   length(dev.list()) == 1L)
+        for (device in list(bmp, jpeg, tiff)) {
+            fail <- tryCatch(device("/tmp/b", 400, 400), error = function(e) conditionMessage(e))
+            stopifnot(grepl("framebuffer exceeds the host vector limit", fail),
+                      length(dev.list()) == 1L)
+        }
         dev.off()
-        png("/tmp/b.png", 400, 400)
+        bmp("/tmp/b.bmp", 400, 400)
         stopifnot(length(dev.list()) == 1L)
         "#,
     );
     assert_eq!(ctx.ext::<GraphicsExt>().framebuffer_bytes(), 640_000);
     r(&mut ctx, "dev.off()");
     assert_eq!(ctx.ext::<GraphicsExt>().framebuffer_bytes(), 0);
+}
+
+#[test]
+fn bmp_jpeg_tiff_headers_and_pixels() {
+    let mut ctx = context();
+    r(
+        &mut ctx,
+        r#"
+        bmp("/tmp/b%03d.bmp", 13, 9, bg = "steelblue", res = 100, type = "cairo")
+        grDevices::jpeg("/tmp/j%03d.jpeg", 13, 9, quality = 100, type = "cairo")
+        grDevices::tiff("/tmp/t%03d.tiff", 13, 9, type = "cairo")
+        stopifnot(identical(names(dev.list()), c("bmp", "jpeg", "tiff")))
+        dev.set(2L)
+        stopifnot(identical(dev.size("px"), c(13, 9)), par("bg") == "steelblue")
+        "#,
+    );
+    for id in 2..=4 {
+        let mut slot = ctx.ext::<GraphicsExt>().slots[id].take().unwrap();
+        let device = &mut slot.device;
+        let ppi_scale = if id == 2 { 72.0 / 100.0 } else { 1.0 };
+        for fill in [BLUE, RED] {
+            device.new_page(ctx.host(), Rgba::WHITE).unwrap();
+            let gc = GContext {
+                col: Rgba::TRANSPARENT,
+                fill,
+                ..GContext::default()
+            };
+            device.rect(
+                Rect::normalized(0.0, 0.0, 13.0 * ppi_scale, 4.0 * ppi_scale),
+                &gc,
+            );
+        }
+        device.close(ctx.host()).unwrap();
+    }
+
+    let u16_at = |data: &[u8], n| u16::from_le_bytes(data[n..n + 2].try_into().unwrap());
+    let u32_at = |data: &[u8], n| u32::from_le_bytes(data[n..n + 4].try_into().unwrap());
+    for (page, rgb) in [(1, [0, 0, 255]), (2, [255, 127, 127])] {
+        let bmp = read(ctx.host(), &format!("/tmp/b{page:03}.bmp"));
+        let stride = 40;
+        assert_eq!(bmp.len(), 54 + stride * 9);
+        assert_eq!(&bmp[..2], b"BM");
+        assert_eq!(u32_at(&bmp, 2) as usize, bmp.len());
+        assert_eq!(u32_at(&bmp, 10), 54);
+        assert_eq!(u32_at(&bmp, 14), 40);
+        assert_eq!((u32_at(&bmp, 18), u32_at(&bmp, 22)), (13, 9));
+        assert_eq!(u16_at(&bmp, 28), 24);
+        assert_eq!(u32_at(&bmp, 38), 3937);
+        assert_eq!(&bmp[54..57], &[rgb[2], rgb[1], rgb[0]]);
+        assert_eq!(bmp[54 + 39], 0);
+        assert_eq!(&bmp[54 + 8 * stride..57 + 8 * stride], &[255; 3]);
+
+        let tiff = read(ctx.host(), &format!("/tmp/t{page:03}.tiff"));
+        assert_eq!(&tiff[..4], b"II\x2a\x00");
+        let ifd = u32_at(&tiff, 4) as usize;
+        let (entries, _) = tiff[ifd + 2..].as_chunks::<12>();
+        let tags = entries.iter().take(u16_at(&tiff, ifd) as usize);
+        let tag = |id| {
+            let entry = tags.clone().find(|&entry| u16_at(entry, 0) == id).unwrap();
+            (u16_at(entry, 2), u32_at(entry, 4), u32_at(entry, 8))
+        };
+        assert_eq!(tag(256), (4, 1, 13));
+        assert_eq!(tag(257), (4, 1, 9));
+        let (field_type, count, bits) = tag(258);
+        assert_eq!((field_type, count), (3, 3));
+        assert_eq!(&tiff[bits as usize..bits as usize + 6], &[8, 0, 8, 0, 8, 0]);
+        assert_eq!(tag(259), (3, 1, 1));
+        assert_eq!(tag(262), (3, 1, 2));
+        assert_eq!(tag(277), (3, 1, 3));
+        assert_eq!(tag(278), (4, 1, 9));
+        assert_eq!(tag(279), (4, 1, 13 * 9 * 3));
+        let pixels = tag(273).2 as usize;
+        assert_eq!(&tiff[pixels..pixels + 3], &[255; 3]);
+        assert_eq!(&tiff[pixels + 8 * 39..pixels + 8 * 39 + 3], &rgb);
+
+        let jpeg = read(ctx.host(), &format!("/tmp/j{page:03}.jpeg"));
+        assert_eq!(&jpeg[..4], b"\xff\xd8\xff\xe0");
+        assert_eq!(&jpeg[6..13], b"JFIF\0\x01\x01");
+        assert!(jpeg.ends_with(b"\xff\xd9"));
+        let sof = jpeg.windows(2).position(|b| b == [0xff, 0xc0]).unwrap();
+        assert_eq!(
+            &jpeg[sof + 4..sof + 19],
+            &[8, 0, 9, 0, 13, 3, 1, 0x11, 0, 2, 0x11, 1, 3, 0x11, 1]
+        );
+        let dqt = jpeg.windows(2).position(|b| b == [0xff, 0xdb]).unwrap();
+        assert_eq!(&jpeg[dqt + 5..dqt + 69], &[1; 64]);
+    }
 }

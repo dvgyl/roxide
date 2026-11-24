@@ -101,7 +101,11 @@ pub(super) fn page(ctx: &mut Ctx, call: &Call, _: &mut Args) -> EvalResult {
     else {
         return Err(ctx.stop(call.err_call(), "no active graphics device"));
     };
-    let result = slot.device.new_page(ctx.host(), Rgba::TRANSPARENT);
+    let bg = slot
+        .device
+        .initial_background()
+        .unwrap_or(Rgba::TRANSPARENT);
+    let result = slot.device.new_page(ctx.host(), bg);
     if result.is_ok() {
         slot.display_list.clear();
         slot.page_count += 1;

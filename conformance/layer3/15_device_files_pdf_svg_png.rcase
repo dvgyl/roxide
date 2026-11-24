@@ -35,3 +35,66 @@ for (one in c(TRUE,FALSE)) {
     invisible(dev.off())
     dput(file.exists(file.path(tempdir(), paste0("first-", one, "- 1-%.pdf"))))
 }
+
+=== case: bmp_writes_numbered_pages ===
+#@ tags: layer3,devices
+#@ compare: exact
+filename <- file.path(tempdir(), "bmp%03d.bmp")
+result <- withVisible(grDevices::bmp(filename, width = 301, height = 243))
+dput(is.null(result$value))
+dput(result$visible)
+dput(names(dev.list()))
+dput(dev.size("px"))
+plot.new()
+plot.new()
+invisible(dev.off())
+for (i in 1:2) {
+    path <- sprintf(filename, i)
+    con <- file(path, "rb")
+    b <- as.integer(readBin(con, "raw", 2L))
+    close(con)
+    dput(identical(b, c(66L, 77L)))
+    dput(file.info(path)$size > 100)
+}
+
+=== case: jpeg_writes_numbered_pages ===
+#@ tags: layer3,devices
+#@ compare: exact
+filename <- file.path(tempdir(), "jpeg%03d.jpeg")
+result <- withVisible(grDevices::jpeg(filename, width = 301, height = 243))
+dput(is.null(result$value))
+dput(result$visible)
+dput(names(dev.list()))
+dput(dev.size("px"))
+plot.new()
+plot.new()
+invisible(dev.off())
+for (i in 1:2) {
+    path <- sprintf(filename, i)
+    con <- file(path, "rb")
+    b <- as.integer(readBin(con, "raw", 2L))
+    close(con)
+    dput(identical(b, c(255L, 216L)))
+    dput(file.info(path)$size > 100)
+}
+
+=== case: tiff_writes_numbered_pages ===
+#@ tags: layer3,devices
+#@ compare: exact
+filename <- file.path(tempdir(), "tiff%03d.tiff")
+result <- withVisible(grDevices::tiff(filename, width = 301, height = 243))
+dput(is.null(result$value))
+dput(result$visible)
+dput(names(dev.list()))
+dput(dev.size("px"))
+plot.new()
+plot.new()
+invisible(dev.off())
+for (i in 1:2) {
+    path <- sprintf(filename, i)
+    con <- file(path, "rb")
+    b <- as.integer(readBin(con, "raw", 4L))
+    close(con)
+    dput(identical(b, c(73L, 73L, 42L, 0L)) || identical(b, c(77L, 77L, 0L, 42L)))
+    dput(file.info(path)$size > 100)
+}

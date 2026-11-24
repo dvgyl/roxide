@@ -470,10 +470,13 @@ pub(super) fn state(slot: &mut DeviceSlot) -> EvalResult<&mut GPar> {
         } else {
             12.0
         };
-        let bg = match slot.device.name() {
-            "svg" | "png" | "quartz_off_screen" => Rgba::WHITE,
-            _ => Rgba::TRANSPARENT,
-        };
+        let bg = slot
+            .device
+            .initial_background()
+            .unwrap_or_else(|| match slot.device.name() {
+                "svg" | "png" | "quartz_off_screen" => Rgba::WHITE,
+                _ => Rgba::TRANSPARENT,
+            });
         Box::new(GPar::new([w, h], ps, bg))
     });
     data.downcast_mut::<GPar>().ok_or_else(|| {

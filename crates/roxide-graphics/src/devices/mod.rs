@@ -1,4 +1,4 @@
-//! Headless PDF, SVG, and PNG devices and their R constructors.
+//! Headless vector and raster devices and their R constructors.
 
 mod metrics;
 mod output;
@@ -22,6 +22,9 @@ pub const MODULE: Module = Module {
         constructor("rox_gr_pdf", 11, pdf),
         constructor("rox_gr_svg", 7, svg),
         constructor("rox_gr_png", 8, png),
+        constructor("rox_gr_bmp", 8, bmp),
+        constructor("rox_gr_jpeg", 9, jpeg),
+        constructor("rox_gr_tiff", 8, tiff),
     ],
     prelude: include_str!("prelude.R"),
 };
@@ -57,7 +60,7 @@ pub fn open_device(host: &mut dyn Host, spec: &DeviceSpec) -> Result<Box<dyn Dev
             false,
         )?)),
         DeviceSpec::Svg { .. } => Ok(Box::new(svg::SvgDevice::open(spec, "sans".into())?)),
-        DeviceSpec::Png { .. } => Ok(Box::new(raster::PngDevice::open(
+        DeviceSpec::Png { .. } => Ok(Box::new(raster::RasterDevice::open_png(
             host.limits().max_vector_bytes,
             spec,
         )?)),
@@ -126,6 +129,28 @@ fn svg(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
 }
 
 fn png(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    open_raster(ctx, call, args, raster::Format::Png)
+}
+
+fn bmp(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    open_raster(ctx, call, args, raster::Format::Bmp)
+}
+
+fn jpeg(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    let quality = number(ctx, call, args.get(8), "quality")?;
+    let quality = if quality.is_finite() {
+        quality.clamp(1.0, 100.0) as u8
+    } else {
+        75
+    };
+    open_raster(ctx, call, args, raster::Format::Jpeg { quality })
+}
+
+fn tiff(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    open_raster(ctx, call, args, raster::Format::Tiff)
+}
+
+fn open_raster(ctx: &mut Ctx, call: &Call, args: &mut Args, format: raster::Format) -> EvalResult {
     let units = text(ctx, call, args.get(3), "units")?;
     let kind = if args.get(7) == SEXP_NIL {
         let info = ctx.host().sys_info();
@@ -139,6 +164,7 @@ fn png(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
         text(ctx, call, args.get(7), "type")?
     };
     let mut res = number(ctx, call, args.get(6), "res")?;
+    let has_resolution = !res.is_nan();
     if res.is_nan() {
         if units != "px" {
             return Err(ctx.stop(
@@ -164,22 +190,25 @@ fn png(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     };
     let device_name = match kind.as_str() {
         "quartz" => "quartz_off_screen",
-        "cairo" | "cairo-png" | "Xlib" => "png",
+        "cairo-png" if format == raster::Format::Png => "png",
+        "cairo" | "Xlib" => format.name(),
         _ => return Err(ctx.stop(call.err_call(), "invalid 'type' argument")),
     };
-    let spec = DeviceSpec::Png {
+    let spec = raster::Spec {
         filename: text(ctx, call, args.get(0), "filename")?,
-        width_px: dimension(ctx, 1, "width")?,
-        height_px: dimension(ctx, 2, "height")?,
+        width: dimension(ctx, 1, "width")?,
+        height: dimension(ctx, 2, "height")?,
         pointsize: number(ctx, call, args.get(4), "pointsize")?,
-        bg: background(ctx, call, args.get(5))?,
-        res,
-        device_name: device_name.into(),
+        bg: crate::grdevices::parse_rgba(ctx, args.get(5))?,
+        ppi: res,
+        has_resolution,
+        name: device_name.into(),
+        format,
     };
     let used = ctx.ext::<GraphicsExt>().framebuffer_bytes();
     let remaining = ctx.host().limits().max_vector_bytes.saturating_sub(used);
     install(ctx, call, |_| {
-        Ok(Box::new(raster::PngDevice::open(remaining, &spec)?))
+        Ok(Box::new(raster::RasterDevice::open(remaining, spec)?))
     })
 }
 

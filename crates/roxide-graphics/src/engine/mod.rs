@@ -253,6 +253,15 @@ pub trait Device {
     fn name(&self) -> &str;
     /// Device page dimensions in inches `(width_in, height_in)`.
     fn size_in(&self) -> (f64, f64);
+    /// Device page dimensions in pixels.
+    fn size_px(&self) -> (f64, f64) {
+        let (width, height) = self.size_in();
+        (width * 72.0, height * 72.0)
+    }
+    /// Background color set when the device opened, if supplied by the backend.
+    fn initial_background(&self) -> Option<Rgba> {
+        None
+    }
     /// Start a new page with background color `bg` (flushing any previous page if applicable).
     fn new_page(&mut self, host: &mut dyn Host, bg: Rgba) -> HostResult<()>;
     /// Update the active clipping rectangle in device coordinates (points).
