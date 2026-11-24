@@ -368,6 +368,9 @@ impl Default for DotCOpts {
     }
 }
 
+/// ABI version tag recorded in `Meta/Roxide.rds` for Roxide-compiled packages.
+pub const CAPI_ABI_VERSION: &str = "roxide-capi-4.6.2-v1";
+
 /// Stateless native C-API & dynamic-library hooks installed by `roxide-capi` (ADRs 0017–0020).
 ///
 /// Any `SEXP`s owned by `roxide-capi` (such as `DLLInfo` external pointers, `CCallable`

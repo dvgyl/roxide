@@ -121,11 +121,18 @@ pub fn run_main() -> ExitCode {
 /// returning the exact process exit status code (preserving `quit(status = N)`).
 #[must_use]
 pub fn run_args(full_args: Vec<String>) -> i32 {
+    run_args_with(full_args, |_| {})
+}
+
+/// Execute Roxide CLI logic with a context setup callback invoked after bootstrap
+/// (used by `roxide-libr` to install `roxide-capi` native hooks).
+#[must_use]
+pub fn run_args_with(full_args: Vec<String>, setup: fn(&mut Ctx)) -> i32 {
     let tail_args: Vec<String> = full_args.iter().skip(1).cloned().collect();
     if tail_args.first().map(String::as_str) == Some("CMD") {
         let (boot_policy, run_policy) = configured_gc_policy();
         let code = cmd::dispatch(&tail_args[1..], &|host| {
-            let mut ctx = bootstrap(host, boot_policy)?;
+            let mut ctx = bootstrap_with(host, boot_policy, setup)?;
             ctx.session_mut().heap.set_policy(run_policy);
             Ok(ctx)
         });
@@ -147,7 +154,7 @@ pub fn run_args(full_args: Vec<String>) -> i32 {
     const STACK_BYTES: usize = 32 * 1024 * 1024;
     let run = std::thread::Builder::new()
         .stack_size(STACK_BYTES)
-        .spawn(move || interpret(opts, STACK_BYTES));
+        .spawn(move || interpret(opts, STACK_BYTES, setup));
     match run {
         Ok(thread) => thread.join().unwrap_or(1),
         Err(err) => {
@@ -159,6 +166,15 @@ pub fn run_args(full_args: Vec<String>) -> i32 {
 
 /// Construct a fully bootstrapped Roxide session with all built-in packages in GNU R 4.6.2 order.
 pub fn bootstrap(host: Box<dyn Host>, policy: GcPolicy) -> Result<Ctx, InternalError> {
+    bootstrap_with(host, policy, |_| {})
+}
+
+/// Construct a fully bootstrapped Roxide session and apply `setup` before running user code.
+pub fn bootstrap_with(
+    host: Box<dyn Host>,
+    policy: GcPolicy,
+    setup: fn(&mut Ctx),
+) -> Result<Ctx, InternalError> {
     let mut ctx = Ctx::new(host, policy)?;
     roxide_base::register_all(&mut ctx)?;
     roxide_pkg::register(&mut ctx)?;
@@ -167,13 +183,14 @@ pub fn bootstrap(host: Box<dyn Host>, policy: GcPolicy) -> Result<Ctx, InternalE
     roxide_utils::register(&mut ctx)?;
     roxide_graphics::register(&mut ctx)?;
     roxide_stats::register(&mut ctx)?;
+    setup(&mut ctx);
     Ok(ctx)
 }
 
-fn interpret(opts: CliOpts, stack_bytes: usize) -> i32 {
+fn interpret(opts: CliOpts, stack_bytes: usize, setup: fn(&mut Ctx)) -> i32 {
     let (boot_policy, run_policy) = configured_gc_policy();
     let host = Box::new(NativeHost::new());
-    let mut ctx = match bootstrap(host, boot_policy) {
+    let mut ctx = match bootstrap_with(host, boot_policy, setup) {
         Ok(c) => c,
         Err(err) => {
             let _ = writeln!(io::stderr().lock(), "Error: {err}");

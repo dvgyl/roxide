@@ -705,6 +705,16 @@ fn signal_warning(ctx: &mut Ctx, call: SexpId, text: &str) -> EvalResult<()> {
     ctx.warning_at(call, text)
 }
 
+fn signal_warning_immediate(ctx: &mut Ctx, call: SexpId, text: &str) -> EvalResult<()> {
+    let saved = ctx.opts().warn;
+    if saved == 0 {
+        ctx.opts_mut().warn = 1;
+    }
+    let result = ctx.warning_at(call, text);
+    ctx.opts_mut().warn = saved;
+    result
+}
+
 #[unsafe(no_mangle)]
 unsafe extern "C" fn rox_capi_error_str(ptr: *const c_char, len: usize) -> c_int {
     // SAFETY: The C shim supplies a live buffer.
@@ -727,6 +737,24 @@ unsafe extern "C" fn rox_capi_warning_str(ptr: *const c_char, len: usize) -> c_i
 unsafe extern "C" fn rox_capi_warningcall_str(call: Sexp, ptr: *const c_char, len: usize) -> c_int {
     // SAFETY: The C shim supplies a live buffer.
     unsafe { formatted_condition(call, ptr, len, "Rf_warningcall", signal_warning) }
+}
+
+#[unsafe(no_mangle)]
+unsafe extern "C" fn rox_capi_warningcall_immediate_str(
+    call: Sexp,
+    ptr: *const c_char,
+    len: usize,
+) -> c_int {
+    // SAFETY: The C shim supplies a live buffer.
+    unsafe {
+        formatted_condition(
+            call,
+            ptr,
+            len,
+            "Rf_warningcall_immediate",
+            signal_warning_immediate,
+        )
+    }
 }
 
 macro_rules! print_bridge {

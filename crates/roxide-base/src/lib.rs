@@ -10,6 +10,7 @@ pub mod datetime;
 pub mod dcf;
 pub mod io_os;
 pub mod linalg;
+pub mod native;
 pub mod ops;
 pub mod random;
 pub mod scan;
@@ -50,6 +51,7 @@ pub const MODULES: &[&Module] = &[
     &special::MODULE,
     &scan::MODULE,
     &dcf::MODULE,
+    &native::MODULE,
 ];
 
 /// Register all `roxide-base` primitives and clean-room R preludes on `ctx`.

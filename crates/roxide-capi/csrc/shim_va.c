@@ -12,6 +12,7 @@ extern int rox_capi_error_str(const char *, size_t);
 extern int rox_capi_errorcall_str(Sexp, const char *, size_t);
 extern int rox_capi_warning_str(const char *, size_t);
 extern int rox_capi_warningcall_str(Sexp, const char *, size_t);
+extern int rox_capi_warningcall_immediate_str(Sexp, const char *, size_t);
 extern int rox_capi_rprintf_str(const char *, size_t);
 extern int rox_capi_reprintf_str(const char *, size_t);
 
@@ -21,7 +22,15 @@ enum {
     print_limit = 64 * 1024 * 1024
 };
 
-enum output { error, error_call, warning, warning_call, standard_out, standard_err };
+enum output {
+    error,
+    error_call,
+    warning,
+    warning_call,
+    warning_call_immediate,
+    standard_out,
+    standard_err
+};
 
 static int emit(enum output dest, Sexp call, const char *format, va_list args) {
     char stack[buffer_size];
@@ -60,6 +69,9 @@ static int emit(enum output dest, Sexp call, const char *format, va_list args) {
     case error_call: target = rox_capi_errorcall_str(call, buf, size); break;
     case warning: target = rox_capi_warning_str(buf, size); break;
     case warning_call: target = rox_capi_warningcall_str(call, buf, size); break;
+    case warning_call_immediate:
+        target = rox_capi_warningcall_immediate_str(call, buf, size);
+        break;
     case standard_out: target = rox_capi_rprintf_str(buf, size); break;
     case standard_err: target = rox_capi_reprintf_str(buf, size); break;
     }
@@ -98,6 +110,7 @@ CONDITION(Rf_error, error, _Noreturn, (const char *format, ...), R_NilValue, abo
 CONDITION(Rf_errorcall, error_call, _Noreturn, (Sexp call, const char *format, ...), call, abort();)
 VARARGS(Rf_warning, warning)
 CONDITION(Rf_warningcall, warning_call, , (Sexp call, const char *format, ...), call, )
+CONDITION(Rf_warningcall_immediate, warning_call_immediate, , (Sexp call, const char *format, ...), call, )
 VARARGS(Rprintf, standard_out)
 VARARGS(REprintf, standard_err)
 

@@ -342,7 +342,7 @@ impl Ctx {
             for &value in &actuals {
                 ctx.session.heap.inc_ref(value);
             }
-            let result = ctx.run_frame(frame, |ctx| ctx.eval(body, env));
+            let result = ctx.run_frame(frame, |ctx| crate::vm::run_body(ctx, fun, body, env));
             for &value in &actuals {
                 ctx.session.heap.dec_ref(value);
             }
@@ -467,7 +467,7 @@ impl Ctx {
             for &value in &actual_vals {
                 ctx.session.heap.inc_ref(value);
             }
-            let result = ctx.run_frame(frame, |ctx| ctx.eval(body, env));
+            let result = ctx.run_frame(frame, |ctx| crate::vm::run_body(ctx, fun, body, env));
             for &value in &actual_vals {
                 ctx.session.heap.dec_ref(value);
             }

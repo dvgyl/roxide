@@ -7,9 +7,13 @@
 //!
 pub mod abi;
 pub mod api;
+pub mod binfmt;
 pub mod cx;
+pub mod dll;
+pub mod dotcall;
 pub mod globals;
+pub mod hooks;
 pub mod jump;
+pub mod register;
 
-/// ABI version tag in `Meta/Roxide.rds` for Roxide-compiled packages.
-pub const CAPI_ABI_VERSION: &str = "roxide-capi-4.6.2-v1";
+pub use roxide_eval::CAPI_ABI_VERSION;

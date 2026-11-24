@@ -3,12 +3,14 @@
 fn main() {
     println!("cargo:rerun-if-changed=csrc/shim.cc");
     println!("cargo:rerun-if-changed=csrc/shim_va.c");
+    println!("cargo:rerun-if-changed=csrc/dotcall.c");
 
     cc::Build::new()
         .std("c11")
         .flag_if_supported("-Wall")
         .flag_if_supported("-Wextra")
         .file("csrc/shim_va.c")
+        .file("csrc/dotcall.c")
         .compile("roxide_capi_va");
     cc::Build::new()
         .cpp(true)

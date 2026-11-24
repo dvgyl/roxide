@@ -333,7 +333,7 @@ pub(crate) struct EnvData {
     pub(crate) enclos: SexpId,
     pub(crate) locked: bool,
     /// Monotonic shape version bumped on binding insertion/removal for VM inline caches (ADR-0020).
-    pub(crate) shape_version: u32,
+    pub(crate) shape_version: u64,
 }
 
 impl EnvData {

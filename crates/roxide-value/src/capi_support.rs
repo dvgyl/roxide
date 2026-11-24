@@ -466,6 +466,22 @@ impl RSession {
         Ok(wr.value)
     }
 
+    /// Clear a `WEAKREFSXP` key/value to `SEXP_NIL` and unregister it from the collector.
+    pub fn clear_weakref(&mut self, x: SexpId) -> Result<(), ValueError> {
+        let obj = self.heap.get_mut(x)?;
+        let ty = obj.sexp_type().type_name(obj.flags.s4);
+        let Body::WeakRef(wr) = &mut obj.body else {
+            return Err(ValueError::TypeMismatch {
+                expected: "weakref",
+                actual: ty,
+            });
+        };
+        wr.key = SEXP_NIL;
+        wr.value = SEXP_NIL;
+        self.heap.remove_weakref(x);
+        Ok(())
+    }
+
     /// Read the general-purpose 16-bit header field (`LEVELS(x)`).
     pub fn gp(&self, x: SexpId) -> Result<u16, ValueError> {
         Ok(self.heap.get(x)?.gp)
@@ -484,7 +500,7 @@ impl RSession {
     }
 
     /// Return the monotonic binding shape version of an `ENVSXP` (ADR-0020).
-    pub fn env_shape_version(&self, env: SexpId) -> Result<u32, ValueError> {
+    pub fn env_shape_version(&self, env: SexpId) -> Result<u64, ValueError> {
         let target = if env == BASE_NAMESPACE { BASE_ENV } else { env };
         let obj = self.heap.get(target)?;
         match &obj.body {

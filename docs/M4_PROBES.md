@@ -26,3 +26,17 @@ All observations below were gathered strictly by executing compiled black-box C 
 ## 3. Permanent `R_*Symbol` Print Names (`CHAR(PRINTNAME(sym))`)
 
 Verified all 41 exported `R_*Symbol` / `R_dot_*` data symbols (`R_BaseSymbol == R_baseSymbol == "base"`, `R_SpecSymbol == "spec"`, `R_PreviousSymbol == "previous"`, `R_NamespaceEnvSymbol == ".__NAMESPACE__."`, `R_LastvalueSymbol == ".Last.value"`, `R_SeedsSymbol == ".Random.seed"`, `R_DeviceSymbol == ".Device"`, `R_dot_Generic == ".Generic"`, `R_dot_Method == ".Method"`, `R_dot_defined == ".defined"`, `R_dot_packageName == ".packageName"`, `R_dot_target == ".target"`, etc.) and allocated all 40 distinct symbols in `roxide-value::session` permanent slots `17..=56`.
+
+## 4. Wave 2 Black-Box Native Dispatch Probes
+
+| Condition | Exact GNU R 4.6.2 Behavior |
+| --- | --- |
+| `.Call` returning C `NULL` | Stderr: `Warning message:\nIn .Call("...") : converting NULL pointer to R NULL` and returns `NULL` |
+| Stack imbalance labels | `Warning: stack imbalance in '.Call'\|'.External'\|'.External2'\|'.C'\|'.Fortran', <before> then <after>` |
+| `.External2` `args` pairlist | Includes `.NAME` as its first element (`CAR(args) == .NAME`), followed by tagged arguments |
+| `.C(..., NAOK = FALSE)` on integer or logical NA | Error: `NAs in foreign function call (arg N)` |
+| `.C(..., NAOK = FALSE)` on double NA, NaN, or Inf | Error: `NA/NaN/Inf in foreign function call (arg N)` |
+| `.C(..., NAOK = FALSE)` on complex NA, NaN, or Inf | Error: `complex NA/NaN/Inf in foreign function call (arg N)` |
+| `.C(..., NAOK = FALSE)` on `NA_character_` | Allowed (no error) |
+| Missing `R_GetCCallable(pkg, sym)` | Error: `function '<sym>' not provided by package '<pkg>'` |
+| `.C` buffer over-run / under-run | GNU R has no canaries (silently corrupts heap); Roxide enforces 64-byte guard canaries and raises `array over-run in .C("<name>") argument N` (ADR-0018) |

@@ -43,8 +43,8 @@ const char *acopy_string(const char *text);
 void R_max_col(double *matrix, int *rows, int *columns, int *maxima, int *ties);
 void F77_NAME(qsort3)(double *x, int *first, int *last);
 void F77_NAME(qsort4)(double *x, int *index, int *first, int *last);
-void F77_NAME(interv)(double *x, int *n, double *value, int *rightmost_closed,
-                      int *all_inside, int *index, int *flag);
+int F77_NAME(interv)(double *x, int *n, double *value, int *rightmost_closed,
+                     int *all_inside, int *index, int *flag);
 double F77_NAME(d1mach)(const int *index);
 int F77_NAME(i1mach)(const int *index);
 void F77_NAME(rchkusr)(void);

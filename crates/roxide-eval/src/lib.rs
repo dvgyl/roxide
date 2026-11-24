@@ -39,9 +39,9 @@ pub mod testing;
 pub mod vm;
 
 pub use api::{
-    ArgEval, Arity, Call, CtxExt, Dispatch, DotCOpts, EvalResult, GroupGeneric, InternalError,
-    Module, NamespaceLoader, NativeCallKind, NativeHooks, OptionsCache, Package, PrimDef, PrimFn,
-    PrimKind, S4Hooks, ScriptOpts, Transfer, Unwind, Visibility,
+    ArgEval, Arity, CAPI_ABI_VERSION, Call, CtxExt, Dispatch, DotCOpts, EvalResult, GroupGeneric,
+    InternalError, Module, NamespaceLoader, NativeCallKind, NativeHooks, OptionsCache, Package,
+    PrimDef, PrimFn, PrimKind, S4Hooks, ScriptOpts, Transfer, Unwind, Visibility,
 };
 pub use ctx::{Args, Ctx, FrameId};
 pub use namespace::NsRecord;
