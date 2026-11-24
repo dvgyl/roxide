@@ -1,0 +1,168 @@
+=== case: anyna_atomic_and_nested_lists ===
+#@ tags: layer3,base,cran
+#@ compare: exact
+dput(c(anyNA(c(TRUE, NA)), anyNA(c(1L, NA_integer_)), anyNA(c(1, NaN)),
+       anyNA(complex(real = 1, imaginary = NaN)), anyNA(c("x", NA)),
+       anyNA(as.raw(0L)), anyNA(character()), anyNA(NULL)))
+dput(c(anyNA(list(1, NA)), anyNA(list(1, c(1, NA)), recursive = FALSE),
+       anyNA(list(1, c(1, NA)), recursive = TRUE),
+       anyNA(list(list(NA))), anyNA(list(list(NA)), TRUE),
+       anyNA(pairlist(x = c(1, NA)), TRUE)))
+anyNA.marked <- function(x, recursive = FALSE) recursive
+dput(anyNA(structure(1, class = "marked"), TRUE))
+is.na.marked_only <- function(x) TRUE
+dput(anyNA(structure(1, class = "marked_only")))
+dput(anyNA(data.frame(x = c(1, NA))))
+for (x in list(quote(x), parse(text = "NA"), list(1))) {
+    dput(tryCatch(anyNA(x, NA), error = conditionMessage))
+}
+
+=== case: substr_empty_attributes ===
+#@ tags: layer3,base,cran
+#@ compare: exact
+x <- structure(character(), class = "abc", marker = TRUE)
+dput(identical(x, substr(x, 1, 1)))
+dput(identical(x, substring(x, 1, 1)))
+named <- setNames(character(), character())
+dput(identical(named, substr(named, integer(), integer())))
+dput(identical(named, substring(named, integer(), integer())))
+dput(substr(NULL, 1, 1))
+
+=== case: rng_version_defaults ===
+#@ tags: layer3,base,cran
+#@ compare: exact
+for (v in c("0.98.99", "1.6.0", "1.7.0", "3.5.0", "3.6.0", "4.6.2")) {
+    set.seed(10, kind = "L'Ecuyer-CMRG", normal.kind = "Box-Muller",
+             sample.kind = "Rejection")
+    warnings <- character()
+    previous <- withCallingHandlers(withVisible(RNGversion(v)), warning = function(w) {
+        warnings <<- c(warnings, conditionMessage(w))
+        dput(as.list(conditionCall(w))[-1L])
+        invokeRestart("muffleWarning")
+    })
+    for (w in warnings) cat(w, "\n", sep = "")
+    dput(previous$value)
+    dput(previous$visible)
+    dput(RNGkind())
+}
+dput(tryCatch(RNGversion("4"), error = conditionMessage))
+
+=== case: timezone_cache_and_override ===
+#@ tags: layer3,base,cran
+#@ compare: exact
+run <- function() {
+    base <- baseenv()
+    tz <- Sys.getenv("TZ", unset = NA_character_)
+    on.exit(if (is.na(tz)) Sys.unsetenv("TZ") else Sys.setenv(TZ = tz))
+    dput(bindingIsLocked(".sys.timezone", base))
+    Sys.unsetenv("TZ")
+    old <- Sys.timezone()
+    dput(identical(old, get(".sys.timezone", base, inherits = FALSE)))
+    unlockBinding(".sys.timezone", base)
+    on.exit({
+        if (bindingIsLocked(".sys.timezone", base)) unlockBinding(".sys.timezone", base)
+        assign(".sys.timezone", old, base)
+        lockBinding(".sys.timezone", base)
+    }, add = TRUE)
+    assign(".sys.timezone", NA_character_, base)
+    Sys.setenv(TZ = "Europe/Paris")
+    dput(Sys.timezone())
+    dput(format(as.POSIXct("2020-01-01", tz = ""), "%Z"))
+    Sys.unsetenv("TZ")
+    dput(identical(Sys.timezone(), old))
+}
+run()
+dput(bindingIsLocked(".sys.timezone", baseenv()))
+
+=== case: format_environment_labels ===
+#@ tags: layer3,base,cran
+#@ compare: exact
+for (e in list(globalenv(), baseenv(), emptyenv(), asNamespace("tools"),
+               as.environment("package:stats"))) {
+    dput(format(e))
+}
+e <- new.env()
+f <- new.env()
+attr(e, "name") <- "ordinary"
+dput(grepl("^<environment: 0x[0-9a-f]+>$", format(e)))
+dput(identical(format(e), format(e)))
+dput(identical(format(e), format(f)))
+dput(identical(format(e), capture.output(print(e))[1L]))
+
+=== case: obsolete_function_conditions ===
+#@ tags: layer3,base,cran
+#@ compare: exact
+fields <- function(e) {
+    cat(conditionMessage(e), "\n", sep = "")
+    dput(class(e))
+    dput(conditionCall(e))
+    dput(list(e$old, e$new, e$package))
+}
+deprecated <- function() .Deprecated("replacement", package = "demo")
+defunct <- function() .Defunct("replacement", package = "demo")
+custom <- function() .Deprecated(msg = "Use another function.", old = "legacy")
+withCallingHandlers(invisible(deprecated()), warning = function(w) {
+    fields(w)
+    invokeRestart("muffleWarning")
+})
+tryCatch(defunct(), defunctError = fields)
+dput(withVisible(suppressWarnings(custom())))
+
+=== case: unlink_paths_in_list ===
+#@ tags: layer3,base,cran
+#@ compare: exact
+do_work <- function() {
+    paths <- list(one = tempfile(), two = tempfile())
+    on.exit(unlink(paths))
+    writeLines("one", paths$one)
+    writeLines("two", paths$two)
+    dput(file.exists(paths$one, paths$two))
+    paths
+}
+paths <- do_work()
+dput(file.exists(paths$one, paths$two))
+dput(withVisible(unlink(NULL)))
+
+=== case: error_option_stores_handler_calls ===
+#@ tags: layer3,base,cran
+#@ compare: exact
+run <- function() {
+    old <- options(error = function(...) 1)
+    on.exit(options(old))
+    dput(typeof(getOption("error")))
+    local({
+        previous <- do.call(options, list(error = function(...) 2))
+        on.exit(options(previous))
+        dput(eval(getOption("error")))
+    })
+    dput(eval(getOption("error")))
+    options(error = parse(text = "3L"))
+    dput(eval(getOption("error")))
+    dput(tryCatch(options(error = 4), error = conditionMessage))
+}
+run()
+
+=== case: source_exposes_eval_context_and_runs_exit_handlers ===
+#@ tags: layer3,base,cran
+#@ compare: exact
+f <- function() {
+    path <- tempfile()
+    on.exit(unlink(path))
+    out <- character()
+    register <- function() {
+        calls <- as.list(sys.calls())
+        frames <- as.list(sys.frames())
+        index <- length(calls) - 4L
+        dput(vapply(calls[index + 0:3], function(call) as.character(call[[1L]]), ""))
+        frame <- frames[[index]]
+        dput(identical(frame$envir, parent.frame()))
+        dput(deparse1(frame$ei))
+        cleanup <- function() out <<- c(out, "exit")
+        do.call(on.exit, list(as.call(list(cleanup)), TRUE), envir = frame)
+    }
+    writeLines(c("out <- c(out, 'begin')", "register()", "out <- c(out, 'end')"), path)
+    source(path, local = TRUE)
+    dput(out)
+}
+f()
+dput(source(exprs = list(quote(1L + 1L)))$value)

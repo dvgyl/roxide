@@ -24,6 +24,7 @@ pub(crate) const MODULE: Module = Module {
         internal("rox_sys_sleep", sys_sleep, 1, Visibility::Off),
         internal("rox_sys_pid", sys_pid, 0, Visibility::On),
         internal("rox_sys_locale", sys_locale, 0, Visibility::On),
+        internal("rox_sys_timezone", sys_timezone, 0, Visibility::On),
         internal("rox_sys_which", sys_which, 1, Visibility::On),
         internal("rox_isatty", isatty, 1, Visibility::On),
         internal("rox_interactive", interactive, 0, Visibility::On),
@@ -41,6 +42,16 @@ pub(crate) const MODULE: Module = Module {
     ],
     prelude: include_str!("tier_a.R"),
 };
+
+fn sys_timezone(ctx: &mut Ctx, _: &Call, _: &mut Args) -> EvalResult {
+    let path = ctx.host().canonicalize(Path::new("/etc/localtime")).ok();
+    let zone = path
+        .as_deref()
+        .and_then(Path::to_str)
+        .and_then(|path| path.split_once("/zoneinfo/"))
+        .map_or("UTC", |(_, zone)| zone);
+    Ok(ctx.session_mut().scalar_str(zone)?)
+}
 
 const fn internal(name: &'static str, fun: PrimFn, n: usize, visibility: Visibility) -> PrimDef {
     PrimDef {

@@ -113,7 +113,22 @@ pub const MODULE: Module = Module {
         group!("sin", summary::sin, Exact(1), Math),
         group!("cos", summary::cos, Exact(1), Math),
         group!("tan", summary::tan, Exact(1), Math),
-        primitive!("is.na", types::is_na),
+        primitive!(
+            "is.na",
+            types::is_na,
+            Eval,
+            Exact(1),
+            Dispatch::Internal("is.na"),
+            On
+        ),
+        primitive!(
+            "anyNA",
+            types::any_na,
+            Eval,
+            Range(1, 2),
+            Dispatch::Internal("anyNA"),
+            On
+        ),
         primitive!("is.nan", types::is_nan),
         primitive!("is.finite", types::is_finite),
         primitive!("is.infinite", types::is_infinite),
@@ -321,6 +336,9 @@ pub const MODULE: Module = Module {
         primitive!("c", types::combine, Eval, Any, Dispatch::Internal("c"), On),
     ],
     prelude: r#"
+anyNA.data.frame <- function(x, recursive = FALSE)
+    any(vapply(x, anyNA, FALSE))
+
 `colnames<-` <- function(x, value) {
     if (is.data.frame(x)) {
         names(x) <- value

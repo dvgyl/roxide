@@ -142,7 +142,7 @@ dir.create <- function(path, showWarnings = TRUE, recursive = FALSE, mode = "077
 file.create <- function(..., showWarnings = TRUE)
     .Internal(rox_io_file_create(c(...), showWarnings))
 unlink <- function(x, recursive = FALSE, force = FALSE, expand = TRUE)
-    .Internal(rox_io_unlink(x, recursive, expand))
+    .Internal(rox_io_unlink(as.character(x), recursive, expand))
 file.exists <- function(...) .Internal(rox_io_exists(c(...), FALSE))
 dir.exists <- function(paths) .Internal(rox_io_exists(paths, TRUE))
 file.info <- function(..., extra_cols = TRUE) .Internal(rox_io_file_info(c(...), extra_cols))

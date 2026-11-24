@@ -66,9 +66,22 @@ Sys.setlocale <- function(category = "LC_ALL", locale = "") {
     }
     current
 }
+.sys.timezone <- NA_character_
+lockBinding(".sys.timezone", baseenv())
+
 Sys.timezone <- function(location = TRUE) {
-    zone <- Sys.getenv("TZ", unset = "UTC")
-    if (nzchar(zone)) zone else "UTC"
+    if (!location) warning("Sys.timezone(location = FALSE) is defunct and ignored")
+    zone <- Sys.getenv("TZ")
+    if (nzchar(zone)) return(zone)
+    zone <- .sys.timezone
+    if (is.na(zone)) {
+        zone <- .Internal(rox_sys_timezone())
+        if (bindingIsLocked(".sys.timezone", baseenv()))
+            unlockBinding(".sys.timezone", baseenv())
+        assign(".sys.timezone", zone, envir = baseenv())
+        lockBinding(".sys.timezone", baseenv())
+    }
+    zone
 }
 l10n_info <- function() {
     locale <- .Internal(rox_sys_locale())
@@ -117,7 +130,8 @@ source <- function(file, local = FALSE, echo = verbose, print.eval = echo, exprs
                    max.deparse.length = 150L, width.cutoff = 60L, deparseCtrl = "showAttributes",
                    chdir = FALSE, encoding = getOption("encoding", "native.enc"), continue.echo = getOption("continue", "+ "),
                    skip.echo = 0L, keep.source = getOption("keep.source")) {
-    env <- if (is.environment(local)) local else if (isTRUE(local)) parent.frame() else globalenv()
+    envir <- if (is.environment(local)) local else if (isTRUE(local)) parent.frame() else
+        if (identical(local, FALSE)) globalenv() else stop("'local' must be TRUE, FALSE or an environment")
     useFile <- missing(exprs)
     if (useFile) {
         exprs <- parse(file = file, keep.source = keep.source, encoding = encoding)
@@ -134,7 +148,8 @@ source <- function(file, local = FALSE, echo = verbose, print.eval = echo, exprs
             cat(prompt.echo, lines[[1L]], "\n", sep = "")
             for (line in lines[-1L]) cat(continue.echo, line, "\n", sep = "")
         }
-        last <- withVisible(eval(exprs[[i]], env))
+        ei <- if (is.expression(exprs)) exprs[i] else exprs[[i]]
+        last <- withVisible(eval(ei, envir))
         if (print.eval && last$visible) print(last$value)
     }
     invisible(last)

@@ -19,6 +19,21 @@ set.seed <- function(seed, kind = NULL, normal.kind = NULL, sample.kind = NULL)
     .Internal(rox_set_seed(seed, kind, normal.kind, sample.kind))
 RNGkind <- function(kind = NULL, normal.kind = NULL, sample.kind = NULL)
     .Internal(rox_rng_kind(kind, normal.kind, sample.kind))
+RNGversion <- function(vstr) {
+    v <- as.integer(strsplit(as.character(vstr), ".", fixed = TRUE)[[1L]])
+    if (length(v) < 2L) stop("malformed version string")
+    before <- function(major, minor)
+        v[1L] < major || (v[1L] == major && v[2L] < minor)
+    if (before(0L, 99L)) {
+        RNGkind("Wichmann-Hill", "Buggy Kinderman-Ramage", "Rounding")
+    } else if (before(1L, 7L)) {
+        RNGkind("Marsaglia-Multicarry", "Buggy Kinderman-Ramage", "Rounding")
+    } else if (before(3L, 6L)) {
+        RNGkind("Mersenne-Twister", "Inversion", "Rounding")
+    } else {
+        RNGkind("Mersenne-Twister", "Inversion", "Rejection")
+    }
+}
 sample.int <- function(n, size = n, replace = FALSE, prob = NULL,
                        useHash = n > 10000000 && !replace && is.null(prob) && size <= n / 2) {
     if (length(n) != 1L) stop("length(n) == 1L is not TRUE")
@@ -132,6 +147,12 @@ impl Changes {
     fn parse(ctx: &mut Ctx, call: &Call, args: &[SexpId]) -> EvalResult<Self> {
         let uniform = match_kind(ctx, call, args[0], "kind", &UNIFORM)?;
         let normal = match_kind(ctx, call, args[1], "normal.kind", &NORMAL)?;
+        if normal == Some(NormalKind::BuggyKindermanRamage) {
+            ctx.warn_now(
+                call.err_call(),
+                "buggy version of Kinderman-Ramage generator used",
+            )?;
+        }
         let sample = match_kind(ctx, call, args[2], "sample.kind", &SAMPLE)?;
         if sample == Some(SampleKind::Rounding) {
             ctx.warn_now(call.err_call(), "non-uniform 'Rounding' sampler used")?;
@@ -154,12 +175,6 @@ impl Changes {
             ctx.warn_now(
                 call.err_call(),
                 "RNGkind: Marsaglia-Multicarry has poor statistical properties",
-            )?;
-        }
-        if self.normal == Some(NormalKind::BuggyKindermanRamage) {
-            ctx.warn_now(
-                call.err_call(),
-                "buggy version of Kinderman-Ramage generator used",
             )?;
         }
         if let Some(normal) = self.normal

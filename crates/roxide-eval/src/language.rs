@@ -325,7 +325,10 @@ fn quote(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
 }
 
 fn with_visible(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
-    let value = ctx.eval(args.get(0), call.env)?;
+    let env = ctx.session.alloc_env(BASE_ENV)?;
+    let frame = evaluation_frame(ctx, call, args, env);
+    let value = ctx.run_frame(frame, |ctx| ctx.eval(args.get(0), call.env))?;
+    ctx.protect(value);
     let visible = ctx.session.scalar_lgl(logical(ctx.visible))?;
     let value_tag = ctx.session.intern("value")?;
     let visible_tag = ctx.session.intern("visible")?;
@@ -601,6 +604,21 @@ fn match_call(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
 
 fn evaluate(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     let kind = ctx.prims[usize::from(call.prim.0)].name;
+    if kind == "local" {
+        return evaluate_in_frame(ctx, call, args, kind, call.env);
+    }
+    let env = ctx.session.alloc_env(BASE_ENV)?;
+    let frame = evaluation_frame(ctx, call, args, env);
+    ctx.run_frame(frame, |ctx| evaluate_in_frame(ctx, call, args, kind, env))
+}
+
+fn evaluate_in_frame(
+    ctx: &mut Ctx,
+    call: &Call,
+    args: &Args,
+    kind: &str,
+    caller: SexpId,
+) -> EvalResult {
     let mut names = vec!["expr", "envir"];
     if kind != "local" {
         names.push("enclos");
@@ -634,18 +652,8 @@ fn evaluate(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
         _ => ctx.require_env(env, call.err_call())?,
     };
     ctx.protect(env);
-    let id = ctx.next_frame();
-    let frame = Frame {
-        id,
-        cloenv: env,
-        call: call.expr,
-        on_exit: Vec::new(),
-        fun: SEXP_NIL,
-        caller: call.env,
-        actuals: args.clone(),
-        supplied: Vec::new(),
-        dispatch: None,
-    };
+    let mut frame = evaluation_frame(ctx, call, args, env);
+    frame.caller = caller;
     ctx.run_frame(frame, |ctx| {
         if ctx.session.type_of(expr)? == SexpType::Expr {
             let mut value = SEXP_NIL;
@@ -657,6 +665,20 @@ fn evaluate(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
             ctx.eval(expr, env)
         }
     })
+}
+
+fn evaluation_frame(ctx: &mut Ctx, call: &Call, args: &Args, env: SexpId) -> Frame {
+    Frame {
+        id: ctx.next_frame(),
+        cloenv: env,
+        call: call.expr,
+        on_exit: Vec::new(),
+        fun: SEXP_NIL,
+        caller: call.env,
+        actuals: args.clone(),
+        supplied: Vec::new(),
+        dispatch: None,
+    }
 }
 
 fn parse(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
@@ -938,6 +960,7 @@ fn function_parts(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
             "seq.int" => &["from", "to", "by", "length.out", "along.with", "..."],
             "log" => &["x", "base"],
             "round" | "signif" => &["x", "digits", "..."],
+            "anyNA" => &["x", "recursive"],
             "length" | "sqrt" | "abs" | "sin" | "cos" | "tan" | "exp" | "is.null" | "is.na"
             | "names" | "is.finite" | "is.infinite" => &["x"],
             _ => return Ok(SEXP_NIL),
@@ -945,7 +968,7 @@ fn function_parts(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
         let mut pairs = Vec::with_capacity(signature.len());
         for &name in signature {
             let default = match name {
-                "na.rm" => roxide_value::FALSE_SCALAR,
+                "na.rm" | "recursive" => roxide_value::FALSE_SCALAR,
                 "base" => {
                     let head = ctx.session.intern("exp")?.as_sexp();
                     let value = ctx.session.scalar_real(1.0)?;

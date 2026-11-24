@@ -174,7 +174,7 @@ fn fields(
                 }
             })
             .collect(),
-        SexpType::Env => return Ok(vec![Some("<environment>".to_owned())]),
+        SexpType::Env => return Ok(vec![Some(ctx.environment_label(x)?)]),
         SexpType::Sym => return Ok(vec![Some(s.sym_name_of(x)?.to_owned())]),
         SexpType::Nil => return Ok(vec![Some("NULL".to_owned())]),
         SexpType::Lang | SexpType::Expr | SexpType::Clo => {

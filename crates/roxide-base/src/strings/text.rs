@@ -378,6 +378,9 @@ fn slice(
     let s = ctx.session_mut();
     let chars = character(s, x)?;
     if chars.is_empty() {
+        if s.type_of(x)? == SexpType::Str {
+            return Ok(x);
+        }
         return Ok(s.alloc_str_from(&[])?);
     }
     let (first, _) = s.coerce(first, SexpType::Int)?;

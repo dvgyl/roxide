@@ -82,6 +82,107 @@ macro_rules! missing_test {
 
 missing_test!(is_na:Na, is_nan:Nan, is_finite:Finite, is_infinite:Infinite);
 
+pub(super) fn any_na(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    let [x, recursive] = formals(ctx.session(), args, ["x", "recursive"]);
+    let s = ctx.session();
+    let recurse =
+        if recursive != SEXP_MISSING && matches!(s.type_of(x)?, Vec | List) && !s.is_object(x)? {
+            let len = s.xlength(recursive)?;
+            if len > 1 {
+                return Err(error(
+                    ctx,
+                    call,
+                    format!("'length = {len}' in coercion to 'logical(1)'"),
+                ));
+            }
+            let (value, _) = ctx.session_mut().coerce(recursive, Lgl)?;
+            let flag = ctx
+                .session()
+                .lgl(value)?
+                .iter()
+                .next()
+                .and_then(RLogical::get);
+            flag.ok_or_else(|| error(ctx, call, "NA in coercion to boolean"))?
+        } else {
+            false
+        };
+    let limit = ctx
+        .opts()
+        .expressions
+        .min((ctx.stack_budget() / 4096).max(1));
+    let found = any_na_value(ctx, call, x, recurse, limit)?;
+    Ok(ctx
+        .session_mut()
+        .scalar_lgl(RLogical::from_option(Some(found)))?)
+}
+
+fn any_na_value(
+    ctx: &mut Ctx,
+    call: &Call,
+    x: SexpId,
+    recursive: bool,
+    remaining: usize,
+) -> EvalResult<bool> {
+    let s = ctx.session();
+    let ty = s.type_of(x)?;
+    if s.is_object(x)? {
+        let result = ctx.call_function("is.na", &[(None, x)], call.env)?;
+        return Ok(ctx
+            .session()
+            .lgl(result)?
+            .iter()
+            .any(|v| v.get() == Some(true)));
+    }
+    match ty {
+        Nil | Raw => Ok(false),
+        ty if atomic(ty) => {
+            for i in 0..s.xlength(x)? {
+                if test_at(s, x, i, MissingTest::Na)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        Vec | List => {
+            if remaining == 0 {
+                return Err(error(ctx, call, "evaluation nested too deeply"));
+            }
+            let mut tail = x;
+            for i in 0..ctx.session().xlength(x)? {
+                let value = if ty == List {
+                    let (value, next, _) = ctx.session().cons_parts(tail)?;
+                    tail = next;
+                    value
+                } else {
+                    ctx.session().list_get(x, i)?
+                };
+                if recursive {
+                    if any_na_value(ctx, call, value, recursive, remaining - 1)? {
+                        return Ok(true);
+                    }
+                } else {
+                    let s = ctx.session();
+                    if atomic(s.type_of(value)?)
+                        && s.xlength(value)? == 1
+                        && test_at(s, value, 0, MissingTest::Na)?
+                    {
+                        return Ok(true);
+                    }
+                }
+            }
+            Ok(false)
+        }
+        _ => Err(error(
+            ctx,
+            call,
+            format!(
+                "anyNA() applied to non-(list or vector) of type '{}'",
+                ty.type_name(false)
+            ),
+        )),
+    }
+}
+
 fn missing(ctx: &mut Ctx, call: &Call, x: SexpId, op: MissingTest) -> EvalResult {
     let s = ctx.session_mut();
     let ty = s.type_of(x)?;

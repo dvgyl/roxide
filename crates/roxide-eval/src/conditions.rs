@@ -115,6 +115,29 @@ suppressMessages <- function(expr, classes = "message") {
     })
 }
 suppressPackageStartupMessages <- function(expr) suppressMessages(expr, "packageStartupMessage")
+.obsoleteMessage <- function(old, new, package, kind, topic) {
+    msg <- paste0("'", old, "' is ", kind, ".")
+    if (!is.null(new)) msg <- paste0(msg, "\nUse '", new, "' instead.")
+    msg <- paste0(msg, "\nSee help(\"", topic, "\")")
+    if (!is.null(package))
+        msg <- paste0(msg, " and help(\"", package, "-", kind, "\").")
+    msg
+}
+.Deprecated <- function(new, package = NULL, msg, old = as.character(sys.call(sys.parent()))[1L]) {
+    if (missing(new)) new <- NULL
+    if (missing(msg)) msg <- .obsoleteMessage(old, new, package, "deprecated", "Deprecated")
+    warning(warningCondition(msg, old = old, new = new, package = package,
+                             class = "deprecatedWarning", call = sys.call(sys.parent())))
+    invisible(msg)
+}
+.Defunct <- function(new, package = NULL, msg) {
+    if (missing(new)) new <- NULL
+    call <- sys.call(sys.parent())
+    old <- as.character(call)[1L]
+    if (missing(msg)) msg <- .obsoleteMessage(old, new, package, "defunct", "Defunct")
+    stop(errorCondition(msg, old = old, new = new, package = package,
+                        class = "defunctError", call = call))
+}
 print.condition <- function(x, ...) {
     msg <- conditionMessage(x)
     call <- conditionCall(x)
@@ -488,6 +511,17 @@ impl Ctx {
     fn set_option(&mut self, name: &str, value: SexpId, call: &Call) -> EvalResult {
         let old = self.option_value(name)?.unwrap_or(SEXP_NIL);
         self.protect(old);
+        let value = if name == "error" {
+            match self.session.type_of(value)? {
+                SexpType::Clo | SexpType::Builtin | SexpType::Special => {
+                    self.make_call(value, &Args::from_pairs(Vec::new()))?
+                }
+                SexpType::Nil | SexpType::Lang | SexpType::Expr => value,
+                _ => return Err(self.stop(call.err_call(), "invalid value for 'error'")),
+            }
+        } else {
+            value
+        };
         match name {
             "digits" => self.opts.digits = self.option_int(name, value, 1, 22, call)? as usize,
             "scipen" => self.opts.scipen = self.option_int(name, value, -999, 999, call)?,
