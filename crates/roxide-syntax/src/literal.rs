@@ -161,7 +161,6 @@ pub(crate) fn decode_escaped(
     let mut out = Vec::with_capacity(inner.len());
     let mut has_unicode_escape = false;
     let mut has_byte_escape = false;
-    let mut has_high_hex = false;
     let bytes = inner.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
@@ -265,9 +264,6 @@ pub(crate) fn decode_escaped(
                         span,
                     });
                 }
-                if val >= 0x80 {
-                    has_high_hex = true;
-                }
                 out.push(val);
             }
             b'u' | b'U' => {
@@ -338,9 +334,6 @@ pub(crate) fn decode_escaped(
                         span,
                     });
                 }
-                if val >= 0x80 {
-                    has_high_hex = true;
-                }
                 out.push(val as u8);
             }
             other => {
@@ -359,12 +352,10 @@ pub(crate) fn decode_escaped(
             span,
         });
     }
-    let enc = if has_high_hex {
-        StrEncoding::Bytes
-    } else if has_unicode_escape || !out.is_ascii() {
-        StrEncoding::Utf8
-    } else {
+    let enc = if has_byte_escape || out.is_ascii() {
         StrEncoding::Native
+    } else {
+        StrEncoding::Utf8
     };
     Ok((out.into_boxed_slice(), enc))
 }

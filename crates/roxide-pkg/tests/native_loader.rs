@@ -108,6 +108,61 @@ fn binds_symbols_before_on_load_and_unloads_the_dll() -> EvalResult<()> {
 }
 
 #[test]
+fn binds_repeated_use_dynlib_directives_from_source_and_cache() -> EvalResult<()> {
+    let namespace = r#"
+useDynLib(primary = nativepkg, explicit = lookup)
+useDynLib(secondary = nativepkg, dynamic, .fixes = "X_")
+useDynLib(nativepkg, .registration = TRUE, .fixes = "Old_")
+useDynLib(nativepkg, .registration = TRUE, .fixes = c("C_", "_end"))
+"#;
+    let legacy_cache = r#"
+list(dynlibs = c(primary = "nativepkg", secondary = "nativepkg", "nativepkg", "nativepkg"),
+     nativeRoutines = list(
+         nativepkg = list(useRegistration = FALSE, symbolNames = c(explicit = "lookup")),
+         nativepkg = list(useRegistration = FALSE, symbolNames = c(X_dynamic = "dynamic")),
+         nativepkg = list(useRegistration = TRUE, registrationFixes = c("Old_", "")),
+         nativepkg = list(useRegistration = TRUE, registrationFixes = c("C_", "_end"))))
+"#;
+    for cache in [None, Some("spec"), Some(legacy_cache)] {
+        let mut ctx = context(
+            namespace,
+            Some(&valid_stamp()),
+            r#"
+.onLoad <- function(lib, pkg) {
+    stopifnot(identical(explicit$name, "lookup"),
+              identical(X_dynamic$name, "dynamic"),
+              identical(C_registered_end$name, "registered"),
+              identical(getNamespaceInfo(pkg, "DLLs"), list(primary = primary)))
+}
+"#,
+        )?;
+        ctx.run_global(
+            "metadata",
+            r#"
+spec <- parseNamespaceFile("nativepkg", "/library")
+stopifnot(identical(spec$dynlibs, c(primary = "nativepkg")),
+          identical(spec$nativeRoutines$nativepkg$symbolNames,
+                    c(explicit = "lookup", X_dynamic = "dynamic")))
+"#,
+        )?;
+        if let Some(cache) = cache {
+            ctx.run_global(
+                "cache",
+                &format!(
+                    r#"
+saveRDS({cache}, "/library/nativepkg/Meta/nsInfo.rds", compress = FALSE)
+writeLines("unsupported()", "/library/nativepkg/NAMESPACE")
+"#
+                ),
+            )?;
+        }
+        ctx.run_global("load", "loadNamespace('nativepkg')")?;
+        assert_eq!(ctx.ext::<Loaded>().0.len(), 1);
+    }
+    Ok(())
+}
+
+#[test]
 fn rolls_back_the_dll_if_namespace_loading_fails() -> EvalResult<()> {
     let mut ctx = context("useDynLib(nativepkg)", Some(&valid_stamp()), ON_LOAD)?;
     ctx.run_global(

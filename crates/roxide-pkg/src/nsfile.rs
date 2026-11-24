@@ -39,8 +39,16 @@ struct DynLib {
     name: String,
     alias: String,
     symbols: Mappings,
-    registration: bool,
-    fixes: [String; 2],
+    registration_fixes: Option<[String; 2]>,
+}
+
+impl DynLib {
+    fn merge_routines(&mut self, symbols: Mappings, registration_fixes: Option<[String; 2]>) {
+        self.symbols.extend(symbols);
+        if registration_fixes.is_some() {
+            self.registration_fixes = registration_fixes;
+        }
+    }
 }
 
 /// Parsed directives from a NAMESPACE file.
@@ -215,7 +223,14 @@ impl NsSpec {
                     self.s3.push(entry);
                 }
             }
-            "useDynLib" => self.dynlibs.push(dynlib(ctx, ast, args, env)?),
+            "useDynLib" => {
+                let lib = dynlib(ctx, ast, args, env)?;
+                if let Some(existing) = self.dynlibs.iter_mut().find(|item| item.name == lib.name) {
+                    existing.merge_routines(lib.symbols, lib.registration_fixes);
+                } else {
+                    self.dynlibs.push(lib);
+                }
+            }
             _ => {
                 let directive = node_name(ctx, ast, node)?;
                 return Err(ctx.stop(
@@ -317,7 +332,7 @@ impl NsSpec {
         let mut keys = Vec::new();
         let mut routines = Vec::new();
         for lib in &self.dynlibs {
-            if lib.symbols.is_empty() && !lib.registration {
+            if lib.symbols.is_empty() && lib.registration_fixes.is_none() {
                 continue;
             }
             let symbols = mappings_value(
@@ -327,7 +342,7 @@ impl NsSpec {
                     .map(|(tag, name)| (tag.as_str(), name.as_str())),
             )?;
             let mut elements = vec![
-                if lib.registration {
+                if lib.registration_fixes.is_some() {
                     TRUE_SCALAR
                 } else {
                     FALSE_SCALAR
@@ -335,8 +350,8 @@ impl NsSpec {
                 symbols,
             ];
             let mut fields = vec!["useRegistration", "symbolNames"];
-            if lib.registration {
-                elements.push(strings(ctx, lib.fixes.iter().map(String::as_str))?);
+            if let Some(fixes) = &lib.registration_fixes {
+                elements.push(strings(ctx, fixes.iter().map(String::as_str))?);
                 fields.push("registrationFixes");
             }
             let map = list(ctx, &elements)?;
@@ -508,15 +523,16 @@ fn dynlib(ctx: &mut Ctx, ast: &Ast, args: &[Arg], env: SexpId) -> EvalResult<Dyn
         name,
         alias: tag(lib).to_owned(),
         symbols: Vec::new(),
-        registration: false,
-        fixes: [String::new(), String::new()],
+        registration_fixes: None,
     };
+    let mut registration = false;
+    let mut fixes = [String::new(), String::new()];
     for arg in args {
         let node = arg_node(ctx, arg)?;
         match tag(arg) {
             ".registration" => {
                 let value = eval_condition(ctx, ast, node, env)?;
-                result.registration = flag(ctx, value)?;
+                registration = flag(ctx, value)?;
             }
             ".fixes" => {
                 let value = eval_condition(ctx, ast, node, env)?;
@@ -524,7 +540,7 @@ fn dynlib(ctx: &mut Ctx, ast: &Ast, args: &[Arg], env: SexpId) -> EvalResult<Dyn
                 if !(1..=2).contains(&items.len()) {
                     return Err(ctx.stop(roxide_value::SEXP_NIL, "invalid '.fixes' in 'useDynLib'"));
                 }
-                for (target, item) in result.fixes.iter_mut().zip(items) {
+                for (target, item) in fixes.iter_mut().zip(items) {
                     *target = item;
                 }
             }
@@ -539,15 +555,17 @@ fn dynlib(ctx: &mut Ctx, ast: &Ast, args: &[Arg], env: SexpId) -> EvalResult<Dyn
             }
         }
     }
-    if !result.registration {
-        if result.symbols.is_empty() && result.fixes.iter().any(|fix| !fix.is_empty()) {
+    if registration {
+        result.registration_fixes = Some(fixes);
+    } else {
+        if result.symbols.is_empty() && fixes.iter().any(|fix| !fix.is_empty()) {
             return Err(ctx.stop(
                 roxide_value::SEXP_NIL,
                 "'names' attribute [1] must be the same length as the vector [0]",
             ));
         }
         for (alias, _) in &mut result.symbols {
-            *alias = format!("{}{alias}{}", result.fixes[0], result.fixes[1]);
+            *alias = format!("{}{alias}{}", fixes[0], fixes[1]);
         }
     }
     Ok(result)
@@ -649,27 +667,45 @@ impl NsSpec {
             }
             let libs = field(ctx, cache, "dynlibs")?.unwrap_or(roxide_value::SEXP_NIL);
             let natives = field(ctx, cache, "nativeRoutines")?.unwrap_or(roxide_value::SEXP_NIL);
-            let mut dynlibs = Vec::new();
+            let mut dynlibs: Vec<DynLib> = Vec::new();
             for (alias, name) in value_mappings(ctx, libs)? {
-                let mut lib = DynLib {
-                    name: name.clone(),
+                if dynlibs.iter().any(|lib| lib.name == name) {
+                    continue;
+                }
+                dynlibs.push(DynLib {
+                    name,
                     alias,
                     symbols: Vec::new(),
-                    registration: false,
-                    fixes: [String::new(), String::new()],
-                };
-                if let Some(map) = field(ctx, natives, &name)? {
-                    if let Some(value) = field(ctx, map, "useRegistration")? {
-                        lib.registration = flag(ctx, value)?;
-                    }
-                    lib.symbols = cache_mappings(ctx, map, "symbolNames")?;
-                    if let Some(value) = field(ctx, map, "registrationFixes")? {
-                        for (fix, part) in lib.fixes.iter_mut().zip(chars(ctx, value)?) {
+                    registration_fixes: None,
+                });
+            }
+            let labels = attr(ctx, natives, "names")?;
+            if labels != roxide_value::SEXP_NIL {
+                for (index, label) in names(ctx, labels)?.into_iter().enumerate() {
+                    let Some(lib) = dynlibs
+                        .iter_mut()
+                        .find(|lib| Some(lib.name.as_str()) == label.as_deref())
+                    else {
+                        continue;
+                    };
+                    let map = ctx.session().list_get(natives, index)?;
+                    let registration = match field(ctx, map, "useRegistration")? {
+                        Some(value) => flag(ctx, value)?,
+                        None => false,
+                    };
+                    let fixes = if registration {
+                        let mut fixes = [String::new(), String::new()];
+                        let value =
+                            field(ctx, map, "registrationFixes")?.unwrap_or(roxide_value::SEXP_NIL);
+                        for (fix, part) in fixes.iter_mut().zip(chars(ctx, value)?) {
                             *fix = part;
                         }
-                    }
+                        Some(fixes)
+                    } else {
+                        None
+                    };
+                    lib.merge_routines(cache_mappings(ctx, map, "symbolNames")?, fixes);
                 }
-                dynlibs.push(lib);
             }
             Ok(Self {
                 exports,

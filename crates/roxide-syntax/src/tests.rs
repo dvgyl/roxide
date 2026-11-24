@@ -2,6 +2,34 @@ use roxide_diag::{SourceMap, SrcFileId};
 
 use crate::{Arg, ArgName, Ast, Const, Node, NodeId, ParseStep, Parser, StrEncoding, ops};
 
+#[test]
+fn string_escape_encoding_preserves_native_bytes() {
+    for (source, bytes, enc) in [
+        (r#""\xc3\xa9""#, &b"\xc3\xa9"[..], StrEncoding::Native),
+        (r#""\xe9""#, &b"\xe9"[..], StrEncoding::Native),
+        (r#""abc\xc3\xa9""#, &b"abc\xc3\xa9"[..], StrEncoding::Native),
+        (r#""\303\251""#, &b"\xc3\xa9"[..], StrEncoding::Native),
+        (r#""\351""#, &b"\xe9"[..], StrEncoding::Native),
+        (r#""é\x21""#, "é!".as_bytes(), StrEncoding::Native),
+        (r#""é\41""#, "é!".as_bytes(), StrEncoding::Native),
+        (r#""\u00e9""#, "é".as_bytes(), StrEncoding::Utf8),
+        (r#""\U0001f600""#, "😀".as_bytes(), StrEncoding::Utf8),
+        (r#""\u0041""#, &b"A"[..], StrEncoding::Native),
+        (r#""é""#, "é".as_bytes(), StrEncoding::Utf8),
+    ] {
+        let mut parser = Parser::new(source, SrcFileId(0));
+        let nodes = parser.parse_all().unwrap();
+        assert_eq!(
+            parser.ast().node(nodes[0]),
+            &Node::Const(Const::Str {
+                bytes: bytes.into(),
+                enc,
+            }),
+            "{source}"
+        );
+    }
+}
+
 fn shape(ast: &Ast, id: NodeId) -> String {
     match ast.node(id) {
         Node::Sym(symbol) => symbol.to_string(),
@@ -469,7 +497,7 @@ fn distinguishes_literals_and_reports_integer_warnings() {
     let mut parser = Parser::new(r#" "\xFF"; "\u00e5"; r'(å)' "#, SrcFileId(0));
     let nodes = parser.parse_all().unwrap();
     for (&node, (expected, enc)) in nodes.iter().zip([
-        (&[255][..], StrEncoding::Bytes),
+        (&[255][..], StrEncoding::Native),
         ("å".as_bytes(), StrEncoding::Utf8),
         ("å".as_bytes(), StrEncoding::Utf8),
     ]) {
