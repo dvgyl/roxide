@@ -1,7 +1,7 @@
 //! Own loaded libraries and the R objects that refer to them.
 
 use std::collections::HashMap;
-use std::ffi::{CStr, c_char, c_int, c_void};
+use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -25,8 +25,15 @@ static OWNERS: Mutex<Owners> = Mutex::new(Owners {
 
 struct Owners {
     session: Weak<()>,
-    images: Vec<(PathBuf, u32)>,
+    images: Vec<OwnedImage>,
 }
+
+struct OwnedImage {
+    path: PathBuf,
+    id: u32,
+    poisoned: bool,
+}
+
 const LIBR: &str = if cfg!(target_os = "macos") {
     "libR.dylib"
 } else {
@@ -116,13 +123,22 @@ struct ImageOwner {
     id: u32,
 }
 
+impl ImageOwner {
+    fn poison(&self) {
+        let mut owners = OWNERS.lock().unwrap_or_else(|err| err.into_inner());
+        if let Some(image) = owners.images.iter_mut().find(|image| image.id == self.id) {
+            image.poisoned = true;
+        }
+    }
+}
+
 impl Drop for ImageOwner {
     fn drop(&mut self) {
         OWNERS
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .images
-            .retain(|(_, id)| *id != self.id);
+            .retain(|image| image.id != self.id || image.poisoned);
     }
 }
 
@@ -286,8 +302,12 @@ struct DlAddr {
     address: *mut c_void,
 }
 
+#[cfg_attr(any(target_os = "linux", target_os = "android"), link(name = "dl"))]
 unsafe extern "C" {
     fn dladdr(address: *const c_void, info: *mut DlAddr) -> c_int;
+    fn dlopen(path: *const c_char, flags: c_int) -> *mut c_void;
+    fn dlclose(handle: *mut c_void) -> c_int;
+    fn dlerror() -> *mut c_char;
 }
 
 fn image_path(address: usize) -> Option<PathBuf> {
@@ -319,8 +339,8 @@ fn image_owner(address: usize) -> Option<u32> {
         .unwrap_or_else(|e| e.into_inner())
         .images
         .iter()
-        .find(|(owner, _)| *owner == path)
-        .map(|(_, id)| *id)
+        .find(|image| image.path == path)
+        .map(|image| image.id)
 }
 
 pub(crate) fn code_owner(ctx: &mut Ctx, address: usize, owner: u32) -> u32 {
@@ -477,40 +497,112 @@ fn validate_image(ctx: &mut Ctx, path: &Path, call: SexpId) -> EvalResult<()> {
     .map_err(|err| load_error(ctx, call, path, err))
 }
 
-struct OpenImage<'a> {
-    path: &'a Path,
+struct LoaderError([u8; 512]);
+
+impl LoaderError {
+    fn capture(&mut self) {
+        // SAFETY: dlerror returns a thread-local C string or NULL. Copy it
+        // before the next loader call can replace it.
+        unsafe {
+            let mut message = dlerror().cast::<u8>();
+            if !message.is_null() {
+                for byte in &mut self.0 {
+                    *byte = message.read();
+                    if *byte == 0 {
+                        break;
+                    }
+                    message = message.add(1);
+                }
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for LoaderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let end = self
+            .0
+            .iter()
+            .position(|&byte| byte == 0)
+            .unwrap_or(self.0.len());
+        if end == 0 {
+            f.write_str("native loader returned no error message")
+        } else {
+            f.write_str(&String::from_utf8_lossy(&self.0[..end]))
+        }
+    }
+}
+
+struct OpenImage {
+    path: *const c_char,
     flags: c_int,
-    result: Option<Result<Library, libloading::Error>>,
+    handle: *mut c_void,
+    error: LoaderError,
+}
+
+struct CloseImage {
+    handle: *mut c_void,
+    status: c_int,
+    error: LoaderError,
 }
 
 unsafe extern "C" fn open_image(data: *mut c_void) {
-    // SAFETY: load keeps the descriptor live while the trampoline runs the loader.
-    let data = unsafe { &mut *data.cast::<OpenImage<'_>>() };
-    // SAFETY: The caller requested native code execution and validated the dependencies.
-    // Loader callbacks must return normally while the OS loader holds its internal locks.
-    data.result = Some(unsafe { Library::open(Some(data.path), data.flags) });
+    // SAFETY: load supplies a live descriptor and validates the library.
+    // A constructor can jump past this frame, so it owns no values with Drop.
+    unsafe {
+        let data = &mut *data.cast::<OpenImage>();
+        data.handle = dlopen(data.path, data.flags);
+        if data.handle.is_null() {
+            data.error.capture();
+        }
+    }
 }
 
 unsafe extern "C" fn close_image(data: *mut c_void) {
-    // SAFETY: close keeps the descriptor live while the trampoline runs the loader.
-    let library = unsafe { &mut *data.cast::<Option<Library>>() };
-    drop(library.take());
+    // SAFETY: close supplies a live descriptor and transfers one loader reference.
+    // A destructor can jump past this frame, so it owns no values with Drop.
+    unsafe {
+        let data = &mut *data.cast::<CloseImage>();
+        data.status = dlclose(data.handle);
+        if data.status != 0 {
+            data.error.capture();
+        }
+    }
 }
 
 fn close(ctx: &mut Ctx, image: Image) -> EvalResult<()> {
     let Image { library, owner } = image;
-    let mut library = Some(library);
-    with_owner(ctx, owner.id, |ctx| {
+    let mut data = CloseImage {
+        handle: library.into_raw(),
+        status: 0,
+        error: LoaderError([0; 512]),
+    };
+    let closed = with_owner(ctx, owner.id, |ctx| {
         // SAFETY: close_image only accesses this descriptor during the trampoline call.
         unsafe {
             enter_trampoline_with(
                 ctx,
                 FrameKind::Entry { label: "dlclose" },
                 close_image,
-                std::ptr::from_mut(&mut library).cast(),
+                std::ptr::from_mut(&mut data).cast(),
             )
         }
-    })
+    });
+    if closed.is_err() || data.status != 0 {
+        owner.poison();
+    }
+    closed?;
+    if data.status != 0 {
+        return Err(ctx.stop(
+            SEXP_NIL,
+            format!(
+                "unable to close shared object '{}':\n  {}",
+                owner.path.display(),
+                data.error
+            ),
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn load(ctx: &mut Ctx, path: &Path, local: bool, now: bool, call: SexpId) -> EvalResult {
@@ -518,6 +610,8 @@ pub(crate) fn load(ctx: &mut Ctx, path: &Path, local: bool, now: bool, call: Sex
         .host()
         .canonicalize(path)
         .map_err(|err| load_error(ctx, call, path, err))?;
+    let c_path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|err| load_error(ctx, call, &path, err))?;
     validate_image(ctx, &path, call)?;
     if ctx.ext::<Registry>().by_path(&path).is_some() {
         unload(ctx, &path, call)?;
@@ -538,17 +632,21 @@ pub(crate) fn load(ctx: &mut Ctx, path: &Path, local: bool, now: bool, call: Sex
             drop(owners);
             return Err(ctx.stop(call, "another R session owns native library loading"));
         }
-        if owners.images.iter().any(|(image, _)| *image == path) {
+        if let Some(image) = owners.images.iter().find(|image| image.path == path) {
+            let reason = if image.poisoned {
+                "shared library is poisoned after an interrupted or failed loader call"
+            } else {
+                "shared library is already loading or closing"
+            };
             drop(owners);
-            return Err(load_error(
-                ctx,
-                call,
-                &path,
-                "shared library is already loading or closing",
-            ));
+            return Err(load_error(ctx, call, &path, reason));
         }
         owners.session = session;
-        owners.images.push((path.clone(), id));
+        owners.images.push(OwnedImage {
+            path: path.clone(),
+            id,
+            poisoned: false,
+        });
         ImageOwner { path, id }
     };
     let flags =
@@ -558,9 +656,10 @@ pub(crate) fn load(ctx: &mut Ctx, path: &Path, local: bool, now: bool, call: Sex
     let handle = dll.handle().addr();
     ctx.ext::<Registry>().dlls.push(dll);
     let mut data = OpenImage {
-        path: &owner.path,
+        path: c_path.as_ptr(),
         flags,
-        result: None,
+        handle: std::ptr::null_mut(),
+        error: LoaderError([0; 512]),
     };
     let loaded = with_owner(ctx, id, |ctx| {
         // SAFETY: open_image only accesses this descriptor during the trampoline call.
@@ -570,19 +669,24 @@ pub(crate) fn load(ctx: &mut Ctx, path: &Path, local: bool, now: bool, call: Sex
                 FrameKind::Entry { label: "dlopen" },
                 open_image,
                 std::ptr::from_mut(&mut data).cast(),
-            )?;
+            )
         }
-        data.result
-            .take()
-            .ok_or_else(|| load_error(ctx, call, data.path, "loader returned no result"))?
-            .map_err(|err| load_error(ctx, call, data.path, err))
     });
-    let initialized = loaded.and_then(|library| {
-        let dll = ctx.ext::<Registry>().get(id).ok_or_else(|| {
-            roxide_eval::Unwind::Internal(roxide_eval::InternalError {
+    if loaded.is_err() {
+        owner.poison();
+    }
+    let initialized = loaded.and_then(|()| {
+        if data.handle.is_null() {
+            return Err(load_error(ctx, call, &owner.path, data.error));
+        }
+        let Some(dll) = ctx.ext::<Registry>().get(id) else {
+            owner.poison();
+            return Err(roxide_eval::Unwind::Internal(roxide_eval::InternalError {
                 message: "missing DLL registry entry".into(),
-            })
-        })?;
+            }));
+        };
+        // SAFETY: dlopen returned a non-null handle and transferred one reference.
+        let library = unsafe { Library::from_raw(data.handle) };
         dll.image = Some(Image { library, owner });
         if let Some(init) = dll.entry("R_init") {
             with_owner(ctx, id, |ctx| {

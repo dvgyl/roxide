@@ -2,6 +2,7 @@
 
 //! Check shared-library dependencies before loading a native image.
 
+use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fmt;
 use std::io::{self, Read, Seek, SeekFrom};
@@ -14,6 +15,8 @@ const CPU: u32 = if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
     0x0100_000c
 };
 const MAX_METADATA_SIZE: u64 = 16 * 1024 * 1024;
+const MAX_IMAGE_READ: u64 = 32 * 1024 * 1024;
+const MAX_CPU_SLICES: usize = 8;
 
 #[derive(Debug)]
 pub(crate) enum Error {
@@ -43,7 +46,11 @@ pub(crate) fn check(
     canonicalize: impl Fn(&Path) -> Option<PathBuf>,
 ) -> Result<(), Error> {
     let image = Region { offset: 0, len };
-    let magic = image.part(0, 4)?.read(file)?;
+    let mut reader = ImageReader {
+        file,
+        remaining: MAX_IMAGE_READ,
+    };
+    let magic = image.part(0, 4)?.read(&mut reader)?;
     let elf_image = magic == b"\x7fELF";
     let dependency = |name: &[u8]| {
         let base = name.rsplit(|b| *b == b'/').next().unwrap_or(name);
@@ -70,13 +77,18 @@ pub(crate) fn check(
         Ok(())
     };
     if elf_image {
-        elf(file, image, dependency)
+        elf(&mut reader, image, dependency)
     } else {
-        mach_image(file, image, &magic, dependency)
+        mach_image(&mut reader, image, &magic, dependency)
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+struct ImageReader<R> {
+    file: R,
+    remaining: u64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct Region {
     offset: u64,
     len: u64,
@@ -93,14 +105,17 @@ impl Region {
         })
     }
 
-    fn read(self, file: &mut (impl Read + Seek)) -> Result<Vec<u8>, Error> {
-        if self.len > MAX_METADATA_SIZE {
+    fn read(self, reader: &mut ImageReader<impl Read + Seek>) -> Result<Vec<u8>, Error> {
+        if self.len > MAX_METADATA_SIZE || self.len > reader.remaining {
             return Err(Error::Invalid);
         }
+        reader.remaining -= self.len;
         let mut bytes = vec![0; self.len as usize];
-        file.seek(SeekFrom::Start(self.offset))
+        reader
+            .file
+            .seek(SeekFrom::Start(self.offset))
             .map_err(Error::Read)?;
-        file.read_exact(&mut bytes).map_err(Error::Read)?;
+        reader.file.read_exact(&mut bytes).map_err(Error::Read)?;
         Ok(bytes)
     }
 }
@@ -150,7 +165,7 @@ fn c_string(bytes: &[u8], offset: usize) -> Result<&[u8], Error> {
 }
 
 fn mach_image(
-    file: &mut (impl Read + Seek),
+    file: &mut ImageReader<impl Read + Seek>,
     image: Region,
     magic: &[u8],
     dependency: impl Fn(&[u8]) -> Result<(), Error>,
@@ -166,7 +181,8 @@ fn mach_image(
     let count = u64::from(Words { bytes: &count, le }.u32(0)?);
     let stride = if wide { 32 } else { 20 };
     let table = image.part(8, count * stride)?.read(file)?;
-    let mut found = false;
+    let mut regions = HashSet::new();
+    let mut matching = Vec::new();
     for entry in table.chunks_exact(stride as usize) {
         let entry = Words { bytes: entry, le };
         let (start, size) = if wide {
@@ -175,19 +191,27 @@ fn mach_image(
             (u64::from(entry.u32(8)?), u64::from(entry.u32(12)?))
         };
         let slice = image.part(start, size)?;
+        if !regions.insert(slice) {
+            return Err(Error::Invalid);
+        }
         if entry.u32(0)? == CPU {
-            mach(file, slice, Some(CPU), &dependency)?;
-            found = true;
+            if matching.len() == MAX_CPU_SLICES {
+                return Err(Error::Invalid);
+            }
+            matching.push(slice);
         }
     }
-    if !found {
+    if matching.is_empty() {
         return Err(Error::Invalid);
+    }
+    for slice in matching {
+        mach(file, slice, Some(CPU), &dependency)?;
     }
     Ok(())
 }
 
 fn mach(
-    file: &mut (impl Read + Seek),
+    file: &mut ImageReader<impl Read + Seek>,
     image: Region,
     cpu: Option<u32>,
     dependency: &impl Fn(&[u8]) -> Result<(), Error>,
@@ -234,7 +258,7 @@ fn mach(
 }
 
 fn elf(
-    file: &mut (impl Read + Seek),
+    file: &mut ImageReader<impl Read + Seek>,
     image: Region,
     dependency: impl Fn(&[u8]) -> Result<(), Error>,
 ) -> Result<(), Error> {
@@ -332,13 +356,8 @@ mod tests {
         let size = (24 + name.len() + 1).next_multiple_of(8);
         let mut data = vec![0; 32 + size];
         data[..4].copy_from_slice(&[0xcf, 0xfa, 0xed, 0xfe]);
-        let cpu: u32 = if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
-            0x0100_0007
-        } else {
-            0x0100_000c
-        };
         for (at, word) in [
-            (4, cpu),
+            (4, CPU),
             (12, 6),
             (16, 1),
             (20, size as u32),
@@ -425,6 +444,43 @@ mod tests {
         assert!(
             matches!(check(&fat(&[&ordinary, &other]), None), Err(Error::Foreign(name)) if name == foreign)
         );
+    }
+
+    #[test]
+    fn fat_rejects_duplicate_and_excess_matching_slices_before_reading_bodies() {
+        let thin = thin(b"/usr/lib/libSystem.B.dylib", 0xc);
+        let mut duplicate = fat(&[&thin, &thin]);
+        duplicate.copy_within(16..24, 36);
+        let mut mixed_cpu_duplicate = duplicate.clone();
+        mixed_cpu_duplicate[28..32].copy_from_slice(&(CPU ^ 1).to_be_bytes());
+        let excessive = fat(&[thin.as_slice(); MAX_CPU_SLICES + 1]);
+
+        for (bytes, table_end) in [
+            (&duplicate, 8 + 2 * 20),
+            (&mixed_cpu_duplicate, 8 + 2 * 20),
+            (&excessive, 8 + (MAX_CPU_SLICES + 1) * 20),
+        ] {
+            let mut reader = io::Cursor::new(bytes);
+            assert!(matches!(
+                super::check(&mut reader, bytes.len() as u64, None, |_| None),
+                Err(Error::Invalid)
+            ));
+            assert_eq!(reader.position(), table_end as u64);
+        }
+        assert!(check(&fat(&[thin.as_slice(); MAX_CPU_SLICES]), None).is_ok());
+    }
+
+    #[test]
+    fn metadata_reads_share_one_budget() {
+        let mut reader = ImageReader {
+            file: io::Cursor::new([0; 12]),
+            remaining: 8,
+        };
+        let first = Region { offset: 0, len: 6 };
+        let second = Region { offset: 6, len: 6 };
+        assert_eq!(first.read(&mut reader).unwrap().len(), 6);
+        assert!(matches!(second.read(&mut reader), Err(Error::Invalid)));
+        assert_eq!(reader.file.position(), 6);
     }
 
     #[test]
