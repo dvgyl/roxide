@@ -46,8 +46,14 @@ def should_skip(path: pathlib.Path) -> bool:
     name = path.name
     if name.startswith("._") or name == ".DS_Store":
         return True
-    parts = set(path.parts)
-    if "target" in parts or "env" in parts or ".git" in parts or "__pycache__" in parts:
+    try:
+        rel_parts = path.relative_to(ROOT).parts
+    except ValueError:
+        rel_parts = path.parts
+    if rel_parts and rel_parts[0] == "env":
+        return True
+    parts = set(rel_parts)
+    if "target" in parts or ".git" in parts or "__pycache__" in parts:
         return True
     return False
 
