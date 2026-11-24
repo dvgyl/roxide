@@ -2,54 +2,67 @@
 
 **Repository:** [github.com/dvgyl/roxide](https://github.com/dvgyl/roxide)
 
-**Roxide** is a strict clean-room, native Rust drop-in replacement for **GNU R 4.6.2** (`MIT OR Apache-2.0`), targeting drop-in compatibility for `R`, `Rscript`, `R CMD`, the R 4.6.2 language and standard libraries, `.rds`/`.RData` binary interchange, reproducible PRNG/numerical computing, and R 4.6.2's cleaned-up public C API for compiled CRAN packages.
+Roxide is a strict clean-room, native Rust drop-in replacement for GNU R 4.6.2 (`MIT OR Apache-2.0`). It targets drop-in parity for `R`, `Rscript`, `R CMD`, compiled CRAN and Bioconductor packages, multi-session sandboxing, zero-copy Arrow interop, first-class host embedding, and browser WASM.
 
-## Target Compatibility
+The project works backwards from [`docs/VISION.md`](docs/VISION.md).
 
-- **Reference oracle:** Official **GNU R 4.6.2** (released October 29, 2026; 4.6 series *"Because it was There"*)
-- **Modern R 4.x – 4.6.2 language & library surface in scope:**
-  - Full R syntax: native pipe `|>` with `_` placeholder (including extraction), shorthand lambdas `\(x) ...`, raw strings `r"(...)"`, `%||%`, `%op%`, integer/complex/hex literals, exact `srcref` & `deparse()`
-  - Complete `SEXP` runtime: cycle-safe GC, copy-on-modify reference counting, `ALTREP` compact/deferred vectors, exact missing values (`NA_integer_`, `NA_real_` IEEE 754 payload `1954` distinct from `NaN`, `NA_character_`, Kleene `NA_logical_`), lazy promises & NSE (`substitute`, `eval`, `match.call`, `...`)
-  - Object systems: S3 (`UseMethod`, `NextMethod`, group generics), S4 (`methods`, multiple dispatch), Reference Classes
-  - R 4.5–4.6.2 additions & fixes:
-    - `use()` selective imports, `grepv()`, `cumvar()`, `list.files(..., fixed = TRUE)`, `boxplot(..., warnN = FALSE)`, `rle()` `print()` forwarding `...`
-    - UTF-8 `read.dcf()` / `write.dcf()` with `#` comment support, `tools::analyze_license()` SPDX identifiers, `zstd` in `extSoftVersion()`, default C++20 for package builds
-    - R 4.6.2 correctness fixes (`rhyper()` large-population overflow guard, `seq.int()` non-vector `along.with`, `writeChar()` multibyte counting, `Rd2txt` comment-paragraph parsing, `dummy.coef()` non-syntactic names, wrapper read-only pointer duplication safety)
-  - Binary interchange: XDR v2/v3 `.rds` and `.RData` serialization (with gzip/bzip2/xz/zstd compression)
-  - Public C API boundary (R 4.6's cleaned-up header contract + R 4.5+ mandatory `R_NO_REMAP` for C++ + experimental resizable vectors API) for loading compiled CRAN packages
+## Top 3 priorities
 
-## Clean-Room Licensing
+1. **CRAN-wide and Bioconductor pass rate.** Nightly testing across all of CRAN and Bioconductor against GNU R, fixing the highest reverse-dependency packages first, supported by clean-room MIT headers written from *Writing R Extensions*, a compatibility layer for common private C API calls, install-time advisories for known-broken packages, and multi-day turnaround on new GNU R releases.
+2. **Bundled toolchain plus prebuilt binary package repo.** Prebuilt native and `wasm32` binary CRAN repos so `install.packages()` finishes in seconds, `renv`-compatible lockfiles, a bundled C/C++/Fortran toolchain (`zig cc` plus Fortran) for source builds on bare machines, and a bundled, swappable pure-Rust BLAS/LAPACK backend (`faer`) with Fortran ABI exports so `Matrix` and `stats` work without system OpenBLAS or `libgfortran`.
+3. **Multi-session execution with compiled packages.** Concurrent zero-global `RSession` instances supporting native CRAN packages behind one API (per-session isolated library copies, per-package share-safe flags, or a transparent process-pool fallback), paired with Deno-style permissions and resource limits, millisecond session snapshots, and an in-process `future`/`parallel` backend with no forking.
 
-- **Roxide (`crates/*`, `tools/*`, `conformance/*`):** Dual-licensed under **`MIT OR Apache-2.0`**.
-- **Strict clean-room boundary:** GNU R is `GPL-2.0-or-later` / `GPL-3.0-or-later`. Zero GNU R source files, base `.R` scripts, `nmath` C files, or GNU R test files may be copied or ported from GNU R source. All behavior is implemented cleanly from R manuals, published mathematical/statistical algorithms, permissive Rust crates, and black-box differential oracle testing against official GNU R 4.6.2.
+## Target product capabilities
 
-## Planned Repository Layout
+- **R 4.6.2 language and standard libraries:** Full syntax (`|>`, `_`, `\(x)`, `r"(...)"`, `%||%`, `%op%`, exact `srcref`), cycle-safe non-moving GC, copy-on-modify refcounting, ALTREP, exact IEEE 754 `NA_real_` (`1954` payload) and Kleene logic, 4-state lazy promises and NSE, S3, S4 multiple dispatch, Reference Classes, and `.rds`/`.RData` binary interchange (gzip, bzip2, xz, zstd).
+- **Real-world performance and Arrow:** Benchmarked optimization of real `dplyr`, `data.table`, and `purrr` workloads, multithreaded base vector operations, zero-copy Arrow data frames over ALTREP for DuckDB, Polars, and Python, and a targeted native JIT for hot paths.
+- **Graphics and widgets:** Headless PNG, SVG, and PDF devices, an interactive native window device (zero X11/Cairo/Pango), `ragg`-parity text shaping with font fallback, CJK, and emoji, plus working `htmlwidgets` and `plotly`.
+- **Embedding SDKs and WASM:** First-class multi-session `RSession` embedding in Rust (`cargo add roxide-r`, since `roxide` is taken on crates.io), Python (`pip install roxide`, without `rpy2` global-state issues), C (`roxide_embed.h`), and JavaScript via a 4 MB WASM engine paired with a precompiled `wasm32` CRAN package repo.
+- **Interactive tooling and diagnostics:** Built-in Jupyter kernel, Positron (Ark) backend, LSP, DAP debugger replacing `browser()`, and Rust-grade error messages with exact line and column, call chain, and suggested fixes.
+
+## Explicit cut list and contracts
+
+- **No `.Rc` bytecode roundtripping:** Roxide unwraps `BCODESXP` `consts[0]` expressions when reading external `.rdb`/`.rds` files and keeps `compiler::cmpfun`/`enableJIT` over its own IR and JIT, without mirroring GNU R's bytecode format (ADR-0022).
+- **Focused PRNG bit-exactness:** Default Mersenne-Twister plus `runif`, `rnorm`, and `sample` match GNU R bit for bit; the remaining 22 distributions target `< 1e-14` relative error (ADR-0022).
+- **Unwind and GC soundness first:** Safe `Rf_error`/`longjmp`, C++ exception unwinding, and GC rooting across `libR` take precedence over minimizing `unsafe` crate counts (ADR-0023).
+
+## Clean-room licensing
+
+- **Roxide (`crates/*`, `tools/*`, `conformance/*`):** Dual-licensed under `MIT OR Apache-2.0`.
+- **Strict clean-room wall:** GNU R is `GPL-2.0-or-later` / `GPL-3.0-or-later`. Zero GNU R source files, base `.R` scripts, `nmath` C files, or GNU R test files may be read, copied, or ported into this repository. All behavior is implemented from R manuals, published mathematical algorithms, permissive crates, and black-box differential oracle testing against official GNU R 4.6.2 binaries.
+
+## Repository layout
 
 ```text
 Roxide/
-├── AGENTS.md                 # Core agent operating instructions & clean-room guardrails
-├── README.md                 # This file
-├── PROGRESS.md               # Live parity scoreboard (created in Milestone 0)
-├── THIRD_PARTY_NOTICES.md    # Permissive crate & algorithm attributions (Milestone 0)
-├── Cargo.toml                # Rust workspace manifest (Milestone 0)
-├── crates/                   # Disjoint Rust crates (see docs/ARCHITECTURE.md)
-├── stdlib/                   # Clean-room Roxide R-level base/stats/utils/methods wrappers
-├── conformance/              # Clean-room differential test suites & numerical golden specs
-├── tools/                    # Oracle harness, licence scanner, numerical ULP checker, CRAN corpus runner
-├── scripts/                  # Mechanical gates & git hooks
+├── AGENTS.md                 # Agent operating rules, model routing, and clean-room wall
+├── README.md                 # Project overview and documentation index
+├── PROGRESS.md               # Live parity scoreboard (M0-M3 complete, M4 Wave 5 active)
+├── THIRD_PARTY_NOTICES.md    # Permissive crate and algorithm attributions
+├── Cargo.toml                # Rust workspace manifest (17 active crates)
+├── crates/                   # Disjoint Rust engine, C API, CLI, and oracle harness crates
+├── conformance/              # Clean-room differential test suites (Layers 1-4)
+├── tests/                    # C/C++ C-API differential fixtures
+├── fuzz/                     # Out-of-workspace cargo-fuzz harnesses
+├── tools/                    # C-API manifest/ABI probes, CRAN corpus runner, benchmarks, licence scan
+├── scripts/                  # Gate runner, R_HOME staging, and Cargo slot limiter
 └── docs/
-    ├── MODEL_ROUTING.md      # Multi-model orchestration & quota policy
-    ├── ARCHITECTURE.md       # Workspace crates, contracts, R 4.6.2 traps & layered oracles
-    ├── ROADMAP.md            # Milestones M0–M4 & real-world R/CRAN corpus ladder
-    ├── KICKOFF_PROMPT.md     # Copy-paste starter prompt for the new thread
-    ├── ADR.md                # Architectural Decision Records (created in M0)
-    └── PRIOR_ART.md          # Dependency & licence log (created in M0)
+    ├── VISION.md             # Working-backwards target Show HN post and product priorities
+    ├── HANDOFF_PROMPT.md     # Short continuation handoff prompt for new threads
+    ├── ROADMAP.md            # Milestones M0-M8 working backwards from VISION.md
+    ├── ARCHITECTURE.md       # Workspace crates, contracts, invariants, and 5-layer oracle
+    ├── ADR.md                # Architectural Decision Records (ADR-0001 through ADR-0025)
+    ├── MODEL_ROUTING.md      # Multi-model orchestration and quota policy
+    └── PRIOR_ART.md          # Vetted permissive dependency and algorithm log
 ```
 
-## Documentation Index
+## Documentation index
 
-- Start here for agent rules: [`AGENTS.md`](AGENTS.md)
-- Model & subscription routing: [`docs/MODEL_ROUTING.md`](docs/MODEL_ROUTING.md)
-- Technical architecture & crate map: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
-- Milestones & kickoff plan: [`docs/ROADMAP.md`](docs/ROADMAP.md)
-- Ready-to-paste first prompt: [`docs/KICKOFF_PROMPT.md`](docs/KICKOFF_PROMPT.md)
+- Target product vision and announcement: [`docs/VISION.md`](docs/VISION.md)
+- Short handoff prompt: [`docs/HANDOFF_PROMPT.md`](docs/HANDOFF_PROMPT.md)
+- Agent rules and clean-room guardrails: [`AGENTS.md`](AGENTS.md)
+- Roadmap (M0 through M8): [`docs/ROADMAP.md`](docs/ROADMAP.md)
+- Technical architecture and crate map: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
+- Architectural decisions (ADRs): [`docs/ADR.md`](docs/ADR.md)
+- Model and subscription routing: [`docs/MODEL_ROUTING.md`](docs/MODEL_ROUTING.md)
+- Live milestone scoreboard: [`PROGRESS.md`](PROGRESS.md)

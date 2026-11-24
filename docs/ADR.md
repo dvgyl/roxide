@@ -276,5 +276,58 @@ Roxide differs from GNU R in two ways.
   - Never execute GNU R `BCODESXP` instruction streams; lower `consts[0]` ASTs to Roxide's own clean-room register IR (`roxide-eval::vm`) with `ENVSXP` `shape_version` inline caches (bumped on binding insert/remove, `env_set_enclos`, lock/active flag mutations, and function/promise binding overwrites; call-site cache hits also confirm the target function `SexpId` in the defining frame) and guard-based fallback to the AST semantic reference.
   - `compiler::enableJIT` levels `1` and `2` both compile closures on call 1 (with loops) or call 2 (without loops) without a separate body-size threshold, matching the observed GNU R 4.6.2 probes in `docs/M4_PROBES.md` §5; level `3` additionally compiles top-level loops, and `.Rc` files serialize source expressions that `loadcmp` recompiles on load.
 
+---
+
+## ADR-0021: Working-Backwards Product Architecture, Top-3 Priorities & `roxide-r` Crate Name
+
+- **Status:** Accepted
+- **Context:** Roxide is moving from a Milestone 0-4 engine bring-up to a cohesive, deployable drop-in R runtime defined in `docs/VISION.md`. Meanwhile, checking crates.io confirms the crate name `roxide` is already taken by an unrelated safe-`rm` CLI tool, which would block publishing an embeddable Rust library under that name.
+- **Decision:**
+  - Anchor all M4-M8 engineering work to the working-backwards product specification in `docs/VISION.md`, with three explicit top priorities: (1) CRAN-wide and Bioconductor pass rate (nightly testing against GNU R, reverse-dependency-first triage, install-time advisories), (2) zero-setup package installation (prebuilt binary repo, bundled C/C++/Fortran toolchain, bundled swappable `faer` BLAS/LAPACK, `renv.lock`), and (3) multi-session `RSession` execution with compiled packages.
+  - Keep **Roxide** as the project name, `roxide` as the CLI binary and PyPI package (`pip install roxide`, verified available on PyPI), `@roxide/wasm` / `roxide-wasm` for JavaScript/WASM (verified available on npm), and reserve **`roxide-r`** on crates.io (verified available) as the public embeddable Rust crate.
+
+---
+
+## ADR-0022: Drop `.Rc` Bytecode Roundtripping & Narrow Forward PRNG Bit-Exactness Contract
+
+- **Status:** Accepted (amends ADR-0009, ADR-0014, ADR-0020)
+- **Context:** Almost no real R workflow exchanges `.Rc` compiled bytecode files across runtimes, and maintaining bidirectional `.Rc` parity constrains Roxide's VM and future native JIT. Similarly, committing to bit-for-bit identity across every non-default RNG and obscure distribution tail creates high clean-room maintenance cost when tracking new GNU R releases, adopting `faer` BLAS/LAPACK, or vectorizing math kernels.
+- **Decision:**
+  - **Cut `.Rc` bytecode roundtripping:** Roxide drops bidirectional `.Rc` bytecode file compatibility. Keep read-only `BCODESXP` `consts[0]` unwrapping when loading existing `.rdb`/`.rds` files produced by GNU R, and keep `compiler::cmpfun`/`enableJIT` as clean-room wrappers over Roxide's own register IR and targeted native JIT.
+  - **Narrow forward PRNG bit-exactness:** Maintain bit-exact parity with GNU R for the default Mersenne-Twister generator and core samplers (`runif`, `rnorm`, `sample`). Target tight numerical agreement (relative error `< 1e-14`) across the remaining 22 distributions and alternate RNG/tail functions. Existing passing M2 Layer-2 tests remain as regression guards without blocking future optimizations or new R release adoption.
+
+---
+
+## ADR-0023: Unwind/GC Soundness Over `unsafe` Crate Counts & Common Private-API Compatibility Layer
+
+- **Status:** Accepted (amends ADR-0001, ADR-0017)
+- **Context:** Real memory safety failures when running compiled CRAN packages (`Rcpp`, `cpp11`, `data.table`, `Matrix`) happen at foreign C/C++ unwinding (`Rf_error`/`longjmp`, C++ exceptions), Fortran ABI calls, and GC rooting boundaries, not from how many crates contain audited `unsafe`. In addition, older CRAN packages still call a small set of high-frequency private C API symbols removed from R 4.6 public headers.
+- **Decision:**
+  - Keep `#![forbid(unsafe_code)]` as the default for pure logic crates, while permitting audited, ADR-governed `unsafe` in explicit low-level boundary crates (`roxide-capi`, `roxide-libr`, `roxide-blas`, `roxide-arrow`, `roxide-py`, `roxide-wasm`, and targeted native JIT modules). Measure safety by `ROXIDE_GC_TORTURE=1`, ASAN/UBSAN, Miri where applicable, and C-API fuzzing rather than minimizing `unsafe` crate counts.
+  - Add an audited, clean-room compatibility layer inside `roxide-capi` for the most common private-API calls observed in the CRAN symbol census so older packages run cleanly, while keeping WRE public headers (`MIT OR Apache-2.0`) as the canonical contract and warning at install time when a package depends on unshimmed internals or is known to be broken.
+
+---
+
+## ADR-0024: Bundled Pure-Rust BLAS/LAPACK (`faer`) with Fortran ABI, Bundled Toolchain & Prebuilt Binary Repos
+
+- **Status:** Accepted (amends ADR-0020)
+- **Context:** Compiling C/C++/Fortran CRAN packages such as `dplyr`, `data.table`, and `Matrix` from source takes minutes and requires a local compiler, OpenMP runtime, OpenBLAS, and `libgfortran`, breaking the zero-dependency single-binary promise. Browser WASM sessions cannot invoke a C compiler at all.
+- **Decision:**
+  - Add `roxide-blas` bundling a pure-Rust BLAS/LAPACK backend (`faer`, MIT) behind explicit Fortran-ABI symbols (`libRblas`/`libRlapack` entry points) so `Matrix` and `stats` work out of the box with zero system OpenBLAS or `libgfortran`, while keeping backend swapping (Accelerate, OpenBLAS, MKL) supported.
+  - Bundle a zero-setup C/C++/Fortran toolchain (built around `zig cc` plus Fortran support) for bare-machine source builds.
+  - Run prebuilt binary package repositories for both native platforms (matching Roxide's ABI via a cached binary installer inside `install.packages()`) and `wasm32` (paired with the 4 MB browser WASM engine), with `renv.lock` support for reproducible environments.
+
+---
+
+## ADR-0025: Three-Tier Multi-Session Native Isolation, Deno-Style Permissions, Snapshots & First-Class SDKs/Tooling
+
+- **Status:** Accepted (amends ADR-0019)
+- **Context:** ADR-0019 limited compiled packages to a single `Ctx` per process because legacy C packages hold mutable static globals. However, zero-global multi-session embedding in Rust, Python, C, and in-process `future`/`parallel` workers is far less valuable if loading `dplyr` or `data.table` drops back to single-session execution. Users also need a drop-in interactive environment without RStudio's private C hooks.
+- **Decision:**
+  - Lift ADR-0019's single-session ceiling behind the unified `RSession` API using a three-tier isolation architecture: (1) isolated per-session copies or private loader namespaces of native package DLLs routed via TLS, (2) a per-package `share_safe` manifest flag allowing verified stateless/reentrant DLLs to share one loaded image across threads, and (3) a transparent worker process-pool fallback for packages with unfixable process-global state.
+  - Extend `roxide-host::Host` with Deno-style per-session permissions (read/write directory allowlists, network host allowlists, subprocess controls) and CPU/memory/wall-time quotas, plus millisecond session snapshots (for preloaded environments such as `tidyverse`) and an in-process `future`/`parallel` backend with no forking.
+  - Standardize zero-copy Arrow data frames over ALTREP (`roxide-arrow`) for DuckDB, Polars, and Python; upgrade `roxide-graphics` with `ragg`-parity text shaping (font fallback, CJK, emoji), an interactive desktop window device, and `htmlwidgets`/`plotly`; and ship built-in Jupyter, Positron (Ark), LSP, DAP debugger, and rich source-mapped error diagnostics alongside the Rust (`roxide-r`), Python (`pip install roxide`), C, and WASM SDKs.
+
+
 
 

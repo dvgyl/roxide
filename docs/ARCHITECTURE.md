@@ -1,80 +1,97 @@
 # Architecture
 
-Roxide models GNU R 4.6.2's runtime cleanly in safe Rust, decomposed into **disjoint crates** so parallel **GPT 6.2 Sol** workers can build language primitives, statistical math, standard packages, serialization, and graphics concurrently without merge conflicts — while isolating any `unsafe` C-API / FFI boundary into a single audited crate.
+Roxide is a clean-room GNU R 4.6.2 runtime in Rust, decomposed into disjoint crates so parallel workers can build language primitives, math, standard libraries, C API compatibility, multi-session isolation, graphics, embedding SDKs, and developer tools concurrently without merge conflicts.
 
-## Execution Pipeline
+Every architectural decision works backwards from [`docs/VISION.md`](VISION.md) and the Top 3 priorities: CRAN-wide/Bioconductor pass rate, bundled toolchain plus binary package repository, and multi-session execution with compiled packages.
 
-1. **CLI & Session (`roxide-cli`, `roxide-host`):** Dispatches `R`, `Rscript`, and `R CMD` via `argv[0]` or subcommands, parses flags (`--vanilla`, `--slave`, `--no-save`, `-e`, `-f`), configures options/locale/search path, and initializes the `Host` and GC arena.
-2. **Parse (`roxide-syntax`):** Tokenizes and parses R 4.6.2 source (including `|>`, `_`, `\(x)`, `r"(...)"`, `%op%`, `srcref` metadata) into R language expressions (`LANGSXP` / `SYMSXP` / literals) and supports exact `deparse()` formatting.
-3. **Evaluate (`roxide-gc`, `roxide-value`, `roxide-eval`):** Runs lexical-scoped evaluation with lazy promises (`PROMSXP`), copy-on-modify vectors, `ALTREP`, condition handling (`tryCatch`, `withCallingHandlers`, `on.exit`), S3/S4 dispatch, and namespaces.
-4. **Standard Libraries & Numerical Engine (`roxide-base`, `roxide-math`, `roxide-stats`, `roxide-methods`, `roxide-utils`, `roxide-graphics`):** Implements clean-room primitives and R-level wrappers for R 4.6.2's core packages.
-5. **C API / CRAN Interop (`roxide-capi`, Milestone 4):** Exposes R 4.6.2's cleaned-up public C ABI (`Rinternals.h`, `R_ext/*.h`, `R_NO_REMAP`) for dynamically loading compiled packages (`.Call`, `.External`, `.C`, `.Fortran`, `ALTREP`).
+## Execution pipeline
 
-## Workspace Crate Map
+1. **CLI, Embedding SDKs and Interactive Backends (`roxide-cli`, `roxide-r`, `roxide-py`, `roxide-wasm`, `roxide-kernel`, `roxide-lsp`, `roxide-dap`):** Dispatches `roxide`, `R`, `Rscript`, `R CMD`, Jupyter/Positron kernels, LSP, DAP, and host-language embedding APIs, configuring per-session `Host` permissions, quotas, snapshots, and GC arenas.
+2. **Parse and Diagnostics (`roxide-diag`, `roxide-syntax`):** Tokenizes and parses R 4.6.2 source (including `|>`, `_`, `\(x)`, `r"(...)"`, `%op%`, exact `srcref` line/column spans) into R expressions and formats both GNU R compatible stderr and rich interactive diagnostics with source snippets, call chains, and suggested fixes.
+3. **Evaluate and Optimize (`roxide-gc`, `roxide-value`, `roxide-eval`):** Runs lexical-scoped evaluation with 4-state lazy promises (`PROMSXP`), copy-on-modify vectors, ALTREP (including zero-copy Arrow columns), condition handling, S3/S4 dispatch, namespaces, clean-room register IR, multithreaded vector ops, and profile-guided native JIT for hot paths.
+4. **Standard Libraries and Numerical Engine (`roxide-base`, `roxide-math`, `roxide-blas`, `roxide-stats`, `roxide-methods`, `roxide-utils`, `roxide-graphics`, `roxide-pkg`):** Clean-room R 4.6.2 base/stats/utils/methods/tools/graphics/grid packages, bundled swappable pure-Rust BLAS/LAPACK (`faer`) with Fortran ABI exports, binary/source package installation, bundled C/C++/Fortran toolchain (`zig cc`), `renv.lock`, and compatibility advisories.
+5. **Native Package Interop and Multi-Session Isolation (`roxide-capi`, `roxide-libr`):** Clean-room MIT headers from *Writing R Extensions*, R 4.6.2 public C API plus common private-API compatibility shims, sound `Rf_error`/`longjmp` and C++ exception unwinding, and three-tier multi-session isolation for compiled CRAN packages.
 
-| Crate | Responsibility | `unsafe` Policy | Depends on |
+## Workspace crate map
+
+### Existing crates (M0 through M4, 17 crates active)
+
+| Crate | Responsibility | `unsafe` policy | Key dependencies |
 | --- | --- | --- | --- |
-| `roxide-diag` | Source spans, `srcref`, R-exact error/warning/message/traceback formatting, condition hierarchy | `forbid` | none |
-| `roxide-host` | `Host` trait (FS, env, stdin/stdout/stderr, connections, process/`system2`, clock, locale/TZ, entropy), `NativeHost`, deterministic `PureHost`, resource limits | `forbid` | `roxide-diag` |
-| `roxide-syntax` | Zero-copy R 4.6.2 lexer & parser (newline rules inside `()` vs `{}`, `|>` + `_`, `\(x)`, raw strings `r"(...)"`, hex/complex literals, `%op%`), AST & `deparse()` | `forbid` | `roxide-diag` |
-| `roxide-gc` | Cycle-safe mark-sweep/generational GC arena, `GcRef` / `SEXP` handles, copy-on-modify refcounts (`NAMED`/shared tracking), `ProtectStack`, `ALTREP` trait & wrapper duplication safety (4.6.2 fix) | `forbid` (or ADR-gated) | `roxide-diag` |
-| `roxide-value` | Core R data model: atomic vectors (`LGL`, `INT`, `REAL`, `CPLX`, `STR`, `RAW`), `VECSXP`, `LISTSXP`, `LANGSXP`, `ENVSXP`, `PROMSXP`, `CLOSXP`, `S4SXP`, attributes, exact `NA_real_` (`1954`) / `NA_integer_` / Kleene logic, coercion, recycling, `print`/`format` | `forbid` | `roxide-diag`, `roxide-gc` |
-| `roxide-eval` | Evaluator & bytecode VM, lexical environments, lazy promises & NSE (`substitute`, `match.call`, `missing`, `eval`, `...`), call argument matching, conditions (`tryCatch`, `withCallingHandlers`, `on.exit`), S3 dispatch (`UseMethod`, `NextMethod`, group generics), namespaces & `use()` | `forbid` | `roxide-syntax`, `roxide-value`, `roxide-host` |
-| `roxide-math` | Clean-room numerical core: special functions (`gamma`, `lgamma`, `beta`, `bessel*`), PRNGs (`MT19937`, `L'Ecuyer-CMRG`, `Wichmann-Hill`, etc.), `d/p/q/r*` distributions (including 4.6.2 `rhyper` large-$m+n$ fix), `fft`, clean-room linear algebra (`qr`, `svd`, `eigen`, `chol`, `solve`, `det`) | `forbid` | `roxide-diag`, `roxide-value` |
-| `roxide-base` | `base` package primitives & R wrappers split into disjoint submodules (`ops`, `subset`, `apply`, `string_regex`, `datetime`, `io_conn`, `files_os`, `serialize_rds`, `env_meta`, `matrix`, `cumvar_seq`, `grepv`) | `forbid` | `roxide-eval`, `roxide-math`, `roxide-host` |
-| `roxide-stats` | `stats` package split into disjoint submodules (`formula_model_matrix`, `lm_glm`, `tests`, `descriptive`, `optim_nlminb`, `timeseries`, `cluster`, `dist_wrappers`, `dummy_coef`) | `forbid` | `roxide-eval`, `roxide-base`, `roxide-math` |
-| `roxide-methods` | S4 class/generic/method system (`setClass`, `setGeneric`, `setMethod`, multiple dispatch, `@` slots, Reference Classes) | `forbid` | `roxide-eval`, `roxide-base` |
-| `roxide-pkg` | `NAMESPACE` parser/evaluator, `DESCRIPTION` loader, `library()`/`require()`/`use()`/`loadNamespace()`, `.rdb`/`.rdx` lazy-load DB, POSIX `ustar`, `R CMD INSTALL` (pure-R) & `R CMD BATCH` | `forbid` | `roxide-eval`, `roxide-base`, `roxide-host` |
-| `roxide-utils` | `utils` & `tools` packages: `read.table`/`read.csv`, `write.table`, `str`, `head`/`tail`, `sessionInfo`, `extSoftVersion` (`zstd`), UTF-8 `read.dcf`/`write.dcf` with `#` comments, `Rd` parser/`Rd2txt` (4.6.2 fix), `analyze_license` (SPDX) | `forbid` | `roxide-eval`, `roxide-base`, `roxide-host` |
-| `roxide-graphics` | `grDevices`, `graphics`, and `grid` engine + zero-new-dep headless `svg`, `pdf`, and `png` devices (`boxplot(..., warnN = FALSE)`, base & `grid` pipelines) | `forbid` | `roxide-eval`, `roxide-base`, `roxide-host` |
-| `roxide-capi` | **Isolated FFI crate (Milestone 4):** R 4.6.2 public C API (`Rinternals.h`, `R_ext/*.h`, `R_NO_REMAP`), `dlopen` package loading, `.Call`/`.External`/`.C`/`.Fortran`, `R_registerRoutines`, `ALTREP` C callbacks, experimental resizable vectors API | audited `unsafe` (ADR-governed) | `roxide-eval`, `roxide-gc`, `roxide-value`, `roxide-math` |
-| `roxide-cli` | Multi-call binary (`roxide`, `R`, `Rscript` via `argv[0]`), interactive REPL, `R CMD` dispatcher | `forbid` | all engine crates |
-| `roxide-harness` | Isolated black-box differential oracle runner comparing `roxide` against official GNU R 4.6.2 (never links core crates) | `forbid` | none of the core crates |
+| `roxide-diag` | Source spans, `srcref`, GNU R and rich interactive error/warning/traceback formatting | `forbid` | none |
+| `roxide-math` | Pure-Rust leaf numerical kernels: PRNGs (bit-exact MT19937 + `runif`/`rnorm`/`sample`), 22 distributions (`< 1e-14` rel error), special/Bessel functions, core linalg, FFT | `forbid` | none |
+| `roxide-host` | `Host` trait (FS, env, streams, connections, process, clock, locale/TZ, entropy), Deno-style permission/quota policies, `NativeHost`, `PureHost` | `forbid` | `roxide-diag` |
+| `roxide-gc` | Non-moving cycle-safe mark-sweep GC arena, `SexpId` handles, saturating copy-on-modify refcounts, `ProtectStack`, ephemerons and finalizers | `forbid` | `roxide-diag` |
+| `roxide-syntax` | Zero-copy R 4.6.2 lexer, parser, `srcref` metadata, and operator tables | `forbid` | `roxide-diag` |
+| `roxide-value` | `RObject` model, atomic/list/env/promise/closure/S4 types, exact `NA_real_` (`1954`) / `NA_integer_` / Kleene logic, `ALTREP` traits, `deparse`/`format`, snapshots | `forbid` | `roxide-diag`, `roxide-gc`, `roxide-syntax` |
+| `roxide-eval` | Evaluator, clean-room register IR VM, targeted JIT hooks, 4-state promises and NSE, conditions, S3 dispatch, dynamic namespaces, `NativeHooks`, `S4Hooks` | `forbid` | `roxide-syntax`, `roxide-value`, `roxide-host` |
+| `roxide-base` | `base` and `compiler` primitives and preludes in disjoint submodules (`ops`, `subset`, `strings`, `datetime`, `io_os`, `serialize`, `native`, `compiler`, etc.) | `forbid` | `roxide-eval`, `roxide-math`, `roxide-host` |
+| `roxide-stats` | `stats` package (`formula`, `lm`, `glm`, `htest`, `optim`/`nlminb`, `ts`, `multivar`, `density`, `loess`, `distn`) | `forbid` | `roxide-eval`, `roxide-base`, `roxide-math` |
+| `roxide-methods` | S4 classes, generics, Pareto-dominance multiple dispatch, `@` slots, Reference Classes | `forbid` | `roxide-eval`, `roxide-base` |
+| `roxide-pkg` | `NAMESPACE`, `DESCRIPTION`, `.rdb`/`.rdx` lazy-load DB, `library`/`use`, `R CMD INSTALL`/`SHLIB`/`BATCH`, binary repo installer, `renv.lock`, bundled toolchain driver, install advisories | `forbid` | `roxide-eval`, `roxide-base`, `roxide-host` |
+| `roxide-utils` | `utils`, `tools`, and `datasets` packages (`read.table`, `str`, `head`, `tail`, `sessionInfo`, DCF, `Rd2txt`, SPDX licence analyzer) | `forbid` | `roxide-eval`, `roxide-base`, `roxide-host` |
+| `roxide-graphics` | `grDevices`, `graphics`, `grid`, PDF/SVG/PNG/BMP/JPEG/TIFF devices, interactive window device, `ragg`-parity text shaping (fallback/CJK/emoji), `htmlwidgets`/`plotly` hooks | `forbid` | `roxide-eval`, `roxide-base`, `roxide-host` |
+| `roxide-capi` | Clean-room MIT C headers, R 4.6.2 public C API + common private-API compat shims, C/C++ setjmp/`catch(...)` unwind wall, `dlopen`/registration, foreign ALTREP, multi-session native router | audited `unsafe` | `roxide-eval`, `roxide-value`, `roxide-gc`, `roxide-math`, `roxide-base`, `roxide-pkg` |
+| `roxide-libr` | `staticlib` re-exporting `roxide-capi`, `roxide-blas`, and `roxide_main` for manifest-driven `libR` linking | audited `unsafe` | `roxide-capi`, `roxide-cli` |
+| `roxide-cli` | Multi-call binary (`roxide`, `R`, `Rscript`, `R CMD`), REPL, session bootstrapper | `forbid` | engine crates |
+| `roxide-harness` | Standalone black-box differential oracle runner comparing Roxide against official GNU R 4.6.2 | `forbid` | none of the engine crates |
 
-## Coordinator-Owned Shared Contracts
+### Planned crates (M5 through M8)
 
-Only the **coordinator (main thread)** edits:
-- Root `Cargo.toml`, `Cargo.lock` dependency additions, `scripts/`, `PROGRESS.md`, `docs/ADR.md`
-- Public traits and core representations in `roxide-diag`, `roxide-host`, `roxide-gc`, `roxide-value`, and `roxide-syntax`
-- Top-level primitive/builtin registration wiring in `roxide-base/src/lib.rs` and `roxide-stats/src/lib.rs`
-- `roxide-harness` test format and conformance baselines
+| Crate | Target milestone | Responsibility | `unsafe` policy |
+| --- | --- | --- | --- |
+| `roxide-blas` | M5 | Bundled, swappable pure-Rust `faer` BLAS/LAPACK backend exporting Fortran-ABI symbols (`libRblas`/`libRlapack`) plus runtime swap to Accelerate/OpenBLAS/MKL | audited `unsafe` (C/Fortran ABI shims only) |
+| `roxide-arrow` | M7 | Zero-copy Arrow data frames through ALTREP and Arrow C Data Interface for DuckDB, Polars, and Python | audited `unsafe` (C Data Interface boundary) |
+| `roxide-r` | M7 | Public embeddable Rust SDK published on crates.io as `roxide-r` (`roxide` is taken on crates.io), exposing multi-session `RSession`, permissions, and snapshots | `forbid` (or thin safe facade over `roxide-capi`) |
+| `roxide-py` | M7 | Python embedding extension (`pip install roxide`) using PyO3/abi3 with zero global state and zero-copy Arrow interop | audited `unsafe` (PyO3 FFI boundary) |
+| `roxide-wasm` | M7 | 4 MB `wasm32` engine build + loader for precompiled `wasm32` CRAN package binaries | audited `unsafe` (wasm-bindgen/ABI boundary) |
+| `roxide-ide` (or `roxide-kernel`, `roxide-lsp`, `roxide-dap`) | M8 | Built-in Jupyter kernel, Positron (Ark) backend, LSP server, and DAP debugger | `forbid` |
 
-Workers implement disjoint crates or disjoint submodules (`roxide-base/src/<family>/`, `roxide-stats/src/<family>/`, `roxide-math/src/<family>/`) and request shared contract changes from the coordinator.
+## Coordinator-owned shared contracts
 
-## Critical GNU R 4.6.2 Invariants & Known Traps
+Only the coordinator (main thread) edits:
 
-Lock these invariants with **Gemini 4 Neon + Opus 5.5 + GPT 6.2 Astra** before writing Milestone 1 code:
+- Root `Cargo.toml`, `Cargo.lock` dependency additions, `scripts/`, `PROGRESS.md`, `docs/ADR.md`, and `docs/VISION.md`.
+- Public traits and core representations in `roxide-diag`, `roxide-host`, `roxide-gc`, `roxide-value`, `roxide-syntax`, and `roxide-eval` hook interfaces (`NativeHooks`, `S4Hooks`, `NamespaceLoader`).
+- Top-level primitive and package wiring in `roxide-base/src/lib.rs`, `roxide-stats/src/lib.rs`, and `roxide-cli/src/lib.rs`.
+- `roxide-harness` test formats and conformance baselines.
 
-1. **Cycle-Safe GC + Copy-on-Modify + `ALTREP`:**
-   - R closures capture environments that contain those very closures; promises reference environments that reference promises. Simple `Rc`/`Arc` leaks memory immediately. Build a real cycle-safe GC arena from Day 1 with an explicit `ProtectStack` so `roxide-capi` slots in cleanly later without a rewrite.
-   - Reference-count sharing (`NAMED` / refcount) enables in-place mutation when unshared while preserving R's value semantics when shared. Implement R 4.6.2's wrapper duplication guard before exposing read-only pointers.
-2. **Exact Missing Values (`NA` vs `NaN`):**
-   - `NA_integer_ == i32::MIN`; integer arithmetic overflow returns `NA_integer_` with the exact R warning (`NAs produced by integer overflow`).
-   - `NA_real_` is an IEEE 754 quiet NaN carrying the `1954` payload in the low 32 bits (`is.na(NaN) == TRUE`, `is.nan(NA_real_) == FALSE`). Preserve `NA_real_` vs `NaN` distinction carefully in arithmetic, comparisons, sorting, hashing, serialization, and printing.
-   - Three-valued Kleene logic (`TRUE | NA == TRUE`, `FALSE & NA == FALSE`, `NA | FALSE == NA`) and `NA_character_` distinct from `"NA"`.
-3. **Lazy Promises, NSE & Call Argument Matching:**
-   - Arguments to R closures are wrapped in promises (`expr`, `env`, `value`) evaluated lazily on first lookup and memoized thereafter.
-   - `substitute()`, `missing()`, `force()`, `match.call()`, `sys.calls()`, `parent.frame()`, `eval()`, and `...` (`DOTSXP`) forwarding must follow exact R rules — otherwise `lm()`, `subset()`, `with()`, `data.frame()`, and modern R packages fail.
-   - Call matching order: exact tag match → unique partial tag match (before `...`) → positional match → remaining args captured into `...`.
-4. **Vector Subsetting, Subassignment & Recycling:**
-   - `[`, `[[`, `$`, `@` with positive/negative/logical/character/matrix indices, `NA` indices, zero-length indices, out-of-bounds `NA` fill, `drop = TRUE` matrix/array reduction, partial `$` matching, and nested replacement calls (`names(x)[2] <- "b"` desugaring via `*tmp*`).
-5. **Regex Dialects (TRE vs PCRE2 vs Fixed):**
-   - R supports three regex engines via `fixed = TRUE`, default POSIX ERE (TRE semantics), and `perl = TRUE` (PCRE2 semantics — BSD-3-Clause!). Never conflate them; handle bytes vs UTF-8 encodings and `writeChar()` multibyte counting (R 4.6.2 fix) accurately.
-6. **XDR v2/v3 `.rds` & `.RData` Serialization:**
-   - Exact big-endian XDR binary encoding of `SEXP`s, `CHARSXP` encoding flags, reference tables for shared environments/symbols, `ALTREP` state, and transparent `gzip`/`bzip2`/`xz`/`zstd` streams so files written by GNU R 4.6.2 load cleanly in Roxide and vice versa.
-7. **Reproducible PRNG & Numerical Accuracy (`nmath` clean-room):**
-   - Exact `set.seed()` / `.Random.seed` state representation for `Mersenne-Twister` + `Inversion` + `Rejection` (default in R 4.x) so `set.seed(42); rnorm(10)` and `sample()` match GNU R 4.6.2!
-   - Clean-room implementations of `d/p/q/r*` distributions, `lm`/`glm`, `optim`/`nlminb` verified against GNU R 4.6.2 with explicit ULP / relative-error tolerances (consult **GPT 6.2 Astra** for tail stability and edge cases like `rhyper` overflow when $m + n > \text{INT\_MAX}$).
-8. **R 4.6.0–4.6.2 Public C API Clean Boundary:**
-   - R 4.6.0 separated private internals out of installed C headers and R 4.5+ enforces `R_NO_REMAP` for C++ — making the public `libR` ABI smaller, cleaner, and far more tractable than legacy R 3.x.
+Workers implement disjoint crates or disjoint submodules and request shared contract changes from the coordinator.
 
-## Layered Differential Oracle Strategy
+## Critical Roxide invariants and design contracts
 
-All verification runs black-box against the official **GNU R 4.6.2** binary (`Rscript --vanilla` / `R --vanilla`):
+1. **Cycle-safe non-moving GC + copy-on-modify + ALTREP (ADRs 0002, 0003, 0017, 0019):**
+   - `SexpId(NonZeroU64)` is the opaque 64-bit `SEXP` value. `Heap::alloc` never collects; collection happens strictly at explicit safepoints. `RVec<T>` backing buffers stay pinned for zero-copy C pointers.
+   - Saturating copy-on-modify refcounts (`REFCNT_MAX = 7`) preserve value semantics and enforce R 4.6.2's wrapper duplication guard.
+   - ALTREP supports compact sequences, wrappers, foreign C ALTREP classes (Seams C1-C7), and zero-copy Arrow arrays (M7).
+2. **Exact missing values (`NA` vs `NaN`) and 4-state lazy promises (ADRs 0005, 0006):**
+   - `NA_integer_ == i32::MIN` with overflow warnings; `NA_real_` preserves IEEE 754 payload `1954` distinct from `NaN`; Kleene three-valued logic for `logical`; handle-identity `NA_character_`.
+   - 4-state lazy promises (`Unforced`, `Evaluating`, `Interrupted`, `Forced`) preserve `substitute()`, `match.call()`, `missing()`, and exact argument matching.
+3. **Unwind safety and GC rooting across `libR` over `unsafe` crate counts (ADRs 0018, 0023):**
+   - Every Rust-to-C call enters a setjmp + `try { ... } catch (...)` trampoline; every C-to-Rust entry uses a panic-free plain-old-frame `boundary()` helper so Rust never unwinds into C and C++ exceptions never cross into Rust.
+   - `#![forbid(unsafe_code)]` stays the default in pure logic crates, while audited, ADR-governed `unsafe` is permitted in explicit FFI/ABI/JIT boundary crates (`roxide-capi`, `roxide-libr`, `roxide-blas`, `roxide-arrow`, `roxide-py`, `roxide-wasm`) and verified via `ROXIDE_GC_TORTURE=1`, ASAN/UBSAN, Miri, and fuzzing.
+4. **Clean-room MIT headers + common private-API compatibility shim (ADRs 0017, 0023):**
+   - All headers under `crates/roxide-capi/include/` are authored clean-room from *Writing R Extensions* with `MIT OR Apache-2.0` SPDX headers and verified numerically by `abi_probe.py`.
+   - To maximize CRAN pass rates on older packages, `roxide-capi` includes an audited compatibility layer for the most frequent private C API entry points identified by CRAN symbol census, while install-time advisories warn on known-broken packages.
+5. **Bundled `faer` BLAS/LAPACK + Fortran ABI + bundled toolchain + binary repos (ADR-0024):**
+   - `roxide-blas` wraps `faer` (MIT) behind explicit Fortran-ABI symbols so `Matrix` and `stats` work on bare machines without system OpenBLAS or `libgfortran`, while remaining swappable for Accelerate/OpenBLAS/MKL.
+   - `roxide-pkg` drives prebuilt binary installs (native and `wasm32`), `renv.lock`, and a bundled C/C++/Fortran toolchain (`zig cc` plus Fortran) for zero-setup source installs.
+6. **Three-tier multi-session isolation for compiled packages (ADR-0025):**
+   - `RSession` holds zero interpreter globals. When compiled packages are loaded across concurrent sessions, `roxide-capi` routes native state per session via: (1) isolated per-session native library copies/namespaces, (2) a per-package `share_safe` manifest flag for verified reentrant libraries, or (3) a transparent process-pool fallback behind the same `RSession` API.
+   - `Host` enforces Deno-style per-session permissions (paths, network hosts, subprocesses) and resource quotas (CPU, memory, wall time). Session snapshots persist and restore warmed-up sessions in milliseconds.
+7. **Realigned numerical, serialization, and VM/JIT contracts (ADRs 0020, 0022):**
+   - Bidirectional XDR v2/v3 `.rds` and `.RData` interchange (gzip, bzip2, xz, zstd) including S4 and ALTREP.
+   - **No `.Rc` bytecode roundtripping:** read-only `BCODESXP` `consts[0]` unwrap preserves compatibility with existing `.rdb`/`.rds` files, while Roxide's register IR and targeted native JIT optimize freely for real `dplyr`, `data.table`, and `purrr` workloads.
+   - **PRNG and distributions:** bit-exact default Mersenne-Twister plus `runif`, `rnorm`, and `sample`; tight numerical agreement (`< 1e-14` relative error) across the remaining 22 distributions.
+
+## Layered differential oracle strategy
+
+All verification runs black-box against the official GNU R 4.6.2 binary (`Rscript --vanilla` / `R --vanilla`) and runs in CI on every change:
 
 | Layer | What it tests | Pass criterion |
 | --- | --- | --- |
-| **Layer 1: Exact Language & Output Parity** | Syntax/parse/deparse, evaluation, promises/NSE, subsetting, S3/S4, `print`/`format`/`str`, conditions/warnings, `base` & `utils` text output | **Byte-for-byte** stdout, stderr, exit code, and `identical()`-equivalent `dput()` output vs. GNU R 4.6.2 |
-| **Layer 2: Numerical & PRNG Parity** | `set.seed()` sequences, `d/p/q/r*` distributions (body + extreme tails + `NA`/`NaN`/`Inf`), linear algebra (`qr`/`svd`/`eigen`/`chol`), `lm`/`glm`/`optim`/`nlminb` | Bit-exact PRNG integer/uniform streams; tight ULP / relative-tolerance bounds (e.g., $\le 10^{-13}$ to $10^{-15}$) verified against GNU R 4.6.2 |
-| **Layer 3: Object Systems, Packages & Graphics** | S4 classes/slots/multiple dispatch/RefClasses, `NAMESPACE`/loader/lazy-load/`R CMD`, `grDevices`/`graphics`/`grid` geometry & structural PDF/SVG/PNG verification | Exact numeric/text/geometry match + structural PDF/SVG/PNG & `ROXIDE_GC_TORTURE=1` pass |
-| **Layer 4: Real-World Pure-R & Compiled CRAN Corpus** | Real-world statistical workflows, pure-R CRAN packages (M2–M3), and compiled C/C++ CRAN packages via `roxide-capi` (M4) | Matching outputs, test-suite pass rates, and zero crashes |
+| **Layer 1: Exact language and `base` parity** | Syntax, `deparse`, evaluation, promises/NSE, subsetting, S3, `print`/`format`, conditions, `base` text output, `.rds`/`.RData` | Byte-for-byte stdout, stderr, exit code, and cross-engine `.rds`/`.RData` roundtrip vs. GNU R 4.6.2 |
+| **Layer 2: Numerical and PRNG parity** | Default MT19937 + `runif`/`rnorm`/`sample`, 22 distributions, linalg (`qr`/`svd`/`eigen`/`chol`), `lm`/`glm`/`optim`/`nlminb`, `utils`/`tools` | Bit-exact MT19937 + core samplers; `< 1e-14` relative error on distributions and tight linalg/model tolerances |
+| **Layer 3: S4, packages and graphics** | S4/RefClass dispatch, `NAMESPACE`/`.rdb`/`.rdx`/`R CMD`, `grDevices`/`graphics`/`grid`, `ragg`-parity text/CJK/emoji | Exact numeric/geometry match, pixel tolerance vs. `ragg`, and `ROXIDE_GC_TORTURE=1` pass |
+| **Layer 4: Curated pure-R and compiled CRAN tiers** | Tier-2 pure-R (`R6`, `withr`, `crayon`, `praise`, `magrittr`, `zeallot`) and Tier-3 compiled (`jsonlite`, `rlang`, `vctrs`, `cli`, `cpp11`, `Rcpp`, `data.table`, `dplyr`, `ggplot2`, `Matrix`) | Test-suite parity with GNU R, zero crashes, GC-torture and multi-session isolation pass |
+| **Layer 5: Nightly CRAN/Bioconductor matrix and workload benchmarks** | Full CRAN and Bioconductor package test suites ranked by reverse-dependency count, plus real `dplyr`/`data.table`/`purrr` and Arrow interop benchmarks | Tracked ecosystem pass rate, zero regressions on pinned reverse-dep leaders, and advisory table updates |

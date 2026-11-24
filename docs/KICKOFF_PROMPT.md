@@ -1,19 +1,16 @@
-# Kickoff Prompt for New Project Thread
+# Kickoff / handoff prompt
 
-Paste this as the first message when you open **Roxide** (`https://github.com/dvgyl/roxide`) in a new T3 Code project thread (running on **Gemini 4 Neon** with Full Access enabled):
-
----
+> Milestones M0 through M3 are complete and M4 is at Wave 5. Use [`docs/HANDOFF_PROMPT.md`](HANDOFF_PROMPT.md) for the active continuation prompt.
 
 ```text
-Hi Gemini! You have full control of **Roxide** (`https://github.com/dvgyl/roxide`), a strict clean-room, native Rust drop-in replacement for **GNU R 4.6.2** (`MIT OR Apache-2.0`).
+Continue Roxide (`https://github.com/dvgyl/roxide`) from `main`, working backwards from `docs/VISION.md`.
 
-Read `AGENTS.md`, `README.md`, `docs/MODEL_ROUTING.md`, `docs/ARCHITECTURE.md`, and `docs/ROADMAP.md` first, then start immediately on **Milestone 0** and keep pushing forward into Milestone 1.
+First read `AGENTS.md`, `docs/VISION.md`, `docs/ROADMAP.md`, `docs/ARCHITECTURE.md`, `docs/ADR.md` (especially ADRs 0021-0025), and `PROGRESS.md`.
 
-Core rules to follow from Turn 1:
-- **Full access & autonomy:** I have enabled full access — do NOT stop to ask me for permissions, confirmations, or minor decisions. Keep working continuously, keep talking to me with regular progress updates, and **keep an eye on your subagents for permissions** (inherit full access, never narrow their runtimeMode, and immediately unstick any subagent that asks a question or hits a permission pause).
-- **Strict clean-room wall:** GNU R is GPL — never download, read, or copy GNU R source or test files; use only official GNU R 4.6.2 binaries as a black-box oracle plus manuals, published math algorithms, and permissive Rust crates.
-- **Commit & push regularly:** Commit clean, gate-passing checkpoints and push regularly to `https://github.com/dvgyl/roxide` (`origin/main`) after every verified wave/milestone.
-- **Model routing:** Go **really aggressive on OpenAI agents** (`GPT 6.2 Sol` at `high`, `GPT 6.2 Astra` for deep scientific/numerical/formal feedback) for everything they can handle just as well as Gemini/Anthropic. **NEVER use `max` effort** on either Anthropic or OpenAI agents. This is not a ban on Gemini 4 Neon or Opus 5.5 — you decide how and when to use them, **Gemini 4 Neon + Opus 5.5 remain the primary planners** (with Astra for feedback), **always do check-ins on OpenAI models' work**, work out disagreements empirically against the GNU R 4.6.2 oracle, and retain final decisions with Neon + Opus 5.5. Never use Fable 5.2.
+Main rules:
+- Follow the Top 3 priorities in `docs/VISION.md` (1. CRAN/Bioconductor pass rate, 2. binary repo + bundled toolchain + `faer` BLAS/LAPACK, 3. multi-session compiled packages) and the cut list in ADRs 0021-0025.
+- Full autonomy (never pause for routine approvals), keep the user updated concisely, monitor delegated agents for stalls, and commit + push to `origin/main` after every verified wave.
+- Enforce the strict clean-room MIT/Apache-2.0 wall, `docs/MODEL_ROUTING.md` (aggressive GPT 6.2 Sol `high`, behind-the-scenes Astra, Neon/Opus planning + check-ins, never `max` effort, never Fable 5.2, max 2 Cargo slots), and `scripts/gate.sh`.
 
-Go ahead and inspect the environment, check `orchestrator_capabilities`, align on Milestone 0 core contracts (`SEXP`/GC/promises/`NA_real_` 1954) with Opus 5.5 + Astra feedback, set up the GNU R 4.6.2 binary oracle and Cargo workspace, and get rolling!
+Resume at M4 Wave 5 (`PROGRESS.md`), close M4, and keep pushing through M5-M8.
 ```
