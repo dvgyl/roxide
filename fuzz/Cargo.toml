@@ -1,0 +1,18 @@
+[package]
+name = "roxide-fuzz"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace]
+
+[dependencies]
+roxide-base = { path = "../crates/roxide-base" }
+roxide-diag = { path = "../crates/roxide-diag" }
+roxide-eval = { path = "../crates/roxide-eval" }
+roxide-host = { path = "../crates/roxide-host" }
+roxide-pkg = { path = "../crates/roxide-pkg" }
+roxide-syntax = { path = "../crates/roxide-syntax" }
+roxide-utils = { path = "../crates/roxide-utils" }
+roxide-value = { path = "../crates/roxide-value" }

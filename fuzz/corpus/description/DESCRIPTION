@@ -1,0 +1,8 @@
+Package: ParserSeed
+Version: 1.2-3
+Description: First line.
+ .
+ Second paragraph.
+Imports: stats (>= 4.0), utils
+Collate.unix: 'seed.R'
+Collate.windows: 'windows.R'
