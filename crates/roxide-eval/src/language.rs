@@ -88,7 +88,7 @@ pub(crate) const MODULE: Module = Module {
             "substitute",
             substitute,
             Unevaluated,
-            Arity::Range(1, 2),
+            Arity::Range(0, 2),
             On
         ),
         primitive!(
@@ -428,6 +428,9 @@ fn missing(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
 }
 
 fn substitute(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    if args.is_empty() {
+        return Ok(SEXP_MISSING);
+    }
     let matched = ctx.match_names(args, &["expr", "env"], call.err_call())?;
     let expr = ctx.matched_arg(args, &matched, 0).unwrap_or(SEXP_MISSING);
     let env = ctx.eval_arg(args, &matched, 1, call, call.env)?;

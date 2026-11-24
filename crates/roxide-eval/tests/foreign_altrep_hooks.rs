@@ -333,7 +333,7 @@ fn ast_and_vm_handle_foreign_conditions_sequences_and_operands() {
         .unwrap();
         let expr = get(&mut ctx, "expr");
         let result = if compiled {
-            let code = compile_expr(ctx.session(), expr).unwrap();
+            let code = compile_expr(ctx.session_mut(), expr).unwrap();
             run_compiled(&mut ctx, &code, GLOBAL_ENV).unwrap()
         } else {
             ctx.eval(expr, GLOBAL_ENV).unwrap()
@@ -369,4 +369,20 @@ fn literal_assignment_errors_match_the_gnu_r_diagnostics() {
         value_text(&mut ctx, "direct"),
         "\"invalid (do_set) left-hand side to assignment\""
     );
+}
+
+#[test]
+fn deep_resolution_visits_language_objects_and_dotted_tails() {
+    let mut ctx = context();
+    let argument = ints(&mut ctx, &[1, 2], 0);
+    let tail = ints(&mut ctx, &[3, 4], 0);
+    let session = ctx.session_mut();
+    let head = session.intern("f").unwrap().as_sexp();
+    let args = session.cons(argument, tail, SEXP_NIL).unwrap();
+    let call = session.lcons(head, args, SEXP_NIL).unwrap();
+
+    ctx.resolve_altrep_deep(call).unwrap();
+
+    assert!(owned(&ctx, argument));
+    assert!(owned(&ctx, tail));
 }

@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use roxide_gc::SexpId;
-use roxide_value::{RSession, SEXP_MISSING, SEXP_NIL, SexpType, ValueApi, ValueError};
+use roxide_value::{RSession, SEXP_MISSING, SEXP_NIL, SexpType, Sym, ValueApi, ValueError};
 
 use super::ir::{Binary, CallSite, CompiledCode, IndexSet, Op, Reg, Unary, VERSION, VarSite};
 use crate::closure::dots_index;
@@ -11,13 +11,17 @@ use crate::closure::dots_index;
 const MAX_DEPTH: usize = 128;
 const MAX_ITEMS: usize = 1 << 16;
 
-/// Compile `expr` without changing the R heap.
+/// Compile `expr` and intern any replacement function names it uses.
 ///
 /// The compiler returns an error for stale handles and when its depth or
 /// instruction limits are exceeded. Callers can evaluate the original AST.
-pub fn compile_expr(session: &RSession, expr: SexpId) -> Result<CompiledCode, ValueError> {
+pub fn compile_expr(session: &mut RSession, expr: SexpId) -> Result<CompiledCode, ValueError> {
+    let index1_replacement = session.intern("[<-")?;
+    let index2_replacement = session.intern("[[<-")?;
     let mut compiler = Compiler {
         session,
+        index1_replacement,
+        index2_replacement,
         out: CompiledCode {
             version: VERSION,
             source: expr,
@@ -42,6 +46,8 @@ pub fn compile_expr(session: &RSession, expr: SexpId) -> Result<CompiledCode, Va
 
 struct Compiler<'a> {
     session: &'a RSession,
+    index1_replacement: Sym,
+    index2_replacement: Sym,
     out: CompiledCode,
     constants: HashMap<SexpId, u32>,
     symbols: HashMap<SexpId, u32>,
@@ -113,24 +119,24 @@ impl Compiler<'_> {
             let (pc, site) = self.guard_call(expr, dst)?;
             let operands = self.binary(dst, *lhs, *rhs, site, depth)?;
             self.emit(op(operands))?;
-            return self.end_guard(pc, site, dst);
+            return self.end_guard_retaining(pc, Some(operands.lhs));
         }
         match (name, args.as_slice()) {
             ("{", body) => {
-                let (pc, site) = self.guard_call(expr, dst)?;
+                let (pc, _) = self.guard_call(expr, dst)?;
                 if body.is_empty() {
                     self.emit(Op::LoadNil(dst))?;
                 }
                 for &stmt in body {
                     self.expr(stmt, dst, depth)?;
                 }
-                self.end_guard(pc, site, dst)
+                self.end_guard(pc)
             }
             ("(", [arg]) => {
-                let (pc, site) = self.guard_call(expr, dst)?;
+                let (pc, _) = self.guard_call(expr, dst)?;
                 self.expr(*arg, dst, depth)?;
                 self.emit(Op::SetVisible(true))?;
-                self.end_guard(pc, site, dst)
+                self.end_guard(pc)
             }
             ("<-" | "=" | "<<-", [lhs, rhs]) => self.assign(expr, name, *lhs, *rhs, dst, depth),
             ("[" | "[[", [receiver, index]) => {
@@ -144,7 +150,7 @@ impl Compiler<'_> {
                     index_const,
                     site,
                 })?;
-                self.end_guard(pc, site, dst)
+                self.end_guard(pc)
             }
             ("if", [cond, yes] | [cond, yes, _]) => {
                 self.if_expr(expr, dst, *cond, *yes, args.get(2).copied(), depth)
@@ -153,15 +159,15 @@ impl Compiler<'_> {
                 self.loop_expr(expr, name, &args, *body, dst, depth)
             }
             ("break" | "next", []) if self.loop_depth != 0 => {
-                let (pc, site) = self.guard_call(expr, dst)?;
+                let (pc, _) = self.guard_call(expr, dst)?;
                 self.emit(if name == "break" { Op::Break } else { Op::Next })?;
-                self.end_guard(pc, site, dst)
+                self.end_guard(pc)
             }
             ("return", [] | [_]) => {
-                let (pc, site) = self.guard_call(expr, dst)?;
+                let (pc, _) = self.guard_call(expr, dst)?;
                 self.expr(args.first().copied().unwrap_or(SEXP_NIL), dst, depth)?;
-                self.emit(Op::ReturnFromFunction { src: dst, site })?;
-                self.end_guard(pc, site, dst)
+                self.emit(Op::ReturnFromFunction(dst))?;
+                self.end_guard(pc)
             }
             ("&&" | "||", [lhs, rhs]) => {
                 self.short_circuit(expr, dst, *lhs, *rhs, name == "||", depth)
@@ -176,7 +182,7 @@ impl Compiler<'_> {
                     "-" => Op::Neg(unary),
                     _ => Op::Not(unary),
                 })?;
-                self.end_guard(pc, site, dst)
+                self.end_guard(pc)
             }
             (
                 "if" | "for" | "while" | "repeat" | "break" | "next" | "return" | "(" | "<-" | "="
@@ -200,24 +206,15 @@ impl Compiler<'_> {
         depth: usize,
     ) -> Result<(), ValueError> {
         if self.is_variable(lhs)? {
-            let (pc, site) = self.guard_call(expr, dst)?;
+            let (pc, _) = self.guard_call(expr, dst)?;
             let var = self.variable(lhs)?;
             self.expr(rhs, dst, depth)?;
-            let call_const = site.call_const;
             self.emit(if name == "<<-" {
-                Op::SuperStoreVar {
-                    var,
-                    src: dst,
-                    call_const,
-                }
+                Op::SuperStoreVar { var, src: dst }
             } else {
-                Op::StoreVar {
-                    var,
-                    src: dst,
-                    call_const,
-                }
+                Op::StoreVar { var, src: dst }
             })?;
-            return self.end_guard(pc, site, dst);
+            return self.end_guard(pc);
         }
         if name == "<<-" || self.session.type_of(lhs)? != SexpType::Lang {
             return self.eval_ast(expr, dst);
@@ -226,9 +223,9 @@ impl Compiler<'_> {
         if self.session.type_of(head)? != SexpType::Sym {
             return self.eval_ast(expr, dst);
         }
-        let op = match self.session.sym_name_of(head)? {
-            "[" => Op::Index1Set,
-            "[[" => Op::Index2Set,
+        let (op, replacement): (fn(IndexSet) -> Op, _) = match self.session.sym_name_of(head)? {
+            "[" => (Op::Index1Set, self.index1_replacement),
+            "[[" => (Op::Index2Set, self.index2_replacement),
             _ => return self.eval_ast(expr, dst),
         };
         let Some(args) = self.positional_args(tail)? else {
@@ -250,9 +247,10 @@ impl Compiler<'_> {
             var,
             index_const,
             site,
+            replacement,
             repl_cache_idx,
         }))?;
-        self.end_guard(pc, site, dst)
+        self.end_guard(pc)
     }
 
     fn if_expr(
@@ -284,7 +282,7 @@ impl Compiler<'_> {
             self.emit(Op::SetVisible(false))?;
         }
         self.patch(jump, Op::Jump(self.pc()))?;
-        self.end_guard(guard, site, dst)
+        self.end_guard(guard)
     }
 
     fn loop_expr(
@@ -337,6 +335,7 @@ impl Compiler<'_> {
             Op::LoopPush {
                 break_target: exit,
                 next_target: step,
+                cursor: iterator.map(|(cursor, _)| cursor),
             },
         )?;
         if let Some(pc) = condition {
@@ -347,7 +346,6 @@ impl Compiler<'_> {
                         cursor,
                         var,
                         target: exit,
-                        call_const: site.call_const,
                     },
                     None => Op::JumpIfFalse {
                         cond: dst,
@@ -361,7 +359,7 @@ impl Compiler<'_> {
         self.emit(Op::LoadNil(dst))?;
         self.emit(Op::SetVisible(false))?;
         self.out.has_loops = true;
-        self.end_guard(guard, site, dst)
+        self.end_guard(guard)
     }
 
     fn short_circuit(
@@ -379,12 +377,15 @@ impl Compiler<'_> {
         let branch = self.placeholder()?;
         let right = self.reg()?;
         self.expr(rhs, right, depth)?;
-        self.emit(Op::FinishLogical(Binary {
-            dst,
-            lhs: left,
-            rhs: right,
-            site,
-        }))?;
+        self.emit(Op::FinishLogical {
+            args: Binary {
+                dst,
+                lhs: left,
+                rhs: right,
+                site,
+            },
+            and: !decisive,
+        })?;
         self.patch(
             branch,
             Op::ShortCircuit {
@@ -395,7 +396,7 @@ impl Compiler<'_> {
                 site,
             },
         )?;
-        self.end_guard(guard, site, dst)
+        self.end_guard_retaining(guard, Some(left))
     }
 
     fn binary(
@@ -476,19 +477,29 @@ impl Compiler<'_> {
             site,
             dst,
             fallback: 0,
+            retain: None,
         })?;
         Ok((pc, site))
     }
 
-    fn end_guard(&mut self, pc: u32, site: CallSite, dst: Reg) -> Result<(), ValueError> {
-        self.patch(
-            pc,
-            Op::GuardCall {
-                site,
-                dst,
-                fallback: self.pc(),
-            },
-        )
+    fn end_guard(&mut self, pc: u32) -> Result<(), ValueError> {
+        self.end_guard_retaining(pc, None)
+    }
+
+    fn end_guard_retaining(&mut self, pc: u32, retained: Option<Reg>) -> Result<(), ValueError> {
+        let end = self.pc();
+        let Some(Op::GuardCall {
+            fallback, retain, ..
+        }) = self.out.code.get_mut(pc as usize)
+        else {
+            return Err(ValueError::TypeMismatch {
+                expected: "guard instruction",
+                actual: "other instruction",
+            });
+        };
+        *fallback = end;
+        *retain = retained;
+        Ok(())
     }
 
     fn reg(&mut self) -> Result<Reg, ValueError> {
@@ -583,7 +594,7 @@ mod tests {
     fn compile(source: &str) -> (RSession, CompiledCode) {
         let mut session = RSession::new(Default::default()).expect("session");
         let expr = lower_source(&mut session, source);
-        let ir = compile_expr(&session, expr).expect("compile R AST");
+        let ir = compile_expr(&mut session, expr).expect("compile R AST");
         assert_eq!(ir.source, expr);
         for op in &ir.code {
             let target = match op {
@@ -597,6 +608,7 @@ mod tests {
                 Op::LoopPush {
                     break_target,
                     next_target,
+                    ..
                 } => {
                     assert!((*next_target as usize) < ir.code.len());
                     *break_target
@@ -691,7 +703,7 @@ mod tests {
         assert!(
             ir.code[branch + 1..target as usize]
                 .iter()
-                .any(|op| matches!(op, Op::ReturnFromFunction { .. }))
+                .any(|op| matches!(op, Op::ReturnFromFunction(_)))
         );
         assert!(matches!(
             &ir.code[target as usize..],
@@ -721,13 +733,14 @@ mod tests {
                     ..
                 },
                 Op::CallFast { dst: right, .. },
-                Op::FinishLogical(finish),
+                Op::FinishLogical { args: finish, and },
                 Op::Return(_),
             ] = ir.code.as_slice()
             else {
                 panic!("{}", ir.disassemble(&session))
             };
             assert_eq!(*value, decisive);
+            assert_ne!(*and, decisive);
             assert_eq!((*target, *fallback), (5, 5));
             assert_eq!(finish.site, *site);
             assert_eq!(branch_site, site);
@@ -748,6 +761,7 @@ mod tests {
                 Op::LoopPush {
                     break_target,
                     next_target,
+                    ..
                 } => Some((*break_target as usize, *next_target as usize)),
                 _ => None,
             })
@@ -877,7 +891,7 @@ mod tests {
         let (session, ir) = compile("x + 2L");
         let printed = ir.disassemble(&session);
         assert!(
-            printed.starts_with("Roxide IR v1 (3 registers, 1 call caches, 1 variable caches)\n")
+            printed.starts_with("Roxide IR v2 (3 registers, 1 call caches, 1 variable caches)\n")
         );
         assert!(printed.contains("symbol 0 = \"x\"\n"));
         assert!(printed.contains("const 0 = call \"+\"\n"));
@@ -896,11 +910,11 @@ mod tests {
             let args = session.cons(expr, SEXP_NIL, SEXP_NIL).unwrap();
             expr = session.lcons(paren, args, SEXP_NIL).unwrap();
         }
-        assert!(compile_expr(&session, expr).is_ok());
+        assert!(compile_expr(&mut session, expr).is_ok());
         let args = session.cons(expr, SEXP_NIL, SEXP_NIL).unwrap();
         let expr = session.lcons(paren, args, SEXP_NIL).unwrap();
         assert_eq!(
-            compile_expr(&session, expr).unwrap_err(),
+            compile_expr(&mut session, expr).unwrap_err(),
             ValueError::IndexOutOfBounds {
                 index: MAX_DEPTH,
                 len: MAX_DEPTH

@@ -3,10 +3,10 @@
 use std::fmt::{self, Write};
 
 use roxide_gc::{SexpId, Trace, Tracer};
-use roxide_value::{RSession, SEXP_MISSING, SexpType, ValueApi};
+use roxide_value::{RSession, SEXP_MISSING, SexpType, Sym, ValueApi};
 
 /// Current version of the Roxide instruction set.
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 
 /// Virtual register for a temporary value or loop cursor.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -72,6 +72,8 @@ pub struct IndexSet {
     /// Original assignment. Resolve the replacement function at its normal
     /// evaluation point, before evaluation of the index.
     pub site: CallSite,
+    /// Interned replacement function name.
+    pub replacement: Sym,
     /// Call cache slot for the replacement function.
     pub repl_cache_idx: u16,
 }
@@ -94,13 +96,6 @@ pub enum Op {
     },
     /// Load a visible R `NULL`.
     LoadNil(Reg),
-    /// Copy a register and preserve visibility.
-    Move {
-        /// Result register.
-        dst: Reg,
-        /// Register to copy.
-        src: Reg,
-    },
     /// Set visibility of the current result.
     SetVisible(bool),
     /// Read a variable using the normal symbol evaluation rules.
@@ -116,8 +111,6 @@ pub enum Op {
         var: VarSite,
         /// Value register.
         src: Reg,
-        /// Original assignment for binding errors.
-        call_const: u32,
     },
     /// Assign in an enclosing environment and make the result invisible.
     SuperStoreVar {
@@ -125,8 +118,6 @@ pub enum Op {
         var: VarSite,
         /// Value register.
         src: Reg,
-        /// Original assignment for binding errors.
-        call_const: u32,
     },
     /// Continue if the call resolves to the expected base primitive. Keep that
     /// resolution for this execution of the site. Otherwise evaluate the
@@ -138,6 +129,8 @@ pub enum Op {
         dst: Reg,
         /// Instruction after the compiled call.
         fallback: u32,
+        /// Register whose value must stay shared during operand evaluation.
+        retain: Option<Reg>,
     },
     /// Add.
     Add(Binary),
@@ -205,17 +198,17 @@ pub enum Op {
     },
     /// Finish `&&` or `||` after evaluation of both operands. Use the original
     /// call for coercion or error handling if the scalar logical guard fails.
-    FinishLogical(Binary),
+    FinishLogical {
+        /// Operands and original call.
+        args: Binary,
+        /// True for `&&`, false for `||`.
+        and: bool,
+    },
     /// Finish the compiled expression and preserve its visibility.
     Return(Reg),
     /// Transfer a return value through the current R function frame.
     /// Report an error if there is no function frame.
-    ReturnFromFunction {
-        /// Register with the return value.
-        src: Reg,
-        /// Original `return` call.
-        site: CallSite,
-    },
+    ReturnFromFunction(Reg),
     /// Set the loop variable to `NULL`, then initialize a cursor from the
     /// evaluated sequence. Compact ALTREP sequences can use an unboxed cursor.
     ForInit {
@@ -236,8 +229,6 @@ pub enum Op {
         var: VarSite,
         /// Destination when the sequence is exhausted.
         target: u32,
-        /// Original `for` call for binding errors.
-        call_const: u32,
     },
     /// Register a loop with the R evaluator to catch transfers from AST code.
     LoopPush {
@@ -245,6 +236,8 @@ pub enum Op {
         break_target: u32,
         /// Instruction that begins the next iteration.
         next_target: u32,
+        /// Cursor to clear when a `for` loop ends.
+        cursor: Option<Reg>,
     },
     /// Remove the current loop frame.
     LoopPop,
@@ -393,7 +386,7 @@ mod tests {
         let args = session.cons(child, SEXP_NIL, SEXP_NIL).unwrap();
         let fallback = session.lcons(head, args, SEXP_NIL).unwrap();
         let unrooted = session.scalar_int(5).unwrap();
-        let mut code = crate::vm::compile_expr(&session, source).unwrap();
+        let mut code = crate::vm::compile_expr(&mut session, source).unwrap();
         // Make each root independent so tracing one cannot keep another alive.
         code.consts = vec![literal, fallback];
         session.collect(&Roots(code));

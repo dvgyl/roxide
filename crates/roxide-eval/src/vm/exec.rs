@@ -12,8 +12,8 @@ pub use super::jit::run_body;
 
 use super::cache::Caches;
 use super::ir::{Binary, CallSite, CompiledCode, Op, Reg, VERSION, VarSite};
-use super::stack::{ForCursor, GuardFrame, LoopFrame, VmFrame, VmStack};
-use super::{compile_expr, guard, scalar, stack, subscript};
+use super::stack::{ForCursor, GuardFrame, LoopFrame, VmFrame};
+use super::{compile_expr, guard, scalar, subscript};
 
 /// Execute compiled code in `env` and preserve the result's R visibility.
 pub fn run_compiled(ctx: &mut Ctx, code: &CompiledCode, env: SexpId) -> EvalResult {
@@ -25,7 +25,7 @@ pub(super) fn execute(
     code: &CompiledCode,
     env: SexpId,
     caches: &RefCell<Caches>,
-    entry: Option<SexpId>,
+    entry: Option<(SexpId, Call)>,
 ) -> EvalResult {
     if code.version != VERSION {
         return Err(invalid());
@@ -39,10 +39,10 @@ pub(super) fn execute(
     let previous_env = std::mem::replace(&mut ctx.eval_env, env);
     let loop_depth = ctx.loops.len();
     let expr_depth = ctx.expr_depth;
-    ctx.ext::<VmStack>().0.push(VmFrame::new(code, env));
+    ctx.vm_stack.frames.push(VmFrame::new(code, env));
     let result = vm.run(ctx);
-    let result = ctx.condition_result(SEXP_NIL, result);
-    if let Some(frame) = ctx.ext::<VmStack>().0.pop() {
+    let result = ctx.condition_result(entry.map_or(SEXP_NIL, |(_, call)| call.err_call()), result);
+    if let Some(frame) = ctx.vm_stack.frames.pop() {
         for guard in frame.guards {
             if let Some(value) = guard.retained {
                 ctx.session.heap.dec_ref(value);
@@ -56,13 +56,14 @@ pub(super) fn execute(
 }
 
 pub(crate) fn try_loop(ctx: &mut Ctx, call: &Call) -> Option<EvalResult> {
-    if ctx.jit_level() < 3 || stack::active(ctx) || ctx.frame(call.env).is_some() {
+    if ctx.jit_level() < 3 || !ctx.vm_stack.frames.is_empty() || ctx.frame(call.env).is_some() {
         return None;
     }
-    let code = compile_expr(&ctx.session, call.expr).ok()?;
     let (head, _, _) = ctx.session.cons_parts(call.expr).ok()?;
     let def = ctx.prims.get(usize::from(call.prim.0))?;
-    if !code.has_loops || ctx.session.sym_name_of(head).ok()? != def.name {
+    if !matches!(def.name, "for" | "while" | "repeat")
+        || ctx.session.sym_name_of(head).ok()? != def.name
+    {
         return None;
     }
     let sym = ctx.session.sexp_as_sym(head).ok()?;
@@ -70,12 +71,16 @@ pub(crate) fn try_loop(ctx: &mut Ctx, call: &Call) -> Option<EvalResult> {
     if ctx.session.prim_parts(fun).ok()?.0 != call.prim {
         return None;
     }
+    let code = compile_expr(&mut ctx.session, call.expr).ok()?;
+    if !code.has_loops {
+        return None;
+    }
     Some(execute(
         ctx,
         &code,
         call.env,
         &RefCell::new(Caches::new(&code)),
-        Some(fun),
+        Some((fun, *call)),
     ))
 }
 
@@ -83,7 +88,7 @@ pub(super) struct Execution<'a> {
     code: &'a CompiledCode,
     env: SexpId,
     caches: &'a RefCell<Caches>,
-    entry: Option<SexpId>,
+    entry: Option<(SexpId, Call)>,
 }
 
 enum Step {
@@ -99,7 +104,20 @@ impl Execution<'_> {
         loop {
             self.close_guards(ctx, pc)?;
             let op = self.code.code.get(pc).ok_or_else(invalid)?;
-            match self.step(ctx, op, pc) {
+            #[cfg(test)]
+            if ctx.vm_stack.collect_each_op {
+                ctx.collect_gc();
+            }
+            let result = self.step(ctx, op, pc);
+            let result = if matches!(result, Err(Unwind::Value(_)))
+                && let Some(site) = frame(ctx)?.guards.last().map(|guard| guard.site)
+            {
+                let call = self.guarded_call(ctx, site)?;
+                ctx.condition_result(call.err_call(), result)
+            } else {
+                result
+            };
+            match result {
                 Ok(Step::Advance) => pc += 1,
                 Ok(Step::Jump(target)) => {
                     if target <= pc {
@@ -135,10 +153,6 @@ impl Execution<'_> {
                 self.write(ctx, dst, SEXP_NIL)?;
                 ctx.visible = true;
             }
-            Op::Move { dst, src } => {
-                let value = self.read(ctx, src)?;
-                self.write(ctx, dst, value)?;
-            }
             Op::SetVisible(visible) => ctx.visible = visible,
             Op::LoadVar { dst, var } => {
                 let (id, sym) = self.symbol(ctx, var)?;
@@ -159,7 +173,7 @@ impl Execution<'_> {
                 };
                 self.write(ctx, dst, value)?;
             }
-            Op::StoreVar { var, src, .. } | Op::SuperStoreVar { var, src, .. } => {
+            Op::StoreVar { var, src } | Op::SuperStoreVar { var, src } => {
                 let value = self.read(ctx, src)?;
                 let (_, sym) = self.symbol(ctx, var)?;
                 if matches!(op, Op::SuperStoreVar { .. }) {
@@ -173,25 +187,36 @@ impl Execution<'_> {
                 site,
                 dst,
                 fallback,
+                retain,
             } => {
                 let expr = self.constant(site.call_const)?;
+                let entry = self.entry.filter(|_| pc == 0);
+                let (fun, counted) = if let Some((fun, _)) = entry {
+                    (Some(fun), false)
+                } else if ctx.expr_depth
+                    < ctx.opts.expressions.min(ctx.host.limits().max_expressions)
+                {
+                    (self.resolve(ctx, expr, site.cache_idx)?, true)
+                } else {
+                    (None, false)
+                };
                 let end = fallback as usize;
-                let skip = Step::Jump(end);
-                if pc == 0
-                    && let Some(fun) = self.entry
-                {
-                    self.push_guard(ctx, pc, end, site, fun, false)?;
-                    return Ok(Step::Advance);
-                }
-                if ctx.expr_depth < ctx.opts.expressions.min(ctx.host.limits().max_expressions)
-                    && let Some(fun) = self.resolve(ctx, expr, site.cache_idx)?
-                {
-                    self.push_guard(ctx, pc, end, site, fun, true)?;
+                if let Some(fun) = fun {
+                    frame(ctx)?.guards.push(GuardFrame {
+                        start: pc,
+                        end,
+                        site,
+                        fun,
+                        retain,
+                        retained: None,
+                        counted,
+                    });
+                    ctx.expr_depth += usize::from(counted);
                     return Ok(Step::Advance);
                 }
                 let value = ctx.eval(expr, self.env)?;
                 self.write(ctx, dst, value)?;
-                return Ok(skip);
+                return Ok(Step::Jump(end));
             }
             Op::Add(args)
             | Op::Sub(args)
@@ -255,7 +280,7 @@ impl Execution<'_> {
                 self.write(ctx, dst, value)?;
                 return Ok(Step::Jump(target as usize));
             }
-            Op::FinishLogical(args) => {
+            Op::FinishLogical { args, and } => {
                 let call = self.guarded_call(ctx, args.site)?;
                 let lhs = self.read(ctx, args.lhs)?;
                 let rhs = self.read(ctx, args.rhs)?;
@@ -263,11 +288,7 @@ impl Execution<'_> {
                     scalar::short_operand(&ctx.session, lhs),
                     scalar::short_operand(&ctx.session, rhs),
                 ) {
-                    let result = if ctx.prims[usize::from(call.prim.0)].name == "&&" {
-                        a.and(b)
-                    } else {
-                        a.or(b)
-                    };
+                    let result = if and { a.and(b) } else { a.or(b) };
                     ctx.visible = true;
                     ctx.session.scalar_lgl(result)?
                 } else {
@@ -276,7 +297,7 @@ impl Execution<'_> {
                 self.write(ctx, args.dst, value)?;
             }
             Op::Return(src) => return Ok(Step::Done(self.read(ctx, src)?)),
-            Op::ReturnFromFunction { src, .. } => {
+            Op::ReturnFromFunction(src) => {
                 let value = self.read(ctx, src)?;
                 let Some(target) = ctx.frame(self.env).map(|frame| frame.id) else {
                     return Err(
@@ -323,9 +344,7 @@ impl Execution<'_> {
                 cursor,
                 var,
                 target,
-                ..
             } => {
-                checkpoint(ctx)?;
                 let mut state = *self.cursor(ctx, cursor)?;
                 let value = state.advance(ctx)?;
                 *self.cursor(ctx, cursor)? = state;
@@ -340,13 +359,10 @@ impl Execution<'_> {
             Op::LoopPush {
                 break_target,
                 next_target,
+                cursor,
             } => {
                 let id = ctx.next_frame();
                 ctx.loops.push((id, self.env));
-                let cursor = match self.code.code.get(next_target as usize) {
-                    Some(Op::ForNext { cursor, .. }) => Some(*cursor),
-                    _ => None,
-                };
                 frame(ctx)?.loops.push(LoopFrame {
                     id,
                     break_target: break_target as usize,
@@ -387,21 +403,8 @@ impl Execution<'_> {
             }
             Op::Index1Set(args) | Op::Index2Set(args) => {
                 let call = self.guarded_call(ctx, args.site)?;
-                let lhs = subscript::arguments(ctx, call.expr)?.get(0);
-                let (head, _, _) = ctx.session.cons_parts(lhs)?;
-                let head = ctx.session.sexp_as_sym(head)?;
-                let replacement = if matches!(op, Op::Index1Set(_)) {
-                    "[<-"
-                } else {
-                    "[[<-"
-                };
-                let replacement = ctx.session.intern(replacement)?;
-                let builtin = guard::base_call(&ctx.session, head, self.env, &mut None);
-                let replacement = if builtin.is_some() {
-                    self.resolve_symbol(ctx, replacement, args.repl_cache_idx)?
-                } else {
-                    None
-                };
+                let replacement =
+                    self.resolve_symbol(ctx, args.replacement, args.repl_cache_idx, 0)?;
                 let (_, sym) = self.symbol(ctx, args.var)?;
                 let value = self.read(ctx, args.value)?;
                 let result = subscript::set(
@@ -481,16 +484,24 @@ impl Execution<'_> {
     fn resolve(&self, ctx: &Ctx, expr: SexpId, cache: u16) -> EvalResult<Option<SexpId>> {
         let (head, _, _) = ctx.session.cons_parts(expr)?;
         let sym = ctx.session.sexp_as_sym(head)?;
-        self.resolve_symbol(ctx, sym, cache)
+        self.resolve_symbol(ctx, sym, cache, 1)
     }
 
-    fn resolve_symbol(&self, ctx: &Ctx, sym: Sym, cache: u16) -> EvalResult<Option<SexpId>> {
+    fn resolve_symbol(
+        &self,
+        ctx: &Ctx,
+        sym: Sym,
+        cache: u16,
+        call_depth: usize,
+    ) -> EvalResult<Option<SexpId>> {
+        let limit = ctx.opts.expressions.min(ctx.host.limits().max_expressions);
+        let can_force = ctx.expr_depth.saturating_add(call_depth) < limit;
         let mut caches = self.caches.borrow_mut();
         let slot = caches
             .calls
             .get_mut(usize::from(cache))
             .ok_or_else(invalid)?;
-        let Some(fun) = guard::base_call(&ctx.session, sym, self.env, slot) else {
+        let Some(fun) = guard::base_call(&ctx.session, sym, self.env, slot, can_force) else {
             return Ok(None);
         };
         let (id, _) = ctx.session.prim_parts(fun)?;
@@ -506,58 +517,24 @@ impl Execution<'_> {
         let fun = frame(ctx)?
             .guards
             .last()
-            .filter(|guard| guard.cache_idx == site.cache_idx)
+            .filter(|guard| guard.site == site)
             .ok_or_else(invalid)?
             .fun;
         let (prim, _) = ctx.session.prim_parts(fun)?;
         let expr = self.constant(site.call_const)?;
+        let user_call = self.entry.map_or(expr, |(_, call)| {
+            if call.expr == expr {
+                call.err_call()
+            } else {
+                expr
+            }
+        });
         Ok(Call {
             expr,
             env: self.env,
             prim,
-            user_call: expr,
+            user_call,
         })
-    }
-
-    fn push_guard(
-        &self,
-        ctx: &mut Ctx,
-        start: usize,
-        end: usize,
-        site: CallSite,
-        fun: SexpId,
-        counted: bool,
-    ) -> EvalResult<()> {
-        let lhs = match end
-            .checked_sub(1)
-            .and_then(|i| self.code.code.get(i))
-            .ok_or_else(invalid)?
-        {
-            Op::Add(args)
-            | Op::Sub(args)
-            | Op::Mul(args)
-            | Op::Div(args)
-            | Op::Pow(args)
-            | Op::Lt(args)
-            | Op::Le(args)
-            | Op::Gt(args)
-            | Op::Ge(args)
-            | Op::Eq(args)
-            | Op::Ne(args)
-            | Op::FinishLogical(args) => Some(args.lhs),
-            _ => None,
-        };
-        frame(ctx)?.guards.push(GuardFrame {
-            start,
-            end,
-            cache_idx: site.cache_idx,
-            fun,
-            lhs,
-            retained: None,
-            counted,
-        });
-        ctx.expr_depth += usize::from(counted);
-        Ok(())
     }
 
     fn close_guards(&self, ctx: &mut Ctx, pc: usize) -> EvalResult<()> {
@@ -607,7 +584,7 @@ impl Execution<'_> {
         if let Some(guard) = frame
             .guards
             .iter_mut()
-            .rfind(|guard| guard.lhs == Some(reg))
+            .rfind(|guard| guard.retain == Some(reg))
         {
             let previous = guard.retained.replace(value);
             ctx.session.heap.inc_ref(value);
@@ -638,11 +615,46 @@ fn checkpoint(ctx: &mut Ctx) -> EvalResult<()> {
 }
 
 fn frame(ctx: &mut Ctx) -> EvalResult<&mut VmFrame> {
-    ctx.ext::<VmStack>().0.last_mut().ok_or_else(invalid)
+    ctx.vm_stack.frames.last_mut().ok_or_else(invalid)
 }
 
 pub(super) fn invalid() -> Unwind {
     Unwind::Internal(InternalError {
         message: "invalid register bytecode".into(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use roxide_gc::GcPolicy;
+    use roxide_host::PureHost;
+    use roxide_value::GLOBAL_ENV;
+
+    use super::*;
+
+    #[test]
+    fn collection_between_instructions_preserves_live_operands_and_loop_values() {
+        let mut ctx = Ctx::new(Box::new(PureHost::new()), GcPolicy::Torture).unwrap();
+        ctx.set_jit_level(3);
+        ctx.vm_stack.collect_each_op = true;
+        ctx.run_global(
+            "<per-instruction GC>",
+            r#"
+            f <- function() {
+                total <- 0L
+                for (x in list(2L, 3L)) {
+                    a <- c(x, x)
+                    b <- a + { a[1L] <- 9L; 1L }
+                    total <- total + b[1L] + b[2L]
+                }
+                total
+            }
+            result <- f()
+            "#,
+        )
+        .unwrap();
+        let name = ctx.session.intern("result").unwrap();
+        let value = ctx.get_var(name, GLOBAL_ENV).unwrap().unwrap();
+        assert_eq!(ctx.session.int(value).unwrap().get(0), 14);
+    }
 }

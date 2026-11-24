@@ -7,10 +7,11 @@ use roxide_diag::msg;
 use roxide_gc::SexpId;
 use roxide_host::OpenMode;
 use roxide_value::format::format_real_scalar;
+use roxide_value::na::RealArithOp as BinOp;
 use roxide_value::{
     BASE_ENV, CharId, DeparseOpts, EMPTY_ENV, Encoding, FormatOpts, GLOBAL_ENV, NA_INTEGER,
     NA_REAL, RLogical, SEXP_NIL, SexpType, ValueApi, deparse, encode_string, format_int_vec,
-    format_lgl_vec, format_real_vec, int_add, int_mul, int_sub, nan_propagate,
+    format_lgl_vec, format_real_vec, int_add, int_mul, int_sub,
 };
 
 use crate::api::{
@@ -188,15 +189,6 @@ fn prim_brace(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     Ok(last)
 }
 
-#[derive(Clone, Copy)]
-enum BinOp {
-    Add,
-    Sub,
-    Mul,
-    Div,
-    Pow,
-}
-
 fn prim_add(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     if args.len() == 1 {
         return unary_sign(ctx, call, args.get(0), false);
@@ -327,34 +319,7 @@ fn binary_arith(ctx: &mut Ctx, call: &Call, a: SexpId, b: SexpId, op: BinOp) -> 
     for i in 0..out_len {
         let x = va[i % la];
         let y = vb[i % lb];
-        let r = match op {
-            BinOp::Add => {
-                let s = x + y;
-                if s.is_nan() { nan_propagate(x, y) } else { s }
-            }
-            BinOp::Sub => {
-                let s = x - y;
-                if s.is_nan() { nan_propagate(x, y) } else { s }
-            }
-            BinOp::Mul => {
-                let s = x * y;
-                if s.is_nan() { nan_propagate(x, y) } else { s }
-            }
-            BinOp::Div => {
-                let s = x / y;
-                if s.is_nan() { nan_propagate(x, y) } else { s }
-            }
-            BinOp::Pow => {
-                // ADR-0005: power identities apply BEFORE missing-value propagation.
-                if y == 0.0 || x == 1.0 {
-                    1.0
-                } else {
-                    let s = x.powf(y);
-                    if s.is_nan() { nan_propagate(x, y) } else { s }
-                }
-            }
-        };
-        out.push(r);
+        out.push(op.apply(x, y));
     }
     Ok(ctx.session.alloc_real_from(&out)?)
 }

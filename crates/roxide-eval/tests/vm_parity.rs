@@ -93,6 +93,64 @@ fn scalar_arithmetic_and_comparison_preserve_types_and_missing_values() {
 }
 
 #[test]
+fn real_power_matches_r_at_zero_and_infinity() {
+    parity(
+        r#"
+        powers <- function() {
+            c((-0)^-1, (-0)^3, 1 / ((-0)^3), (-2)^Inf, (-1)^Inf,
+              (-1)^(-Inf), (-Inf)^0.5, (-Inf)^(-0.5), (-Inf)^3,
+              (-Inf)^2, 1 / ((-Inf)^-3), Inf^-1, Inf^0.5, (-2)^0.5,
+              NA_real_^NaN, NaN^NA_real_, 1^NaN, NaN^0)
+        }
+        powers()
+        result <- powers()
+        "#,
+        concat!(
+            "c(Inf, 0, Inf, NaN, NaN, NaN, NaN, NaN, -Inf, Inf, Inf, 0, Inf, ",
+            "NaN, NA, NA, 1, 1)"
+        ),
+    );
+}
+
+#[test]
+fn compiled_calls_respect_the_expression_depth_limit() {
+    for (depth, expected) in [
+        (25, "1"),
+        (
+            110,
+            "\"evaluation nested too deeply: infinite recursion / options(expressions=)?\"",
+        ),
+    ] {
+        let body = format!("{}1{}", "(".repeat(depth), ")".repeat(depth));
+        parity(
+            &format!(
+                r#"
+                options(expressions = 100)
+                f <- function() {body}
+                tryCatch(f(), error = conditionMessage)
+                result <- tryCatch(f(), error = conditionMessage)
+                "#
+            ),
+            expected,
+        );
+    }
+}
+
+#[test]
+fn subscript_replacement_preserves_function_literals() {
+    parity(
+        r#"
+        f <- function() { x <- 1L; x[1L] <- 2L; x }
+        before <- deparse(body(f))
+        first <- f()
+        second <- f()
+        result <- list(first, second, identical(deparse(body(f)), before))
+        "#,
+        "list(2L, 2L, TRUE)",
+    );
+}
+
+#[test]
 fn arithmetic_dispatch_uses_values_and_original_argument_expressions() {
     parity(
         r#"
@@ -207,7 +265,7 @@ fn compiled_transfers_keep_side_effects_and_release_top_level_loops() {
         "#,
         );
         let expr = get(&mut ctx, "expr");
-        let code = compile_expr(ctx.session(), expr).unwrap();
+        let code = compile_expr(ctx.session_mut(), expr).unwrap();
         assert!(run_compiled(&mut ctx, &code, GLOBAL_ENV).is_err());
         let done = get(&mut ctx, "done");
         assert_eq!(ctx.session().int(done).unwrap().get(0), 1);
@@ -287,7 +345,7 @@ fn replacement_reuses_unshared_storage_for_both_subscripts() {
         );
         let value = get(&mut ctx, "x");
         let expr = get(&mut ctx, "expr");
-        let code = compile_expr(ctx.session(), expr).unwrap();
+        let code = compile_expr(ctx.session_mut(), expr).unwrap();
         let rhs = run_compiled(&mut ctx, &code, GLOBAL_ENV).unwrap();
         assert_eq!(ctx.session().int(rhs).unwrap().get(0), 8);
         assert!(!ctx.is_visible());
@@ -313,15 +371,21 @@ fn caches_respect_rebinding_promises_and_active_bindings() {
             local_plus <- function(`+`) 1L + stop("lazy")
             local_plus(function(a, b) 7L)
             promised <- local_plus(function(a, b) 7L)
+            forced_plus <- function(`+`) {
+                force(`+`)
+                1L + 2L
+            }
+            forced_plus(base::`+`)
+            forced <- c(forced_plus(base::`+`), forced_plus(function(a, b) 9L))
             remove("+", envir = environment())
             makeActiveBinding("+", function() function(a, b) 8L, environment())
             active <- add(stop("lazy"))
-            c(reread, shadow, after, promised, active)
+            c(reread, shadow, after, promised, forced, active)
         }
         make()
         result <- make()
         "#,
-        "c(22L, 99L, 23L, 7L, 8L)",
+        "c(22L, 99L, 23L, 7L, 3L, 9L, 8L)",
     );
 }
 

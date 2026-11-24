@@ -6,7 +6,7 @@ use roxide_value::{
 };
 use std::cmp::Ordering;
 
-use roxide_value::na::R_NAN;
+use roxide_value::na::{R_NAN, RealArithOp, real_pow};
 
 use super::common::{attr, copy_attrs, error, rank, set, vector_limit};
 
@@ -322,27 +322,16 @@ fn recycle_values<A: roxide_value::Elem, B: roxide_value::Elem, C>(
 }
 
 fn real_op(a: f64, b: f64, op: Op, accuracy: &mut bool) -> f64 {
-    if op == Op::Pow && (b == 0.0 || a == 1.0) {
-        return 1.0;
-    }
-    if a.is_nan() || b.is_nan() {
-        return nan_propagate(a, b);
-    }
     match op {
-        Op::Add => a + b,
-        Op::Sub => a - b,
-        Op::Mul => a * b,
-        Op::Div => a / b,
-        Op::Pow => {
-            if a == 0.0 && b < 0.0 {
-                return f64::INFINITY;
-            }
-            if a.is_finite() && a < 0.0 && b.is_infinite() {
-                return R_NAN;
-            }
-            a.powf(b)
-        }
+        Op::Add => RealArithOp::Add.apply(a, b),
+        Op::Sub => RealArithOp::Sub.apply(a, b),
+        Op::Mul => RealArithOp::Mul.apply(a, b),
+        Op::Div => RealArithOp::Div.apply(a, b),
+        Op::Pow => real_pow(a, b),
         Op::Idiv | Op::Rem => {
+            if a.is_nan() || b.is_nan() {
+                return nan_propagate(a, b);
+            }
             if b == 0.0 {
                 return if op == Op::Idiv { a / b } else { R_NAN };
             }

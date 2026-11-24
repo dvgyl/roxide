@@ -77,6 +77,69 @@ pub fn nan_propagate(a: f64, b: f64) -> f64 {
     R_NAN
 }
 
+/// A real arithmetic operation shared by the AST and register evaluators.
+#[derive(Clone, Copy)]
+pub enum RealArithOp {
+    /// Add.
+    Add,
+    /// Subtract.
+    Sub,
+    /// Multiply.
+    Mul,
+    /// Divide.
+    Div,
+    /// Raise to a power.
+    Pow,
+}
+
+impl RealArithOp {
+    /// Apply this operation with R's NaN propagation rules.
+    #[inline]
+    #[must_use]
+    pub fn apply(self, a: f64, b: f64) -> f64 {
+        let result = match self {
+            Self::Add => a + b,
+            Self::Sub => a - b,
+            Self::Mul => a * b,
+            Self::Div => a / b,
+            Self::Pow => return real_pow(a, b),
+        };
+        if result.is_nan() {
+            nan_propagate(a, b)
+        } else {
+            result
+        }
+    }
+}
+
+/// Raise a real value to a power with R's rules for zero, infinities, and NaNs.
+#[inline]
+#[must_use]
+pub fn real_pow(base: f64, exp: f64) -> f64 {
+    if base == 1.0 || exp == 0.0 {
+        return 1.0;
+    }
+    if base.is_nan() || exp.is_nan() {
+        return nan_propagate(base, exp);
+    }
+    if base == 0.0 {
+        return if exp > 0.0 { 0.0 } else { f64::INFINITY };
+    }
+    if base < 0.0 && (exp.is_infinite() || exp.fract() != 0.0) {
+        return R_NAN;
+    }
+    if base == f64::NEG_INFINITY {
+        return if exp < 0.0 {
+            0.0
+        } else if exp % 2.0 != 0.0 {
+            f64::NEG_INFINITY
+        } else {
+            f64::INFINITY
+        };
+    }
+    base.powf(exp)
+}
+
 /// Checked R integer addition returning `(result, overflowed)`.
 #[inline]
 #[must_use]

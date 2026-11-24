@@ -75,6 +75,15 @@ dput(deparse1(quote(x <- 2L)))
 }
 
 #[test]
+fn substitute_with_no_arguments_returns_the_missing_symbol() {
+    check(
+        "dput(identical(substitute(), quote(expr = )))",
+        "TRUE\n",
+        "",
+    );
+}
+
+#[test]
 fn condition_handlers_resume_or_unwind_with_cleanup() {
     check(
         r#"

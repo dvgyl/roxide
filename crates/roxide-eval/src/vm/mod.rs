@@ -20,6 +20,7 @@ pub use ir::{CompiledCode, Op, Reg};
 pub use jit::is_compiled;
 
 pub(crate) use exec::try_loop;
+pub(crate) use stack::VmStack;
 
 /// Return true if automatic JIT compilation is active at `level` (`level >= 1`).
 #[inline]

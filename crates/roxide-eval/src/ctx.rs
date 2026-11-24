@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use roxide_diag::{SourceMap, SrcFileId, format as diag_format};
-use roxide_gc::{GcPolicy, RootSet, SexpId, Tracer};
+use roxide_gc::{GcPolicy, RootSet, SexpId, Trace, Tracer};
 use roxide_host::{
     CommandSpec, CpuTimes, DirEntry, FileMeta, Host, HostError, HostErrorKind, HostFile,
     HostResult, Limits, LocaleInfo, OpenMode, ProcessOutput, StdStream, SysInfo, WallTime,
@@ -159,6 +159,7 @@ pub struct Ctx {
     pub(crate) eval_env: SexpId,
     pub(crate) visible: bool,
     pub(crate) pending_warnings: Vec<(Option<Vec<String>>, String)>,
+    pub(crate) vm_stack: crate::vm::VmStack,
     pub(crate) extensions: HashMap<TypeId, ExtEntry>,
     pub(crate) running_finalizers: bool,
     pub(crate) s4_hooks: Option<&'static dyn S4Hooks>,
@@ -350,6 +351,7 @@ struct CtxRoots<'a> {
     autoloads: SexpId,
     namespaces: &'a [NsRecord],
     pending_s3: &'a [DeferredS3],
+    vm_stack: &'a crate::vm::VmStack,
     extensions: &'a HashMap<TypeId, ExtEntry>,
 }
 
@@ -385,6 +387,7 @@ impl RootSet for CtxRoots<'_> {
         for &(_, value) in self.options {
             tracer.edge(value);
         }
+        self.vm_stack.trace(tracer);
         for entry in self.extensions.values() {
             (entry.trace_fn)(entry.boxed.as_ref(), tracer);
         }
@@ -469,6 +472,7 @@ impl Ctx {
             eval_env: GLOBAL_ENV,
             visible: true,
             pending_warnings: Vec::new(),
+            vm_stack: Default::default(),
             extensions: HashMap::new(),
             running_finalizers: false,
             s4_hooks: None,
@@ -1032,6 +1036,14 @@ impl Ctx {
             .unwrap_or_else(|| unreachable!("TypeId key guarantees exact type match"))
     }
 
+    /// Return the extension state if this context has initialized it.
+    pub fn ext_ref<T: CtxExt>(&self) -> Option<&T> {
+        self.extensions
+            .get(&TypeId::of::<T>())?
+            .boxed
+            .downcast_ref()
+    }
+
     /// Install the native C-API & dynamic-library hooks (owned by `roxide-capi`, ADRs 0017–0020).
     pub fn set_native_hooks(&mut self, hooks: &'static dyn NativeHooks) {
         self.native_hooks = Some(hooks);
@@ -1071,7 +1083,7 @@ impl Ctx {
         })
     }
 
-    /// Resolve foreign ALTREP values in lists, pairlists, expressions, and attributes.
+    /// Resolve foreign ALTREP values in lists, pairlists, calls, expressions, and attributes.
     /// Stop at environments, closures, and promises.
     pub fn resolve_altrep_deep(&mut self, x: SexpId) -> EvalResult<()> {
         if !self.session.foreign_alt_seen() {
@@ -1097,10 +1109,10 @@ impl Ctx {
                     SexpType::Vec | SexpType::Expr => {
                         children.extend_from_slice(self.session.list_slice(value)?);
                     }
-                    SexpType::List => {
+                    SexpType::List | SexpType::Lang => {
                         let (car, cdr, _) = self.session.cons_parts(value)?;
                         children.push(car);
-                        if self.session.type_of(cdr)? == SexpType::List {
+                        if cdr != SEXP_NIL {
                             children.push(cdr);
                         }
                     }
@@ -1263,6 +1275,7 @@ impl Ctx {
             autoloads: self.autoloads,
             namespaces: &self.namespaces,
             pending_s3: &self.pending_s3,
+            vm_stack: &self.vm_stack,
             extensions: &self.extensions,
         };
         self.session.collect(&roots)

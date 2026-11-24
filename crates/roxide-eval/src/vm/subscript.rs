@@ -19,7 +19,7 @@ pub(super) fn get(
         return ctx.run_primitive(
             call,
             args,
-            ArgInput::AssignmentLayer {
+            ArgInput::ReceiverValue {
                 target: receiver,
                 replacement: None,
             },

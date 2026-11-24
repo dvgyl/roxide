@@ -1,8 +1,7 @@
 use roxide_gc::SexpId;
-use roxide_value::na::R_NAN;
+use roxide_value::na::RealArithOp;
 use roxide_value::{
     NA_INTEGER, NA_REAL, RLogical, RSession, SexpType, ValueApi, int_add, int_mul, int_sub,
-    nan_propagate,
 };
 
 use super::{guard, ir::Op};
@@ -95,19 +94,15 @@ pub(super) fn binary(
         return Ok((session.scalar_lgl(result)?, false));
     }
 
-    let n = match op {
-        Op::Pow(_) if b == 0.0 || a == 1.0 => 1.0,
-        _ if a.is_nan() || b.is_nan() => nan_propagate(a, b),
-        Op::Add(_) => a + b,
-        Op::Sub(_) => a - b,
-        Op::Mul(_) => a * b,
-        Op::Div(_) => a / b,
-        Op::Pow(_) if a == 0.0 && b < 0.0 => f64::INFINITY,
-        Op::Pow(_) if a.is_finite() && a < 0.0 && b.is_infinite() => R_NAN,
-        Op::Pow(_) => a.powf(b),
+    let real_op = match op {
+        Op::Add(_) => RealArithOp::Add,
+        Op::Sub(_) => RealArithOp::Sub,
+        Op::Mul(_) => RealArithOp::Mul,
+        Op::Div(_) => RealArithOp::Div,
+        Op::Pow(_) => RealArithOp::Pow,
         _ => return Err(super::exec::invalid()),
     };
-    Ok((session.scalar_real(n)?, false))
+    Ok((session.scalar_real(real_op.apply(a, b))?, false))
 }
 
 pub(super) fn unary(session: &mut RSession, op: &Op, src: Number) -> EvalResult {

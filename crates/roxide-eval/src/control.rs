@@ -171,7 +171,7 @@ fn invoke_assignment(
         return ctx.run_primitive(
             call,
             args.clone(),
-            ArgInput::AssignmentLayer {
+            ArgInput::ReceiverValue {
                 target,
                 replacement,
             },

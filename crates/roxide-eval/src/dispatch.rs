@@ -1084,3 +1084,45 @@ fn as_s4_prim(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     ctx.session.set_s4_flag(copy, flag)?;
     Ok(copy)
 }
+
+#[cfg(test)]
+mod tests {
+    use roxide_gc::GcPolicy;
+    use roxide_host::PureHost;
+    use roxide_value::GLOBAL_ENV;
+
+    use super::*;
+
+    #[test]
+    fn as_character_dispatches_a_namespace_method_for_an_external_pointer() {
+        let mut ctx = Ctx::new(Box::new(PureHost::new()), GcPolicy::Torture).unwrap();
+        let (ns, _) = ctx.ns_create("pointerpkg", "1.0", None).unwrap();
+        ctx.protect(ns);
+        ctx.run_script(
+            "<S3 method>",
+            "as.character.rx_pointer <- function(x, ...) 'method:externalptr'",
+            ns,
+            false,
+        )
+        .unwrap();
+        let method = ctx.session.intern("as.character.rx_pointer").unwrap();
+        let method = ctx.get_local(method, ns).unwrap().unwrap();
+        ctx.ns_register_s3("base", "as.character", "rx_pointer", method)
+            .unwrap();
+
+        let pointer = ctx.session.alloc_extptr(0, SEXP_NIL, SEXP_NIL).unwrap();
+        let class = ctx.session.scalar_str("rx_pointer").unwrap();
+        let tag = ctx.session.intern("class").unwrap();
+        ctx.session.set_attrib(pointer, tag, class).unwrap();
+        let name = ctx.session.intern("pointer").unwrap();
+        ctx.assign(name, pointer, GLOBAL_ENV).unwrap();
+
+        ctx.run_global("<dispatch>", "result <- as.character(pointer)")
+            .unwrap();
+        let name = ctx.session.intern("result").unwrap();
+        let result = ctx.get_var(name, GLOBAL_ENV).unwrap().unwrap();
+        assert_eq!(ctx.session.str_slice(result).unwrap().len(), 1);
+        let text = ctx.session.str_slice(result).unwrap()[0];
+        assert_eq!(ctx.session.char_bytes(text).unwrap(), b"method:externalptr");
+    }
+}

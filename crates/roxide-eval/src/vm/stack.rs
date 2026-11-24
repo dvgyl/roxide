@@ -1,17 +1,19 @@
 use roxide_gc::{SexpId, Trace, Tracer};
 use roxide_value::SEXP_NIL;
 
-use super::ir::{CompiledCode, Reg};
-use crate::{Ctx, CtxExt, FrameId};
+use super::ir::{CallSite, CompiledCode, Reg};
+use crate::FrameId;
 
 #[derive(Default)]
-pub(super) struct VmStack(pub Vec<VmFrame>);
-
-impl CtxExt for VmStack {}
+pub(crate) struct VmStack {
+    pub(super) frames: Vec<VmFrame>,
+    #[cfg(test)]
+    pub(super) collect_each_op: bool,
+}
 
 impl Trace for VmStack {
     fn trace(&self, tracer: &mut Tracer<'_>) {
-        for frame in &self.0 {
+        for frame in &self.frames {
             frame.trace(tracer);
         }
     }
@@ -55,6 +57,9 @@ impl Trace for VmFrame {
         }
         for guard in &self.guards {
             tracer.edge(guard.fun);
+            if let Some(value) = guard.retained {
+                tracer.edge(value);
+            }
         }
     }
 }
@@ -92,12 +97,8 @@ pub(super) struct GuardFrame {
     pub counted: bool,
     pub start: usize,
     pub end: usize,
-    pub cache_idx: u16,
+    pub site: CallSite,
     pub fun: SexpId,
-    pub lhs: Option<Reg>,
+    pub retain: Option<Reg>,
     pub retained: Option<SexpId>,
-}
-
-pub(super) fn active(ctx: &mut Ctx) -> bool {
-    !ctx.ext::<VmStack>().0.is_empty()
 }

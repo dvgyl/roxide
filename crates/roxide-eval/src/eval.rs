@@ -15,7 +15,7 @@ const STACK_RECOVERY_BYTES: usize = 128 * 1024;
 
 pub(crate) enum ArgInput {
     Expressions,
-    AssignmentLayer {
+    ReceiverValue {
         target: SexpId,
         replacement: Option<SexpId>,
     },
@@ -494,7 +494,7 @@ impl Ctx {
             ctx.protect(value);
         }
         let (mut receiver, replacement) = match input {
-            ArgInput::AssignmentLayer {
+            ArgInput::ReceiverValue {
                 target,
                 replacement,
             } => {
@@ -509,7 +509,7 @@ impl Ctx {
         let mut dispatch = dispatch;
         let mut raw;
         let source = match input {
-            ArgInput::Expressions | ArgInput::AssignmentLayer { .. }
+            ArgInput::Expressions | ArgInput::ReceiverValue { .. }
                 if def.args != ArgEval::Unevaluated =>
             {
                 let subscript = dispatch && is_subscript_generic(def.dispatch);
