@@ -10,6 +10,7 @@ use super::definitions::{
     ClassState, Edge, Key, cached, class_spec, data_class, key, lookup, methods_env, object_info,
     refresh, refresh_edges, resolve, special_class,
 };
+use super::inheritance::path;
 use super::objects::{data_copy, set_data, slot_value, stamp_instance};
 use super::*;
 
@@ -486,7 +487,7 @@ fn project(
     source: Option<&ClassInfo>,
 ) -> EvalResult {
     if info.slots.is_empty() && info.package == "methods" {
-        let data = source.map(|s| data_class(ctx, s)).transpose()?.flatten();
+        let data = source.and_then(|info| data_class(ctx, info));
         if ctx.session().is_s4(object)? {
             return data_copy(ctx, object, data.as_deref().unwrap_or(&info.name));
         }
@@ -494,7 +495,7 @@ fn project(
     }
     let prototype = decode_slot(attr(ctx, info.class_def, "prototype")?);
     let mut out = stamp_instance(ctx, prototype, info)?;
-    if let Some(data) = data_class(ctx, info)? {
+    if let Some(data) = data_class(ctx, info) {
         out = set_data(ctx, out, object, &data)?;
     }
     for (slot, _) in info.slots.iter().filter(|(slot, _)| slot != ".Data") {
@@ -533,25 +534,10 @@ fn conversion_builtin(class: &str) -> Option<&'static str> {
     })
 }
 
-fn inheritance_path(ctx: &mut Ctx, source: &Key, target: &str) -> Option<Vec<Edge>> {
-    let records = &ctx.ext::<ClassState>().records;
-    let mut seen = HashSet::from([source.clone()]);
-    let mut pending = std::collections::VecDeque::from([(source.clone(), Vec::<Edge>::new())]);
-    while let Some((class, path)) = pending.pop_front() {
-        if class.0 == target {
-            return Some(path);
-        }
-        if let Some(record) = records.get(&class) {
-            for edge in &record.edges {
-                if seen.insert(edge.target.clone()) {
-                    let mut path = path.clone();
-                    path.push(edge.clone());
-                    pending.push_back((edge.target.clone(), path));
-                }
-            }
-        }
-    }
-    None
+enum InheritanceConversion {
+    NoCustomPath,
+    Rejected,
+    Converted(SexpId),
 }
 
 fn inheritance_conversion(
@@ -562,19 +548,19 @@ fn inheritance_conversion(
     strict: bool,
     env: SexpId,
     call: &Call,
-) -> EvalResult<Option<SexpId>> {
-    let Some(path) = inheritance_path(ctx, &source, target) else {
-        return Ok(None);
+) -> EvalResult<InheritanceConversion> {
+    let Some(route) = path(&ctx.ext::<ClassState>().records, &source, target) else {
+        return Ok(InheritanceConversion::NoCustomPath);
     };
-    if !path.iter().any(|edge| edge.methods.is_some()) {
-        return Ok(None);
+    if !route.iter().any(|edge| edge.methods.is_some()) {
+        return Ok(InheritanceConversion::NoCustomPath);
     }
-    for edge in path {
-        let Some(mut next) = inheritance_path(ctx, &source, target)
+    for edge in route {
+        let Some(mut next) = path(&ctx.ext::<ClassState>().records, &source, target)
             .and_then(|path| path.into_iter().next())
             .filter(|next| next.target == edge.target)
         else {
-            return Ok(None);
+            return Ok(InheritanceConversion::Rejected);
         };
         if let Some(methods) = next.methods
             && methods.test != SEXP_NIL
@@ -583,19 +569,19 @@ fn inheritance_conversion(
             ctx.protect(methods.forward);
             let valid = ctx.apply(methods.test, &[(None, value)], SEXP_NIL, env)?;
             if !flag(ctx, valid)? {
-                return Ok(None);
+                return Ok(InheritanceConversion::Rejected);
             }
-            let Some(updated) = inheritance_path(ctx, &source, target)
+            let Some(updated) = path(&ctx.ext::<ClassState>().records, &source, target)
                 .and_then(|path| path.into_iter().next())
                 .filter(|updated| updated.target == next.target)
             else {
-                return Ok(None);
+                return Ok(InheritanceConversion::Rejected);
             };
             next = updated;
         }
         let (name, package) = &next.target;
         let Some(info) = cached(ctx, name, Some(package)) else {
-            return Ok(None);
+            return Ok(InheritanceConversion::Rejected);
         };
         if let Some(methods) = next.methods.filter(|methods| methods.forward != SEXP_NIL) {
             value = apply_conversion(
@@ -614,7 +600,7 @@ fn inheritance_conversion(
         ctx.protect(value);
         source = next.target;
     }
-    Ok(Some(value))
+    Ok(InheritanceConversion::Converted(value))
 }
 
 pub(super) fn convert(
@@ -660,18 +646,16 @@ pub(super) fn convert(
         if let Some(fun) = table_conversion(ctx, &source, target, env, call)? {
             return apply_conversion(ctx, fun, &[(None, object)], target, strict, env, call);
         }
-        let custom_path = source_info
-            .as_ref()
-            .and_then(|info| inheritance_path(ctx, &key(info), target))
-            .is_some_and(|path| path.iter().any(|edge| edge.methods.is_some()));
-        if custom_path
-            && let Some(info) = &source_info
-            && let Some(value) =
+        let outcome = match &source_info {
+            Some(info) => {
                 inheritance_conversion(ctx, object, key(info), target, strict, env, call)?
-        {
+            }
+            None => InheritanceConversion::NoCustomPath,
+        };
+        if let InheritanceConversion::Converted(value) = outcome {
             return Ok(value);
         }
-        if !custom_path
+        if matches!(outcome, InheritanceConversion::NoCustomPath)
             && matches(ctx, object, target, env)?
             && let Some(info) = lookup(ctx, target, None, env, true)?
         {
@@ -756,7 +740,7 @@ pub(super) fn as_set(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult 
         && let Some(info) = lookup(ctx, &target, None, env, true)?
         && names_in_chain(&source_info).any(|name| name == target)
     {
-        let out = if let Some(data) = data_class(ctx, &info)? {
+        let out = if let Some(data) = data_class(ctx, &info) {
             set_data(ctx, object, value, &data)?
         } else {
             ctx.session_mut().shallow_duplicate(object)?

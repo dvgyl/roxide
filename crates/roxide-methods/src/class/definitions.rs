@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 
 use roxide_eval::{Args, Call, Ctx, CtxExt, EvalResult};
 use roxide_gc::{SexpId, Trace, Tracer};
@@ -6,10 +6,13 @@ use roxide_value::{BASE_ENV, GLOBAL_ENV, SEXP_NIL, SexpType, ValueApi};
 
 use crate::registry::{ClassInfo, MethodsExt};
 
+use super::inheritance;
 use super::*;
 
 mod builtins;
+mod prototype;
 pub(super) use builtins::bootstrap;
+pub(super) use prototype::prototype;
 
 pub(super) type Key = (String, String);
 
@@ -284,7 +287,7 @@ pub(crate) fn cache_namespace_class(
             methods,
         });
     }
-    let data = data_class(ctx, info)?;
+    let data = data_class(ctx, info);
     let state = ctx.ext::<ClassState>();
     state.order.push(key.clone());
     state.records.insert(
@@ -317,15 +320,14 @@ pub(crate) fn forget_namespace_classes(ctx: &mut Ctx, package: &str) {
     }
 }
 
-pub(super) fn data_class(ctx: &mut Ctx, info: &ClassInfo) -> EvalResult<Option<String>> {
+pub(super) fn data_class(ctx: &mut Ctx, info: &ClassInfo) -> Option<String> {
     if let Some(record) = ctx.ext::<ClassState>().records.get(&key(info)) {
-        return Ok(record.data.clone());
+        return record.data.clone();
     }
-    Ok(info
-        .slots
+    info.slots
         .iter()
         .find(|(name, _)| name == ".Data")
-        .map(|(_, class)| class.clone()))
+        .map(|(_, class)| class.clone())
 }
 
 struct Definition {
@@ -548,38 +550,6 @@ impl Extensions {
     }
 }
 
-type Chain = Vec<(Key, usize, usize, Option<Key>)>;
-
-fn linearize(source: &Key, records: &HashMap<Key, Record>) -> Chain {
-    let mut found = HashSet::from([source.clone()]);
-    let mut chain = Vec::new();
-    let mut pending = VecDeque::new();
-    if let Some(record) = records.get(source) {
-        pending.extend(
-            record
-                .edges
-                .iter()
-                .enumerate()
-                .map(|(i, edge)| (&edge.target, 1, i, None::<&Key>)),
-        );
-    }
-    while let Some((parent, distance, rank, via)) = pending.pop_front() {
-        if !found.insert(parent.clone()) {
-            continue;
-        }
-        chain.push((parent.clone(), distance, rank, via.cloned()));
-        if let Some(record) = records.get(parent) {
-            pending.extend(
-                record
-                    .edges
-                    .iter()
-                    .map(|edge| (&edge.target, distance + 1, rank, Some(parent))),
-            );
-        }
-    }
-    chain
-}
-
 pub(super) fn refresh(ctx: &mut Ctx) -> EvalResult<()> {
     refresh_edges(ctx, None)
 }
@@ -591,15 +561,21 @@ pub(super) fn refresh_edges(ctx: &mut Ctx, changed: Option<(&Key, &Key)>) -> Eva
         let records = state.records.clone();
         let chains: HashMap<_, _> = order
             .iter()
-            .map(|key| (key.clone(), linearize(key, &records)))
+            .map(|key| {
+                (
+                    key.clone(),
+                    inheritance::walk(&records, key).collect::<Vec<_>>(),
+                )
+            })
             .collect();
         let mut subclasses: HashMap<Key, Vec<_>> = HashMap::new();
         for sub in &order {
-            for (parent, distance, _, via) in &chains[sub] {
-                subclasses
-                    .entry(parent.clone())
-                    .or_default()
-                    .push((sub.clone(), *distance, via));
+            for step in &chains[sub] {
+                subclasses.entry(step.class.clone()).or_default().push((
+                    sub.clone(),
+                    step.distance,
+                    step.predecessor,
+                ));
             }
         }
         let mut extensions = Extensions::new(ctx)?;
@@ -610,13 +586,17 @@ pub(super) fn refresh_edges(ctx: &mut Ctx, changed: Option<(&Key, &Key)>) -> Eva
             let chain = &chains[key];
             let linear = chain
                 .iter()
-                .map(|((n, _), d, rank, _)| (n.clone(), *d, *rank))
+                .map(|step| (step.class.0.clone(), step.distance, step.parent_rank))
                 .collect::<Vec<_>>();
             let parents = attr(ctx, info.class_def, "contains")?;
             let kids = attr(ctx, info.class_def, "subclasses")?;
             let descendants = subclasses.get(key).map_or(&[][..], Vec::as_slice);
             let same_parents = info.superclasses == linear
-                && matching_extensions(ctx, parents, chain.iter().map(|(p, d, _, _)| (p, *d)))?;
+                && matching_extensions(
+                    ctx,
+                    parents,
+                    chain.iter().map(|step| (step.class, step.distance)),
+                )?;
             let same_children =
                 matching_extensions(ctx, kids, descendants.iter().map(|(c, d, _)| (c, *d)))?;
             if same_parents
@@ -628,10 +608,10 @@ pub(super) fn refresh_edges(ctx: &mut Ctx, changed: Option<(&Key, &Key)>) -> Eva
             let new_def = ctx.session_mut().shallow_duplicate(info.class_def)?;
             let contains = chain
                 .iter()
-                .map(|(parent, distance, _, via)| {
+                .map(|step| {
                     Ok((
-                        parent.0.clone(),
-                        extensions.get(ctx, key, parent, *distance, via.as_ref())?,
+                        step.class.0.clone(),
+                        extensions.get(ctx, key, step.class, step.distance, step.predecessor)?,
                     ))
                 })
                 .collect::<EvalResult<Vec<_>>>()?;
@@ -641,7 +621,7 @@ pub(super) fn refresh_edges(ctx: &mut Ctx, changed: Option<(&Key, &Key)>) -> Eva
                 .map(|(child, distance, via)| {
                     Ok((
                         child.0.clone(),
-                        extensions.get(ctx, child, key, *distance, via.as_ref())?,
+                        extensions.get(ctx, child, key, *distance, *via)?,
                     ))
                 })
                 .collect::<EvalResult<Vec<_>>>()?;
@@ -781,48 +761,6 @@ pub(super) fn generator(ctx: &mut Ctx, _: &Call, args: &mut Args) -> EvalResult 
     Ok(generator)
 }
 
-pub(super) fn prototype(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
-    let entries = named_values(ctx, args.get(0))?;
-    let (base, named) = match entries.split_first() {
-        Some(((n, value), rest)) if n.is_empty() => (Some(*value), rest),
-        _ => (None, entries.as_slice()),
-    };
-    if named.iter().any(|(n, _)| n.is_empty()) {
-        return Err(error(
-            ctx,
-            call,
-            "all slot values in a prototype must be named",
-        ));
-    }
-    if base == Some(SEXP_NIL) && !named.is_empty() {
-        return Err(error(ctx, call, "attempt to set slot on NULL object"));
-    }
-    let object = if let Some(base) = base {
-        ctx.session_mut().shallow_duplicate(base)?
-    } else {
-        ctx.session_mut().alloc_s4_object()?
-    };
-    if !named.is_empty() && ctx.session().type_of(object)? == SexpType::Sym {
-        return Err(error(ctx, call, "cannot set an attribute on a 'symbol'"));
-    }
-    for (slot, value) in named {
-        write_slot(ctx, object, slot, *value)?;
-    }
-    let slots = strings(ctx, named.iter().map(|(n, _)| n.as_str()))?;
-    let data = logical(ctx, base.is_some())?;
-    let class = qualified(ctx, "classPrototypeDef", "methods")?;
-    let ret = ctx.session_mut().alloc_s4_object()?;
-    for (name, value) in [
-        ("object", object),
-        ("slots", slots),
-        ("dataPart", data),
-        ("class", class),
-    ] {
-        write_slot(ctx, ret, name, value)?;
-    }
-    Ok(ret)
-}
-
 fn slot_entries(ctx: &mut Ctx, value: SexpId) -> EvalResult<Vec<(String, SexpId)>> {
     if ctx.session().type_of(value)? != SexpType::Str {
         return named_values(ctx, value);
@@ -903,7 +841,7 @@ pub(super) fn define(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult 
         for parent in &ancestors {
             ctx.protect(parent.class_def);
             if data.is_none() {
-                data = data_class(ctx, parent)?;
+                data = data_class(ctx, parent);
             }
             for (slot, inherited) in parent.slots.iter().filter(|(name, _)| name != ".Data") {
                 if let Some((_, declared)) = slots.iter().find(|(name, _)| name == slot) {
@@ -926,104 +864,23 @@ pub(super) fn define(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult 
         {
             slots.push((".xData".into(), parent.name.clone()));
         }
-        let mut seen = HashSet::new();
-        slots.retain(|(name, _)| seen.insert(name.clone()));
         slots.retain(|(name, _)| name != ".Data");
         if let Some(data) = &data {
             slots.insert(0, (".Data".into(), data.clone()));
         }
 
-        let mut defaults = HashMap::new();
-        let given = args.get(2);
-        let mut explicit_data = SEXP_NIL;
-        if given != SEXP_NIL {
-            let class_attr = attr(ctx, given, "class")?;
-            let is_prototype = ctx.session().is_s4(given)?
-                && class_attr != SEXP_NIL
-                && name(ctx, class_attr, call.err_call())? == "classPrototypeDef";
-            if is_prototype {
-                let object = decode_slot(attr(ctx, given, "object")?);
-                let slots = attr(ctx, given, "slots")?;
-                for slot in text_vec(ctx, slots)? {
-                    let val = decode_slot(attr(ctx, object, &slot)?);
-                    defaults.insert(slot, val);
-                }
-                let data_part = attr(ctx, given, "dataPart")?;
-                if flag(ctx, data_part)? {
-                    explicit_data = object;
-                }
-            } else if ctx.session().type_of(given)? == SexpType::Vec && !ctx.session().is_s4(given)? {
-                defaults = named_values(ctx, given)?.into_iter().collect();
-            } else {
-                explicit_data = given;
-            }
-        }
-        if let Some(value) = defaults.remove(".Data") {
-            explicit_data = value;
-        }
-
-        let undefined: Vec<_> = defaults.keys()
-            .filter(|name| !slots.iter().any(|(slot, _)| slot == *name)).collect();
-        if !undefined.is_empty() {
-            let mut names = undefined.iter().map(|name| format!("'{name}'")).collect::<Vec<_>>();
-            names.sort();
-            return Err(error(ctx, call, format!("The prototype for class “{class}” has undefined slot(s): {}", names.join(", "))));
-        }
-        let prototype = if let Some(data) = &data {
-            let source = if explicit_data != SEXP_NIL {
-                if !relations::matches(ctx, explicit_data, data, env)? {
-                    return Err(error(ctx, call, format!("prototype data does not extend class “{data}”")));
-                }
-                explicit_data
-            } else if let Some(parent) = ancestors.iter().find(|p| {
-                cached_data_class(ctx, p).as_ref() == Some(data)
-            }) {
-                decode_slot(attr(ctx, parent.class_def, "prototype")?)
-            } else {
-                default_value(ctx, data, env)?
-            };
-            if matches!(ctx.session().type_of(source)?, SexpType::Nil | SexpType::Sym | SexpType::Env | SexpType::ExtPtr) {
-                return Err(error(ctx, call, format!("in constructing the prototype for class “{class}”: prototype has class “S4”, but the data part specifies class “{data}”")));
-            }
-            objects::data_copy(ctx, source, data)?
-        } else {
-            ctx.session_mut().alloc_s4_object()?
-        };
-        ctx.protect(prototype);
-        ctx.session_mut().set_s4_flag(prototype, true)?;
-        let mut missing = Vec::new();
-        for (slot, typ) in slots.iter().filter(|(slot, _)| slot != ".Data") {
-            let value = if let Some(val) = defaults.get(slot) {
-                if !relations::matches(ctx, *val, typ, env)? {
-                    return Err(error(ctx, call, format!("in making the prototype for class “{class}” elements of the prototype failed to match the corresponding slot class: {slot} (class \"{typ}\" )")));
-                }
-                *val
-            } else {
-                let mut inherited = SEXP_NIL;
-                for parent in &ancestors {
-                    let source = decode_slot(attr(ctx, parent.class_def, "prototype")?);
-                    inherited = attr(ctx, source, slot)?;
-                    if inherited != SEXP_NIL
-                        && relations::matches(ctx, decode_slot(inherited), typ, env)?
-                    {
-                        break;
-                    }
-                    inherited = SEXP_NIL;
-                }
-                if inherited == SEXP_NIL {
-                    if lookup(ctx, typ, None, env, true)?.is_none() && typ != &class {
-                        missing.push(format!("{slot}(class \"{typ}\")"));
-                    }
-                    default_value(ctx, typ, env)?
-                } else {
-                    decode_slot(inherited)
-                }
-            };
-            write_slot(ctx, prototype, slot, value)?;
-        }
-        if !missing.is_empty() {
-            ctx.warn(call.err_call(), format!("undefined slot classes in definition of \"{class}\": {}", missing.join(", ")));
-        }
+        let prototype = prototype::build(
+            ctx,
+            call,
+            args.get(2),
+            prototype::Spec {
+                class: &class,
+                slots: &slots,
+                data: data.as_deref(),
+                ancestors: &ancestors,
+                env,
+            },
+        )?;
         let validity = args.get(4);
         if validity != SEXP_NIL && !callable(ctx, validity)? {
             return Err(error(ctx, call, "the validity method must be a function"));
@@ -1043,27 +900,6 @@ pub(super) fn define(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult 
     })
 }
 
-fn cached_data_class(ctx: &mut Ctx, info: &ClassInfo) -> Option<String> {
-    ctx.ext::<ClassState>()
-        .records
-        .get(&key(info))
-        .and_then(|r| r.data.clone())
-}
-
-fn default_value(ctx: &mut Ctx, class: &str, env: SexpId) -> EvalResult {
-    let Some(info) = lookup(ctx, class, None, env, true)? else {
-        return Ok(SEXP_NIL);
-    };
-    if matches!(class, "ANY" | "NULL" | "VIRTUAL") {
-        return Ok(SEXP_NIL);
-    }
-    let value = decode_slot(attr(ctx, info.class_def, "prototype")?);
-    if info.is_virtual || !ctx.session().is_s4(value)? {
-        return Ok(value);
-    }
-    objects::stamp_instance(ctx, value, &info)
-}
-
 pub(super) fn special_class(
     ctx: &mut Ctx,
     name: String,
@@ -1073,10 +909,7 @@ pub(super) fn special_class(
     prototype: SexpId,
     template: Option<&ClassInfo>,
 ) -> EvalResult<ClassInfo> {
-    let data = template
-        .map(|info| data_class(ctx, info))
-        .transpose()?
-        .flatten();
+    let data = template.and_then(|info| data_class(ctx, info));
     let package = package_name(ctx, env)?;
     let def = Definition {
         info: ClassInfo {

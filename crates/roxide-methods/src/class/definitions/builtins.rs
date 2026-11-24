@@ -1,3 +1,4 @@
+use super::prototype::default_value;
 use super::*;
 use roxide_value::EMPTY_ENV;
 

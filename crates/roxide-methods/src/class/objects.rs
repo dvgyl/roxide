@@ -64,7 +64,7 @@ pub(super) fn data_copy(ctx: &mut Ctx, source: SexpId, class: &str) -> EvalResul
 pub(super) fn slot_value(ctx: &mut Ctx, obj: SexpId, slot: &str) -> EvalResult {
     if slot == ".Data" {
         if let Some(info) = object_info(ctx, obj)?
-            && let Some(class) = data_class(ctx, &info)?
+            && let Some(class) = data_class(ctx, &info)
         {
             return data_copy(ctx, obj, &class);
         }
@@ -200,7 +200,7 @@ pub(super) fn slot_set(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResul
     }
     if name == ".Data"
         && let Some(info) = object_info(ctx, object)?
-        && let Some(data) = data_class(ctx, &info)?
+        && let Some(data) = data_class(ctx, &info)
     {
         return set_data(ctx, object, value, &data);
     }
@@ -270,7 +270,7 @@ fn inherit_values(
     env: SexpId,
     call: &Call,
 ) -> EvalResult {
-    if let Some(data) = data_class(ctx, info)?
+    if let Some(data) = data_class(ctx, info)
         && relations::matches(ctx, value, &data, env)?
     {
         object = set_data(ctx, object, value, &data)?;
@@ -345,7 +345,7 @@ pub(super) fn initialize(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalRes
                 ));
             }
             if name == ".Data"
-                && let Some(data) = data_class(ctx, &info)?
+                && let Some(data) = data_class(ctx, &info)
             {
                 let value = relations::convert(ctx, *value, &data, true, SEXP_NIL, env, call)?;
                 ctx.protect(value);

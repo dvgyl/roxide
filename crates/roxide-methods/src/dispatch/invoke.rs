@@ -5,10 +5,10 @@ use roxide_value::{
 };
 
 use super::metadata::{
-    Method, attr, by_definition, canonical_generic_name, dispatch_tables, formal_pairs,
-    generic_definition, lookup, make_call, merge_tables, methods, package_string, signature_object,
-    texts,
+    attr, by_definition, canonical_generic_name, dispatch_tables, formal_pairs, generic_definition,
+    lookup, make_call, merge_tables, package_string, texts,
 };
+use super::method_table::{Method, methods, signature_object};
 use super::resolver::{self, Class, Selection};
 use crate::registry::GenericInfo;
 

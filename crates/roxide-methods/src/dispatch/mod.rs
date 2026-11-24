@@ -3,6 +3,7 @@
 mod groups;
 mod invoke;
 pub(crate) mod metadata;
+mod method_table;
 mod rank;
 mod resolver;
 
@@ -42,13 +43,13 @@ pub const MODULE: Module = Module {
         ),
         prim(
             ".rx_setMethod",
-            metadata::set_method,
+            method_table::set_method,
             ArgEval::Eval,
             Visibility::Off,
         ),
         prim(
             ".rx_removeMethod",
-            metadata::remove_method,
+            method_table::remove_method,
             ArgEval::Eval,
             Visibility::On,
         ),

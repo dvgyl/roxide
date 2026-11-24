@@ -4,7 +4,8 @@ use roxide_eval::{Ctx, CtxExt, EvalResult};
 use roxide_gc::{SexpId, Trace, Tracer};
 use roxide_value::{SEXP_MISSING, SexpType, ValueApi};
 
-use super::metadata::{Method, attr, methods, texts};
+use super::metadata::{attr, texts};
+use super::method_table::{Method, methods};
 use super::rank::{Ranked, add_any_distance, distances};
 use crate::registry::{self, GenericInfo, MethodsExt};
 

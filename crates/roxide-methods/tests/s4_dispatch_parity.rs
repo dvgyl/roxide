@@ -377,3 +377,31 @@ show(obj)
     assert_eq!(String::from_utf8(output)?, "BaseA=10\n");
     Ok(())
 }
+
+#[test]
+fn remove_method_shrinks_signature_width() -> Result<(), Box<dyn std::error::Error>> {
+    let mut ctx = Ctx::new(Box::new(PureHost::new()), GcPolicy::Torture)
+        .map_err(|e| format!("ctx: {e:?}"))?;
+    roxide_base::register_all(&mut ctx).map_err(|e| format!("base: {e:?}"))?;
+    roxide_methods::register(&mut ctx).map_err(|e| format!("methods: {e:?}"))?;
+    ctx.run_script(
+        "remove_method_width.R",
+        r#"
+setGeneric("rxWidth", function(x, y) standardGeneric("rxWidth"))
+setMethod("rxWidth", "numeric", function(x, y) "narrow")
+setMethod("rxWidth", c("numeric", "character"), function(x, y) "wide")
+table <- get(".__T__rxWidth:.GlobalEnv", envir = .GlobalEnv, inherits = FALSE)
+stopifnot(exists("numeric#ANY", envir = table, inherits = FALSE))
+stopifnot(identical(rxWidth(1, "a"), "wide"))
+stopifnot(removeMethod("rxWidth", c("numeric", "character")))
+stopifnot(exists("numeric", envir = table, inherits = FALSE))
+stopifnot(!exists("numeric#ANY", envir = table, inherits = FALSE))
+stopifnot(!exists("numeric#character", envir = table, inherits = FALSE))
+stopifnot(identical(rxWidth(1, "a"), "narrow"))
+"#,
+        GLOBAL_ENV,
+        false,
+    )
+    .map_err(|e| format!("eval: {e:?}"))?;
+    Ok(())
+}

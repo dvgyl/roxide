@@ -1,6 +1,7 @@
 //! S4 class definitions, construction, slots, validity, and coercion.
 
 pub(crate) mod definitions;
+mod inheritance;
 pub(crate) mod objects;
 pub(crate) mod relations;
 

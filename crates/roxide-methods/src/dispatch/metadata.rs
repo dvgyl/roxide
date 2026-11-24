@@ -8,10 +8,12 @@ use roxide_value::{
     Sym, ValueApi,
 };
 
+use super::method_table::{
+    ANY, Method, activate, local_table, method_definition, method_key, methods, normalize,
+    sig_width,
+};
 use super::resolver::{self, Class};
 use crate::registry::{GenericInfo, MethodsExt};
-
-const ANY: &str = "ANY";
 
 pub(crate) fn attr(ctx: &mut Ctx, value: SexpId, name: &str) -> EvalResult<SexpId> {
     let sym = ctx.session_mut().intern(name)?;
@@ -50,7 +52,7 @@ pub(crate) fn texts(ctx: &mut Ctx, value: SexpId) -> EvalResult<Vec<String>> {
         .collect()
 }
 
-fn text(ctx: &mut Ctx, value: SexpId) -> EvalResult<String> {
+pub(super) fn text(ctx: &mut Ctx, value: SexpId) -> EvalResult<String> {
     match texts(ctx, value)?.as_slice() {
         [name] if !name.is_empty() => Ok(name.clone()),
         _ => Err(ctx.stop(SEXP_NIL, "expected one nonempty name")),
@@ -63,7 +65,7 @@ pub(crate) fn flag(ctx: &Ctx, value: SexpId) -> bool {
         .is_ok_and(|v| v.get(0) == RLogical::TRUE)
 }
 
-fn logical(ctx: &mut Ctx, value: bool) -> EvalResult<SexpId> {
+pub(super) fn logical(ctx: &mut Ctx, value: bool) -> EvalResult<SexpId> {
     Ok(ctx.session_mut().scalar_lgl(if value {
         RLogical::TRUE
     } else {
@@ -107,17 +109,17 @@ pub(super) fn make_call(
     Ok(ctx.session_mut().lcons(head, tail, SEXP_NIL)?)
 }
 
-fn bind(ctx: &mut Ctx, env: SexpId, name: &str, value: SexpId) -> EvalResult<()> {
+pub(super) fn bind(ctx: &mut Ctx, env: SexpId, name: &str, value: SexpId) -> EvalResult<()> {
     let key = ctx.session_mut().intern(name)?;
     Ok(ctx.session_mut().env_define(env, key, value)?)
 }
 
-fn binding(ctx: &mut Ctx, env: SexpId, name: &str) -> EvalResult<Option<SexpId>> {
+pub(super) fn binding(ctx: &mut Ctx, env: SexpId, name: &str) -> EvalResult<Option<SexpId>> {
     let key = ctx.session_mut().intern(name)?;
     Ok(ctx.session().env_get(env, key).map(|b| b.value))
 }
 
-fn table_name(name: &str, package: &str) -> String {
+pub(super) fn table_name(name: &str, package: &str) -> String {
     format!(".__T__{name}:{package}")
 }
 
@@ -207,7 +209,7 @@ pub(crate) fn environment_chain(ctx: &Ctx, mut env: SexpId) -> EvalResult<Vec<Se
     Ok(chain)
 }
 
-fn local_tables(
+pub(super) fn local_tables(
     ctx: &mut Ctx,
     name: &str,
     package: &str,
@@ -670,191 +672,19 @@ pub(super) fn remove_generic(ctx: &mut Ctx, _: &Call, args: &mut Args) -> EvalRe
     logical(ctx, true)
 }
 
-fn normalize(ctx: &mut Ctx, info: &GenericInfo, value: SexpId) -> EvalResult<Vec<String>> {
-    let classes = texts(ctx, value)?;
-    let names = attr(ctx, value, "names")?;
-    let names = texts(ctx, names)?;
-    let mut sig = vec![None; info.signature.len()];
-    for (i, class) in classes
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| names.get(*i).is_some_and(|name| !name.is_empty()))
-    {
-        let name = &names[i];
-        let Some(pos) = info.signature.iter().position(|param| param == name) else {
-            return Err(ctx.stop(
-                SEXP_NIL,
-                format!("argument ‘{name}’ is not in the generic signature"),
-            ));
-        };
-        if sig[pos].replace(class.clone()).is_some() {
-            return Err(ctx.stop(SEXP_NIL, format!("duplicate signature argument ‘{name}’")));
-        }
-    }
-    let mut free = sig.iter_mut().filter(|slot| slot.is_none());
-    for (_, class) in classes
-        .into_iter()
-        .enumerate()
-        .filter(|(i, _)| names.get(*i).is_none_or(String::is_empty))
-    {
-        let Some(slot) = free.next() else {
-            return Err(ctx.stop(
-                SEXP_NIL,
-                "more classes than arguments in the generic signature",
-            ));
-        };
-        *slot = Some(class);
-    }
-    Ok(sig
-        .into_iter()
-        .map(|slot| slot.unwrap_or_else(|| ANY.to_owned()))
-        .collect())
-}
-
-fn sig_width(sig: &[String]) -> usize {
-    sig.iter().rposition(|cl| cl != ANY).map_or(1, |i| i + 1)
-}
-
-fn method_key(sig: &[String], width: usize) -> String {
-    if sig.is_empty() {
-        ANY.to_owned()
-    } else {
-        sig[..width.min(sig.len())].join("#")
-    }
-}
-
-#[derive(Clone)]
-pub(super) struct Method {
-    pub(super) signature: Vec<String>,
-    pub(super) fun: SexpId,
-}
-
-pub(super) fn methods(ctx: &mut Ctx, info: &GenericInfo) -> EvalResult<Vec<Method>> {
-    let mut methods = Vec::new();
-    for (sym, _) in ctx.session().env_entries(info.table)? {
-        let mut signature: Vec<_> = ctx
-            .session()
-            .sym_name(sym)?
-            .split('#')
-            .map(str::to_owned)
-            .collect();
-        signature.resize(info.signature.len(), ANY.to_owned());
-        if let Some(fun) = ctx.get_local(sym, info.table)? {
-            ctx.protect(fun);
-            methods.push(Method { signature, fun });
-        }
-    }
-    methods.sort_by(|a, b| a.signature.cmp(&b.signature));
-    Ok(methods)
-}
-
-pub(super) fn signature_object(
+pub(super) fn lookup_or_create_generic(
     ctx: &mut Ctx,
-    info: &GenericInfo,
-    sig: &[String],
-) -> EvalResult<SexpId> {
-    let value = strings(ctx, sig)?;
-    let names = strings(ctx, &info.signature[..sig.len()])?;
-    set_attr(ctx, value, "names", names)?;
-    let packages = sig
-        .iter()
-        .map(|class| {
-            crate::registry::class_info(ctx, class, None)
-                .map_or_else(|| "methods".to_owned(), |info| info.package)
-        })
-        .collect::<Vec<_>>();
-    let packages = strings(ctx, &packages)?;
-    set_attr(ctx, value, "package", packages)?;
-    set_class(ctx, value, "signature")?;
-    Ok(value)
-}
-
-fn method_definition(
-    ctx: &mut Ctx,
-    info: &GenericInfo,
-    defined: &[String],
-    target: &[String],
-    fun: SexpId,
-    class: &str,
-) -> EvalResult<SexpId> {
-    if ctx.session().type_of(fun)? != SexpType::Clo {
-        return Ok(fun);
-    }
-    let (formals, body, env) = ctx.session().closure_parts(fun)?;
-    let fun = ctx.session_mut().alloc_closure(formals, body, env)?;
-    let defined = signature_object(ctx, info, defined)?;
-    let target = signature_object(ctx, info, target)?;
-    let generic = package_string(ctx, &info.name, &info.package)?;
-    for (key, value) in [
-        ("target", target),
-        ("defined", defined),
-        ("generic", generic),
-    ] {
-        set_attr(ctx, fun, key, value)?;
-    }
-    set_class(ctx, fun, class)?;
-    Ok(fun)
-}
-
-fn missing_defaults(ctx: &mut Ctx, generic: SexpId, definition: SexpId) -> EvalResult<SexpId> {
-    let (_, body, env) = ctx.session().closure_parts(definition)?;
-    let formal_pairs = formal_pairs(ctx, definition)?;
-    let generic_formals = self::formal_pairs(ctx, generic)?;
-    let mut new = SEXP_NIL;
-    let mut changed = false;
-    for (tag, mut default) in formal_pairs.into_iter().rev() {
-        if default == SEXP_MISSING
-            && let Some(&(_, inherited)) = generic_formals.iter().find(|&&(sym, _)| sym == tag)
-        {
-            changed |= inherited != SEXP_MISSING;
-            default = inherited;
-        }
-        new = ctx.session_mut().cons(default, new, tag.as_sexp())?;
-    }
-    if changed {
-        Ok(ctx.session_mut().alloc_closure(new, body, env)?)
-    } else {
-        Ok(definition)
-    }
-}
-
-fn local_table(ctx: &mut Ctx, info: &mut GenericInfo, where_: SexpId) -> EvalResult<()> {
-    let key = table_name(&info.name, &info.package);
-    if binding(ctx, where_, &key)?.is_none() {
-        let table = ctx.session_mut().alloc_env(EMPTY_ENV)?;
-        for (sym, value) in ctx.session().attrs(info.table)? {
-            ctx.session_mut().set_attrib(table, sym, value)?;
-        }
-        if info.default_fun != SEXP_NIL {
-            bind(ctx, table, "ANY", info.default_fun)?;
-        }
-        bind(ctx, where_, &key, table)?;
-        info.table = table;
-    } else if let Some(table) = binding(ctx, where_, &key)? {
-        info.table = table;
-    }
-    Ok(())
-}
-
-fn activate(ctx: &mut Ctx, info: &GenericInfo) -> EvalResult<()> {
-    let active = logical(ctx, true)?;
-    set_attr(ctx, info.table, ".rx_active", active)
-}
-
-pub(super) fn set_method(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
-    let mut name = text(ctx, args.get(0))?;
-    name = canonical_generic_name(&name).to_owned();
-    let where_ = args.get(3);
-    let sig_arg = args.get(1);
-    let definition = args.get(2);
-    let mut info = match lookup(ctx, &name, "", where_)? {
-        Some(info) => info,
+    name: &str,
+    where_: SexpId,
+) -> EvalResult<GenericInfo> {
+    match lookup(ctx, name, "", where_)? {
+        Some(info) => Ok(info),
         None => {
             let pkg = ctx
                 .namespace_name(where_)
                 .unwrap_or_else(|| ".GlobalEnv".to_owned());
             let spec = GenericSpec {
-                name: &name,
+                name,
                 package: &pkg,
                 where_,
                 def: SEXP_NIL,
@@ -863,141 +693,9 @@ pub(super) fn set_method(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalRes
                 group: SEXP_NIL,
                 value_class: SEXP_NIL,
             };
-            create(ctx, &spec, false)?
-        }
-    };
-    let signature = normalize(ctx, &info, sig_arg)?;
-    let generic = generic_definition(ctx, &info, where_)?;
-    let definition = missing_defaults(ctx, generic, definition)?;
-    let definition = method_definition(
-        ctx,
-        &info,
-        &signature,
-        &signature,
-        definition,
-        "MethodDefinition",
-    )?;
-    if flag(ctx, args.get(5)) {
-        let sealed = logical(ctx, true)?;
-        set_attr(ctx, definition, "sealed", sealed)?;
-    }
-    local_table(ctx, &mut info, where_)?;
-    let old = methods(ctx, &info)?;
-    let width = old
-        .iter()
-        .map(|m| sig_width(&m.signature))
-        .max()
-        .unwrap_or(1);
-    let new_width = width.max(sig_width(&signature));
-    let key = method_key(&signature, width);
-    if new_width == width
-        && let Some(prior) = binding(ctx, info.table, &key)?
-    {
-        let sealed = attr(ctx, prior, "sealed")?;
-        if flag(ctx, sealed) {
-            return Err(ctx.stop(call.err_call(), "the method is sealed"));
+            create(ctx, &spec, false)
         }
     }
-    if width != new_width {
-        for method in old {
-            let previous = ctx
-                .session_mut()
-                .intern(&method_key(&method.signature, width))?;
-            ctx.session_mut().env_remove(info.table, previous)?;
-            bind(
-                ctx,
-                info.table,
-                &method_key(&method.signature, new_width),
-                method.fun,
-            )?;
-        }
-    }
-    bind(
-        ctx,
-        info.table,
-        &method_key(&signature, new_width),
-        definition,
-    )?;
-    activate(ctx, &info)?;
-    let registry = ctx.ext::<MethodsExt>();
-    registry
-        .generics
-        .insert((name.clone(), info.package.clone()), info);
-    registry.bump_epoch();
-    Ok(ctx.session_mut().scalar_str(&name)?)
-}
-
-pub(super) fn remove_method(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
-    let name = text(ctx, args.get(0))?;
-    let name = canonical_generic_name(&name);
-    let where_ = args.get(2);
-    let Some(info) = local_tables(ctx, name, "", where_)?.into_iter().next() else {
-        if lookup(ctx, name, "", where_)?.is_some() {
-            return warn_missing_method(ctx, call, name, args.get(1));
-        }
-        ctx.warn_now(
-            call.err_call(),
-            format!("no generic function ‘{name}’ found"),
-        )?;
-        return logical(ctx, false);
-    };
-    let signature = normalize(ctx, &info, args.get(1))?;
-    let old = methods(ctx, &info)?;
-    let width = old
-        .iter()
-        .map(|m| sig_width(&m.signature))
-        .max()
-        .unwrap_or(1);
-    if !old.iter().any(|method| method.signature == signature) {
-        return warn_missing_method(ctx, call, name, args.get(1));
-    }
-    let key = method_key(&signature, width);
-    if let Some(prior) = binding(ctx, info.table, &key)? {
-        let sealed = attr(ctx, prior, "sealed")?;
-        if flag(ctx, sealed) {
-            return Err(ctx.stop(call.err_call(), "the method is sealed"));
-        }
-    }
-    let key = ctx.session_mut().intern(&key)?;
-    let removed = ctx.session_mut().env_remove(info.table, key)?;
-    if removed {
-        let new_width = old
-            .iter()
-            .filter(|m| m.signature != signature)
-            .map(|m| sig_width(&m.signature))
-            .max()
-            .unwrap_or(1);
-        if new_width != width {
-            for method in old.into_iter().filter(|m| m.signature != signature) {
-                let previous = ctx
-                    .session_mut()
-                    .intern(&method_key(&method.signature, width))?;
-                ctx.session_mut().env_remove(info.table, previous)?;
-                bind(
-                    ctx,
-                    info.table,
-                    &method_key(&method.signature, new_width),
-                    method.fun,
-                )?;
-            }
-        }
-        ctx.ext::<MethodsExt>().bump_epoch();
-    }
-    logical(ctx, removed)
-}
-
-fn warn_missing_method(ctx: &mut Ctx, call: &Call, name: &str, signature: SexpId) -> EvalResult {
-    let given = texts(ctx, signature)?;
-    let given = given
-        .iter()
-        .map(|class| roxide_value::encode_string(class.as_bytes()))
-        .collect::<Vec<_>>()
-        .join(", ");
-    ctx.warn_now(
-        call.err_call(),
-        format!("no method found for function ‘{name}’ and signature {given}"),
-    )?;
-    logical(ctx, false)
 }
 
 pub(super) fn by_definition(
