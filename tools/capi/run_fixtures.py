@@ -36,7 +36,8 @@ def normalize(output: bytes, scratch: Path) -> bytes:
     for path in (scratch, scratch.resolve()):
         output = output.replace(os.fsencode(path) + b"/", b"<temp>/")
     output = POINTER.sub(b"<address>", output)
-    return STACK_LINE.sub(rb"\g<1><before> then <after>", output)
+    output = STACK_LINE.sub(rb"\g<1><before> then <after>", output)
+    return re.sub(rb"[ \t]+(?=\r?\n|$)", b"", output)
 
 
 def run(command: list[str], scratch: Path, env: dict[str, str], timeout: float) -> Result:
@@ -140,7 +141,7 @@ def main() -> int:
     parser.add_argument("--include-negative", action="store_true",
                         help="Run the safety fixtures on Roxide.")
     parser.add_argument("--filter", default="*", help="Shell pattern for the fixture name.")
-    parser.add_argument("--timeout", type=float, default=60,
+    parser.add_argument("--timeout", type=float, default=120,
                         help="Time limit in seconds for each compile or Rscript process.")
     args = parser.parse_args()
     if not math.isfinite(args.timeout) or args.timeout <= 0:

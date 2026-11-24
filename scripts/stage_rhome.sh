@@ -200,4 +200,38 @@ MAKE
   done
 } > "$RHOME/etc/Makeconf"
 
+mkdir -p "$RHOME/library/base/Meta"
+cat > "$RHOME/library/base/DESCRIPTION" <<'DESC'
+Package: base
+Version: 4.6.2
+Priority: base
+Title: The R Base Package
+Description: Clean-room Roxide implementation of the R base package.
+License: MIT + file LICENSE | Apache License 2.0
+DESC
+"$RHOME/bin/Rscript" --vanilla -e '
+  meta <- structure(list(
+    DESCRIPTION = c(
+      Package = "base",
+      Version = "4.6.2",
+      Priority = "base",
+      Title = "The R Base Package",
+      License = "MIT OR Apache-2.0"
+    ),
+    Built = list(
+      R = structure(
+        list(c(4L, 6L, 2L)),
+        class = c("R_system_version", "package_version", "numeric_version")
+      )
+    ),
+    Rdepends = list(),
+    Rdepends2 = list(),
+    Depends = list(),
+    Suggests = list(),
+    Imports = list(),
+    LinkingTo = list()
+  ), class = "packageDescription2")
+  saveRDS(meta, file.path(Sys.getenv("R_HOME"), "library/base/Meta/package.rds"))
+'
+
 printf 'Staged Roxide R_HOME at %s (profile=%s, libR=libR.%s)\n' "$RHOME" "$PROFILE" "$LIBR_EXT"
