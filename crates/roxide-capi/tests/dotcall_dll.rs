@@ -23,6 +23,8 @@ const FIXTURE: &str = r#"
 #include <Rinternals.h>
 #include <R_ext/Rdynload.h>
 
+extern Rboolean R_Visible;
+
 static int *events;
 static SEXP preserved;
 
@@ -63,6 +65,14 @@ static SEXP external2(SEXP call, SEXP op, SEXP args, SEXP rho) {
     if (call != R_NilValue || op != R_NilValue || rho != R_GlobalEnv)
         Rf_error("wrong .External2 call context");
     return external(args);
+}
+static SEXP eval_call(SEXP expr) { return Rf_eval(expr, R_GlobalEnv); }
+static SEXP eval_external2(SEXP call, SEXP op, SEXP args, SEXP rho) {
+    return Rf_eval(CADR(args), rho);
+}
+static SEXP hide_external2(SEXP call, SEXP op, SEXP args, SEXP rho) {
+    R_Visible = FALSE;
+    return CADR(args);
 }
 static void mutate(int *value, double *other) { *value += 3; *other += 0.5; }
 static void ignore(void *value) { (void)value; }
@@ -120,10 +130,13 @@ static const R_CallMethodDef call[] = {
     {"finalizer_address", (DL_FUNC)finalizer_address, 0},
     {"preserved_value", (DL_FUNC)preserved_value, 0},
     {"add_non_exit", (DL_FUNC)add_non_exit, 1},
+    {"eval_call", (DL_FUNC)eval_call, 1},
     {NULL, NULL, 0}
 };
 static const R_ExternalMethodDef ext[] = {
-    {"external", (DL_FUNC)external, 1}, {"external2", (DL_FUNC)external2, 1}, {NULL, NULL, 0}
+    {"external", (DL_FUNC)external, 1}, {"external2", (DL_FUNC)external2, 1},
+    {"eval_external2", (DL_FUNC)eval_external2, 1},
+    {"hide_external2", (DL_FUNC)hide_external2, 1}, {NULL, NULL, 0}
 };
 static const R_CMethodDef c[] = {
     {"mutate", (DL_FUNC)mutate, 2, NULL}, {"ignore", (DL_FUNC)ignore, 1, NULL},
@@ -187,7 +200,7 @@ fn compile(temp: &Temp) -> PathBuf {
         let (headers, code) = FIXTURE.split_once("static int *events;").unwrap();
         let mut prelude = headers.to_owned();
         for (name, address) in ffi_addresses() {
-            let alias = if matches!(name, "R_NilValue" | "R_GlobalEnv") {
+            let alias = if matches!(name, "R_NilValue" | "R_GlobalEnv" | "R_Visible") {
                 format!("(*(__typeof__({name}) *){address:#x}ULL)")
             } else {
                 format!("((__typeof__(&{name})){address:#x}ULL)")
@@ -242,6 +255,7 @@ fn ffi_addresses() -> Vec<(&'static str, usize)> {
     }
     let mut symbols = address![
         coerce::Rf_ScalarInteger,
+        eval::Rf_eval,
         eval::R_GetCurrentEnv,
         memory::R_PreserveObject,
         memory::R_ReleaseObject,
@@ -251,6 +265,7 @@ fn ffi_addresses() -> Vec<(&'static str, usize)> {
         pairlist::TAG,
         pairlist::CDR,
         pairlist::CAR,
+        pairlist::CADR,
         sym::Rf_install,
         register::R_registerRoutines,
         register::R_useDynamicSymbols,
@@ -268,6 +283,7 @@ fn ffi_addresses() -> Vec<(&'static str, usize)> {
     symbols.extend([
         ("R_NilValue", (&raw const globals::R_NilValue).addr()),
         ("R_GlobalEnv", (&raw const globals::R_GlobalEnv).addr()),
+        ("R_Visible", (&raw const eval::R_Visible).addr()),
         ("Rf_error", Rf_error as *const () as usize),
     ]);
     symbols
@@ -492,6 +508,7 @@ fn sexp_calls(ctx: &mut Ctx) {
         (NativeCallKind::External2, "external2"),
     ] {
         let symbol = info(ctx, name);
+        ctx.set_visible(false);
         assert_eq!(
             invoke(
                 ctx,
@@ -503,6 +520,34 @@ fn sexp_calls(ctx: &mut Ctx) {
             .unwrap(),
             symbol
         );
+        assert!(ctx.is_visible());
+    }
+}
+
+fn sexp_call_visibility(ctx: &mut Ctx) {
+    let value = keep(ctx, |ctx| ctx.session_mut().scalar_int(42).unwrap());
+    let invisible = keep(ctx, |ctx| {
+        let session = ctx.session_mut();
+        let fun = session.intern("invisible").unwrap().as_sexp();
+        let args = session.cons(value, SEXP_NIL, SEXP_NIL).unwrap();
+        session.lcons(fun, args, SEXP_NIL).unwrap()
+    });
+    for (kind, name, expr, visible) in [
+        (
+            NativeCallKind::External2,
+            "eval_external2",
+            invisible,
+            false,
+        ),
+        (NativeCallKind::External2, "eval_external2", value, true),
+        (NativeCallKind::External2, "hide_external2", value, false),
+        (NativeCallKind::Call, "eval_call", invisible, true),
+    ] {
+        let routine = info(ctx, name);
+        let args = Args::from_pairs(vec![(None, expr)]);
+        let result = invoke(ctx, kind, routine, &args, None).unwrap();
+        assert_eq!(int(ctx, result), 42);
+        assert_eq!(ctx.is_visible(), visible, "{name}");
     }
 }
 
@@ -730,7 +775,7 @@ fn exercise(policy: GcPolicy) {
         assert_eq!(int(ctx, preserved), 97);
         let tables = native.get_dll_registered_routines(ctx, dll, true, SEXP_NIL)?;
         let calls = ctx.session().list_get(tables, 1)?;
-        assert_eq!(ctx.session().xlength(calls)?, 15);
+        assert_eq!(ctx.session().xlength(calls)?, 16);
         let dynamic = ctx.session().list_get(dll, 2)?;
         assert_eq!(
             ctx.session().lgl(dynamic)?.iter().next(),
@@ -754,6 +799,7 @@ fn exercise(policy: GcPolicy) {
             r#""zero" not available for .Call() for package "wave.test""#
         );
 
+        sexp_call_visibility(ctx);
         sexp_calls(ctx);
         copy_calls(ctx);
 

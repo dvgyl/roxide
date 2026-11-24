@@ -11,7 +11,9 @@
 #include <R_ext/Complex.h>
 #include <R_ext/Error.h>
 #include <R_ext/Memory.h>
+#include <R_ext/Print.h>
 #include <R_ext/Rdynload.h>
+#include <R_ext/Utils.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -306,6 +308,7 @@ void R_removeVarFromFrame(SEXP sym, SEXP rho);
 void Rf_defineVar(SEXP symbol, SEXP value, SEXP rho);
 void Rf_setVar(SEXP symbol, SEXP value, SEXP rho);
 SEXP Rf_findFun(SEXP symbol, SEXP rho);
+SEXP Rf_findVar(SEXP symbol, SEXP rho);
 SEXP Rf_topenv(SEXP target, SEXP rho);
 SEXP R_envSymbols(SEXP rho);
 SEXP R_lsInternal3(SEXP rho, Rboolean all, Rboolean sorted);
@@ -640,6 +643,7 @@ Rboolean Rf_isVectorizable(SEXP x);
 #define errorcall Rf_errorcall
 #define eval Rf_eval
 #define findFun Rf_findFun
+#define findVar Rf_findVar
 #define getAttrib Rf_getAttrib
 #define getCharCE Rf_getCharCE
 #define inherits Rf_inherits

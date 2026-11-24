@@ -64,7 +64,7 @@ impl RSession {
         })
     }
 
-    /// Mutate `TAG` of a cons cell (`SET_TAG`).
+    /// Store any live object in the `TAG` field of a cons cell (`SET_TAG`).
     pub fn set_tag(&mut self, x: SexpId, tag: SexpId) -> Result<(), ValueError> {
         self.replace_edge(x, tag, "pairlist/language", |body| match body {
             Body::List(cell) | Body::Lang(cell) | Body::Dots(cell) => Some(&mut cell.tag),

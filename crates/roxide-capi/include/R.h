@@ -2,6 +2,7 @@
 #ifndef ROXIDE_R_H
 #define ROXIDE_R_H
 
+#include <errno.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>

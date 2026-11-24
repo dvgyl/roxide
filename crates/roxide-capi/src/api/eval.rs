@@ -14,7 +14,7 @@ use crate::abi::Sexp;
 
 use super::{api, environment, root, symbol};
 
-/// Visibility of the most recent evaluation through the C API.
+/// Result visibility flag shared with native routines.
 #[allow(non_upper_case_globals)]
 #[unsafe(no_mangle)]
 pub static R_Visible: AtomicI32 = AtomicI32::new(1);
@@ -36,7 +36,7 @@ pub(super) fn eval(ctx: &mut Ctx, expression: SexpId, env: SexpId) -> EvalResult
     result
 }
 
-pub(super) fn sync_visibility(ctx: &Ctx) {
+pub(crate) fn sync_visibility(ctx: &Ctx) {
     R_Visible.store(i32::from(ctx.is_visible()), Ordering::Relaxed);
 }
 

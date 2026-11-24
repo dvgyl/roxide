@@ -3,6 +3,7 @@
 use std::alloc::{Layout, alloc, dealloc};
 use std::ffi::{c_int, c_void};
 use std::ptr::NonNull;
+use std::sync::atomic::Ordering;
 
 use roxide_eval::{Args, Call, Ctx, DotCOpts, EvalResult, NativeCallKind};
 use roxide_gc::SexpId;
@@ -11,6 +12,8 @@ use roxide_value::{
 };
 
 use crate::abi::Sexp;
+use crate::api::eval::{R_Visible, sync_visibility};
+use crate::cx::{with_ctx_entered, with_full};
 use crate::dll::{self, Interface, Registry, Routine};
 use crate::jump::{FrameKind, enter_trampoline_with};
 
@@ -74,9 +77,10 @@ fn call_sexp(
     ctx: &mut Ctx,
     address: usize,
     values: &[SexpId],
-    label: &'static str,
+    kind: NativeCallKind,
     call: SexpId,
 ) -> EvalResult {
+    let label = Interface::label(kind);
     let mut data = SexpCall {
         fun: address,
         nargs: values.len() as c_int,
@@ -86,20 +90,32 @@ fn call_sexp(
     for (slot, &value) in data.args.iter_mut().zip(values) {
         *slot = Sexp::from_id(value);
     }
-    // SAFETY: Dispatch checked the signature and protected the arguments.
-    unsafe {
-        enter_trampoline_with(
-            ctx,
-            FrameKind::Entry { label },
-            rox_capi_call_sexp,
-            std::ptr::from_mut(&mut data).cast(),
-        )?
-    };
-    if data.result == Sexp::NULL {
-        ctx.warning_at(call, "converting NULL pointer to R NULL")?;
-        return Ok(SEXP_NIL);
-    }
-    crate::api::vector::id(ctx, data.result, label)
+    with_ctx_entered(ctx, || {
+        with_full(|ctx| {
+            ctx.set_visible(true);
+            sync_visibility(ctx);
+            // SAFETY: Dispatch checked the signature and protected the arguments.
+            unsafe {
+                enter_trampoline_with(
+                    ctx,
+                    FrameKind::Entry { label },
+                    rox_capi_call_sexp,
+                    std::ptr::from_mut(&mut data).cast(),
+                )?
+            };
+            let visible =
+                kind != NativeCallKind::External2 || R_Visible.load(Ordering::Relaxed) != 0;
+            let result = if data.result == Sexp::NULL {
+                ctx.warning_at(call, "converting NULL pointer to R NULL")?;
+                SEXP_NIL
+            } else {
+                crate::api::vector::id(ctx, data.result, label)?
+            };
+            ctx.set_visible(visible);
+            sync_visibility(ctx);
+            Ok(result)
+        })
+    })
 }
 
 fn resolve(
@@ -195,7 +211,6 @@ pub(crate) fn dispatch(ctx: &mut Ctx, request: Invocation<'_>) -> EvalResult {
         call,
     } = request;
     let interface = Interface::from(kind);
-    let label = Interface::label(kind);
     let site = call.err_call();
     ctx.scoped(|ctx| {
         if args.len() > MAX_ARGS {
@@ -228,7 +243,7 @@ pub(crate) fn dispatch(ctx: &mut Ctx, request: Invocation<'_>) -> EvalResult {
         }
 
         dll::with_owner(ctx, routine.code_owner, |ctx| match kind {
-            NativeCallKind::Call => call_sexp(ctx, routine.addr, args.values(), label, site),
+            NativeCallKind::Call => call_sexp(ctx, routine.addr, args.values(), kind, site),
             NativeCallKind::External | NativeCallKind::External2 => {
                 let mut pairlist = SEXP_NIL;
                 for i in (0..args.len()).rev() {
@@ -242,11 +257,11 @@ pub(crate) fn dispatch(ctx: &mut Ctx, request: Invocation<'_>) -> EvalResult {
                         ctx,
                         routine.addr,
                         &[call.expr, op, pairlist, env],
-                        label,
+                        kind,
                         site,
                     )
                 } else {
-                    call_sexp(ctx, routine.addr, &[pairlist], label, site)
+                    call_sexp(ctx, routine.addr, &[pairlist], kind, site)
                 }
             }
             NativeCallKind::C | NativeCallKind::Fortran => copy_call(

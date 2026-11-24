@@ -33,7 +33,7 @@ macro_rules! fixture_api {
         static API: Api = Api { $($name,)+ };
 
         const C_API: &str = concat!(
-            "#define R_NO_REMAP\n#include <Rinternals.h>\n#include <R_ext/Utils.h>\nstruct Api {\n",
+            "#define R_NO_REMAP\n#include <Rinternals.h>\nstruct Api {\n",
             $("__typeof__(&", stringify!($name), ") ", stringify!($name), ";\n",)+
             "};\n",
         );
@@ -180,7 +180,6 @@ struct State {
 
 const C_FIXTURE: &str = r#"
 #include <math.h>
-#include <string.h>
 
 struct State {
     const struct Api *api;
@@ -405,6 +404,24 @@ void pairlists(void *data) {
     CHECK(A->Rf_listAppend(list, tail) == list);
     CHECK(A->Rf_lastElt(list) == tail && A->LENGTH(list) == 2);
     UNPROTECT(3);
+}
+
+void pairlist_object_tags(void *data) {
+    struct State *s = data;
+    SEXP pair = PROTECT(A->Rf_cons(s->nil, s->nil));
+    SEXP list_tag = A->Rf_cons(s->nil, s->nil);
+    A->SET_TAG(pair, list_tag);
+    SEXP string_tag = A->Rf_mkString("tag");
+    CHECK(A->TAG(pair) == list_tag && A->TYPEOF(list_tag) == LISTSXP);
+
+    A->SET_TAG(pair, string_tag);
+    (void)A->Rf_ScalarInteger(42);
+    CHECK(A->TAG(pair) == string_tag && A->TYPEOF(string_tag) == STRSXP);
+    CHECK(strcmp(A->R_CHAR(A->STRING_ELT(string_tag, 0)), "tag") == 0);
+
+    A->SET_TAG(pair, s->nil);
+    CHECK(A->TAG(pair) == s->nil);
+    UNPROTECT(1);
 }
 
 void attributes_and_coercion(void *data) {
@@ -656,6 +673,83 @@ fn check_user_interrupt_returns_when_none_is_pending() {
 #[test]
 fn pairlist_and_language_construction() {
     each_policy(|ctx| run(ctx, b"pairlists", Sexp::NULL).unwrap());
+}
+
+#[test]
+fn pairlist_object_tags_survive_torture_gc() {
+    let mut ctx = Ctx::new(Box::new(PureHost::new()), GcPolicy::Torture).unwrap();
+    run(&mut ctx, b"pairlist_object_tags", Sexp::NULL).unwrap();
+}
+
+#[test]
+fn public_headers_compile_without_extra_includes() {
+    const PRINT_AND_INTERRUPT: &str = r#"
+void print_probe(const char *format, ...) {
+    va_list args;
+    va_start(args, format);
+    Rprintf("%s", format);
+    REprintf("%s", format);
+    Rvprintf(format, args);
+    va_end(args);
+    va_start(args, format);
+    REvprintf(format, args);
+    va_end(args);
+    R_CheckUserInterrupt();
+}
+"#;
+    const FIND_VAR: &str = r#"
+SEXP find_var_probe(SEXP symbol, SEXP rho) {
+#ifdef R_NO_REMAP
+#ifdef findVar
+#error findVar must be disabled by R_NO_REMAP
+#endif
+    return Rf_findVar(symbol, rho);
+#else
+    return Rf_findVar(symbol, rho) == findVar(symbol, rho) ? rho : symbol;
+#endif
+}
+"#;
+    for (header, no_remap) in [
+        ("R.h", false),
+        ("R_ext/RS.h", false),
+        ("Rinternals.h", false),
+        ("Rinternals.h", true),
+    ] {
+        let mut cc = Command::new("cc")
+            .args(["-std=c11", "-Werror", "-fsyntax-only", "-x", "c", "-"])
+            .arg("-I")
+            .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/include"))
+            .stdin(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = cc.stdin.take().unwrap();
+        if no_remap {
+            writeln!(stdin, "#define R_NO_REMAP").unwrap();
+        }
+        writeln!(stdin, "#include <{header}>").unwrap();
+        writeln!(
+            stdin,
+            "size_t string_probe(char *out, const char *text) {{ return strlen(memcpy(out, text, strlen(text) + 1)); }}"
+        )
+        .unwrap();
+        if header == "R.h" {
+            writeln!(stdin, "int errno_probe(void) {{ return EINVAL; }}").unwrap();
+        }
+        if matches!(header, "R.h" | "Rinternals.h") {
+            stdin.write_all(PRINT_AND_INTERRUPT.as_bytes()).unwrap();
+        }
+        if header == "Rinternals.h" {
+            stdin.write_all(FIND_VAR.as_bytes()).unwrap();
+        }
+        drop(stdin);
+        let output = cc.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
 
 #[test]

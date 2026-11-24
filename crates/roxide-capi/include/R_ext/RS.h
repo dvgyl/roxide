@@ -3,6 +3,7 @@
 #define ROXIDE_R_EXT_RS_H
 
 #include <stddef.h>
+#include <string.h>
 #include <Rconfig.h>
 
 #ifdef __cplusplus

@@ -165,9 +165,6 @@ api! {
     fn SET_TAG(x: Sexp, tag: Sexp) -> () = (); |ctx| {
         let x = id(ctx, x, "SET_TAG")?;
         let tag = id(ctx, tag, "SET_TAG")?;
-        if tag != SEXP_NIL {
-            ctx.session().sexp_as_sym(tag)?;
-        }
         Ok(ctx.session_mut().set_tag(x, tag)?)
     }
     /// Follow the specified number of CDR links.
