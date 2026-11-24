@@ -2,9 +2,10 @@
 
 use std::any::Any;
 use std::fmt;
+use std::path::Path;
 
 use roxide_gc::{SexpId, Trace};
-use roxide_value::{PrimId, SEXP_NIL, Sym, ValueError};
+use roxide_value::{PrimId, SEXP_NIL, Sym, ValueApi, ValueError};
 
 use crate::ctx::{Args, Ctx, FrameId};
 
@@ -329,4 +330,102 @@ pub trait S4Hooks {
 pub trait NamespaceLoader {
     /// Load and register the namespace for `name`, returning its `ENVSXP`.
     fn load(&self, ctx: &mut Ctx, name: &str, call: SexpId) -> EvalResult<SexpId>;
+}
+
+/// Foreign function interface dispatch kind (`.Call`, `.External`, `.External2`, `.C`, `.Fortran`).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum NativeCallKind {
+    /// `.Call(...)`
+    Call,
+    /// `.External(...)`
+    External,
+    /// `.External2(...)`
+    External2,
+    /// `.C(...)`
+    C,
+    /// `.Fortran(...)`
+    Fortran,
+}
+
+/// Stateless native C-API & dynamic-library hooks installed by `roxide-capi` (ADRs 0017–0020).
+pub trait NativeHooks {
+    /// Invoke a registered or dynamically looked-up native symbol via `.Call`/`.External`/`.C`/`.Fortran`.
+    fn call_native(
+        &self,
+        ctx: &mut Ctx,
+        kind: NativeCallKind,
+        symbol: SexpId,
+        args: &Args,
+        package: Option<&str>,
+        call: &Call,
+    ) -> EvalResult<SexpId> {
+        let _ = (kind, symbol, args, package);
+        Err(ctx.stop(call.err_call(), "native C API support is not initialized"))
+    }
+
+    /// Load a compiled shared library (`dyn.load`) and return its `DLLInfo` object.
+    fn dyn_load(
+        &self,
+        ctx: &mut Ctx,
+        path: &Path,
+        local: bool,
+        now: bool,
+        call: SexpId,
+    ) -> EvalResult<SexpId> {
+        let _ = (path, local, now);
+        Err(ctx.stop(call, "native dynamic library loading is not initialized"))
+    }
+
+    /// Unload a previously loaded shared library (`dyn.unload`).
+    fn dyn_unload(&self, ctx: &mut Ctx, path: &Path, call: SexpId) -> EvalResult<()> {
+        let _ = path;
+        Err(ctx.stop(call, "native dynamic library loading is not initialized"))
+    }
+
+    /// Check whether a native symbol is loaded (`is.loaded`).
+    fn is_loaded(
+        &self,
+        ctx: &mut Ctx,
+        symbol: &str,
+        package: Option<&str>,
+        kind: Option<NativeCallKind>,
+    ) -> EvalResult<bool> {
+        let _ = (ctx, symbol, package, kind);
+        Ok(false)
+    }
+
+    /// Return a `NativeSymbolInfo` list (`getNativeSymbolInfo`).
+    fn get_native_symbol_info(
+        &self,
+        ctx: &mut Ctx,
+        name: &str,
+        package: Option<&str>,
+        with_registration: bool,
+        call: SexpId,
+    ) -> EvalResult<SexpId> {
+        let _ = (name, package, with_registration);
+        Err(ctx.stop(call, "native symbol lookup is not initialized"))
+    }
+
+    /// Return the list of loaded `DLLInfo` objects (`getLoadedDLLs`).
+    fn get_loaded_dlls(&self, ctx: &mut Ctx) -> EvalResult<SexpId> {
+        Ok(ctx.session_mut().alloc_list(0)?)
+    }
+
+    /// Return registered routines for a DLL (`getDLLRegisteredRoutines`).
+    fn get_dll_registered_routines(
+        &self,
+        ctx: &mut Ctx,
+        dll: SexpId,
+        add_names: bool,
+        call: SexpId,
+    ) -> EvalResult<SexpId> {
+        let _ = (dll, add_names);
+        Err(ctx.stop(call, "native routine inspection is not initialized"))
+    }
+
+    /// Invoke a C finalizer function pointer (`R_CFinalizer_t`) across `roxide-capi`'s trampoline.
+    fn run_c_finalizer(&self, ctx: &mut Ctx, fun_addr: usize, target: SexpId) {
+        let _ = (ctx, fun_addr, target);
+    }
 }

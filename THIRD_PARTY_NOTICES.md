@@ -13,6 +13,11 @@ This file tracks all third-party crates, libraries, datasets, and published algo
 - **`lzma-rust2`** (`Apache-2.0`) — Pure-Rust XZ/LZMA2 compression and decompression (`#![forbid(unsafe_code)]` with default non-SIMD features).
 - **`zstd`** (`MIT` / `BSD-3-Clause`), **`zstd-safe`** (`BSD-3-Clause`), **`zstd-sys`** (`BSD-3-Clause AND BSD-2-Clause`, bundled libzstd 1.5.7 selected under BSD-3-Clause).
 
+## External Rust Crates (Milestone 4 Wave 0 — ADR-0020)
+
+- **`cc`** (`MIT OR Apache-2.0`) — Rust build-script C/C++ compiler invocation for `roxide-capi`'s clean-room trampoline shims (`csrc/shim.cc`, `csrc/shim_va.c`).
+- **`libloading`** (`ISC`) — Cross-platform dynamic library loader (`dlopen`/`dlsym`) isolated to `roxide-capi`.
+
 ## Reference Algorithms & Specifications
 
 - **R Language Definition / R Internals / Writing R Extensions** — Clean-room behavioral specification reference (no GNU R source code or test suites consulted or copied).

@@ -14,7 +14,9 @@ members = [
     "crates/roxide-methods",
     "crates/roxide-pkg",
     "crates/roxide-graphics",
+    "crates/roxide-capi",
     "crates/roxide-cli",
+    "crates/roxide-libr",
     "crates/roxide-harness",
 ]
 
@@ -38,14 +40,18 @@ roxide-utils = { path = "crates/roxide-utils" }
 roxide-methods = { path = "crates/roxide-methods" }
 roxide-pkg = { path = "crates/roxide-pkg" }
 roxide-graphics = { path = "crates/roxide-graphics" }
+roxide-capi = { path = "crates/roxide-capi" }
+roxide-cli = { path = "crates/roxide-cli" }
 
-# Vetted permissive dependencies (ADR-0008, docs/PRIOR_ART.md)
+# Vetted permissive dependencies (ADR-0008, ADR-0020, docs/PRIOR_ART.md)
 regex = "1.13"
 fancy-regex = "0.20"
 flate2 = { version = "1.1", default-features = false, features = ["miniz_oxide"] }
 bzip2 = "0.6"
 lzma-rust2 = { version = "0.25", default-features = false, features = ["std", "encoder", "xz"] }
 zstd = { version = "0.14", default-features = false, features = ["vendored"] }
+cc = "1.2"
+libloading = "0.8"
 
 [workspace.lints.rust]
 missing_docs = "deny"
@@ -62,4 +68,7 @@ opt-level = 2
 opt-level = 2
 
 [profile.dev.package.roxide-eval]
+opt-level = 2
+
+[profile.dev.package.roxide-capi]
 opt-level = 2

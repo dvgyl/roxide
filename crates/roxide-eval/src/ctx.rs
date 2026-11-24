@@ -18,8 +18,8 @@ use roxide_value::{
 };
 
 use crate::api::{
-    ArgEval, Call, CtxExt, EvalResult, InternalError, Module, NamespaceLoader, OptionsCache,
-    Package, PrimDef, PrimKind, S4Hooks, ScriptOpts, Unwind,
+    ArgEval, Call, CtxExt, EvalResult, InternalError, Module, NamespaceLoader, NativeHooks,
+    OptionsCache, Package, PrimDef, PrimKind, S4Hooks, ScriptOpts, Unwind,
 };
 use crate::builtins;
 use crate::namespace::{DeferredS3, NsRecord};
@@ -121,14 +121,6 @@ pub(crate) struct ExtEntry {
     trace_fn: fn(&dyn Any, &mut Tracer<'_>),
 }
 
-/// Weak-keyed ephemeron finalizer entry registered via `reg.finalizer()`.
-#[derive(Clone, Copy)]
-pub(crate) struct FinalizerEntry {
-    pub(crate) target: SexpId,
-    pub(crate) fun: SexpId,
-    pub(crate) onexit: bool,
-}
-
 /// Core Roxide execution context owning the [`RSession`], [`Host`], frames, and primitive table.
 pub struct Ctx {
     pub(crate) session: RSession,
@@ -159,10 +151,10 @@ pub struct Ctx {
     pub(crate) visible: bool,
     pub(crate) pending_warnings: Vec<(Option<Vec<String>>, String)>,
     pub(crate) extensions: HashMap<TypeId, ExtEntry>,
-    pub(crate) finalizers: Vec<FinalizerEntry>,
-    pub(crate) pending_finalizers: Vec<(SexpId, SexpId)>,
     pub(crate) running_finalizers: bool,
     pub(crate) s4_hooks: Option<&'static dyn S4Hooks>,
+    pub(crate) native_hooks: Option<&'static dyn NativeHooks>,
+    pub(crate) jit_level: u8,
     pub(crate) interactive: bool,
 }
 
@@ -342,7 +334,6 @@ struct CtxRoots<'a> {
     autoloads: SexpId,
     namespaces: &'a [NsRecord],
     pending_s3: &'a [DeferredS3],
-    pending_finalizers: &'a [(SexpId, SexpId)],
     extensions: &'a HashMap<TypeId, ExtEntry>,
 }
 
@@ -375,10 +366,6 @@ impl RootSet for CtxRoots<'_> {
         for entry in self.pending_s3 {
             entry.trace(tracer);
         }
-        for &(target, fun) in self.pending_finalizers {
-            tracer.edge(target);
-            tracer.edge(fun);
-        }
         for &(_, value) in self.options {
             tracer.edge(value);
         }
@@ -401,6 +388,11 @@ impl Ctx {
         let s3_sym = session.intern(".__S3MethodsTable__.")?;
         session.env_define(BASE_NAMESPACE, s3_sym, base_s3)?;
         let max_expressions = host.limits().max_expressions;
+        let jit_level = host
+            .env_var("ROXIDE_JIT")
+            .or_else(|| host.env_var("R_ENABLE_JIT"))
+            .and_then(|v| std::str::from_utf8(&v).ok()?.trim().parse::<u8>().ok())
+            .map_or(3, |n| n.min(3));
         let opts = OptionsCache {
             expressions: max_expressions,
             ..OptionsCache::default()
@@ -438,10 +430,10 @@ impl Ctx {
             visible: true,
             pending_warnings: Vec::new(),
             extensions: HashMap::new(),
-            finalizers: Vec::new(),
-            pending_finalizers: Vec::new(),
             running_finalizers: false,
             s4_hooks: None,
+            native_hooks: None,
+            jit_level,
             interactive: false,
         };
         let global = ctx.session.intern(".GlobalEnv")?;
@@ -999,7 +991,34 @@ impl Ctx {
             .unwrap_or_else(|| unreachable!("TypeId key guarantees exact type match"))
     }
 
+    /// Install the native C-API & dynamic-library hooks (owned by `roxide-capi`, ADRs 0017–0020).
+    pub fn set_native_hooks(&mut self, hooks: &'static dyn NativeHooks) {
+        self.native_hooks = Some(hooks);
+    }
+
+    /// Borrow the installed [`NativeHooks`], if `roxide-capi` has been registered.
+    #[must_use]
+    pub fn native_hooks(&self) -> Option<&'static dyn NativeHooks> {
+        self.native_hooks
+    }
+
+    /// Current bytecode JIT compilation level (`0..=3`, default `3`; ADR-0020).
+    #[must_use]
+    pub fn jit_level(&self) -> u8 {
+        self.jit_level
+    }
+
+    /// Update the bytecode JIT compilation level (`0..=3`), returning the previous level.
+    pub fn set_jit_level(&mut self, level: u8) -> u8 {
+        let prev = self.jit_level;
+        self.jit_level = level.min(3);
+        prev
+    }
+
     /// Explicit GC safepoint (ADR-0002): runs collection only if policy requests it.
+    ///
+    /// Does not run queued R/C finalizers directly so C-API allocating paths can call
+    /// `safepoint()` safely; evaluator safepoints drain finalizers via [`Ctx::run_pending_finalizers`].
     pub fn safepoint(&mut self) {
         if self.session.heap.wants_collection() {
             let _ = self.collect_gc();
@@ -1018,58 +1037,42 @@ impl Ctx {
             autoloads: self.autoloads,
             namespaces: &self.namespaces,
             pending_s3: &self.pending_s3,
-            pending_finalizers: &self.pending_finalizers,
             extensions: &self.extensions,
         };
-        let finalizers = &mut self.finalizers;
-        let mut newly_dead = Vec::new();
-        let stats = self.session.collect_with_hook(&roots, |marked| {
-            // Ephemeron fixpoint: if a finalizer's target is reachable, keep its callback alive
-            // without letting the callback alone keep the target alive.
-            loop {
-                let mut changed = false;
-                for entry in finalizers.iter() {
-                    if marked.is_marked(entry.target) && !marked.is_marked(entry.fun) {
-                        marked.mark_transitive(entry.fun);
-                        changed = true;
-                    }
-                }
-                if !changed {
-                    break;
-                }
-            }
-            // Partition all newly unreachable targets before resurrecting them so one
-            // dead finalizer's closure cannot mask another dead target in the same cycle.
-            let mut alive = Vec::with_capacity(finalizers.len());
-            for entry in finalizers.drain(..) {
-                if marked.is_marked(entry.target) {
-                    alive.push(entry);
-                } else {
-                    newly_dead.push((entry.target, entry.fun));
-                }
-            }
-            *finalizers = alive;
-            for &(target, fun) in &newly_dead {
-                marked.mark_transitive(target);
-                marked.mark_transitive(fun);
-            }
-        });
-        self.pending_finalizers.extend(newly_dead);
-        stats
+        self.session.collect(&roots)
     }
 
-    /// Execute any GC finalizers queued by completed collections (re-entrancy safe).
+    /// Execute any GC finalizers queued by completed collections (re-entrancy safe, ADR-0019).
     pub fn run_pending_finalizers(&mut self) {
-        if self.running_finalizers || self.pending_finalizers.is_empty() {
+        if self.running_finalizers || !self.session.heap.has_pending_finalizers() {
             return;
         }
         self.running_finalizers = true;
         let visible = self.visible;
-        while let Some((target, fun)) = self.pending_finalizers.pop() {
+        loop {
+            let batch = self.session.heap.drain_pending_finalizers();
+            if batch.is_empty() {
+                break;
+            }
             let _ = self.scoped(|ctx| {
-                ctx.protect(target);
-                ctx.protect(fun);
-                let _ = ctx.apply(fun, &[(None, target)], SEXP_NIL, GLOBAL_ENV);
+                for fin in &batch {
+                    ctx.protect(fin.target);
+                    if let roxide_gc::FinalizerKind::RClosure(fun) = fin.kind {
+                        ctx.protect(fun);
+                    }
+                }
+                for fin in batch.into_iter().rev() {
+                    match fin.kind {
+                        roxide_gc::FinalizerKind::RClosure(fun) => {
+                            let _ = ctx.apply(fun, &[(None, fin.target)], SEXP_NIL, GLOBAL_ENV);
+                        }
+                        roxide_gc::FinalizerKind::Native(addr) => {
+                            if let Some(hooks) = ctx.native_hooks {
+                                hooks.run_c_finalizer(ctx, addr, fin.target);
+                            }
+                        }
+                    }
+                }
                 Ok(())
             });
         }
@@ -1087,6 +1090,11 @@ impl Ctx {
         self.pending_warnings.push((call_lines, msg.into()));
     }
 
+    /// Emit a warning at `call` honoring `options(warn=)` and active warning handlers (`Rf_warning`).
+    pub fn warning_at(&mut self, call: SexpId, msg: &str) -> EvalResult<()> {
+        self.warn_now(call, msg)
+    }
+
     /// Flush accumulated deferred warnings to `stderr`.
     pub fn flush_warnings(&mut self) {
         if self.pending_warnings.is_empty() {
@@ -1101,6 +1109,19 @@ impl Ctx {
     /// Signal an R error and return the resulting unwind.
     pub fn stop(&mut self, call: SexpId, msg: impl Into<String>) -> Unwind {
         self.error_condition(call, msg.into())
+    }
+
+    /// Public C-API error signaling helper (`Rf_error` / `Rf_errorcall`).
+    pub fn signal_error_at(&mut self, call: SexpId, msg: &str) -> Unwind {
+        self.stop(call, msg)
+    }
+
+    /// Check for pending user interrupts (`R_CheckUserInterrupt`).
+    pub fn check_user_interrupt(&mut self) -> EvalResult<()> {
+        if self.host.poll_interrupt() {
+            return Err(self.stop(SEXP_NIL, "interrupted"));
+        }
+        Ok(())
     }
 
     /// Parse and execute a complete R script string in `env`.

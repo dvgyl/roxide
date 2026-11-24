@@ -5,7 +5,6 @@ use roxide_value::{
 };
 
 use crate::control::logical;
-use crate::ctx::FinalizerEntry;
 use crate::{
     ArgEval, Args, Arity, Call, Ctx, Dispatch, EvalResult, Module, PrimDef, PrimKind, Visibility,
 };
@@ -611,11 +610,9 @@ fn register_finalizer(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult
         return Err(ctx.stop(call.err_call(), "second argument must be a function"));
     }
     let onexit = scalar_flag(ctx, ctx.matched_arg(args, &matched, 2), false, call)?;
-    ctx.finalizers.push(FinalizerEntry {
-        target: env,
-        fun,
-        onexit,
-    });
+    ctx.session
+        .heap
+        .register_finalizer(env, roxide_gc::FinalizerKind::RClosure(fun), onexit);
     Ok(SEXP_NIL)
 }
 
@@ -703,23 +700,29 @@ impl Ctx {
     /// in reverse registration order.
     pub fn run_exit_finalizers(&mut self) {
         self.run_pending_finalizers();
-        let remaining = std::mem::take(&mut self.finalizers);
-        let exit_only: Vec<_> = remaining
-            .into_iter()
-            .filter(|entry| entry.onexit)
-            .map(|entry| (entry.target, entry.fun))
-            .collect();
+        let exit_only = self.session.heap.take_exit_finalizers();
         if exit_only.is_empty() {
             return;
         }
         let _ = self.scoped(|ctx| {
             let visible = ctx.visible;
-            for &(env, fun) in &exit_only {
-                ctx.protect(env);
-                ctx.protect(fun);
+            for fin in &exit_only {
+                ctx.protect(fin.target);
+                if let roxide_gc::FinalizerKind::RClosure(fun) = fin.kind {
+                    ctx.protect(fun);
+                }
             }
-            for (env, fun) in exit_only.into_iter().rev() {
-                let _ = ctx.apply(fun, &[(None, env)], SEXP_NIL, GLOBAL_ENV);
+            for fin in exit_only.into_iter().rev() {
+                match fin.kind {
+                    roxide_gc::FinalizerKind::RClosure(fun) => {
+                        let _ = ctx.apply(fun, &[(None, fin.target)], SEXP_NIL, GLOBAL_ENV);
+                    }
+                    roxide_gc::FinalizerKind::Native(addr) => {
+                        if let Some(hooks) = ctx.native_hooks {
+                            hooks.run_c_finalizer(ctx, addr, fin.target);
+                        }
+                    }
+                }
             }
             ctx.visible = visible;
             Ok(())

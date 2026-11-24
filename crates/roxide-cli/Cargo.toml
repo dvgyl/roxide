@@ -3,7 +3,11 @@ name = "roxide-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Multi-call CLI binary for Roxide (roxide, R, Rscript, R CMD)"
+description = "Multi-call CLI binary and session bootstrapper for Roxide (roxide, R, Rscript, R CMD)"
+
+[lib]
+name = "roxide_cli"
+path = "src/lib.rs"
 
 [[bin]]
 name = "roxide"

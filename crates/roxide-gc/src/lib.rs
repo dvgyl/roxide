@@ -13,7 +13,7 @@ pub mod heap;
 pub mod id;
 
 pub use heap::{
-    GcPolicy, GcStats, Heap, HeapError, HeapSize, Marked, ProtectIndex, ProtectMark, REFCNT_MAX,
-    RootSet, Trace, Tracer,
+    DEFAULT_PROTECT_LIMIT, Finalizer, FinalizerKind, GcPolicy, GcStats, Heap, HeapError, HeapSize,
+    Marked, ProtectIndex, ProtectMark, REFCNT_MAX, RootSet, Trace, Tracer, WeakRefEntry,
 };
 pub use id::{MAX_GENERATION, SexpId};

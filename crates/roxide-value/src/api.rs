@@ -866,6 +866,7 @@ impl ValueApi for RSession {
                 let idx = e.entries.len();
                 e.entries.push((sym, binding));
                 e.index.insert(sym, idx);
+                e.shape_version = e.shape_version.wrapping_add(1);
                 None
             }
         };

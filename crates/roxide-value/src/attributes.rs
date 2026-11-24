@@ -171,6 +171,7 @@ impl RSession {
         for (offset, (key, _)) in frame.entries[index..].iter().enumerate() {
             frame.index.insert(*key, index + offset);
         }
+        frame.shape_version = frame.shape_version.wrapping_add(1);
         self.heap.dec_ref(binding.value);
         Ok(true)
     }

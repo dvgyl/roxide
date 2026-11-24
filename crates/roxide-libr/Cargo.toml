@@ -1,0 +1,16 @@
+[package]
+name = "roxide-libr"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Staged libR static archive and launcher bridge for compiled CRAN packages (ADR-0020)"
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+roxide-capi = { workspace = true }
+roxide-cli = { workspace = true }
+
+[lints]
+workspace = true

@@ -58,9 +58,8 @@ impl Ctx {
 
     fn eval_protected(&mut self, expr: SexpId, env: SexpId) -> EvalResult {
         self.safepoint();
-        if self.host.poll_interrupt() {
-            return Err(self.stop(SEXP_NIL, "interrupted"));
-        }
+        self.run_pending_finalizers();
+        self.check_user_interrupt()?;
         let ty = self.session.type_of(expr)?;
         let counted = usize::from(matches!(ty, SexpType::Lang | SexpType::Prom));
         let limit = self

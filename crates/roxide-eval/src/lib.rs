@@ -36,11 +36,12 @@ pub mod ctx;
 pub mod eval;
 pub mod namespace;
 pub mod testing;
+pub mod vm;
 
 pub use api::{
     ArgEval, Arity, Call, CtxExt, Dispatch, EvalResult, GroupGeneric, InternalError, Module,
-    NamespaceLoader, OptionsCache, Package, PrimDef, PrimFn, PrimKind, S4Hooks, ScriptOpts,
-    Transfer, Unwind, Visibility,
+    NamespaceLoader, NativeCallKind, NativeHooks, OptionsCache, Package, PrimDef, PrimFn, PrimKind,
+    S4Hooks, ScriptOpts, Transfer, Unwind, Visibility,
 };
 pub use ctx::{Args, Ctx, FrameId};
 pub use namespace::NsRecord;

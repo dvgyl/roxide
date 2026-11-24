@@ -213,5 +213,54 @@ All major architectural contracts and deviations from `docs/ARCHITECTURE.md` are
   - Evaluate every color analytically on demand through `roxide-graphics::grdevices::colors::hcl_rgb`, supporting exact arbitrary `n`, `fixup`, `alpha`, and `rev` semantics with zero binary lookup tables.
   - Record BSD-3-Clause attribution in `THIRD_PARTY_NOTICES.md`, `docs/PRIOR_ART.md`, and `third_party/licences/colorspace-BSD-3-Clause.txt`.
 
+---
+
+## ADR-0017: Public R 4.6.2 C API Handle ABI & Clean-Room Headers (`roxide-capi`)
+
+- **Status:** Accepted
+- **Context:** Compiled CRAN packages interact with R through `SEXP` handles, data-pointer accessors (`INTEGER`, `REAL`, `RAW`, `R_CHAR`), and public headers (`R.h`, `Rinternals.h`, `Rmath.h`, `R_ext/*.h`). Roxide's `MIT OR Apache-2.0` licence strictly prohibits reading or copying GNU R's LGPL/GPL headers or source files.
+- **Decision:**
+  - Isolate all C-ABI `unsafe` code into `crates/roxide-capi` and `crates/roxide-libr` (amending ADR-0001 only for these two explicit boundary crates; all 15 pure-Rust crates keep `#![forbid(unsafe_code)]`).
+  - Represent `SEXP` as an opaque 64-bit pointer whose bit pattern is `SexpId::to_bits()` (never dereferenced by C code; 64-bit targets only). C `NULL` (`0`) is rejected with a deterministic R error (or converted with GNU R's warning on `.Call` return).
+  - Allocate all public `R_*` `SEXP` globals (sentinels, environments, `R_BlankScalarString`, `R_NamespaceRegistry`, `R_MethodsNamespace`, and all standard `R_*Symbol` symbols) in fixed permanent generation-0 slots in `roxide-value::RSession::new` so C data exports are link-time constants.
+  - Keep `roxide-gc` non-moving forever so `INTEGER()`/`REAL()`/`RAW()`/`DATAPTR_RO()`/`R_CHAR()` return direct zero-copy pointers into pinned `RVec<T>` / `RChar` backing buffers.
+  - Author all headers under `crates/roxide-capi/include/` strictly clean-room from *Writing R Extensions* and verify symbol coverage via `tools/capi/api_manifest.py` (`tools:::funAPI()` + `nm -gU`) and numeric ABI parity via `tools/capi/abi_probe.py`.
+
+---
+
+## ADR-0018: Foreign Control Transfer & C++ Exception Wall (`roxide-capi`)
+
+- **Status:** Accepted
+- **Context:** R C API functions such as `Rf_error()` and `R_ContinueUnwind()` perform non-local jumps (`longjmp`), whereas Rust `Result<T, Unwind>` relies on structured unwinding and destructors. C++ CRAN packages (`fastmap`, `cpp11`, `vctrs`) also throw C++ exceptions across C frames.
+- **Decision:**
+  - Every Rust→C call (`.Call`, `.External`, `.C`, `.Fortran`, package `R_init_*`, C finalizers, foreign ALTREP callbacks) enters through a small clean-room C++ trampoline (`crates/roxide-capi/csrc/shim.cc`) combining `sigsetjmp` with a `try { ... } catch (...)` wall so C++ exceptions never cross into Rust and are translated into R errors.
+  - Every C→Rust entry point uses a panic-free `boundary()` helper that catches panics via `std::panic::catch_unwind`, records any `Unwind` in a depth-indexed pending-unwind slot, drops all Rust locals cleanly, and invokes a plain-old-frame `longjmp` tail (never using `extern "C-unwind"`).
+  - Support `R_UnwindProtect`, `R_MakeUnwindCont`, and `R_ContinueUnwind` cleanly via an `EXTPTRSXP` continuation token carrying the pending unwind depth, preserving C++ RAII cleanup semantics.
+
+---
+
+## ADR-0019: C-API Reentrancy Modes, Unified GC Finalizers & Foreign ALTREP
+
+- **Status:** Accepted
+- **Context:** Re-entrant C→Rust→R→C calls (`Rf_eval`, `R_tryCatchError`), worker threads in packages like `cli`, GC finalizers (`reg.finalizer` + `R_RegisterCFinalizerEx` + `WEAKREFSXP`), and foreign C ALTREP classes require strict borrow-safety and GC rooting discipline.
+- **Decision:**
+  - Track active C-API access in thread-local `Mode { Full, Session, Heap, Released }` with single-owner reborrowing per C entry point and immediate abort on main-thread double-borrow or unauthorized non-main-thread API calls (allowing read-only worker access only while the main thread is `Released`).
+  - Move the unified ephemeron finalizer & `WEAKREFSXP` registry into `roxide-gc` (supporting both `FinalizerKind::RClosure(SexpId)` and `FinalizerKind::Native(usize)` while keeping `roxide-gc` `#![forbid(unsafe_code)]`). Finalizers drain strictly at evaluator safepoints (`Ctx::run_pending_finalizers`), never inside `collect_gc`.
+  - Enforce GNU R's protect-stack limit (`50_000`), `unprotect_ptr`, and trampoline protect-mark restoration with exact stack-imbalance warnings.
+  - Enforce the single-authority rule for foreign ALTREP objects: `roxide-value` stores opaque `ForeignAltObj` (`class_id`, `base_type`, `data1`, `data2`) traced by GC while `roxide-capi` dispatches foreign method tables exclusively.
+
+---
+
+## ADR-0020: Staged `libR` Build/Link, Compiled Packages, New Dependencies & Native IR VM
+
+- **Status:** Accepted
+- **Context:** Compiled CRAN packages dynamically link against `libR` (`R CMD SHLIB` / `R CMD INSTALL`), invoke `R CMD config`, link system BLAS/LAPACK, and expect JIT bytecode compilation (`compiler::enableJIT`).
+- **Decision:**
+  - Build `libR` via `crates/roxide-libr` (`staticlib`) finalized by the system linker with an explicit manifest export list and staged into `target/rhome/{bin,include,lib,etc/Makeconf,share/make/shlib.mk}` via `scripts/stage_rhome.sh`.
+  - Link compiled CRAN packages against system BLAS/LAPACK (Accelerate on macOS, OpenBLAS on Linux) while preserving Roxide's bit-exact `roxide-math` engine path (ADR-0009).
+  - Stamp Roxide-installed compiled packages with `Meta/Roxide.rds` and refuse foreign-runtime shared libraries via pure-Rust Mach-O/ELF dependency inspection so GNU R is never loaded into a Roxide process.
+  - Adopt two vetted permissive dependencies: `cc` (`MIT OR Apache-2.0`) for building `roxide-capi`'s C/C++ trampoline shim and `libloading` (`ISC`) for dynamic library loading (`dyn.load`), plus optional out-of-workspace nightly `cargo-fuzz` (`MIT OR Apache-2.0`).
+  - Never execute GNU R `BCODESXP` instruction streams; lower `consts[0]` ASTs to Roxide's own clean-room register IR (`roxide-eval::vm`) with `ENVSXP` `shape_version` inline caches and guard-based fallback to the AST semantic reference.
+
 
 

@@ -20,7 +20,7 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 
-ALLOWED_UNSAFE_CRATES = {"roxide-capi"}
+ALLOWED_UNSAFE_CRATES = {"roxide-capi", "roxide-libr"}
 
 FORBIDDEN_SOURCE_PATTERNS = [
     (re.compile(r"R\s*:\s*A\s+Computer\s+Language\s+for\s+Statistical\s+Data\s+Analysis", re.I),
@@ -29,12 +29,17 @@ FORBIDDEN_SOURCE_PATTERNS = [
      "GNU R copyright banner detected"),
     (re.compile(r"This\s+program\s+is\s+free\s+software;\s+you\s+can\s+redistribute\s+it\s+and/or\s+modify\s+it\s+under\s+the\s+terms\s+of\s+the\s+GNU\s+General\s+Public\s+License", re.I),
      "GPL licence header detected in source file"),
+    (re.compile(r"GNU\s+Lesser\s+General\s+Public\s+License", re.I),
+     "LGPL licence header detected in source file"),
     (re.compile(r"^\s*(Co-Authored-By:|Claude-Session:|Generated\s+with\s+)", re.I | re.M),
      "Forbidden AI attribution trailer detected"),
 ]
 
-SCAN_DIRS = ["crates", "stdlib", "conformance", "tools", "scripts"]
-TEXT_EXTENSIONS = {".rs", ".r", ".R", ".py", ".sh", ".toml", ".md", ".c", ".h", ".txt", ".json", ".tsv", ".rcase"}
+SCAN_DIRS = ["crates", "stdlib", "conformance", "tools", "scripts", "share"]
+TEXT_EXTENSIONS = {
+    ".rs", ".r", ".R", ".py", ".sh", ".toml", ".md", ".c", ".cc", ".cpp",
+    ".h", ".hpp", ".mk", ".txt", ".json", ".tsv", ".rcase",
+}
 
 
 def should_skip(path: pathlib.Path) -> bool:
@@ -138,10 +143,36 @@ def check_dependency_licenses() -> list[str]:
     return errors
 
 
+def check_capi_headers() -> list[str]:
+    """Verify clean-room SPDX header & forbid GNU R internal guard leakage in C API headers."""
+    errors: list[str] = []
+    include_dir = ROOT / "crates" / "roxide-capi" / "include"
+    if not include_dir.exists():
+        return errors
+    forbidden_header = [
+        (re.compile(r"\bR_RINTERNALS_H_\b"), "GNU R internal include guard `R_RINTERNALS_H_` detected"),
+        (re.compile(r"\bUSE_RINTERNALS\b"), "Forbidden internal macro `USE_RINTERNALS` detected"),
+    ]
+    for path in sorted(include_dir.rglob("*.h")):
+        if should_skip(path):
+            continue
+        text = path.read_text(encoding="utf-8")
+        rel = path.relative_to(ROOT)
+        if "SPDX-License-Identifier: MIT OR Apache-2.0" not in text:
+            errors.append(
+                f"{rel}: clean-room C API header must carry `SPDX-License-Identifier: MIT OR Apache-2.0`"
+            )
+        for pat, msg in forbidden_header:
+            if pat.search(text):
+                errors.append(f"{rel}: {msg}")
+    return errors
+
+
 def main() -> int:
     errors = []
     errors.extend(scan_files())
     errors.extend(check_pure_crates_forbid_unsafe())
+    errors.extend(check_capi_headers())
     errors.extend(check_cargo_licenses())
     errors.extend(check_dependency_licenses())
     if errors:

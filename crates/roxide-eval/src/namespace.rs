@@ -4,8 +4,8 @@ use std::path::PathBuf;
 
 use roxide_gc::{SexpId, Tracer};
 use roxide_value::{
-    BASE_ENV, BASE_NAMESPACE, CharId, EMPTY_ENV, GLOBAL_ENV, SEXP_NIL, SexpType, TRUE_SCALAR,
-    ValueApi,
+    BASE_ENV, BASE_NAMESPACE, CharId, EMPTY_ENV, GLOBAL_ENV, METHODS_NAMESPACE, NAMESPACE_REGISTRY,
+    SEXP_NIL, SexpType, TRUE_SCALAR, ValueApi,
 };
 
 use crate::api::{EvalResult, NamespaceLoader};
@@ -195,7 +195,12 @@ impl Ctx {
             ctx.protect(imports_label);
             ctx.session.set_attrib(imports, name_sym, imports_label)?;
 
-            let ns = ctx.session.alloc_env(imports)?;
+            let ns = if name == "methods" {
+                ctx.session.env_set_enclos(METHODS_NAMESPACE, imports)?;
+                METHODS_NAMESPACE
+            } else {
+                ctx.session.alloc_env(imports)?
+            };
             ctx.protect(ns);
 
             // Bind `.packageName` in `ns` (matches GNU R `get(".packageName", asNamespace(pkg))`).
@@ -288,6 +293,10 @@ impl Ctx {
         } else {
             self.namespaces.push(record);
         }
+        if name != "base" {
+            let sym = self.session.intern(&name)?;
+            let _ = self.session.env_define(NAMESPACE_REGISTRY, sym, ns);
+        }
         // Keep `self.pending_s3` intact as GC roots while flushing matching entries!
         let count = self.pending_s3.len();
         for idx in 0..count {
@@ -307,6 +316,11 @@ impl Ctx {
     /// callers must protect them immediately before any GC-allocating operation if kept alive.
     pub fn ns_unregister(&mut self, name: &str) -> Option<NsRecord> {
         let pos = self.namespaces.iter().position(|r| r.name == name)?;
+        if name != "base"
+            && let Ok(sym) = self.session.intern(name)
+        {
+            let _ = self.session.env_remove(NAMESPACE_REGISTRY, sym);
+        }
         Some(self.namespaces.remove(pos))
     }
 

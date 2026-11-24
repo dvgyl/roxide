@@ -34,6 +34,137 @@ pub const FALSE_SCALAR: SexpId = SexpId::permanent(10);
 pub const NA_LGL_SCALAR: SexpId = SexpId::permanent(11);
 /// Permanent S4 pseudo-NULL slot sentinel (`\x01NULL\x01`, index 12; ADR-0012).
 pub const SEXP_S4_NULL: SexpId = SexpId::permanent(12);
+// Index 13 is the permanent CHARSXP for `SEXP_S4_NULL`.
+/// Permanent 1-element blank character vector `""` (`R_BlankScalarString`, index 14; ADR-0017).
+pub const BLANK_SCALAR_STRING: SexpId = SexpId::permanent(14);
+/// Permanent namespace registry environment (`R_NamespaceRegistry`, index 15; ADR-0017).
+pub const NAMESPACE_REGISTRY: SexpId = SexpId::permanent(15);
+/// Permanent `namespace:methods` environment (`R_MethodsNamespace`, index 16; ADR-0017).
+pub const METHODS_NAMESPACE: SexpId = SexpId::permanent(16);
+
+/// Permanent `R_AsCharacterSymbol` (`"as.character"`, index 17).
+pub const SYM_AS_CHARACTER: Sym = Sym(SexpId::permanent(17));
+/// Permanent `R_AtsignSymbol` (`"@"`, index 18).
+pub const SYM_ATSIGN: Sym = Sym(SexpId::permanent(18));
+/// Permanent `R_BaseSymbol` / `R_baseSymbol` (`"base"`, index 19).
+pub const SYM_BASE: Sym = Sym(SexpId::permanent(19));
+/// Permanent `R_BraceSymbol` (`"{"`, index 20).
+pub const SYM_BRACE: Sym = Sym(SexpId::permanent(20));
+/// Permanent `R_Bracket2Symbol` (`"[["`, index 21).
+pub const SYM_BRACKET2: Sym = Sym(SexpId::permanent(21));
+/// Permanent `R_BracketSymbol` (`"["`, index 22).
+pub const SYM_BRACKET: Sym = Sym(SexpId::permanent(22));
+/// Permanent `R_ClassSymbol` (`"class"`, index 23).
+pub const SYM_CLASS: Sym = Sym(SexpId::permanent(23));
+/// Permanent `R_DeviceSymbol` (`".Device"`, index 24).
+pub const SYM_DEVICE: Sym = Sym(SexpId::permanent(24));
+/// Permanent `R_DimNamesSymbol` (`"dimnames"`, index 25).
+pub const SYM_DIMNAMES: Sym = Sym(SexpId::permanent(25));
+/// Permanent `R_DimSymbol` (`"dim"`, index 26).
+pub const SYM_DIM: Sym = Sym(SexpId::permanent(26));
+/// Permanent `R_DollarSymbol` (`"$"`, index 27).
+pub const SYM_DOLLAR: Sym = Sym(SexpId::permanent(27));
+/// Permanent `R_DotsSymbol` (`"..."`, index 28).
+pub const SYM_DOTS: Sym = Sym(SexpId::permanent(28));
+/// Permanent `R_DoubleColonSymbol` (`"::"`, index 29).
+pub const SYM_DOUBLE_COLON: Sym = Sym(SexpId::permanent(29));
+/// Permanent `R_DropSymbol` (`"drop"`, index 30).
+pub const SYM_DROP: Sym = Sym(SexpId::permanent(30));
+/// Permanent `R_EvalSymbol` (`"eval"`, index 31).
+pub const SYM_EVAL: Sym = Sym(SexpId::permanent(31));
+/// Permanent `R_FunctionSymbol` (`"function"`, index 32).
+pub const SYM_FUNCTION: Sym = Sym(SexpId::permanent(32));
+/// Permanent `R_LastvalueSymbol` (`".Last.value"`, index 33).
+pub const SYM_LASTVALUE: Sym = Sym(SexpId::permanent(33));
+/// Permanent `R_LevelsSymbol` (`"levels"`, index 34).
+pub const SYM_LEVELS: Sym = Sym(SexpId::permanent(34));
+/// Permanent `R_ModeSymbol` (`"mode"`, index 35).
+pub const SYM_MODE: Sym = Sym(SexpId::permanent(35));
+/// Permanent `R_NaRmSymbol` (`"na.rm"`, index 36).
+pub const SYM_NA_RM: Sym = Sym(SexpId::permanent(36));
+/// Permanent `R_NameSymbol` (`"name"`, index 37).
+pub const SYM_NAME: Sym = Sym(SexpId::permanent(37));
+/// Permanent `R_NamesSymbol` (`"names"`, index 38).
+pub const SYM_NAMES: Sym = Sym(SexpId::permanent(38));
+/// Permanent `R_NamespaceEnvSymbol` (`".__NAMESPACE__."`, index 39).
+pub const SYM_NAMESPACE_ENV: Sym = Sym(SexpId::permanent(39));
+/// Permanent `R_PackageSymbol` (`"package"`, index 40).
+pub const SYM_PACKAGE: Sym = Sym(SexpId::permanent(40));
+/// Permanent `R_PreviousSymbol` (`"previous"`, index 41).
+pub const SYM_PREVIOUS: Sym = Sym(SexpId::permanent(41));
+/// Permanent `R_QuoteSymbol` (`"quote"`, index 42).
+pub const SYM_QUOTE: Sym = Sym(SexpId::permanent(42));
+/// Permanent `R_RowNamesSymbol` (`"row.names"`, index 43).
+pub const SYM_ROW_NAMES: Sym = Sym(SexpId::permanent(43));
+/// Permanent `R_SeedsSymbol` (`".Random.seed"`, index 44).
+pub const SYM_SEEDS: Sym = Sym(SexpId::permanent(44));
+/// Permanent `R_SortListSymbol` (`"sort.list"`, index 45).
+pub const SYM_SORT_LIST: Sym = Sym(SexpId::permanent(45));
+/// Permanent `R_SourceSymbol` (`"source"`, index 46).
+pub const SYM_SOURCE: Sym = Sym(SexpId::permanent(46));
+/// Permanent `R_SpecSymbol` (`"spec"`, index 47).
+pub const SYM_SPEC: Sym = Sym(SexpId::permanent(47));
+/// Permanent `R_SrcfileSymbol` (`"srcfile"`, index 48).
+pub const SYM_SRCFILE: Sym = Sym(SexpId::permanent(48));
+/// Permanent `R_SrcrefSymbol` (`"srcref"`, index 49).
+pub const SYM_SRCREF: Sym = Sym(SexpId::permanent(49));
+/// Permanent `R_TripleColonSymbol` (`":::"`, index 50).
+pub const SYM_TRIPLE_COLON: Sym = Sym(SexpId::permanent(50));
+/// Permanent `R_TspSymbol` (`"tsp"`, index 51).
+pub const SYM_TSP: Sym = Sym(SexpId::permanent(51));
+/// Permanent `R_dot_Generic` (`".Generic"`, index 52).
+pub const SYM_DOT_GENERIC: Sym = Sym(SexpId::permanent(52));
+/// Permanent `R_dot_Method` (`".Method"`, index 53).
+pub const SYM_DOT_METHOD: Sym = Sym(SexpId::permanent(53));
+/// Permanent `R_dot_defined` (`".defined"`, index 54).
+pub const SYM_DOT_DEFINED: Sym = Sym(SexpId::permanent(54));
+/// Permanent `R_dot_packageName` (`".packageName"`, index 55).
+pub const SYM_DOT_PACKAGE_NAME: Sym = Sym(SexpId::permanent(55));
+/// Permanent `R_dot_target` (`".target"`, index 56).
+pub const SYM_DOT_TARGET: Sym = Sym(SexpId::permanent(56));
+
+const PERMANENT_SYMBOLS: &[(Sym, &str)] = &[
+    (SYM_AS_CHARACTER, "as.character"),
+    (SYM_ATSIGN, "@"),
+    (SYM_BASE, "base"),
+    (SYM_BRACE, "{"),
+    (SYM_BRACKET2, "[["),
+    (SYM_BRACKET, "["),
+    (SYM_CLASS, "class"),
+    (SYM_DEVICE, ".Device"),
+    (SYM_DIMNAMES, "dimnames"),
+    (SYM_DIM, "dim"),
+    (SYM_DOLLAR, "$"),
+    (SYM_DOTS, "..."),
+    (SYM_DOUBLE_COLON, "::"),
+    (SYM_DROP, "drop"),
+    (SYM_EVAL, "eval"),
+    (SYM_FUNCTION, "function"),
+    (SYM_LASTVALUE, ".Last.value"),
+    (SYM_LEVELS, "levels"),
+    (SYM_MODE, "mode"),
+    (SYM_NA_RM, "na.rm"),
+    (SYM_NAME, "name"),
+    (SYM_NAMES, "names"),
+    (SYM_NAMESPACE_ENV, ".__NAMESPACE__."),
+    (SYM_PACKAGE, "package"),
+    (SYM_PREVIOUS, "previous"),
+    (SYM_QUOTE, "quote"),
+    (SYM_ROW_NAMES, "row.names"),
+    (SYM_SEEDS, ".Random.seed"),
+    (SYM_SORT_LIST, "sort.list"),
+    (SYM_SOURCE, "source"),
+    (SYM_SPEC, "spec"),
+    (SYM_SRCFILE, "srcfile"),
+    (SYM_SRCREF, "srcref"),
+    (SYM_TRIPLE_COLON, ":::"),
+    (SYM_TSP, "tsp"),
+    (SYM_DOT_GENERIC, ".Generic"),
+    (SYM_DOT_METHOD, ".Method"),
+    (SYM_DOT_DEFINED, ".defined"),
+    (SYM_DOT_PACKAGE_NAME, ".packageName"),
+    (SYM_DOT_TARGET, ".target"),
+];
 
 /// Owns the Roxide GC heap, permanent symbol table, weak `CHARSXP` table, and ALTREP registry.
 pub struct RSession {
@@ -125,12 +256,49 @@ impl RSession {
         let mut symbols = HashMap::new();
         symbols.insert(Box::from(s4_null_bytes), Sym(SEXP_S4_NULL));
 
-        Ok(Self {
+        // Indices 14..=16: C-API permanent scalar & environment globals (ADR-0017).
+        let blank_scalar =
+            heap.alloc_permanent(RObject::new(Body::Str(RVec::from_vec(vec![CharId::BLANK]))))?;
+        debug_assert_eq!(blank_scalar, BLANK_SCALAR_STRING);
+
+        let ns_registry =
+            heap.alloc_permanent(RObject::new(Body::Env(Box::new(EnvData::new(EMPTY_ENV)))))?;
+        debug_assert_eq!(ns_registry, NAMESPACE_REGISTRY);
+
+        let methods_ns = heap.alloc_permanent(RObject::new(Body::Env(Box::new(EnvData::new(
+            BASE_NAMESPACE,
+        )))))?;
+        debug_assert_eq!(methods_ns, METHODS_NAMESPACE);
+
+        // Indices 17..=56: permanent well-known R_*Symbol entries (ADR-0017).
+        for &(expected_sym, _) in PERMANENT_SYMBOLS {
+            let sym_id = heap.alloc_permanent(RObject::new(Body::Sym {
+                name: CharId::BLANK,
+            }))?;
+            debug_assert_eq!(sym_id, expected_sym.as_sexp());
+        }
+        // Indices 57..=96: permanent CHARSXP names backing indices 17..=56.
+        for &(sym, text) in PERMANENT_SYMBOLS {
+            let bytes = text.as_bytes();
+            let cid = CharId(heap.alloc_permanent(RObject::new(Body::Char(RChar::new(
+                bytes,
+                Encoding::Native,
+            ))))?);
+            if let Body::Sym { name } = &mut heap.get_mut(sym.as_sexp())?.body {
+                *name = cid;
+            }
+            chars.insert((Box::from(bytes), Encoding::Native), cid);
+            symbols.insert(Box::from(bytes), sym);
+        }
+
+        let mut session = Self {
             heap,
             symbols,
             chars,
             alt: AltRegistry::new(),
-        })
+        };
+        session.env_define(NAMESPACE_REGISTRY, SYM_BASE, BASE_NAMESPACE)?;
+        Ok(session)
     }
 
     /// Intern a symbol (`SYMSXP`) permanently.
@@ -295,6 +463,7 @@ impl RSession {
         let enclos = std::mem::replace(&mut frame.enclos, SEXP_NIL);
         let entries = std::mem::take(&mut frame.entries);
         frame.index.clear();
+        frame.shape_version = frame.shape_version.wrapping_add(1);
         self.heap.dec_ref(enclos);
         let mut candidates = actuals.to_vec();
         for (_, binding) in entries {
@@ -348,10 +517,7 @@ impl RSession {
         self.collect_with_hook(roots, |_| {})
     }
 
-    /// Run a two-phase GC cycle, invoking `hook` between mark and weak-cache/sweep cleanup.
-    ///
-    /// Used by `roxide-eval` to run ephemeron finalizer fixpoint marking and resurrect dead
-    /// targets queued for finalization before sweeping.
+    /// Run a two-phase GC cycle, invoking `hook` between mark and ephemeron/weak-cache/sweep cleanup.
     pub fn collect_with_hook(
         &mut self,
         roots: &dyn RootSet,
@@ -359,7 +525,16 @@ impl RSession {
     ) -> GcStats {
         let mut marked = self.heap.mark(roots);
         hook(&mut marked);
+        let dead_weakrefs = marked.resolve_ephemerons();
         self.chars.retain(|_, cid| marked.is_marked(cid.as_sexp()));
-        marked.sweep()
+        let stats = marked.sweep();
+        for wr_id in dead_weakrefs {
+            if let Ok(obj) = self.heap.get_mut(wr_id)
+                && let Body::WeakRef(wr) = &mut obj.body
+            {
+                wr.clear();
+            }
+        }
+        stats
     }
 }

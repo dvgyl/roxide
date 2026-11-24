@@ -199,6 +199,13 @@ impl RChar {
         &self.bytes_nul[..self.bytes_nul.len() - 1]
     }
 
+    /// Borrow NUL-terminated bytes for C-API `R_CHAR()` access.
+    #[inline]
+    #[must_use]
+    pub fn bytes_nul(&self) -> &[u8] {
+        &self.bytes_nul
+    }
+
     /// Encoding mark.
     #[inline]
     #[must_use]
@@ -236,6 +243,7 @@ pub enum PromiseState {
 pub struct RVec<T> {
     pub(crate) buf: Box<[T]>,
     pub(crate) len: usize,
+    pub(crate) resizable: bool,
 }
 
 impl<T> RVec<T> {
@@ -246,6 +254,18 @@ impl<T> RVec<T> {
         Self {
             buf: v.into_boxed_slice(),
             len,
+            resizable: false,
+        }
+    }
+
+    /// Create a resizable vector with logical length `len` and fixed pinned capacity `max_len`.
+    #[must_use]
+    pub(crate) fn resizable(buf: Box<[T]>, len: usize) -> Self {
+        debug_assert!(len <= buf.len());
+        Self {
+            buf,
+            len,
+            resizable: true,
         }
     }
 
@@ -254,6 +274,20 @@ impl<T> RVec<T> {
     #[must_use]
     pub const fn len(&self) -> usize {
         self.len
+    }
+
+    /// Allocated backing capacity (`TRUELENGTH` for resizable vectors).
+    #[inline]
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.buf.len()
+    }
+
+    /// Return true if allocated via `R_allocResizableVector`.
+    #[inline]
+    #[must_use]
+    pub const fn is_resizable(&self) -> bool {
+        self.resizable
     }
 
     /// Return true if empty.
@@ -298,6 +332,8 @@ pub(crate) struct EnvData {
     pub(crate) index: HashMap<Sym, usize>,
     pub(crate) enclos: SexpId,
     pub(crate) locked: bool,
+    /// Monotonic shape version bumped on binding insertion/removal for VM inline caches (ADR-0020).
+    pub(crate) shape_version: u32,
 }
 
 impl EnvData {
@@ -307,6 +343,7 @@ impl EnvData {
             index: HashMap::new(),
             enclos,
             locked: false,
+            shape_version: 0,
         }
     }
 }
@@ -333,13 +370,20 @@ pub(crate) struct ExtPtrData {
     pub(crate) prot: SexpId,
 }
 
-/// Weak reference body (`WEAKREFSXP`).
-#[allow(dead_code)]
+/// Weak reference body (`WEAKREFSXP`, ephemeron-managed by `roxide-gc`, ADR-0019).
 #[derive(Debug)]
 pub(crate) struct WeakRefData {
     pub(crate) key: SexpId,
     pub(crate) value: SexpId,
     pub(crate) finalizer: SexpId,
+}
+
+impl WeakRefData {
+    pub(crate) fn clear(&mut self) {
+        self.key = crate::session::SEXP_NIL;
+        self.value = crate::session::SEXP_NIL;
+        self.finalizer = crate::session::SEXP_NIL;
+    }
 }
 
 /// Object header flags.
@@ -511,10 +555,8 @@ impl Trace for RObject {
                 t.edge(ep.tag);
                 t.edge(ep.prot);
             }
-            Body::WeakRef(wr) => {
-                t.edge(wr.value);
-                t.edge(wr.finalizer);
-            }
+            // WeakRef edges are traced strictly through roxide-gc's ephemeron fixpoint (ADR-0019).
+            Body::WeakRef(_) => {}
             Body::Alt(alt) => alt.trace(t),
         }
     }

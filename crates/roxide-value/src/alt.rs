@@ -61,6 +61,36 @@ pub trait AltClass: Trace + fmt::Debug + 'static {
     fn wrapped_target(&self) -> Option<SexpId> {
         None
     }
+    /// Return true if backed by a foreign C ALTREP class dispatched by `roxide-capi` (ADR-0019).
+    fn is_foreign(&self) -> bool {
+        false
+    }
+}
+
+/// Foreign C ALTREP object payload traced by `roxide-gc` (single-authority rule, ADR-0019).
+///
+/// Method tables and callback dispatch live exclusively in `roxide-capi`.
+#[derive(Clone, Debug)]
+pub struct ForeignAltObj {
+    /// Class identifier allocated by `roxide-capi`'s foreign ALTREP registry.
+    pub class_id: u32,
+    /// Underlying R vector [`SexpType`] (`Lgl`, `Int`, `Real`, `Cplx`, `Raw`, `Str`, `Vec`).
+    pub base_type: SexpType,
+    /// Class name registered with `R_make_alt*_class`.
+    pub name: String,
+    /// Package name registered with `R_make_alt*_class`.
+    pub package: String,
+    /// First GC-traced state slot (`R_altrep_data1`).
+    pub data1: SexpId,
+    /// Second GC-traced state slot (`R_altrep_data2`).
+    pub data2: SexpId,
+}
+
+impl Trace for ForeignAltObj {
+    fn trace(&self, t: &mut Tracer<'_>) {
+        t.edge(self.data1);
+        t.edge(self.data2);
+    }
 }
 
 /// Typed ALTREP atomic vector interface.
@@ -251,6 +281,7 @@ pub(crate) enum AltKind {
     Cplx(Rc<dyn AltVector<RComplex>>),
     Raw(Rc<dyn AltVector<u8>>),
     Str(Rc<dyn AltString>),
+    Foreign(ForeignAltObj),
 }
 
 /// Materialized backing storage for an [`AltObj`].
@@ -263,6 +294,7 @@ pub(crate) enum AltMaterialized {
     Cplx(RVec<RComplex>),
     Raw(RVec<u8>),
     Str(RVec<CharId>),
+    Vec(RVec<SexpId>),
 }
 
 /// Heap body for an ALTREP vector.
@@ -281,6 +313,7 @@ impl AltObj {
             AltKind::Cplx(_) => SexpType::Cplx,
             AltKind::Raw(_) => SexpType::Raw,
             AltKind::Str(_) => SexpType::Str,
+            AltKind::Foreign(f) => f.base_type,
         }
     }
 
@@ -292,6 +325,7 @@ impl AltObj {
             AltKind::Cplx(c) => c.wrapped_target(),
             AltKind::Raw(c) => c.wrapped_target(),
             AltKind::Str(c) => c.wrapped_target(),
+            AltKind::Foreign(_) => None,
         }
     }
 
@@ -304,6 +338,7 @@ impl AltObj {
                 AltMaterialized::Cplx(v) => v.len(),
                 AltMaterialized::Raw(v) => v.len(),
                 AltMaterialized::Str(v) => v.len(),
+                AltMaterialized::Vec(v) => v.len(),
             };
         }
         match &self.kind {
@@ -313,6 +348,7 @@ impl AltObj {
             AltKind::Cplx(c) => c.length(heap),
             AltKind::Raw(c) => c.length(heap),
             AltKind::Str(c) => c.length(heap),
+            AltKind::Foreign(_) => 0,
         }
     }
 
@@ -324,6 +360,7 @@ impl AltObj {
             Some(AltMaterialized::Cplx(v)) => std::mem::size_of_val(&*v.buf),
             Some(AltMaterialized::Raw(v)) => v.buf.len(),
             Some(AltMaterialized::Str(v)) => std::mem::size_of_val(&*v.buf),
+            Some(AltMaterialized::Vec(v)) => std::mem::size_of_val(&*v.buf),
             None => 0,
         }
     }
@@ -336,11 +373,18 @@ impl AltObj {
             AltKind::Cplx(c) => c.trace(t),
             AltKind::Raw(c) => c.trace(t),
             AltKind::Str(c) => c.trace(t),
+            AltKind::Foreign(f) => f.trace(t),
         }
-        if let Some(AltMaterialized::Str(v)) = &self.materialized {
-            for c in v.as_slice() {
-                t.edge(c.as_sexp());
+        match &self.materialized {
+            Some(AltMaterialized::Str(v)) => {
+                for c in v.as_slice() {
+                    t.edge(c.as_sexp());
+                }
             }
+            Some(AltMaterialized::Vec(v)) => {
+                t.edges(v.as_slice());
+            }
+            _ => {}
         }
     }
 }
@@ -509,7 +553,11 @@ macro_rules! atomic_dataptr {
                     let buf = class.materialize(&self.heap)?;
                     let len = buf.len();
                     if let Body::Alt(alt) = &mut self.heap.get_mut(x)?.body {
-                        alt.materialized = Some(AltMaterialized::$variant(RVec { buf, len }));
+                        alt.materialized = Some(AltMaterialized::$variant(RVec {
+                            buf,
+                            len,
+                            resizable: false,
+                        }));
                     }
                     self.heap.update_size(x)?;
                 }

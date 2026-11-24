@@ -1,0 +1,20 @@
+[package]
+name = "roxide-capi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Clean-room GNU R 4.6.2 public C API boundary and dynamic library loader (ADRs 0017–0020)"
+
+[dependencies]
+libloading = { workspace = true }
+roxide-eval = { workspace = true }
+roxide-gc = { workspace = true }
+roxide-host = { workspace = true }
+roxide-math = { workspace = true }
+roxide-value = { workspace = true }
+
+[build-dependencies]
+cc = { workspace = true }
+
+[lints]
+workspace = true

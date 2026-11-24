@@ -22,6 +22,8 @@ Every external Rust crate, C library, published algorithm, or specification adop
 | `colorspace` HCL palette parameters & trajectory equations | Zeileis et al. (2020) *JSS* 96(1) / CRAN `colorspace` 2.1-4 | `BSD-3-Clause` | Analytical HCL palette trajectories (`hcl.colors`, `hcl.pals`) in `roxide-graphics::grdevices` | ADR-0016 |
 | X11 `rgb.txt` named color catalog & public qualitative palettes (Okabe-Ito, ColorBrewer, Tableau) | X.Org `rgb.txt` (MIT/X11); Okabe & Ito (2002); Brewer (Apache-2.0); Tableau | Permissive / Public | `colors()` 657-entry catalog and `palette.colors()` / `palette.pals()` in `roxide-graphics::grdevices` | ADR-0016 |
 | Published scientific benchmark datasets (uncopyrightable factual tables, original Rust/R constructors) | Anderson (1935) / Fisher (1936) *Annals of Eugenics* (`iris`); Henderson & Velleman (1981) *Biometrics* (`mtcars`); Ezekiel (1930) (`cars`); World Almanac (1975) (`women`); Weast (1973) (`pressure`); Bates & Watts (1988) (`BOD`); US Census Bureau (`state.*`) | Public-Domain Scientific Facts | Clean-room `datasets` package (`roxide-utils::datasets`) | Clean-Room |
+| `cc` (Rust build-script C/C++ compiler driver) | `cc` crate (`1.2`) | `MIT OR Apache-2.0` | Compiles `roxide-capi`'s clean-room C/C++ trampoline shims (`csrc/shim.cc`, `csrc/shim_va.c`) | ADR-0018, ADR-0020 |
+| `libloading` (Rust dynamic library loader) | `libloading` crate (`0.8`) | `ISC` | Cross-platform `dlopen`/`dlsym` wrapper for `dyn.load` in `roxide-capi` | ADR-0020 |
 
 ## Forbidden Sources (Strict Clean-Room Wall)
 
