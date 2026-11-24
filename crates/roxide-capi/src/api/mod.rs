@@ -1,4 +1,4 @@
-//! Public GNU R 4.6.2 C API entry points grouped into disjoint implementation families (M4 W1).
+//! Public GNU R 4.6.2 C API entry points grouped by function.
 
 // Wave 1-A: core vector, attribute, coercion, pairlist, string, symbol, and resizable vector APIs.
 pub mod attrib;
@@ -26,6 +26,10 @@ pub mod rmath;
 pub mod s4;
 pub mod utils;
 pub mod weakref;
+
+pub mod gc_alloc;
+pub mod iconv;
+pub mod optim_integrate;
 
 use roxide_eval::{Ctx, EvalResult, Unwind};
 use roxide_value::{SEXP_NIL, Sym, ValueApi};

@@ -19,6 +19,7 @@ extern "C" {
 #define ROXIDE_PRINTF(position, first)
 #endif
 
+NORET void UNIMPLEMENTED(const char *msg);
 NORET void Rf_error(const char *format, ...) ROXIDE_PRINTF(1, 2);
 void Rf_warning(const char *format, ...) ROXIDE_PRINTF(1, 2);
 const char *R_curErrorBuf(void);

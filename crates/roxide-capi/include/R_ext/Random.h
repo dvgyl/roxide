@@ -6,6 +6,9 @@
 extern "C" {
 #endif
 
+typedef enum { ROUNDING = 0, REJECTION = 1 } Sampletype;
+
+Sampletype R_sample_kind(void);
 void GetRNGstate(void);
 void PutRNGstate(void);
 double unif_rand(void);

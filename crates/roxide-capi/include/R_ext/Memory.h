@@ -8,6 +8,10 @@
 extern "C" {
 #endif
 
+void *R_calloc_gc(size_t count, size_t size);
+void *R_malloc_gc(size_t size);
+void *R_realloc_gc(void *ptr, size_t size);
+
 void *vmaxget(void);
 void vmaxset(const void *mark);
 char *R_alloc(size_t count, int size);

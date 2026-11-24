@@ -104,3 +104,23 @@ pub unsafe extern "C" fn R_CheckUserInterrupt() {
         })
     }
 }
+
+/// Signal an error that names an unimplemented feature.
+///
+/// # Safety
+/// Call inside an active native trampoline. `msg` must point to a C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn UNIMPLEMENTED(msg: *const c_char) -> ! {
+    // SAFETY: The caller supplies a trampoline and a C string.
+    unsafe {
+        api((), |ctx| {
+            let msg = if msg.is_null() {
+                "(null)".into()
+            } else {
+                CStr::from_ptr(msg).to_string_lossy()
+            };
+            Err(ctx.stop(SEXP_NIL, format!("unimplemented feature in {msg}")))
+        });
+    }
+    std::process::abort()
+}
