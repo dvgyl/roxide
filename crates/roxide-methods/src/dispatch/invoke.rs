@@ -104,8 +104,12 @@ fn force(ctx: &mut Ctx, value: SexpId) -> EvalResult<SexpId> {
     }
 }
 
-fn target(ctx: &mut Ctx, info: &GenericInfo, matched: &[(Sym, SexpId)]) -> EvalResult<Vec<Class>> {
-    info.signature
+fn target(
+    ctx: &mut Ctx,
+    signature: &[String],
+    matched: &[(Sym, SexpId)],
+) -> EvalResult<Vec<Class>> {
+    signature
         .iter()
         .map(|param| {
             let tag = ctx.session_mut().intern(param)?;
@@ -265,7 +269,7 @@ pub(super) fn standard_generic(ctx: &mut Ctx, name: Sym, frame: FrameId) -> Eval
     let value_class = attr(ctx, fun, "valueClass")?;
     let value_classes = texts(ctx, value_class)?;
     let matched = ctx.generic_frame_args(frame)?;
-    let target = target(ctx, &info, &matched)?;
+    let target = target(ctx, &info.signature, &matched)?;
     let opts = Selection {
         inherited: true,
         next: false,
@@ -586,6 +590,8 @@ pub(super) fn dispatch_primitive(
     };
     let sources = primitive_sources(ctx, &info, call.env)?;
     let info = merge_tables(ctx, info, &sources, false)?;
+    let lazy_subscript = matches!(name.as_str(), "[" | "[[" | "[<-" | "[[<-")
+        && ctx.session().type_of(args.get(0))? == SexpType::Prom;
     let mut all_args = args
         .iter()
         .enumerate()
@@ -597,7 +603,12 @@ pub(super) fn dispatch_primitive(
                 let field = field.to_owned();
                 value = ctx.session_mut().scalar_str(&field)?;
             }
-            Ok((tag, forced_promise(ctx, value)?))
+            let promise = if lazy_subscript {
+                value
+            } else {
+                forced_promise(ctx, value)?
+            };
+            Ok((tag, promise))
         })
         .collect::<EvalResult<Vec<_>>>()?;
     if super::groups::parent(&name) == Some("Summary") {
@@ -617,7 +628,19 @@ pub(super) fn dispatch_primitive(
     for &(_, value) in &matched {
         ctx.protect(value);
     }
-    let target = target(ctx, &info, &matched)?;
+    let width = if lazy_subscript {
+        methods(ctx, &info)?
+            .iter()
+            .filter_map(|method| method.signature.iter().rposition(|class| class != "ANY"))
+            .max()
+            .map_or(0, |last| last + 1)
+    } else {
+        info.signature.len()
+    };
+    let mut target = target(ctx, &info.signature[..width], &matched)?;
+    target.resize_with(info.signature.len(), || {
+        Class::unqualified("ANY".to_owned())
+    });
     let opts = Selection {
         inherited: true,
         next: false,

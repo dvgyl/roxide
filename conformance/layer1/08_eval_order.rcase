@@ -1,0 +1,137 @@
+=== case: s3_subscript_methods_receive_lazy_indices ===
+#@ tags: subset,promises
+`[.rx_lazy` <- function(x, i) substitute(i)
+`[[.rx_lazy` <- function(x, i) 42L
+`[<-.rx_lazy` <- function(x, i, value) {
+    dput(substitute(i))
+    value
+}
+`[[<-.rx_lazy` <- function(x, i, value) value
+x <- structure(1:3, class = "rx_lazy")
+n <- 0L
+dput(x[{n <- n + 1L; 1L}])
+dput(x[[stop("index")]])
+x[stop("index")] <- 5L
+dput(x)
+x <- structure(1:3, class = "rx_lazy")
+x[[stop("index")]] <- 6L
+dput(x)
+dput(n)
+
+=== case: subscript_default_evaluates_receiver_and_index_once ===
+#@ tags: subset,promises
+x <- structure(1:3, class = "rx_no_method")
+n <- 0L
+dput(({n <- n + 1L; x})[{n <- n * 2L; 2L}])
+dput(n)
+
+=== case: subscript_evaluates_receiver_before_expanding_index_dots ===
+#@ tags: subset,promises
+n <- 0L
+tryCatch(({n <- 1L; 1:2})[...], error = function(e) dput(conditionMessage(e)))
+dput(n)
+extract <- function(...) `[`(...)
+dput(extract(1:3, 2L))
+`[.rx_dots` <- function(x, i) substitute(i)
+dput(extract(structure(1:3, class = "rx_dots"), stop("index")))
+
+=== case: direct_replacement_keeps_value_lazy_until_used ===
+#@ tags: subset,promises
+`[<-.rx_lazy` <- function(x, i, value) {
+    dput(substitute(i))
+    dput(substitute(value))
+    99L
+}
+x <- structure(1:3, class = "rx_lazy")
+n <- 0L
+dput(`[<-`(x, stop("index"), {n <- 1L; 123L}))
+dput(n)
+x[stop("index")] <- {n <- 2L; 124L}
+dput(n)
+dput(x)
+
+=== case: s4_subscript_methods_receive_lazy_indices ===
+#@ tags: subset,promises,s4
+setClass("RxLazy", slots = c(value = "integer"))
+invisible(setMethod("[", "RxLazy", function(x, i, j, ..., drop) substitute(i)))
+invisible(setMethod("[[", "RxLazy", function(x, i, j, ...) 42L))
+invisible(setMethod("[<-", "RxLazy", function(x, i, j, ..., value) {
+    dput(substitute(i))
+    x@value <- value
+    x
+}))
+invisible(setMethod("[[<-", "RxLazy", function(x, i, j, ..., value) {
+    x@value <- value
+    x
+}))
+x <- new("RxLazy", value = 1L)
+dput(x[stop("index")])
+dput(x[[stop("index")]])
+x[stop("index")] <- 5L
+dput(x@value)
+x[[stop("index")]] <- 6L
+dput(x@value)
+
+=== case: s4_subscript_dispatch_forces_required_arguments_once ===
+#@ tags: subset,promises,s4
+setClass("RxIndex", slots = c(value = "integer"))
+invisible(setMethod("[", c(x = "RxIndex", i = "integer"),
+    function(x, i, j, ..., drop) {
+        dput(substitute(i))
+        x@value + i
+    }))
+x <- new("RxIndex", value = 5L)
+n <- 0L
+index <- function() {
+    n <<- n + 1L
+    2L
+}
+dput(x[index()])
+dput(n)
+
+=== case: return_outside_function_evaluates_argument ===
+#@ tags: control
+n <- 0L
+tryCatch(return(n <- 1L), error = function(e) dput(conditionMessage(e)))
+dput(n)
+tryCatch(return(stop("argument error")), error = function(e) dput(conditionMessage(e)))
+tryCatch(return(), error = function(e) dput(conditionMessage(e)))
+
+=== case: replacement_installs_inherited_target_before_index ===
+#@ tags: subset,assignment
+parent <- new.env()
+parent$x <- 1:2
+child <- new.env(parent = parent)
+tryCatch(eval(quote(x[stop("boom")] <- 99L), child),
+    error = function(e) dput(conditionMessage(e)))
+dput(exists("x", child, inherits = FALSE))
+dput(child$x)
+dput(parent$x)
+
+=== case: replacement_keeps_target_before_index_mutates_it ===
+#@ tags: subset,assignment
+x <- 1:2
+x[{x[2L] <- 9L; 1L}] <- 3L
+dput(x)
+x <- list(c(1L, 2L), 3L)
+x[[1L]][{x[[2L]] <- 9L; 1L}] <- 8L
+dput(x)
+
+=== case: for_loop_initializes_variable_after_sequence_evaluation ===
+#@ tags: control
+i <- 99L
+tryCatch(for (i in stop("sequence")) {}, error = function(e) dput(conditionMessage(e)))
+dput(i)
+tryCatch(for (i in environment()) {}, error = function(e) dput(conditionMessage(e)))
+dput(i)
+
+=== case: short_circuit_empty_operands_and_length_errors ===
+#@ tags: control,logical
+dput(c(logical() && TRUE, integer() && FALSE, logical() || TRUE,
+       numeric() || FALSE, TRUE && logical(), FALSE || integer()))
+n <- 0L
+tryCatch(c(TRUE, FALSE) && {n <- 1L; TRUE},
+    error = function(e) dput(conditionMessage(e)))
+tryCatch(c(TRUE, FALSE) || {n <- 2L; FALSE},
+    error = function(e) dput(conditionMessage(e)))
+dput(n)

@@ -133,6 +133,19 @@ impl Compiler<'_> {
                 self.end_guard(pc, site, dst)
             }
             ("<-" | "=" | "<<-", [lhs, rhs]) => self.assign(expr, name, *lhs, *rhs, dst, depth),
+            ("[" | "[[", [receiver, index]) => {
+                let (pc, site) = self.guard_call(expr, dst)?;
+                let target = self.reg()?;
+                self.expr(*receiver, target, depth)?;
+                let index_const = self.constant(*index)?;
+                self.emit(Op::IndexGet {
+                    dst,
+                    target,
+                    index_const,
+                    site,
+                })?;
+                self.end_guard(pc, site, dst)
+            }
             ("if", [cond, yes] | [cond, yes, _]) => {
                 self.if_expr(expr, dst, *cond, *yes, args.get(2).copied(), depth)
             }
@@ -167,7 +180,7 @@ impl Compiler<'_> {
             }
             (
                 "if" | "for" | "while" | "repeat" | "break" | "next" | "return" | "(" | "<-" | "="
-                | "<<-",
+                | "<<-" | "[" | "[[" | "[<-" | "[[<-",
                 _,
             ) => self.eval_ast(expr, dst),
             _ => {
@@ -231,11 +244,13 @@ impl Compiler<'_> {
         let var = self.variable(target)?;
         let index_const = self.constant(index)?;
         self.expr(rhs, dst, depth)?;
+        let repl_cache_idx = take_slot(&mut self.out.num_call_caches)?;
         self.emit(op(IndexSet {
             value: dst,
             var,
             index_const,
             site,
+            repl_cache_idx,
         }))?;
         self.end_guard(pc, site, dst)
     }
@@ -519,8 +534,6 @@ fn binary_op(name: &str) -> Option<fn(Binary) -> Op> {
         ">=" => Op::Ge,
         "==" => Op::Eq,
         "!=" => Op::Ne,
-        "[" => Op::Index1,
-        "[[" => Op::Index2,
         _ => return None,
     })
 }
@@ -770,7 +783,7 @@ mod tests {
 
     #[test]
     fn subscript_assignment_keeps_index_lazy_and_returns_rhs() {
-        let (session, ir) = compile("{x[i()] <- rhs(); x[[j()]] <- 2L; x[i]; x[[j]]}");
+        let (session, ir) = compile("{x[i()] <- rhs(); x[[j()]] <- 2L}");
         let set = ir
             .code
             .iter()
@@ -791,8 +804,34 @@ mod tests {
         );
         assert!(matches!(ir.code[set - 1], Op::CallFast { dst, .. } if dst == args.value));
         assert!(ir.code.iter().any(|op| matches!(op, Op::Index2Set(_))));
-        assert!(ir.code.iter().any(|op| matches!(op, Op::Index1(_))));
-        assert!(ir.code.iter().any(|op| matches!(op, Op::Index2(_))));
+        assert_ne!(args.site.cache_idx, args.repl_cache_idx);
+        assert!(args.repl_cache_idx < ir.num_call_caches);
+    }
+
+    #[test]
+    fn subscript_extraction_keeps_index_as_an_expression() {
+        for (source, name) in [("x[i()]", "["), ("x[[i()]]", "[[")] {
+            let (session, ir) = compile(source);
+            let [
+                Op::GuardCall { .. },
+                Op::LoadVar { dst, .. },
+                Op::IndexGet {
+                    target,
+                    index_const,
+                    site,
+                    ..
+                },
+                Op::Return(_),
+            ] = ir.code.as_slice()
+            else {
+                panic!("unexpected subscript instructions: {:?}", ir.code)
+            };
+            assert_eq!(dst, target);
+            for (slot, expected) in [(*index_const, "i"), (site.call_const, name)] {
+                let (head, _, _) = session.cons_parts(ir.consts[slot as usize]).unwrap();
+                assert_eq!(session.sym_name_of(head).unwrap(), expected);
+            }
+        }
     }
 
     #[test]

@@ -72,6 +72,8 @@ pub struct IndexSet {
     /// Original assignment. Resolve the replacement function at its normal
     /// evaluation point, before evaluation of the index.
     pub site: CallSite,
+    /// Call cache slot for the replacement function.
+    pub repl_cache_idx: u16,
 }
 
 /// One instruction in a compiled R expression.
@@ -128,8 +130,7 @@ pub enum Op {
     },
     /// Continue if the call resolves to the expected base primitive. Keep that
     /// resolution for this execution of the site. Otherwise evaluate the
-    /// original call and jump over the compiled instructions. For `return`,
-    /// also require a function frame before any argument evaluation.
+    /// original call and jump over the compiled instructions.
     GuardCall {
         /// Site that holds the original call.
         site: CallSite,
@@ -208,14 +209,15 @@ pub enum Op {
     /// Finish the compiled expression and preserve its visibility.
     Return(Reg),
     /// Transfer a return value through the current R function frame.
+    /// Report an error if there is no function frame.
     ReturnFromFunction {
         /// Register with the return value.
         src: Reg,
         /// Original `return` call.
         site: CallSite,
     },
-    /// Initialize a cursor from an evaluated sequence and set the loop variable
-    /// to `NULL`. Compact ALTREP sequences can use an unboxed cursor.
+    /// Set the loop variable to `NULL`, then initialize a cursor from the
+    /// evaluated sequence. Compact ALTREP sequences can use an unboxed cursor.
     ForInit {
         /// Cursor register.
         cursor: Reg,
@@ -250,10 +252,17 @@ pub enum Op {
     Break,
     /// Jump to the current loop's next target.
     Next,
-    /// Extract with `x[i]`. The left operand is the target.
-    Index1(Binary),
-    /// Extract with `x[[i]]`. The left operand is the target.
-    Index2(Binary),
+    /// Extract with the subscript primitive in the call site.
+    IndexGet {
+        /// Result register.
+        dst: Reg,
+        /// Evaluated target.
+        target: Reg,
+        /// Unevaluated index expression in the constant table.
+        index_const: u32,
+        /// Original `[` or `[[` call.
+        site: CallSite,
+    },
     /// Replace with `x[i] <- v`. The fast path can reuse an unshared vector.
     Index1Set(IndexSet),
     /// Replace with `x[[i]] <- v`. The fast path can reuse an unshared vector.

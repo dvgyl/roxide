@@ -82,47 +82,59 @@ fn assign_replacement(
     let mut target = ctx.eval(sym.as_sexp(), dest)?;
     if ctx.session.env_get(dest, sym).is_none() {
         target = ctx.session.shallow_duplicate(target)?;
-    }
-    let mut replacements = Vec::with_capacity(layers.len());
-    let mut shared_parent = false;
-    while let Some((source, head, args)) = layers.pop() {
         ctx.protect(target);
-        if shared_parent {
-            target = ctx.session.shallow_duplicate(target)?;
+        ctx.assign(sym, target, dest)?;
+    }
+    let mut retained = Vec::new();
+    let result = (|| {
+        let mut replacements = Vec::with_capacity(layers.len());
+        let mut shared_parent = false;
+        while let Some((source, head, args)) = layers.pop() {
             ctx.protect(target);
+            if shared_parent {
+                target = ctx.session.shallow_duplicate(target)?;
+                ctx.protect(target);
+            }
+            if !layers.is_empty() {
+                let next = invoke_assignment(ctx, head, source, call.env, &args, target, None)?;
+                shared_parent |= ctx.session.heap.maybe_shared(target);
+                ctx.session.heap.inc_ref(target);
+                retained.push(target);
+                replacements.push((head, args, target));
+                target = next;
+            } else {
+                replacements.push((head, args, target));
+            }
         }
-        if !layers.is_empty() {
-            let next = invoke_assignment(ctx, head, source, call.env, &args, target, None)?;
-            shared_parent |= ctx.session.heap.maybe_shared(target);
-            replacements.push((head, args, target));
-            target = next;
-        } else {
-            replacements.push((head, args, target));
-        }
-    }
 
-    let value_tag = ctx.session.intern("value")?;
-    let mut value = rhs;
-    let mut original = rhs_expr;
-    let simple = replacements.len() == 1
-        && ctx
-            .session
-            .env_get(dest, sym)
-            .is_some_and(|binding| !binding.active && !binding.locked);
-    for (head, args, target) in replacements.into_iter().rev() {
-        ctx.protect(value);
-        let replacement = replacement_head(ctx, head, call.err_call())?;
-        let raw = Args::from_pairs(args.iter().chain([(Some(value_tag), original)]).collect());
-        let expr = ctx.make_call(replacement, &raw)?;
-        ctx.protect(expr);
-        let previous = std::mem::replace(&mut ctx.replacement_call, simple.then_some(expr));
-        let result = invoke_assignment(ctx, replacement, expr, call.env, &raw, target, Some(value));
-        ctx.replacement_call = previous;
-        value = result?;
-        original = expr;
+        let value_tag = ctx.session.intern("value")?;
+        let mut value = rhs;
+        let mut original = rhs_expr;
+        let simple = replacements.len() == 1
+            && ctx
+                .session
+                .env_get(dest, sym)
+                .is_some_and(|binding| !binding.active && !binding.locked);
+        for (head, args, target) in replacements.into_iter().rev() {
+            ctx.protect(value);
+            let replacement = replacement_head(ctx, head, call.err_call())?;
+            let raw = Args::from_pairs(args.iter().chain([(Some(value_tag), original)]).collect());
+            let expr = ctx.make_call(replacement, &raw)?;
+            ctx.protect(expr);
+            let previous = std::mem::replace(&mut ctx.replacement_call, simple.then_some(expr));
+            let result =
+                invoke_assignment(ctx, replacement, expr, call.env, &raw, target, Some(value));
+            ctx.replacement_call = previous;
+            value = result?;
+            original = expr;
+        }
+        ctx.assign(sym, value, dest)?;
+        Ok(rhs)
+    })();
+    for target in retained {
+        ctx.session.heap.dec_ref(target);
     }
-    ctx.assign(sym, value, dest)?;
-    Ok(rhs)
+    result
 }
 
 fn invoke_assignment(
@@ -141,63 +153,24 @@ fn invoke_assignment(
         ctx.eval(head, env)?
     };
     ctx.protect(fun);
-    if let Ok((prim, _)) = ctx.session.prim_parts(fun) {
-        let policy = ctx.prims[usize::from(prim.0)].args;
-        if policy != ArgEval::Unevaluated {
-            let mut values = vec![(args.name(0), target)];
-            let end = args.len() - usize::from(replacement.is_some());
-            let middle = Args::from_pairs(args.iter().skip(1).take(end - 1).collect());
-            let middle = if policy == ArgEval::EvalDollar {
-                middle
-            } else {
-                ctx.expand_dots(&middle, env, expr)?
-            };
-            for &arg in middle.values() {
-                ctx.protect(arg);
-            }
-            ctx.session.heap.inc_ref(target);
-            let result = (|| {
-                for (tag, value) in middle.iter() {
-                    let value = if policy == ArgEval::EvalDollar {
-                        value
-                    } else if value == SEXP_MISSING {
-                        if policy != ArgEval::EvalKeepMissing {
-                            return Err(ctx.stop(expr, "argument is missing, with no default"));
-                        }
-                        value
-                    } else {
-                        ctx.eval(value, env)?
-                    };
-                    ctx.protect(value);
-                    values.push((tag, value));
-                }
-                Ok(())
-            })();
-            ctx.session.heap.dec_ref(target);
-            result?;
-            if let Some(value) = replacement {
-                values.push((args.name(end), value));
-            }
-            let call = Call {
-                expr,
-                env,
-                prim,
-                user_call: expr,
-            };
-            let source = Args::from_pairs(
-                args.iter()
-                    .take(1)
-                    .chain(middle.iter())
-                    .chain(args.iter().skip(end))
-                    .collect(),
-            );
-            return ctx.run_primitive(
-                call,
-                Args::from_pairs(values),
-                ArgInput::Values(Some(&source)),
-                true,
-            );
-        }
+    if let Ok((prim, _)) = ctx.session.prim_parts(fun)
+        && ctx.prims[usize::from(prim.0)].args != ArgEval::Unevaluated
+    {
+        let call = Call {
+            expr,
+            env,
+            prim,
+            user_call: expr,
+        };
+        return ctx.run_primitive(
+            call,
+            args.clone(),
+            ArgInput::AssignmentLayer {
+                target,
+                replacement,
+            },
+            true,
+        );
     }
     let mut raw: Vec<_> = args.iter().collect();
     raw[0].1 = ctx.value_promise(raw[0].1, target)?;
@@ -303,6 +276,7 @@ fn for_loop(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     let var = ctx.sym_from_sexp(args.get(0))?;
     let mut sequence = ctx.eval(args.get(1), call.env)?;
     ctx.protect(sequence);
+    ctx.assign(var, SEXP_NIL, call.env)?;
     if ctx
         .classes(sequence, false)?
         .iter()
@@ -352,7 +326,6 @@ fn for_loop(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
         }
         _ => return Err(ctx.stop(call.err_call(), "invalid for() loop sequence")),
     };
-    ctx.assign(var, SEXP_NIL, call.env)?;
     let mut indices = 0..len;
     run_loop(ctx, call, args.get(2), |ctx| {
         let value = if tail != SEXP_NIL {
@@ -426,10 +399,14 @@ fn loop_jump(ctx: &mut Ctx, call: &Call, _: &mut Args) -> EvalResult {
 }
 
 fn return_expr(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    let value = if args.is_empty() {
+        SEXP_NIL
+    } else {
+        ctx.eval(args.get(0), call.env)?
+    };
     let Some(target) = ctx.frame(call.env).map(|frame| frame.id) else {
         return Err(ctx.stop(SEXP_NIL, "no function to return from, jumping to top level"));
     };
-    let value = ctx.eval(args.get(0), call.env)?;
     Err(Unwind::Transfer {
         target,
         kind: Transfer::Return(value),

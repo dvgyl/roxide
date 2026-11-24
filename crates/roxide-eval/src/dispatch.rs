@@ -148,6 +148,17 @@ fn group_name(group: GroupGeneric) -> &'static str {
     }
 }
 
+pub(crate) enum DispatchInput<'a> {
+    Values {
+        args: &'a Args,
+        source: Option<&'a Args>,
+    },
+    Subscript {
+        receiver: SexpId,
+        actuals: &'a Args,
+    },
+}
+
 impl Ctx {
     /// Return the calling environment of the current closure frame.
     pub fn closure_caller(&self, env: SexpId) -> SexpId {
@@ -362,8 +373,7 @@ impl Ctx {
         &mut self,
         def: &PrimDef,
         call: Call,
-        args: &Args,
-        promised: Option<&Args>,
+        input: DispatchInput<'_>,
     ) -> EvalResult<Option<SexpId>> {
         let (generic, group) = match def.dispatch {
             Dispatch::None => return Ok(None),
@@ -379,12 +389,22 @@ impl Ctx {
         }
         let na_rm = self.session.intern("na.rm")?;
         let ops = matches!(group, Some(GroupGeneric::Ops | GroupGeneric::MatrixOps));
-        let candidates: Vec<_> = args
-            .iter()
-            .enumerate()
-            .filter(|(_, (tag, _))| group != Some(GroupGeneric::Summary) || *tag != Some(na_rm))
-            .take(if ops { 2 } else { 1 })
-            .collect();
+        let (args, candidates) = match input {
+            DispatchInput::Values { args, .. } => {
+                let candidates = args
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (tag, _))| {
+                        group != Some(GroupGeneric::Summary) || *tag != Some(na_rm)
+                    })
+                    .take(if ops { 2 } else { 1 })
+                    .collect();
+                (args, candidates)
+            }
+            DispatchInput::Subscript { receiver, actuals } => {
+                (actuals, vec![(0, (actuals.name(0), receiver))])
+            }
+        };
         if let Some(hooks) = self.s4_hooks {
             for &(_, (_, value)) in &candidates {
                 if self.session.is_s4(value)? {
@@ -456,6 +476,20 @@ impl Ctx {
         let Some((candidate, method)) = methods.pop() else {
             return Ok(None);
         };
+        let source = match input {
+            DispatchInput::Values { source, .. } => source,
+            DispatchInput::Subscript { actuals, .. } => {
+                return self
+                    .invoke_method(
+                        candidate.fun,
+                        &candidate.name,
+                        actuals.clone(),
+                        call.env,
+                        method,
+                    )
+                    .map(Some);
+            }
+        };
         let dollar = self.dollar_method_args(generic, call, args)?;
         let args = dollar.as_ref().unwrap_or(args);
         let mut pairs = Vec::with_capacity(args.len() + 1);
@@ -463,7 +497,7 @@ impl Ctx {
             let expr = if dollar.is_some() && i == 1 {
                 value
             } else {
-                promised.map_or(Ok(value), |args| self.promise_expr(args.get(i)))?
+                source.map_or(Ok(value), |args| self.promise_expr(args.get(i)))?
             };
             let tag = if group == Some(GroupGeneric::Ops) {
                 None
@@ -760,12 +794,7 @@ fn next_method(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
             ctx.protect(value);
             values.push((tag, value));
         }
-        return ctx.run_primitive(
-            primitive,
-            Args::from_pairs(values),
-            ArgInput::Values(None),
-            false,
-        );
+        return ctx.run_primitive(primitive, Args::from_pairs(values), ArgInput::Values, false);
     }
     let sym = ctx.session.intern(&method.generic)?;
     if let Some(binding) = ctx.session.env_get(BASE_ENV, sym)

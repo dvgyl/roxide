@@ -6,15 +6,24 @@ use roxide_value::{
     PromiseState, SEXP_MISSING, SEXP_NIL, SEXP_UNBOUND, SexpType, Sym, ValueApi, ValueError,
 };
 
-use crate::api::{ArgEval, Arity, Call, EvalResult, InternalError, Unwind, Visibility};
+use crate::api::{ArgEval, Arity, Call, Dispatch, EvalResult, InternalError, Unwind, Visibility};
 use crate::ctx::{Args, Ctx};
+use crate::dispatch::DispatchInput;
 
 const OVERFLOW_HEADROOM: usize = 500;
 const STACK_RECOVERY_BYTES: usize = 128 * 1024;
 
-pub(crate) enum ArgInput<'a> {
+pub(crate) enum ArgInput {
     Expressions,
-    Values(Option<&'a Args>),
+    AssignmentLayer {
+        target: SexpId,
+        replacement: Option<SexpId>,
+    },
+    Values,
+}
+
+fn is_subscript_generic(dispatch: Dispatch) -> bool {
+    matches!(dispatch, Dispatch::Internal("[" | "[[" | "[<-" | "[[<-"))
 }
 
 impl Ctx {
@@ -351,7 +360,7 @@ impl Ctx {
                 ctx.run_primitive(
                     call,
                     Args::from_pairs(args.to_vec()),
-                    ArgInput::Values(None),
+                    ArgInput::Values,
                     true,
                 )
             }
@@ -438,7 +447,7 @@ impl Ctx {
         &mut self,
         call: Call,
         args: Args,
-        input: ArgInput<'_>,
+        input: ArgInput,
         dispatch: bool,
     ) -> EvalResult {
         let Some(&def) = self.prims.get(usize::from(call.prim.0)) else {
@@ -474,7 +483,7 @@ impl Ctx {
         def: &crate::PrimDef,
         call: Call,
         mut args: Args,
-        input: ArgInput<'_>,
+        input: ArgInput,
         dispatch: bool,
     ) -> EvalResult {
         let ctx = self;
@@ -484,19 +493,80 @@ impl Ctx {
         for &value in args.values() {
             ctx.protect(value);
         }
-        let raw;
+        let (mut receiver, replacement) = match input {
+            ArgInput::AssignmentLayer {
+                target,
+                replacement,
+            } => {
+                ctx.protect(target);
+                if let Some(value) = replacement {
+                    ctx.protect(value);
+                }
+                (Some(target), replacement)
+            }
+            _ => (None, None),
+        };
+        let mut dispatch = dispatch;
+        let mut raw;
         let source = match input {
-            ArgInput::Expressions if def.args != ArgEval::Unevaluated => {
+            ArgInput::Expressions | ArgInput::AssignmentLayer { .. }
+                if def.args != ArgEval::Unevaluated =>
+            {
+                let subscript = dispatch && is_subscript_generic(def.dispatch);
+                if subscript
+                    && receiver.is_none()
+                    && !args.is_empty()
+                    && ctx.session.sym_name_of(args.get(0)).ok() != Some("...")
+                {
+                    receiver = Some(ctx.eval_subscript_receiver(args.get(0), call.env)?);
+                }
                 raw = if def.args == ArgEval::EvalDollar {
                     args
+                } else if receiver.is_some() {
+                    let end = args.len() - usize::from(replacement.is_some());
+                    let middle = Args::from_pairs(args.iter().skip(1).take(end - 1).collect());
+                    let middle = ctx.expand_dots(&middle, call.env, call.err_call())?;
+                    Args::from_pairs(
+                        args.iter()
+                            .take(1)
+                            .chain(middle.iter())
+                            .chain(args.iter().skip(end))
+                            .collect(),
+                    )
                 } else {
                     ctx.expand_dots(&args, call.env, call.err_call())?
                 };
-                args = ctx.eval_primitive_args(&raw, call, def.args)?;
+                if subscript && !raw.is_empty() {
+                    for &arg in raw.values() {
+                        ctx.protect(arg);
+                    }
+                    let target = match receiver {
+                        Some(value) => value,
+                        None => ctx.eval_subscript_receiver(raw.get(0), call.env)?,
+                    };
+                    if target != SEXP_MISSING
+                        && (ctx.session.is_object(target)? || ctx.session.is_s4(target)?)
+                    {
+                        raw = ctx.subscript_promises(&raw, call, target, replacement)?;
+                        ctx.visible = true;
+                        if let Some(result) = ctx.dispatch_primitive(
+                            def,
+                            call,
+                            DispatchInput::Subscript {
+                                receiver: target,
+                                actuals: &raw,
+                            },
+                        )? {
+                            return Ok(result);
+                        }
+                    }
+                    receiver = Some(target);
+                    dispatch = false;
+                }
+                args = ctx.eval_primitive_args(&raw, call, def.args, receiver, replacement)?;
                 Some(&raw)
             }
-            ArgInput::Expressions => None,
-            ArgInput::Values(source) => source,
+            _ => None,
         };
         let valid = match def.arity {
             Arity::Any => true,
@@ -537,7 +607,10 @@ impl Ctx {
         dispatch: bool,
     ) -> EvalResult {
         self.visible = true;
-        if dispatch && let Some(result) = self.dispatch_primitive(def, call, args, raw)? {
+        if dispatch
+            && let Some(result) =
+                self.dispatch_primitive(def, call, DispatchInput::Values { args, source: raw })?
+        {
             return Ok(result);
         }
         if def.name == "names" && self.session.type_of(args.get(0))? == SexpType::Env {
@@ -557,14 +630,66 @@ impl Ctx {
         Ok(result)
     }
 
-    fn eval_primitive_args(&mut self, raw: &Args, call: Call, policy: ArgEval) -> EvalResult<Args> {
+    fn eval_subscript_receiver(&mut self, expr: SexpId, env: SexpId) -> EvalResult {
+        let target = if expr == SEXP_MISSING {
+            SEXP_MISSING
+        } else {
+            self.eval(expr, env)?
+        };
+        self.protect(target);
+        Ok(target)
+    }
+
+    fn subscript_promises(
+        &mut self,
+        raw: &Args,
+        call: Call,
+        receiver: SexpId,
+        replacement: Option<SexpId>,
+    ) -> EvalResult<Args> {
+        let receiver_expr = self.promise_expr(raw.get(0))?;
+        let receiver = self.value_promise(receiver_expr, receiver)?;
+        self.protect(receiver);
+        let mut pairs: Vec<_> = [(raw.name(0), receiver)]
+            .into_iter()
+            .chain(raw.iter().skip(1))
+            .collect();
+        if let Some(value) = replacement
+            && let Some((_, expr)) = pairs.last_mut()
+        {
+            *expr = self.value_promise(*expr, value)?;
+            self.protect(*expr);
+        }
+        let actuals = self.promise_args(&Args::from_pairs(pairs), call.env, call.err_call())?;
+        for &promise in actuals.values() {
+            self.protect(promise);
+        }
+        Ok(actuals)
+    }
+
+    fn eval_primitive_args(
+        &mut self,
+        raw: &Args,
+        call: Call,
+        policy: ArgEval,
+        receiver: Option<SexpId>,
+        replacement: Option<SexpId>,
+    ) -> EvalResult<Args> {
         for &arg in raw.values() {
             self.protect(arg);
         }
         let mut values = Vec::with_capacity(raw.len());
         let result = (|| {
             for (i, (tag, arg)) in raw.iter().enumerate() {
-                let value = if policy == ArgEval::EvalDollar && i == 1 {
+                let value = if i == 0
+                    && let Some(value) = receiver
+                {
+                    value
+                } else if i + 1 == raw.len()
+                    && let Some(value) = replacement
+                {
+                    value
+                } else if policy == ArgEval::EvalDollar && i == 1 {
                     arg
                 } else if arg == SEXP_MISSING {
                     if policy != ArgEval::EvalKeepMissing {

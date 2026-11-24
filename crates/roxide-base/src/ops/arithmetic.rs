@@ -604,7 +604,7 @@ fn short(ctx: &mut Ctx, call: &Call, args: &Args, and: bool) -> EvalResult {
             ));
         }
         let len = s.xlength(x)?;
-        if len != 1 {
+        if len > 1 {
             return Err(error(
                 ctx,
                 call,
