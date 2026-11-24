@@ -40,3 +40,13 @@ Verified all 41 exported `R_*Symbol` / `R_dot_*` data symbols (`R_BaseSymbol == 
 | `.C(..., NAOK = FALSE)` on `NA_character_` | Allowed (no error) |
 | Missing `R_GetCCallable(pkg, sym)` | Error: `function '<sym>' not provided by package '<pkg>'` |
 | `.C` buffer over-run / under-run | GNU R has no canaries (silently corrupts heap); Roxide enforces 64-byte guard canaries and raises `array over-run in .C("<name>") argument N` (ADR-0018) |
+
+## 5. Wave 2-G / 2-H / 2-V2 Black-Box Probes (`SHLIB` and `R_ENABLE_JIT=1/2`)
+
+| Condition | Exact GNU R 4.6.2 Behavior |
+| --- | --- |
+| `R_ENABLE_JIT=1` and `R_ENABLE_JIT=2` | Plain closure `function(x) x + 1` compiles on call 2; closure with a loop compiles on call 1; top-level `for` loops remain interpreted (compiled only at level 3) |
+| `compiler::enableJIT(-1)` / `compiler::enableJIT(0)` | `enableJIT(-1)` returns the active level (`1`/`2`/`3`); `enableJIT(0)` returns the previous level and sets it to `0` |
+| `R CMD SHLIB` missing source | Exits `1` (`tools:::.shlib_internal` returns make status `2`), stderr reports missing target `missing.o` needed by `missing.so` |
+| `R CMD SHLIB -n` / `--dry-run` | Identical output, exits `0`, empty stderr, zero build artifacts; prints `make cmd is` + `make would use` compile/link lines |
+| `R CMD SHLIB -o <path>` | Writes the shared object to the exact requested path (`custom.so` or `out/custom.so`) |
