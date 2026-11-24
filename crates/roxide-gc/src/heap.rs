@@ -13,14 +13,29 @@ pub const DEFAULT_PROTECT_LIMIT: usize = 50_000;
 
 /// Callback kind attached to a GC finalizer or weak reference (ADR-0019).
 ///
-/// Native C finalizer pointers are stored as `usize` addresses so `roxide-gc` keeps
-/// `#![forbid(unsafe_code)]`; `roxide-capi` casts and invokes them across its trampoline.
+/// Native C finalizer pointers are stored as `(fun, dll)` addresses/ids so `roxide-gc` keeps
+/// `#![forbid(unsafe_code)]` while allowing `dyn.unload` to purge finalizers targeting an
+/// unloading DLL before `dlclose`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FinalizerKind {
     /// R closure finalizer (`reg.finalizer`, `R_RegisterFinalizerEx`, `R_MakeWeakRef`).
     RClosure(SexpId),
     /// Native C finalizer function pointer (`R_RegisterCFinalizerEx`, `R_MakeWeakRefC`).
-    Native(usize),
+    Native {
+        /// Function pointer address (`R_CFinalizer_t`).
+        fun: usize,
+        /// Owning DLL handle identifier (`0` if built-in / non-unloadable).
+        dll: u32,
+    },
+}
+
+/// Result returned by [`Marked::sweep_outcome`].
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct SweepOutcome {
+    /// Collection statistics.
+    pub stats: GcStats,
+    /// `WEAKREFSXP` handles whose keys became unreachable during this cycle and must be cleared.
+    pub cleared_weakrefs: Vec<SexpId>,
 }
 
 /// Registered ephemeron finalizer entry.
@@ -537,6 +552,26 @@ impl<T: Trace + HeapSize> Heap<T> {
         self.weakrefs.push(entry);
     }
 
+    /// Remove and return the registered ephemeron entry for `weakref` (`R_RunWeakRefFinalizer`).
+    pub fn remove_weakref(&mut self, weakref: SexpId) -> Option<WeakRefEntry> {
+        let pos = self.weakrefs.iter().position(|w| w.weakref == weakref)?;
+        Some(self.weakrefs.remove(pos))
+    }
+
+    /// Retain only finalizers satisfying `keep` across registered finalizers, weakref finalizers,
+    /// and the pending queue (used before `dlclose` in `dyn.unload`, ADR-0019).
+    pub fn retain_finalizers(&mut self, keep: impl Fn(FinalizerKind) -> bool) {
+        self.finalizers.retain(|f| keep(f.kind));
+        self.pending_finalizers.retain(|f| keep(f.kind));
+        for wr in &mut self.weakrefs {
+            if let Some(kind) = wr.finalizer
+                && !keep(kind)
+            {
+                wr.finalizer = None;
+            }
+        }
+    }
+
     /// Return true if dead finalizers are queued awaiting execution at a safepoint.
     #[must_use]
     pub fn has_pending_finalizers(&self) -> bool {
@@ -686,7 +721,7 @@ impl<T: Trace + HeapSize> Heap<T> {
             heap: self,
             marked,
             ephemerons_resolved: false,
-            newly_queued: Vec::new(),
+            cleared_weakrefs: Vec::new(),
         }
     }
 
@@ -726,7 +761,7 @@ pub struct Marked<'h, T: Trace + HeapSize> {
     heap: &'h mut Heap<T>,
     marked: Vec<bool>,
     ephemerons_resolved: bool,
-    newly_queued: Vec<Finalizer>,
+    cleared_weakrefs: Vec<SexpId>,
 }
 
 impl<T: Trace + HeapSize> Marked<'_, T> {
@@ -768,13 +803,13 @@ impl<T: Trace + HeapSize> Marked<'_, T> {
     }
 
     /// Run ephemeron fixpoint marking for all registered finalizers and `WEAKREFSXP` entries,
-    /// partition dead targets before resurrecting them for finalization, and return handles of
-    /// cleared weakref objects whose keys became unreachable.
+    /// partition dead targets before resurrecting them for finalization, and retain cleared
+    /// weakref handles inside [`Marked`] for [`Marked::sweep_outcome`].
     ///
     /// Idempotent within a single collection cycle.
-    pub fn resolve_ephemerons(&mut self) -> Vec<SexpId> {
+    pub fn resolve_ephemerons(&mut self) {
         if self.ephemerons_resolved {
-            return Vec::new();
+            return;
         }
         self.ephemerons_resolved = true;
 
@@ -854,26 +889,22 @@ impl<T: Trace + HeapSize> Marked<'_, T> {
                 self.mark_transitive(fun);
             }
         }
-        self.heap
-            .pending_finalizers
-            .extend(dead_fins.iter().copied());
-        self.newly_queued = dead_fins;
-
-        dead_weakrefs
+        self.heap.pending_finalizers.extend(dead_fins);
+        self.cleared_weakrefs = dead_weakrefs;
     }
 
     /// Sweep all unmarked non-permanent slots, bump generations, and return [`GcStats`].
     pub fn sweep(self) -> GcStats {
-        self.sweep_with_finalizers().0
+        self.sweep_outcome().stats
     }
 
-    /// Sweep all unmarked non-permanent slots and return `(GcStats, newly_queued_finalizers)`.
+    /// Sweep all unmarked non-permanent slots and return [`SweepOutcome`] (stats + cleared weakrefs).
     ///
-    /// Note that `newly_queued_finalizers` are also retained inside [`Heap::drain_pending_finalizers`]
-    /// until drained by the evaluator at a safepoint.
-    pub fn sweep_with_finalizers(mut self) -> (GcStats, Vec<Finalizer>) {
-        let _ = self.resolve_ephemerons();
-        let queued = std::mem::take(&mut self.newly_queued);
+    /// Newly queued finalizers remain rooted on the heap until drained via
+    /// [`Heap::drain_pending_finalizers`], preserving single-consumer finalizer execution.
+    pub fn sweep_outcome(mut self) -> SweepOutcome {
+        self.resolve_ephemerons();
+        let cleared_weakrefs = std::mem::take(&mut self.cleared_weakrefs);
         let mut freed = 0usize;
         let mut live_objects = 0usize;
         let mut live_bytes = 0usize;
@@ -910,13 +941,15 @@ impl<T: Trace + HeapSize> Marked<'_, T> {
             self.heap.next_gc_bytes = scaled.max(min_bytes);
         }
 
-        let stats = GcStats {
-            live_objects,
-            freed_objects: freed,
-            live_bytes,
-            collections: self.heap.collections,
-        };
-        (stats, queued)
+        SweepOutcome {
+            stats: GcStats {
+                live_objects,
+                freed_objects: freed,
+                live_bytes,
+                collections: self.heap.collections,
+            },
+            cleared_weakrefs,
+        }
     }
 }
 
@@ -1027,27 +1060,40 @@ mod tests {
         // Protect target: closure stays alive via ephemeron fixpoint.
         let mark = heap.protect_mark();
         heap.protect(target);
-        let (stats1, queued1) = heap.mark(&EmptyRoots).sweep_with_finalizers();
-        assert_eq!(stats1.freed_objects, 0);
-        assert!(queued1.is_empty());
+        let out1 = heap.mark(&EmptyRoots).sweep_outcome();
+        assert_eq!(out1.stats.freed_objects, 0);
+        assert!(!heap.has_pending_finalizers());
         assert!(heap.get(fin_closure).is_ok());
 
         // Drop target: even though fin_closure references target, target is dead,
         // queued once, and resurrected until pending finalizers are drained.
         heap.unprotect_to(mark);
-        let (stats2, queued2) = heap.mark(&EmptyRoots).sweep_with_finalizers();
-        assert_eq!(stats2.freed_objects, 0);
-        assert_eq!(queued2.len(), 1);
-        assert_eq!(queued2[0].target, target);
+        let out2 = heap.mark(&EmptyRoots).sweep_outcome();
+        assert_eq!(out2.stats.freed_objects, 0);
+        assert!(heap.has_pending_finalizers());
         assert!(heap.get(target).is_ok());
         assert!(heap.get(fin_closure).is_ok());
 
         // Drain finalizers and sweep again: both target and closure are freed.
         let drained = heap.drain_pending_finalizers();
         assert_eq!(drained.len(), 1);
-        let (stats3, queued3) = heap.mark(&EmptyRoots).sweep_with_finalizers();
-        assert!(queued3.is_empty());
-        assert_eq!(stats3.freed_objects, 2);
+        assert_eq!(drained[0].target, target);
+        let out3 = heap.mark(&EmptyRoots).sweep_outcome();
+        assert!(!heap.has_pending_finalizers());
+        assert_eq!(out3.stats.freed_objects, 2);
         assert_eq!(heap.get(target).err(), Some(HeapError::Stale(target)));
+
+        // retain_finalizers purges native finalizers for an unloading DLL across all lists.
+        let t2 = heap.alloc(Node { edges: vec![] }).unwrap();
+        heap.register_finalizer(
+            t2,
+            FinalizerKind::Native {
+                fun: 0x1000,
+                dll: 7,
+            },
+            true,
+        );
+        heap.retain_finalizers(|k| !matches!(k, FinalizerKind::Native { dll: 7, .. }));
+        assert!(heap.take_exit_finalizers().is_empty());
     }
 }

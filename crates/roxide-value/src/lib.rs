@@ -23,7 +23,7 @@ pub mod session;
 
 pub use alt::{
     AltClass, AltRegistry, AltString, AltVector, AltWrapper, CompactIntSeq, CompactRealSeq,
-    ForeignAltObj, Sortedness,
+    Sortedness,
 };
 pub use api::{CoerceWarn, PairlistIter, ValueApi, ValueError, VecView};
 pub use deparse::{DeparseOpts, deparse, dput};

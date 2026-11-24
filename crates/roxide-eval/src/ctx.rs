@@ -1066,9 +1066,9 @@ impl Ctx {
                         roxide_gc::FinalizerKind::RClosure(fun) => {
                             let _ = ctx.apply(fun, &[(None, fin.target)], SEXP_NIL, GLOBAL_ENV);
                         }
-                        roxide_gc::FinalizerKind::Native(addr) => {
+                        roxide_gc::FinalizerKind::Native { fun, .. } => {
                             if let Some(hooks) = ctx.native_hooks {
-                                hooks.run_c_finalizer(ctx, addr, fin.target);
+                                let _ = hooks.run_c_finalizer(ctx, fun, fin.target);
                             }
                         }
                     }

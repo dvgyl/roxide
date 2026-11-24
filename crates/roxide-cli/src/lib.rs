@@ -113,32 +113,35 @@ fn configured_gc_policy() -> (GcPolicy, GcPolicy) {
 /// Entry point shared by the standalone `roxide` binary and `roxide-libr`'s launcher.
 #[must_use]
 pub fn run_main() -> ExitCode {
-    run_args(env::args().collect())
+    let code = run_args(env::args().collect());
+    ExitCode::from(code.clamp(0, 255) as u8)
 }
 
-/// Execute Roxide CLI logic for an explicit argument vector (`argv[0]` included).
+/// Execute Roxide CLI logic for an explicit argument vector (`argv[0]` included),
+/// returning the exact process exit status code (preserving `quit(status = N)`).
 #[must_use]
-pub fn run_args(full_args: Vec<String>) -> ExitCode {
+pub fn run_args(full_args: Vec<String>) -> i32 {
     let tail_args: Vec<String> = full_args.iter().skip(1).cloned().collect();
     if tail_args.first().map(String::as_str) == Some("CMD") {
         let (boot_policy, run_policy) = configured_gc_policy();
-        return cmd::dispatch(&tail_args[1..], &|host| {
+        let code = cmd::dispatch(&tail_args[1..], &|host| {
             let mut ctx = bootstrap(host, boot_policy)?;
             ctx.session_mut().heap.set_policy(run_policy);
             Ok(ctx)
         });
+        return if code == ExitCode::SUCCESS { 0 } else { 1 };
     }
     let opts = match parse_cli(full_args) {
         Ok(o) => o,
         Err(err) => {
             let _ = writeln!(io::stderr().lock(), "roxide: {err}");
-            return ExitCode::FAILURE;
+            return 1;
         }
     };
 
     if opts.show_version {
         let _ = writeln!(io::stdout().lock(), "{VERSION_LINE}");
-        return ExitCode::SUCCESS;
+        return 0;
     }
 
     const STACK_BYTES: usize = 32 * 1024 * 1024;
@@ -146,10 +149,10 @@ pub fn run_args(full_args: Vec<String>) -> ExitCode {
         .stack_size(STACK_BYTES)
         .spawn(move || interpret(opts, STACK_BYTES));
     match run {
-        Ok(thread) => thread.join().unwrap_or(ExitCode::FAILURE),
+        Ok(thread) => thread.join().unwrap_or(1),
         Err(err) => {
             let _ = writeln!(io::stderr().lock(), "Error: {err}");
-            ExitCode::FAILURE
+            1
         }
     }
 }
@@ -167,14 +170,14 @@ pub fn bootstrap(host: Box<dyn Host>, policy: GcPolicy) -> Result<Ctx, InternalE
     Ok(ctx)
 }
 
-fn interpret(opts: CliOpts, stack_bytes: usize) -> ExitCode {
+fn interpret(opts: CliOpts, stack_bytes: usize) -> i32 {
     let (boot_policy, run_policy) = configured_gc_policy();
     let host = Box::new(NativeHost::new());
     let mut ctx = match bootstrap(host, boot_policy) {
         Ok(c) => c,
         Err(err) => {
             let _ = writeln!(io::stderr().lock(), "Error: {err}");
-            return ExitCode::FAILURE;
+            return 1;
         }
     };
     ctx.session_mut().heap.set_policy(run_policy);
@@ -188,7 +191,7 @@ fn interpret(opts: CliOpts, stack_bytes: usize) -> ExitCode {
             }
         }
         ctx.run_exit_finalizers();
-        return ExitCode::SUCCESS;
+        return 0;
     }
 
     if let Some(path_str) = opts.file {
@@ -200,13 +203,13 @@ fn interpret(opts: CliOpts, stack_bytes: usize) -> ExitCode {
                     io::stderr().lock(),
                     "Error: cannot open file '{path_str}': {err}"
                 );
-                return ExitCode::FAILURE;
+                return 1;
             }
         };
         return match ctx.run_global(&path_str, &src) {
             Ok(()) => {
                 ctx.run_exit_finalizers();
-                ExitCode::SUCCESS
+                0
             }
             Err(unwind) => handle_unwind(&mut ctx, unwind),
         };
@@ -216,18 +219,18 @@ fn interpret(opts: CliOpts, stack_bytes: usize) -> ExitCode {
     let mut src = String::new();
     if let Err(err) = io::Read::read_to_string(&mut io::stdin().lock(), &mut src) {
         let _ = writeln!(io::stderr().lock(), "Error: {err}");
-        return ExitCode::FAILURE;
+        return 1;
     }
     match ctx.run_global("<stdin>", &src) {
         Ok(()) => {
             ctx.run_exit_finalizers();
-            ExitCode::SUCCESS
+            0
         }
         Err(unwind) => handle_unwind(&mut ctx, unwind),
     }
 }
 
-fn handle_unwind(ctx: &mut Ctx, unwind: Unwind) -> ExitCode {
+fn handle_unwind(ctx: &mut Ctx, unwind: Unwind) -> i32 {
     match unwind {
         Unwind::Quit {
             status, run_last, ..
@@ -235,23 +238,23 @@ fn handle_unwind(ctx: &mut Ctx, unwind: Unwind) -> ExitCode {
             if run_last {
                 ctx.run_exit_finalizers();
             }
-            ExitCode::from(status.clamp(0, 255) as u8)
+            status.clamp(0, 255)
         }
         Unwind::TopLevel => {
             let _ = writeln!(io::stderr().lock(), "Execution halted");
-            ExitCode::FAILURE
+            1
         }
         Unwind::Value(err) => {
             let _ = writeln!(io::stderr().lock(), "Error: {err}\nExecution halted");
-            ExitCode::FAILURE
+            1
         }
         Unwind::Internal(err) => {
             let _ = writeln!(io::stderr().lock(), "Error: {err}\nExecution halted");
-            ExitCode::FAILURE
+            1
         }
         Unwind::Transfer { .. } => {
             let _ = writeln!(io::stderr().lock(), "Execution halted");
-            ExitCode::FAILURE
+            1
         }
     }
 }

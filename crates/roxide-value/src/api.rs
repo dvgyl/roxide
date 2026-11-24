@@ -843,6 +843,10 @@ impl ValueApi for RSession {
     ) -> Result<(), ValueError> {
         let target = if env == BASE_NAMESPACE { BASE_ENV } else { env };
         let sym_name = self.sym_name(sym).unwrap_or("").to_owned();
+        let new_is_callable = matches!(
+            self.heap.get(binding.value).map(RObject::sexp_type),
+            Ok(SexpType::Clo | SexpType::Builtin | SexpType::Special | SexpType::Prom)
+        );
         let old_val = {
             let obj = self.heap.get_mut(target)?;
             let ty = obj.sexp_type().type_name(obj.flags.s4);
@@ -853,12 +857,17 @@ impl ValueApi for RSession {
                 });
             };
             if let Some(&idx) = e.index.get(&sym) {
-                if e.entries[idx].1.locked {
+                let prev_entry = e.entries[idx].1;
+                if prev_entry.locked {
                     return Err(ValueError::LockedBinding(sym_name));
                 }
-                let prev = e.entries[idx].1.value;
+                let flags_changed =
+                    prev_entry.active != binding.active || prev_entry.locked != binding.locked;
                 e.entries[idx].1 = binding;
-                Some(prev)
+                if flags_changed || new_is_callable {
+                    e.shape_version = e.shape_version.wrapping_add(1);
+                }
+                Some((prev_entry.value, flags_changed || new_is_callable))
             } else {
                 if e.locked {
                     return Err(ValueError::LockedEnvironment);
@@ -871,7 +880,17 @@ impl ValueApi for RSession {
             }
         };
         self.heap.inc_ref(binding.value);
-        if let Some(old) = old_val {
+        if let Some((old, already_bumped)) = old_val {
+            if !already_bumped
+                && matches!(
+                    self.heap.get(old).map(RObject::sexp_type),
+                    Ok(SexpType::Clo | SexpType::Builtin | SexpType::Special | SexpType::Prom)
+                )
+                && let Ok(obj) = self.heap.get_mut(target)
+                && let Body::Env(e) = &mut obj.body
+            {
+                e.shape_version = e.shape_version.wrapping_add(1);
+            }
             self.heap.dec_ref(old);
         }
         Ok(())

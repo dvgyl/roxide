@@ -3,7 +3,7 @@
 
 Combines strictly black-box symbol metadata from:
   1. Official GNU R 4.6.2 `tools:::funAPI()` (symbol names, locations, API tier)
-  2. `nm` exported symbol table of oracle `libR` (exported symbol names & text/data kind)
+  2. `nm` exported symbol table of oracle `libR` (exported symbol names & func/data kind)
 
 Never reads any GNU R header or source file.
 """
@@ -19,6 +19,72 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 DEFAULT_OUT = ROOT / "tools" / "capi" / "manifest.json"
+
+# Documented R 4.6.2 public C-API data globals (from Writing R Extensions & Rinternals.h).
+# Strictly excludes non-API/internal data globals such as R_FunTab or R_PPStack.
+PUBLIC_DATA_GLOBALS = {
+    "R_NilValue",
+    "R_UnboundValue",
+    "R_MissingArg",
+    "R_NaString",
+    "R_BlankString",
+    "R_BlankScalarString",
+    "R_EmptyEnv",
+    "R_BaseEnv",
+    "R_GlobalEnv",
+    "R_BaseNamespace",
+    "R_NamespaceRegistry",
+    "R_MethodsNamespace",
+    "R_TrueValue",
+    "R_FalseValue",
+    "R_LogicalNAValue",
+    "R_NaInt",
+    "R_NaReal",
+    "R_NaN",
+    "R_PosInf",
+    "R_NegInf",
+    "R_AsCharacterSymbol",
+    "R_AtsignSymbol",
+    "R_BaseSymbol",
+    "R_baseSymbol",
+    "R_BraceSymbol",
+    "R_Bracket2Symbol",
+    "R_BracketSymbol",
+    "R_ClassSymbol",
+    "R_DeviceSymbol",
+    "R_DimNamesSymbol",
+    "R_DimSymbol",
+    "R_DollarSymbol",
+    "R_DotsSymbol",
+    "R_DoubleColonSymbol",
+    "R_DropSymbol",
+    "R_EvalSymbol",
+    "R_FunctionSymbol",
+    "R_LastvalueSymbol",
+    "R_LevelsSymbol",
+    "R_ModeSymbol",
+    "R_NaRmSymbol",
+    "R_NameSymbol",
+    "R_NamesSymbol",
+    "R_NamespaceEnvSymbol",
+    "R_PackageSymbol",
+    "R_PreviousSymbol",
+    "R_QuoteSymbol",
+    "R_RowNamesSymbol",
+    "R_SeedsSymbol",
+    "R_SortListSymbol",
+    "R_SourceSymbol",
+    "R_SpecSymbol",
+    "R_SrcfileSymbol",
+    "R_SrcrefSymbol",
+    "R_TripleColonSymbol",
+    "R_TspSymbol",
+    "R_dot_Generic",
+    "R_dot_Method",
+    "R_dot_defined",
+    "R_dot_packageName",
+    "R_dot_target",
+}
 
 
 def query_funapi(rscript: str) -> dict[str, dict[str, str]]:
@@ -42,7 +108,7 @@ def query_funapi(rscript: str) -> dict[str, dict[str, str]]:
 
 
 def query_nm_exports(libr_path: pathlib.Path) -> dict[str, str]:
-    """Read defined global symbol names and section classes from `libR` via `nm`."""
+    """Read defined global symbol names and func/data kinds from `libR` via `nm`."""
     if sys.platform == "darwin":
         cmd = ["nm", "-gU", str(libr_path)]
     else:
@@ -55,9 +121,9 @@ def query_nm_exports(libr_path: pathlib.Path) -> dict[str, str]:
             continue
         sym_type, raw_name = parts[1], parts[2]
         name = raw_name[1:] if sys.platform == "darwin" and raw_name.startswith("_") else raw_name
-        if sym_type in {"T", "t"}:
+        if sym_type in {"T", "t", "W", "i"}:
             kind = "func"
-        elif sym_type in {"D", "S", "B", "R"}:
+        elif sym_type in {"D", "S", "B", "R", "V"}:
             kind = "data"
         else:
             continue
@@ -65,39 +131,25 @@ def query_nm_exports(libr_path: pathlib.Path) -> dict[str, str]:
     return exports
 
 
-def is_public_r_data(name: str) -> bool:
-    """Identify standard documented R data globals (R_* singletons, symbols, Na values)."""
-    return (
-        name.startswith("R_")
-        and not name.startswith("R_BC")
-        and name
-        not in {
-            "R_FunTab",
-            "R_GlobalContext",
-            "R_CurrentExpression",
-            "R_InBCInterpreter",
-            "R_PPStack",
-            "R_PPStackTop",
-            "R_PPStackSize",
-        }
-    )
-
-
 def build_manifest(rscript: str, libr_path: pathlib.Path) -> dict:
     funapi = query_funapi(rscript)
     exports = query_nm_exports(libr_path)
 
+    all_names = sorted(set(funapi) | PUBLIC_DATA_GLOBALS | set(exports))
     symbols: list[dict[str, object]] = []
-    for name in sorted(set(funapi) | {k for k in exports if is_public_r_data(k)}):
+    for name in all_names:
         meta = funapi.get(name)
         in_libr = name in exports
-        kind = exports.get(name, "macro_or_header")
+        kind = exports.get(name, "macro_or_external")
         if meta is not None:
             apitype = meta["apitype"]
             loc = meta["loc"]
-        else:
+        elif name in PUBLIC_DATA_GLOBALS and kind == "data":
             apitype = "data"
             loc = "Rinternals.h"
+        else:
+            apitype = "nonapi"
+            loc = ""
         symbols.append(
             {
                 "name": name,

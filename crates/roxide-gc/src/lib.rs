@@ -14,6 +14,7 @@ pub mod id;
 
 pub use heap::{
     DEFAULT_PROTECT_LIMIT, Finalizer, FinalizerKind, GcPolicy, GcStats, Heap, HeapError, HeapSize,
-    Marked, ProtectIndex, ProtectMark, REFCNT_MAX, RootSet, Trace, Tracer, WeakRefEntry,
+    Marked, ProtectIndex, ProtectMark, REFCNT_MAX, RootSet, SweepOutcome, Trace, Tracer,
+    WeakRefEntry,
 };
 pub use id::{MAX_GENERATION, SexpId};

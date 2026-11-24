@@ -195,8 +195,8 @@ impl Ctx {
             ctx.protect(imports_label);
             ctx.session.set_attrib(imports, name_sym, imports_label)?;
 
-            let ns = if name == "methods" {
-                ctx.session.env_set_enclos(METHODS_NAMESPACE, imports)?;
+            let ns = if name == "methods" && ctx.ns_lookup("methods").is_none() {
+                ctx.session.env_reset(METHODS_NAMESPACE, imports)?;
                 METHODS_NAMESPACE
             } else {
                 ctx.session.alloc_env(imports)?
@@ -295,7 +295,7 @@ impl Ctx {
         }
         if name != "base" {
             let sym = self.session.intern(&name)?;
-            let _ = self.session.env_define(NAMESPACE_REGISTRY, sym, ns);
+            self.session.env_define(NAMESPACE_REGISTRY, sym, ns)?;
         }
         // Keep `self.pending_s3` intact as GC roots while flushing matching entries!
         let count = self.pending_s3.len();
@@ -316,12 +316,16 @@ impl Ctx {
     /// callers must protect them immediately before any GC-allocating operation if kept alive.
     pub fn ns_unregister(&mut self, name: &str) -> Option<NsRecord> {
         let pos = self.namespaces.iter().position(|r| r.name == name)?;
+        let record = self.namespaces.remove(pos);
         if name != "base"
             && let Ok(sym) = self.session.intern(name)
         {
             let _ = self.session.env_remove(NAMESPACE_REGISTRY, sym);
         }
-        Some(self.namespaces.remove(pos))
+        if name == "methods" && record.ns == METHODS_NAMESPACE {
+            let _ = self.session.env_reset(METHODS_NAMESPACE, BASE_NAMESPACE);
+        }
+        Some(record)
     }
 
     /// Record or clear the attached search-path environment for a loaded namespace.

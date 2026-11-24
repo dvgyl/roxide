@@ -347,9 +347,35 @@ pub enum NativeCallKind {
     Fortran,
 }
 
+/// Options passed to `.C` and `.Fortran` foreign calls (`NAOK`, `DUP`, `ENCODING`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DotCOpts {
+    /// Allow `NA` / `NaN` / `Inf` in foreign numeric/logical arguments (`NAOK = TRUE`).
+    pub naok: bool,
+    /// Copy arguments before passing to foreign code (`DUP = TRUE`, deprecated in R 4.x).
+    pub dup: bool,
+    /// Optional encoding conversion hint (`ENCODING`).
+    pub encoding: Option<String>,
+}
+
+impl Default for DotCOpts {
+    fn default() -> Self {
+        Self {
+            naok: false,
+            dup: true,
+            encoding: None,
+        }
+    }
+}
+
 /// Stateless native C-API & dynamic-library hooks installed by `roxide-capi` (ADRs 0017–0020).
+///
+/// Any `SEXP`s owned by `roxide-capi` (such as `DLLInfo` external pointers, `CCallable`
+/// registries, and ALTREP class metadata) are GC-rooted via a traced [`CtxExt`] installed
+/// inside [`Ctx`].
 pub trait NativeHooks {
-    /// Invoke a registered or dynamically looked-up native symbol via `.Call`/`.External`/`.C`/`.Fortran`.
+    /// Invoke a registered or dynamically looked-up native symbol via `.Call`/`.External`/`.External2`/`.C`/`.Fortran`.
+    #[allow(clippy::too_many_arguments)]
     fn call_native(
         &self,
         ctx: &mut Ctx,
@@ -357,10 +383,16 @@ pub trait NativeHooks {
         symbol: SexpId,
         args: &Args,
         package: Option<&str>,
+        dotc: Option<&DotCOpts>,
+        op: SexpId,
+        env: SexpId,
         call: &Call,
     ) -> EvalResult<SexpId> {
-        let _ = (kind, symbol, args, package);
-        Err(ctx.stop(call.err_call(), "native C API support is not initialized"))
+        let _ = (kind, symbol, args, package, dotc, op, env);
+        Err(ctx.stop(
+            call.err_call(),
+            "compiled code requires the staged Roxide R_HOME; run scripts/stage_rhome.sh",
+        ))
     }
 
     /// Load a compiled shared library (`dyn.load`) and return its `DLLInfo` object.
@@ -373,13 +405,19 @@ pub trait NativeHooks {
         call: SexpId,
     ) -> EvalResult<SexpId> {
         let _ = (path, local, now);
-        Err(ctx.stop(call, "native dynamic library loading is not initialized"))
+        Err(ctx.stop(
+            call,
+            "compiled code requires the staged Roxide R_HOME; run scripts/stage_rhome.sh",
+        ))
     }
 
     /// Unload a previously loaded shared library (`dyn.unload`).
     fn dyn_unload(&self, ctx: &mut Ctx, path: &Path, call: SexpId) -> EvalResult<()> {
         let _ = path;
-        Err(ctx.stop(call, "native dynamic library loading is not initialized"))
+        Err(ctx.stop(
+            call,
+            "compiled code requires the staged Roxide R_HOME; run scripts/stage_rhome.sh",
+        ))
     }
 
     /// Check whether a native symbol is loaded (`is.loaded`).
@@ -404,7 +442,10 @@ pub trait NativeHooks {
         call: SexpId,
     ) -> EvalResult<SexpId> {
         let _ = (name, package, with_registration);
-        Err(ctx.stop(call, "native symbol lookup is not initialized"))
+        Err(ctx.stop(
+            call,
+            "compiled code requires the staged Roxide R_HOME; run scripts/stage_rhome.sh",
+        ))
     }
 
     /// Return the list of loaded `DLLInfo` objects (`getLoadedDLLs`).
@@ -421,11 +462,15 @@ pub trait NativeHooks {
         call: SexpId,
     ) -> EvalResult<SexpId> {
         let _ = (dll, add_names);
-        Err(ctx.stop(call, "native routine inspection is not initialized"))
+        Err(ctx.stop(
+            call,
+            "compiled code requires the staged Roxide R_HOME; run scripts/stage_rhome.sh",
+        ))
     }
 
     /// Invoke a C finalizer function pointer (`R_CFinalizer_t`) across `roxide-capi`'s trampoline.
-    fn run_c_finalizer(&self, ctx: &mut Ctx, fun_addr: usize, target: SexpId) {
+    fn run_c_finalizer(&self, ctx: &mut Ctx, fun_addr: usize, target: SexpId) -> EvalResult<()> {
         let _ = (ctx, fun_addr, target);
+        Ok(())
     }
 }

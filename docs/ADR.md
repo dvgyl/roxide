@@ -223,8 +223,8 @@ All major architectural contracts and deviations from `docs/ARCHITECTURE.md` are
   - Isolate all C-ABI `unsafe` code into `crates/roxide-capi` and `crates/roxide-libr` (amending ADR-0001 only for these two explicit boundary crates; all 15 pure-Rust crates keep `#![forbid(unsafe_code)]`).
   - Represent `SEXP` as an opaque 64-bit pointer whose bit pattern is `SexpId::to_bits()` (never dereferenced by C code; 64-bit targets only). C `NULL` (`0`) is rejected with a deterministic R error (or converted with GNU R's warning on `.Call` return).
   - Allocate all public `R_*` `SEXP` globals (sentinels, environments, `R_BlankScalarString`, `R_NamespaceRegistry`, `R_MethodsNamespace`, and all standard `R_*Symbol` symbols) in fixed permanent generation-0 slots in `roxide-value::RSession::new` so C data exports are link-time constants.
-  - Keep `roxide-gc` non-moving forever so `INTEGER()`/`REAL()`/`RAW()`/`DATAPTR_RO()`/`R_CHAR()` return direct zero-copy pointers into pinned `RVec<T>` / `RChar` backing buffers.
-  - Author all headers under `crates/roxide-capi/include/` strictly clean-room from *Writing R Extensions* and verify symbol coverage via `tools/capi/api_manifest.py` (`tools:::funAPI()` + `nm -gU`) and numeric ABI parity via `tools/capi/abi_probe.py`.
+  - Keep `roxide-gc` non-moving forever so `INTEGER()`/`REAL()`/`RAW()`/`DATAPTR_RO()`/`R_CHAR()` return direct zero-copy pointers into pinned `RVec<T>` / `RChar` backing buffers. Writable pointers (`data_ptr_rw`) are restricted strictly to atomic vector buffers; `STRSXP`/`VECSXP`/`EXPRSXP` elements are mutated exclusively via `SET_STRING_ELT`/`SET_VECTOR_ELT` to preserve GC refcounts and type invariants. Because FFI calls are opaque to the Rust optimizer, pinned `Box<[T]>` buffers remain valid across `Mode::Released` callbacks (moving to `UnsafeCell`-backed storage remains a local drop-in option if formal Miri/Tree-Borrows verification is later enabled).
+  - Author all headers under `crates/roxide-capi/include/` strictly clean-room from *Writing R Extensions* and verify symbol coverage via `tools/capi/api_manifest.py` (`tools:::funAPI()` + `nm -gU`) and numeric ABI parity via `tools/capi/abi_probe.py` (which suppresses all oracle compiler diagnostics so zero oracle header text can leak).
 
 ---
 
@@ -260,7 +260,7 @@ All major architectural contracts and deviations from `docs/ARCHITECTURE.md` are
   - Link compiled CRAN packages against system BLAS/LAPACK (Accelerate on macOS, OpenBLAS on Linux) while preserving Roxide's bit-exact `roxide-math` engine path (ADR-0009).
   - Stamp Roxide-installed compiled packages with `Meta/Roxide.rds` and refuse foreign-runtime shared libraries via pure-Rust Mach-O/ELF dependency inspection so GNU R is never loaded into a Roxide process.
   - Adopt two vetted permissive dependencies: `cc` (`MIT OR Apache-2.0`) for building `roxide-capi`'s C/C++ trampoline shim and `libloading` (`ISC`) for dynamic library loading (`dyn.load`), plus optional out-of-workspace nightly `cargo-fuzz` (`MIT OR Apache-2.0`).
-  - Never execute GNU R `BCODESXP` instruction streams; lower `consts[0]` ASTs to Roxide's own clean-room register IR (`roxide-eval::vm`) with `ENVSXP` `shape_version` inline caches and guard-based fallback to the AST semantic reference.
+  - Never execute GNU R `BCODESXP` instruction streams; lower `consts[0]` ASTs to Roxide's own clean-room register IR (`roxide-eval::vm`) with `ENVSXP` `shape_version` inline caches (bumped on binding insert/remove, `env_set_enclos`, lock/active flag mutations, and function/promise binding overwrites; call-site cache hits also confirm the target function `SexpId` in the defining frame) and guard-based fallback to the AST semantic reference.
 
 
 

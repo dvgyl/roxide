@@ -3,10 +3,10 @@
 
 use roxide_gc::{FinalizerKind, HeapError, SexpId, WeakRefEntry};
 
-use crate::alt::{AltKind, AltMaterialized, AltObj, ForeignAltObj};
+use crate::alt::AltMaterialized;
 use crate::api::ValueError;
 use crate::na::{RComplex, RLogical};
-use crate::object::{Body, CharId, ExtPtrData, RObject, RVec, SexpType, WeakRefData};
+use crate::object::{Attrs, Body, CharId, ExtPtrData, RObject, RVec, SexpType, WeakRefData};
 use crate::session::{BASE_ENV, BASE_NAMESPACE, RSession, SEXP_NIL};
 
 impl RSession {
@@ -32,7 +32,6 @@ impl RSession {
                 Some(AltMaterialized::Cplx(v)) => Ok((v.as_slice().as_ptr() as usize, v.len())),
                 Some(AltMaterialized::Raw(v)) => Ok((v.as_slice().as_ptr() as usize, v.len())),
                 Some(AltMaterialized::Str(v)) => Ok((v.as_slice().as_ptr() as usize, v.len())),
-                Some(AltMaterialized::Vec(v)) => Ok((v.as_slice().as_ptr() as usize, v.len())),
                 None => Err(ValueError::TypeMismatch {
                     expected: "materialized vector",
                     actual: obj.sexp_type().type_name(obj.flags.s4),
@@ -45,9 +44,12 @@ impl RSession {
         }
     }
 
-    /// Return `(raw_address, element_len)` for writable direct buffer access (`INTEGER`, `REAL`, etc.).
+    /// Return `(raw_address, element_len)` for writable direct buffer access (`INTEGER`, `REAL`,
+    /// `LOGICAL`, `COMPLEX`, `RAW`).
     ///
-    /// Materializes native Rust ALTREP vectors on demand before returning their pinned buffer address.
+    /// Strictly restricted to atomic numeric/logical/raw vectors (ADR-0017); `STRSXP`/`VECSXP`/
+    /// `EXPRSXP` must be read via [`RSession::data_ptr_ro`] and mutated via `str_set`/`list_set`
+    /// so GC refcounts and `CharId` invariants are never bypassed.
     pub fn data_ptr_rw(&mut self, x: SexpId) -> Result<(usize, usize), ValueError> {
         let obj = self.heap.get(x)?;
         if let Body::Alt(alt) = &obj.body
@@ -83,9 +85,7 @@ impl RSession {
             Body::Int(v) => Ok((v.as_mut_slice().as_mut_ptr() as usize, v.len())),
             Body::Real(v) => Ok((v.as_mut_slice().as_mut_ptr() as usize, v.len())),
             Body::Cplx(v) => Ok((v.as_mut_slice().as_mut_ptr() as usize, v.len())),
-            Body::Str(v) => Ok((v.as_mut_slice().as_mut_ptr() as usize, v.len())),
             Body::Raw(v) => Ok((v.as_mut_slice().as_mut_ptr() as usize, v.len())),
-            Body::Vec(v) | Body::Expr(v) => Ok((v.as_mut_slice().as_mut_ptr() as usize, v.len())),
             Body::Alt(alt) => match &mut alt.materialized {
                 Some(AltMaterialized::Lgl(v)) => {
                     Ok((v.as_mut_slice().as_mut_ptr() as usize, v.len()))
@@ -102,19 +102,13 @@ impl RSession {
                 Some(AltMaterialized::Raw(v)) => {
                     Ok((v.as_mut_slice().as_mut_ptr() as usize, v.len()))
                 }
-                Some(AltMaterialized::Str(v)) => {
-                    Ok((v.as_mut_slice().as_mut_ptr() as usize, v.len()))
-                }
-                Some(AltMaterialized::Vec(v)) => {
-                    Ok((v.as_mut_slice().as_mut_ptr() as usize, v.len()))
-                }
-                None => Err(ValueError::TypeMismatch {
-                    expected: "materialized vector",
+                _ => Err(ValueError::TypeMismatch {
+                    expected: "atomic vector",
                     actual: obj.sexp_type().type_name(obj.flags.s4),
                 }),
             },
             _ => Err(ValueError::TypeMismatch {
-                expected: "vector",
+                expected: "atomic vector",
                 actual: obj.sexp_type().type_name(obj.flags.s4),
             }),
         }
@@ -402,6 +396,10 @@ impl RSession {
     }
 
     /// Allocate an ephemeron weak reference (`WEAKREFSXP`, `R_MakeWeakRef` / `R_MakeWeakRefC`).
+    ///
+    /// Matches GNU R: `key` must be `NULL`, an environment, or an external pointer. Weakref
+    /// entries remain tracked globally so registered finalizers still run when `key` becomes
+    /// unreachable even if the `WEAKREFSXP` handle itself is no longer referenced.
     pub fn alloc_weakref(
         &mut self,
         key: SexpId,
@@ -409,6 +407,16 @@ impl RSession {
         finalizer: Option<FinalizerKind>,
         onexit: bool,
     ) -> Result<SexpId, ValueError> {
+        let key_obj = self.heap.get(key)?;
+        if !matches!(
+            key_obj.sexp_type(),
+            SexpType::Nil | SexpType::Env | SexpType::ExtPtr
+        ) {
+            return Err(ValueError::TypeMismatch {
+                expected: "NULL, environment, or externalptr",
+                actual: key_obj.sexp_type().type_name(key_obj.flags.s4),
+            });
+        }
         let fin_sexp = match finalizer {
             Some(FinalizerKind::RClosure(f)) => f,
             _ => SEXP_NIL,
@@ -420,13 +428,15 @@ impl RSession {
                 value,
                 finalizer: fin_sexp,
             }))))?;
-        self.heap.register_weakref(WeakRefEntry {
-            weakref: wr,
-            key,
-            value,
-            finalizer,
-            onexit,
-        });
+        if key != SEXP_NIL {
+            self.heap.register_weakref(WeakRefEntry {
+                weakref: wr,
+                key,
+                value,
+                finalizer,
+                onexit,
+            });
+        }
         Ok(wr)
     }
 
@@ -598,96 +608,37 @@ impl RSession {
         Ok(())
     }
 
-    /// Allocate a foreign C ALTREP vector backed by `roxide-capi` (ADR-0019).
-    pub fn alloc_foreign_altrep(&mut self, foreign: ForeignAltObj) -> Result<SexpId, ValueError> {
-        self.heap.inc_ref(foreign.data1);
-        self.heap.inc_ref(foreign.data2);
-        Ok(self.heap.alloc(RObject::new(Body::Alt(Box::new(AltObj {
-            kind: AltKind::Foreign(foreign),
-            materialized: None,
-        }))))?)
-    }
-
-    /// Return true iff `x` is a foreign C ALTREP object.
-    pub fn is_foreign_altrep(&self, x: SexpId) -> Result<bool, ValueError> {
-        let obj = self.heap.get(x)?;
-        Ok(matches!(
-            &obj.body,
-            Body::Alt(alt) if matches!(alt.kind, AltKind::Foreign(_))
-        ))
-    }
-
-    /// Borrow the [`ForeignAltObj`] descriptor of a foreign C ALTREP object.
-    pub fn foreign_altrep(&self, x: SexpId) -> Result<&ForeignAltObj, ValueError> {
-        let obj = self.heap.get(x)?;
-        match &obj.body {
-            Body::Alt(alt) => match &alt.kind {
-                AltKind::Foreign(f) => Ok(f),
-                _ => Err(ValueError::TypeMismatch {
-                    expected: "foreign ALTREP",
-                    actual: obj.sexp_type().type_name(obj.flags.s4),
-                }),
-            },
-            _ => Err(ValueError::TypeMismatch {
-                expected: "foreign ALTREP",
-                actual: obj.sexp_type().type_name(obj.flags.s4),
-            }),
+    /// Reset an environment frame to empty unlocked state with a new parent (`METHODS_NAMESPACE` reload).
+    pub fn env_reset(&mut self, env: SexpId, enclos: SexpId) -> Result<(), ValueError> {
+        let (old_enclos, old_entries, old_attrs) = {
+            let obj = self.heap.get_mut(env)?;
+            let ty = obj.sexp_type().type_name(obj.flags.s4);
+            let old_attrs: Vec<SexpId> = obj.attrs.iter().map(|(_, v)| v).collect();
+            let Body::Env(frame) = &mut obj.body else {
+                return Err(ValueError::TypeMismatch {
+                    expected: "environment",
+                    actual: ty,
+                });
+            };
+            let old_enclos = std::mem::replace(&mut frame.enclos, enclos);
+            let old_entries = std::mem::take(&mut frame.entries);
+            frame.index.clear();
+            frame.locked = false;
+            frame.shape_version = frame.shape_version.wrapping_add(1);
+            obj.attrs = Attrs::default();
+            obj.flags.object = false;
+            obj.flags.s4 = false;
+            (old_enclos, old_entries, old_attrs)
+        };
+        self.heap.inc_ref(enclos);
+        self.heap.dec_ref(old_enclos);
+        for (_, b) in old_entries {
+            self.heap.dec_ref(b.value);
         }
-    }
-
-    /// Update `data1` on a foreign C ALTREP object (`R_set_altrep_data1`).
-    pub fn set_foreign_altrep_data1(&mut self, x: SexpId, data1: SexpId) -> Result<(), ValueError> {
-        let old = {
-            let obj = self.heap.get_mut(x)?;
-            let ty = obj.sexp_type().type_name(obj.flags.s4);
-            match &mut obj.body {
-                Body::Alt(alt) => match &mut alt.kind {
-                    AltKind::Foreign(f) => std::mem::replace(&mut f.data1, data1),
-                    _ => {
-                        return Err(ValueError::TypeMismatch {
-                            expected: "foreign ALTREP",
-                            actual: ty,
-                        });
-                    }
-                },
-                _ => {
-                    return Err(ValueError::TypeMismatch {
-                        expected: "foreign ALTREP",
-                        actual: ty,
-                    });
-                }
-            }
-        };
-        self.heap.inc_ref(data1);
-        self.heap.dec_ref(old);
-        Ok(())
-    }
-
-    /// Update `data2` on a foreign C ALTREP object (`R_set_altrep_data2`).
-    pub fn set_foreign_altrep_data2(&mut self, x: SexpId, data2: SexpId) -> Result<(), ValueError> {
-        let old = {
-            let obj = self.heap.get_mut(x)?;
-            let ty = obj.sexp_type().type_name(obj.flags.s4);
-            match &mut obj.body {
-                Body::Alt(alt) => match &mut alt.kind {
-                    AltKind::Foreign(f) => std::mem::replace(&mut f.data2, data2),
-                    _ => {
-                        return Err(ValueError::TypeMismatch {
-                            expected: "foreign ALTREP",
-                            actual: ty,
-                        });
-                    }
-                },
-                _ => {
-                    return Err(ValueError::TypeMismatch {
-                        expected: "foreign ALTREP",
-                        actual: ty,
-                    });
-                }
-            }
-        };
-        self.heap.inc_ref(data2);
-        self.heap.dec_ref(old);
+        for v in old_attrs {
+            self.heap.dec_ref(v);
+        }
+        self.heap.update_size(env)?;
         Ok(())
     }
 }

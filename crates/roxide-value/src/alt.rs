@@ -1,5 +1,6 @@
 //! `ALTREP` traits, compact sequence implementations, and R 4.6.2 wrapper duplication guards.
 
+use std::any::Any;
 use std::collections::HashMap;
 use std::fmt;
 use std::rc::Rc;
@@ -61,35 +62,10 @@ pub trait AltClass: Trace + fmt::Debug + 'static {
     fn wrapped_target(&self) -> Option<SexpId> {
         None
     }
-    /// Return true if backed by a foreign C ALTREP class dispatched by `roxide-capi` (ADR-0019).
-    fn is_foreign(&self) -> bool {
-        false
-    }
-}
-
-/// Foreign C ALTREP object payload traced by `roxide-gc` (single-authority rule, ADR-0019).
-///
-/// Method tables and callback dispatch live exclusively in `roxide-capi`.
-#[derive(Clone, Debug)]
-pub struct ForeignAltObj {
-    /// Class identifier allocated by `roxide-capi`'s foreign ALTREP registry.
-    pub class_id: u32,
-    /// Underlying R vector [`SexpType`] (`Lgl`, `Int`, `Real`, `Cplx`, `Raw`, `Str`, `Vec`).
-    pub base_type: SexpType,
-    /// Class name registered with `R_make_alt*_class`.
-    pub name: String,
-    /// Package name registered with `R_make_alt*_class`.
-    pub package: String,
-    /// First GC-traced state slot (`R_altrep_data1`).
-    pub data1: SexpId,
-    /// Second GC-traced state slot (`R_altrep_data2`).
-    pub data2: SexpId,
-}
-
-impl Trace for ForeignAltObj {
-    fn trace(&self, t: &mut Tracer<'_>) {
-        t.edge(self.data1);
-        t.edge(self.data2);
+    /// Optional `Any` view allowing `roxide-capi` to downcast foreign ALTREP class instances
+    /// (single-authority rule, ADR-0019).
+    fn as_any(&self) -> Option<&dyn Any> {
+        None
     }
 }
 
@@ -281,7 +257,6 @@ pub(crate) enum AltKind {
     Cplx(Rc<dyn AltVector<RComplex>>),
     Raw(Rc<dyn AltVector<u8>>),
     Str(Rc<dyn AltString>),
-    Foreign(ForeignAltObj),
 }
 
 /// Materialized backing storage for an [`AltObj`].
@@ -294,7 +269,6 @@ pub(crate) enum AltMaterialized {
     Cplx(RVec<RComplex>),
     Raw(RVec<u8>),
     Str(RVec<CharId>),
-    Vec(RVec<SexpId>),
 }
 
 /// Heap body for an ALTREP vector.
@@ -313,7 +287,17 @@ impl AltObj {
             AltKind::Cplx(_) => SexpType::Cplx,
             AltKind::Raw(_) => SexpType::Raw,
             AltKind::Str(_) => SexpType::Str,
-            AltKind::Foreign(f) => f.base_type,
+        }
+    }
+
+    pub(crate) fn class_any(&self) -> Option<&dyn Any> {
+        match &self.kind {
+            AltKind::Lgl(c) => c.as_any(),
+            AltKind::Int(c) => c.as_any(),
+            AltKind::Real(c) => c.as_any(),
+            AltKind::Cplx(c) => c.as_any(),
+            AltKind::Raw(c) => c.as_any(),
+            AltKind::Str(c) => c.as_any(),
         }
     }
 
@@ -325,7 +309,6 @@ impl AltObj {
             AltKind::Cplx(c) => c.wrapped_target(),
             AltKind::Raw(c) => c.wrapped_target(),
             AltKind::Str(c) => c.wrapped_target(),
-            AltKind::Foreign(_) => None,
         }
     }
 
@@ -338,7 +321,6 @@ impl AltObj {
                 AltMaterialized::Cplx(v) => v.len(),
                 AltMaterialized::Raw(v) => v.len(),
                 AltMaterialized::Str(v) => v.len(),
-                AltMaterialized::Vec(v) => v.len(),
             };
         }
         match &self.kind {
@@ -348,7 +330,6 @@ impl AltObj {
             AltKind::Cplx(c) => c.length(heap),
             AltKind::Raw(c) => c.length(heap),
             AltKind::Str(c) => c.length(heap),
-            AltKind::Foreign(_) => 0,
         }
     }
 
@@ -360,7 +341,6 @@ impl AltObj {
             Some(AltMaterialized::Cplx(v)) => std::mem::size_of_val(&*v.buf),
             Some(AltMaterialized::Raw(v)) => v.buf.len(),
             Some(AltMaterialized::Str(v)) => std::mem::size_of_val(&*v.buf),
-            Some(AltMaterialized::Vec(v)) => std::mem::size_of_val(&*v.buf),
             None => 0,
         }
     }
@@ -373,18 +353,11 @@ impl AltObj {
             AltKind::Cplx(c) => c.trace(t),
             AltKind::Raw(c) => c.trace(t),
             AltKind::Str(c) => c.trace(t),
-            AltKind::Foreign(f) => f.trace(t),
         }
-        match &self.materialized {
-            Some(AltMaterialized::Str(v)) => {
-                for c in v.as_slice() {
-                    t.edge(c.as_sexp());
-                }
+        if let Some(AltMaterialized::Str(v)) = &self.materialized {
+            for c in v.as_slice() {
+                t.edge(c.as_sexp());
             }
-            Some(AltMaterialized::Vec(v)) => {
-                t.edges(v.as_slice());
-            }
-            _ => {}
         }
     }
 }
@@ -666,6 +639,56 @@ impl RSession {
             AltKind::Real(Rc::new(CompactRealSeq { start, len, incr })),
             None,
         )
+    }
+
+    /// Allocate a custom logical ALTREP vector (used by `roxide-capi` foreign ALTREP classes).
+    pub fn alloc_alt_lgl(
+        &mut self,
+        class: Rc<dyn AltVector<RLogical>>,
+    ) -> Result<SexpId, ValueError> {
+        self.alloc_alt(AltKind::Lgl(class), None)
+    }
+
+    /// Allocate a custom integer ALTREP vector.
+    pub fn alloc_alt_int(&mut self, class: Rc<dyn AltVector<i32>>) -> Result<SexpId, ValueError> {
+        self.alloc_alt(AltKind::Int(class), None)
+    }
+
+    /// Allocate a custom double ALTREP vector.
+    pub fn alloc_alt_real(&mut self, class: Rc<dyn AltVector<f64>>) -> Result<SexpId, ValueError> {
+        self.alloc_alt(AltKind::Real(class), None)
+    }
+
+    /// Allocate a custom complex ALTREP vector.
+    pub fn alloc_alt_cplx(
+        &mut self,
+        class: Rc<dyn AltVector<RComplex>>,
+    ) -> Result<SexpId, ValueError> {
+        self.alloc_alt(AltKind::Cplx(class), None)
+    }
+
+    /// Allocate a custom raw ALTREP vector.
+    pub fn alloc_alt_raw(&mut self, class: Rc<dyn AltVector<u8>>) -> Result<SexpId, ValueError> {
+        self.alloc_alt(AltKind::Raw(class), None)
+    }
+
+    /// Allocate a custom character ALTREP vector.
+    pub fn alloc_alt_str(&mut self, class: Rc<dyn AltString>) -> Result<SexpId, ValueError> {
+        self.alloc_alt(AltKind::Str(class), None)
+    }
+
+    /// Return true iff `x` is an ALTREP vector (`ALTREP(x)`).
+    pub fn is_altrep(&self, x: SexpId) -> Result<bool, ValueError> {
+        Ok(matches!(self.heap.get(x)?.body, Body::Alt(_)))
+    }
+
+    /// Borrow the underlying ALTREP class as `&dyn Any` (if implemented by that class).
+    pub fn alt_class_any(&self, x: SexpId) -> Result<Option<&dyn Any>, ValueError> {
+        let obj = self.heap.get(x)?;
+        Ok(match &obj.body {
+            Body::Alt(alt) => alt.class_any(),
+            _ => None,
+        })
     }
 
     fn alloc_alt(

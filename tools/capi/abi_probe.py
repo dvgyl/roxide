@@ -3,7 +3,8 @@
 
 Compiles an identical clean-room C probe against Roxide headers and oracle headers,
 runs both binaries, and compares ONLY their printed numeric values (`sizeof`,
-`alignof`, `offsetof`, enum values, numeric macros). Never reads oracle header text.
+`alignof`, `offsetof`, enum values, numeric macros). Never reads oracle header text
+or emits oracle compiler diagnostics.
 """
 
 from __future__ import annotations
@@ -70,14 +71,26 @@ int main(void) {
 """
 
 
-def compile_and_run(cc: str, include_dir: pathlib.Path, probe_src: str, td: pathlib.Path, tag: str) -> dict[str, str]:
+def compile_and_run(
+    cc: str,
+    include_dir: pathlib.Path,
+    probe_src: str,
+    td: pathlib.Path,
+    tag: str,
+    is_oracle: bool,
+) -> dict[str, str]:
     c_path = td / f"probe_{tag}.c"
     bin_path = td / f"probe_{tag}"
     c_path.write_text(probe_src, encoding="utf-8")
-    subprocess.run(
-        [cc, "-std=c11", "-Wall", "-Wextra", f"-I{include_dir}", str(c_path), "-o", str(bin_path)],
-        check=True,
-    )
+    if is_oracle:
+        # Clean-room barrier: suppress all warnings/caret diagnostics and never print compiler stderr.
+        cmd = [cc, "-std=c11", "-w", "-fno-caret-diagnostics", f"-I{include_dir}", str(c_path), "-o", str(bin_path)]
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if res.returncode != 0:
+            raise RuntimeError(f"oracle probe compile failed (exit {res.returncode})")
+    else:
+        cmd = [cc, "-std=c11", "-Wall", "-Wextra", f"-I{include_dir}", str(c_path), "-o", str(bin_path)]
+        subprocess.run(cmd, check=True)
     out = subprocess.check_output([str(bin_path)], text=True)
     values: dict[str, str] = {}
     for line in out.splitlines():
@@ -111,8 +124,12 @@ def main() -> int:
 
     with tempfile.TemporaryDirectory() as raw_td:
         td = pathlib.Path(raw_td)
-        oracle_vals = compile_and_run(args.cc, oracle_inc, probe_src, td, "oracle")
-        roxide_vals = compile_and_run(args.cc, args.roxide_include, probe_src, td, "roxide")
+        try:
+            oracle_vals = compile_and_run(args.cc, oracle_inc, probe_src, td, "oracle", is_oracle=True)
+        except RuntimeError as err:
+            print(str(err), file=sys.stderr)
+            return 1
+        roxide_vals = compile_and_run(args.cc, args.roxide_include, probe_src, td, "roxide", is_oracle=False)
 
     diffs: list[str] = []
     for key in sorted(set(oracle_vals) | set(roxide_vals)):

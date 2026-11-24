@@ -6,7 +6,6 @@
 //! so compiled CRAN packages resolve all public R 4.6.2 C API symbols against Roxide.
 
 use std::ffi::{CStr, c_char, c_int};
-use std::process::ExitCode;
 
 /// C-callable launcher entry point invoked by the staged `bin/R` / `bin/Rscript` wrapper.
 ///
@@ -23,17 +22,17 @@ pub unsafe extern "C" fn roxide_main(argc: c_int, argv: *const *const c_char) ->
                 args.push(String::new());
             } else {
                 // SAFETY: caller guarantees each non-null `argv[i]` is NUL-terminated.
-                let s = unsafe { CStr::from_ptr(ptr) };
-                args.push(s.to_string_lossy().into_owned());
+                let bytes = unsafe { CStr::from_ptr(ptr) }.to_bytes();
+                let decoded = match std::str::from_utf8(bytes) {
+                    Ok(valid) => valid.to_owned(),
+                    Err(_) => String::from_utf8_lossy(bytes).into_owned(),
+                };
+                args.push(decoded);
             }
         }
     }
     if args.is_empty() {
         args.push(String::from("roxide"));
     }
-    match std::panic::catch_unwind(|| roxide_cli::run_args(args)) {
-        Ok(code) if code == ExitCode::SUCCESS => 0,
-        Ok(_) => 1,
-        Err(_) => 1,
-    }
+    std::panic::catch_unwind(|| roxide_cli::run_args(args) as c_int).unwrap_or(1)
 }

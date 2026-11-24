@@ -256,26 +256,38 @@ impl RSession {
         let mut symbols = HashMap::new();
         symbols.insert(Box::from(s4_null_bytes), Sym(SEXP_S4_NULL));
 
+        let check_slot = |actual: SexpId, expected: SexpId| -> Result<(), ValueError> {
+            if actual == expected {
+                Ok(())
+            } else {
+                Err(ValueError::InvalidAttribute(format!(
+                    "permanent slot mismatch: expected {}, got {}",
+                    expected.index(),
+                    actual.index()
+                )))
+            }
+        };
+
         // Indices 14..=16: C-API permanent scalar & environment globals (ADR-0017).
         let blank_scalar =
             heap.alloc_permanent(RObject::new(Body::Str(RVec::from_vec(vec![CharId::BLANK]))))?;
-        debug_assert_eq!(blank_scalar, BLANK_SCALAR_STRING);
+        check_slot(blank_scalar, BLANK_SCALAR_STRING)?;
 
         let ns_registry =
             heap.alloc_permanent(RObject::new(Body::Env(Box::new(EnvData::new(EMPTY_ENV)))))?;
-        debug_assert_eq!(ns_registry, NAMESPACE_REGISTRY);
+        check_slot(ns_registry, NAMESPACE_REGISTRY)?;
 
         let methods_ns = heap.alloc_permanent(RObject::new(Body::Env(Box::new(EnvData::new(
             BASE_NAMESPACE,
         )))))?;
-        debug_assert_eq!(methods_ns, METHODS_NAMESPACE);
+        check_slot(methods_ns, METHODS_NAMESPACE)?;
 
         // Indices 17..=56: permanent well-known R_*Symbol entries (ADR-0017).
         for &(expected_sym, _) in PERMANENT_SYMBOLS {
             let sym_id = heap.alloc_permanent(RObject::new(Body::Sym {
                 name: CharId::BLANK,
             }))?;
-            debug_assert_eq!(sym_id, expected_sym.as_sexp());
+            check_slot(sym_id, expected_sym.as_sexp())?;
         }
         // Indices 57..=96: permanent CHARSXP names backing indices 17..=56.
         for &(sym, text) in PERMANENT_SYMBOLS {
@@ -525,16 +537,16 @@ impl RSession {
     ) -> GcStats {
         let mut marked = self.heap.mark(roots);
         hook(&mut marked);
-        let dead_weakrefs = marked.resolve_ephemerons();
+        marked.resolve_ephemerons();
         self.chars.retain(|_, cid| marked.is_marked(cid.as_sexp()));
-        let stats = marked.sweep();
-        for wr_id in dead_weakrefs {
+        let outcome = marked.sweep_outcome();
+        for wr_id in outcome.cleared_weakrefs {
             if let Ok(obj) = self.heap.get_mut(wr_id)
                 && let Body::WeakRef(wr) = &mut obj.body
             {
                 wr.clear();
             }
         }
-        stats
+        outcome.stats
     }
 }

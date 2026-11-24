@@ -183,7 +183,11 @@ impl RSession {
         } else {
             env
         };
-        self.env_frame_mut(target)?.locked = locked;
+        let frame = self.env_frame_mut(target)?;
+        if frame.locked != locked {
+            frame.locked = locked;
+            frame.shape_version = frame.shape_version.wrapping_add(1);
+        }
         Ok(())
     }
 
@@ -220,7 +224,10 @@ impl RSession {
         let Some(&index) = frame.index.get(&sym) else {
             return Ok(false);
         };
-        frame.entries[index].1.locked = locked;
+        if frame.entries[index].1.locked != locked {
+            frame.entries[index].1.locked = locked;
+            frame.shape_version = frame.shape_version.wrapping_add(1);
+        }
         Ok(true)
     }
 
@@ -275,13 +282,16 @@ impl RSession {
         for (_, binding) in &mut frame.entries {
             binding.locked = true;
         }
+        frame.shape_version = frame.shape_version.wrapping_add(1);
         Ok(())
     }
 
     /// Set the enclosing environment and update its reference count.
     pub fn env_set_enclos(&mut self, env: SexpId, enclos: SexpId) -> Result<(), ValueError> {
         self.env_enclos(enclos)?;
-        let old = std::mem::replace(&mut self.env_frame_mut(env)?.enclos, enclos);
+        let frame = self.env_frame_mut(env)?;
+        let old = std::mem::replace(&mut frame.enclos, enclos);
+        frame.shape_version = frame.shape_version.wrapping_add(1);
         self.heap.inc_ref(enclos);
         self.heap.dec_ref(old);
         Ok(())

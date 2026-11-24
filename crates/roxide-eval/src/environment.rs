@@ -697,36 +697,40 @@ fn gctorture2_internal(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResul
 
 impl Ctx {
     /// Run pending GC finalizers and any remaining `onexit = TRUE` finalizers once,
-    /// in reverse registration order.
+    /// in reverse registration order, draining any finalizers newly queued during shutdown.
     pub fn run_exit_finalizers(&mut self) {
-        self.run_pending_finalizers();
-        let exit_only = self.session.heap.take_exit_finalizers();
-        if exit_only.is_empty() {
-            return;
-        }
-        let _ = self.scoped(|ctx| {
-            let visible = ctx.visible;
-            for fin in &exit_only {
-                ctx.protect(fin.target);
-                if let roxide_gc::FinalizerKind::RClosure(fun) = fin.kind {
-                    ctx.protect(fun);
-                }
+        const MAX_EXIT_ROUNDS: usize = 16;
+        for _ in 0..MAX_EXIT_ROUNDS {
+            self.run_pending_finalizers();
+            let exit_only = self.session.heap.take_exit_finalizers();
+            if exit_only.is_empty() {
+                break;
             }
-            for fin in exit_only.into_iter().rev() {
-                match fin.kind {
-                    roxide_gc::FinalizerKind::RClosure(fun) => {
-                        let _ = ctx.apply(fun, &[(None, fin.target)], SEXP_NIL, GLOBAL_ENV);
+            let _ = self.scoped(|ctx| {
+                let visible = ctx.visible;
+                for fin in &exit_only {
+                    ctx.protect(fin.target);
+                    if let roxide_gc::FinalizerKind::RClosure(fun) = fin.kind {
+                        ctx.protect(fun);
                     }
-                    roxide_gc::FinalizerKind::Native(addr) => {
-                        if let Some(hooks) = ctx.native_hooks {
-                            hooks.run_c_finalizer(ctx, addr, fin.target);
+                }
+                for fin in exit_only.into_iter().rev() {
+                    match fin.kind {
+                        roxide_gc::FinalizerKind::RClosure(fun) => {
+                            let _ = ctx.apply(fun, &[(None, fin.target)], SEXP_NIL, GLOBAL_ENV);
+                        }
+                        roxide_gc::FinalizerKind::Native { fun, .. } => {
+                            if let Some(hooks) = ctx.native_hooks {
+                                let _ = hooks.run_c_finalizer(ctx, fun, fin.target);
+                            }
                         }
                     }
                 }
-            }
-            ctx.visible = visible;
-            Ok(())
-        });
+                ctx.visible = visible;
+                Ok(())
+            });
+            self.run_pending_finalizers();
+        }
     }
 }
 
