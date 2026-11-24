@@ -59,3 +59,16 @@ Verified all 41 exported `R_*Symbol` / `R_dot_*` data symbols (`R_BaseSymbol == 
 | `R CMD SHLIB` missing source | Exits `1` (`tools:::.shlib_internal` returns make status `2`), stderr reports missing target `missing.o` needed by `missing.so` |
 | `R CMD SHLIB -n` / `--dry-run` | Identical output, exits `0`, empty stderr, zero build artifacts; prints `make cmd is` + `make would use` compile/link lines |
 | `R CMD SHLIB -o <path>` | Writes the shared object to the exact requested path (`custom.so` or `out/custom.so`) |
+
+## 6. Wave 3-A Foreign ALTREP Black-Box Probes
+
+| Condition | Exact GNU R 4.6.2 Behavior |
+| --- | --- |
+| `DATAPTR(x)` with no `Dataptr` method | `Dataptr_or_null` returns C `NULL`; `DATAPTR(x)` raises `cannot access data pointer for this ALTVEC object [class: <cls>, pkg: <pkg>]` |
+| Default `Rf_duplicate(x)` (no `Duplicate`/`DuplicateEX`) | Returns dense vector (`ALTREP(dup) == 0`) when `Dataptr` succeeds; raises the `DATAPTR` error if `Dataptr` is absent |
+| `Extract_subset` indices & names | Logical index `c(TRUE, FALSE)` converted to 1-based integer `c(1L, 3L)`; source vector names are attached to an unnamed callback result; unnamed source gives unnamed result |
+| Unserialize unknown ALTREP class `(cls, pkg)` | Attempts `loadNamespace("<pkg>")`, warns `cannot unserialize ALTVEC object of class '<cls>' from package '<pkg>'; returning length zero vector`, returns length-0 vector of base type |
+| `serialize(x, NULL)` after `Dataptr` materialization | Still invokes `Serialized_state` before and after `Dataptr` materializes the object |
+| Built-in class names (`R_altrep_class_name`/`package`) | `1:10` and `seq_len(10)` -> `compact_intseq` (`base`); `R_tryWrap(c(1L, 2L))` -> `wrap_integer` (`base`) |
+| Repeated `R_make_alt*_class(name, pkg, dll)` | Succeeds with distinct class pointer; existing objects keep old class; unserialization resolves the latest registration |
+| `altinteger_Sum` returning C `NULL` vs `R_NilValue` | C `NULL` falls back to `Get_region`/element sum; `R_NilValue` returns R `NULL` without fallback |
