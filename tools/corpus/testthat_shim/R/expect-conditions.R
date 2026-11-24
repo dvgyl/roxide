@@ -25,17 +25,19 @@ check_condition <- function(object, kind, regexp, class, inherit, fixed, perl, .
         !matches_condition(cond, regexp, class, inherit, fixed, perl, ...)) {
       return(invisible(NULL))
     }
+    if (inherits(cond, "error")) {
+      if (!absent || !is_missing_optional_package(cond)) {
+        invokeRestart("capture_error", cond)
+      }
+      return(invisible(NULL))
+    }
     if (absent || is.null(captured) || all) {
       if (is.null(captured)) captured <<- cond
       muffle_condition(cond)
     }
   }
 
-  value <- tryCatch(withCallingHandlers(object, condition = handler), error = function(cond) {
-    if ((absent && is_missing_optional_package(cond)) || !inherits(cond, kind) ||
-        !matches_condition(cond, regexp, class, inherit, fixed, perl, ...)) {
-      stop(cond)
-    }
+  value <- withRestarts(withCallingHandlers(object, condition = handler), capture_error = function(cond) {
     captured <<- cond
     NULL
   })

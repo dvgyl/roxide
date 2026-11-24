@@ -27,6 +27,13 @@ capture_expectations <- function(expr) {
   results
 }
 
+capture_success_failure <- function(expr) {
+  results <- capture_expectations(expr)
+  failed <- vapply(results, inherits, logical(1L), what = "expectation_failure")
+  list(n_success = length(results) - sum(failed), n_failure = sum(failed),
+       failures = results[failed])
+}
+
 expect_success <- function(expr) {
   results <- capture_expectations(expr)
   expect(length(results) == 1L && inherits(results[[1L]], "expectation_success"),

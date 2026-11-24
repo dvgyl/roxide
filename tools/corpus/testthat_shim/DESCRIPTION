@@ -5,5 +5,6 @@ Authors@R: person("Roxide", "Contributors", email = "devg@users.noreply.github.c
 Description: Run pure R package tests with a small set of testthat expectations,
     condition handlers, and an ASCII reporter.
 License: MIT + file LICENSE
+Suggests: R6
 Encoding: UTF-8
 Config/roxide/shim: true

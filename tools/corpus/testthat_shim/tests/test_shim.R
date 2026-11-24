@@ -108,6 +108,34 @@ test_that("checks internal expectations without adding their results", {
   expect_identical(conditionMessage(caught), "nested skip")
 })
 
+test_that("continues after a failed expectation inside a message check", {
+  outcomes <- capture_success_failure(expect_message({
+    expect_equal(1, 2)
+    message("probe")
+  }, "probe"))
+  expect_equal(outcomes$n_success, 1L)
+  expect_equal(outcomes$n_failure, 1L)
+  expect_match(conditionMessage(outcomes$failures[[1L]]), "1 not equal to 2.", fixed = TRUE)
+  caught <- tryCatch(expect_message(skip("nested skip")), skip = identity)
+  expect_identical(conditionMessage(caught), "nested skip")
+})
+
+test_that("uses comparison proxies in edition 3", {
+  compare_proxy.shim_probe <- function(x, path) {
+    class(x) <- NULL
+    NextMethod()
+  }
+  wrapped <- structure(1L, class = "shim_probe")
+  strict <- structure(1L, class = "no_shim_proxy")
+  local_edition(2L)
+  expect_failure(expect_identical(wrapped, 1L))
+  local_edition(3L)
+  expect_equal(wrapped, 1L)
+  expect_identical(1L, wrapped)
+  expect_failure(expect_identical(strict, 1L))
+  expect_failure(expect_identical(1L, 1))
+})
+
 test_that("evaluates comparison operands once in order and preserves random draws", {
   check <- function() {
     seed_env <- globalenv()
@@ -131,6 +159,26 @@ test_that("evaluates comparison operands once in order and preserves random draw
     expect_identical(preserve(runif(3L)), runif(3L))
   }
   check()
+})
+
+test_that("calls reporter methods in test order", {
+  events <- new.env()
+  events$order <- character()
+  record <- function(event) events$order <- c(events$order, event)
+  reporter <- list(
+    start_reporter = function() record("start report"),
+    end_reporter = function() record("end report"),
+    start_test = function(context, test) record(test),
+    end_test = function(context, test) record("end test"),
+    add_result = function(context, test, result) record(class(result)[[1L]])
+  )
+  with_reporter(reporter, test_that("inner test", {
+    on.exit(record("cleanup"), add = TRUE)
+    succeed()
+    stop("probe")
+  }))
+  expect_identical(events$order, c("start report", "inner test", "expectation_success",
+                                   "cleanup", "expectation_error", "end test", "end report"))
 })
 
 test_that("skips each snapshot helper before it evaluates its arguments", {
