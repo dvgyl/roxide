@@ -9,6 +9,13 @@ use crate::object::{CharId, Encoding, SexpType};
 
 use super::{Deparser, symbol};
 
+struct ElementFormat<'a> {
+    names: &'a [CharId],
+    indent: usize,
+    empty: &'static str,
+    typed_na: &'static str,
+}
+
 impl Deparser<'_> {
     pub(super) fn atomic(
         &mut self,
@@ -24,11 +31,13 @@ impl Deparser<'_> {
                 self.elements(
                     view.iter(),
                     view.len(),
-                    names,
-                    indent,
-                    $empty,
+                    ElementFormat {
+                        names,
+                        indent,
+                        empty: $empty,
+                        typed_na: $na,
+                    },
                     $missing,
-                    $na,
                     $show,
                 )?;
             }};
@@ -67,11 +76,13 @@ impl Deparser<'_> {
                 self.elements(
                     values.iter().copied(),
                     values.len(),
-                    names,
-                    indent,
-                    "character",
+                    ElementFormat {
+                        names,
+                        indent,
+                        empty: "character",
+                        typed_na: "NA_character_",
+                    },
                     |v| v == CharId::NA,
-                    "NA_character_",
                     |this, v| this.string(v),
                 )?;
             }
@@ -84,11 +95,13 @@ impl Deparser<'_> {
                     self.elements(
                         view.iter(),
                         view.len(),
-                        names,
-                        indent,
-                        "raw",
+                        ElementFormat {
+                            names,
+                            indent,
+                            empty: "raw",
+                            typed_na: "NA",
+                        },
                         |_| false,
-                        "NA",
                         |_, v| Ok(format!("0x{v:02x}")),
                     )?;
                     self.push(")");
@@ -99,18 +112,20 @@ impl Deparser<'_> {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn elements<T: Copy>(
         &mut self,
         values: impl Iterator<Item = T> + Clone,
         len: usize,
-        names: &[CharId],
-        indent: usize,
-        empty: &str,
+        format: ElementFormat<'_>,
         missing: impl Fn(T) -> bool,
-        typed_na: &str,
         show: impl Fn(&Self, T) -> Result<String, ValueError>,
     ) -> Result<(), ValueError> {
+        let ElementFormat {
+            names,
+            indent,
+            empty,
+            typed_na,
+        } = format;
         if len == 0 {
             self.push(&format!("{empty}(0)"));
             return Ok(());

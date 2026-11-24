@@ -361,11 +361,9 @@ pub trait ExtPayload: Any + fmt::Debug + 'static {}
 impl<T: Any + fmt::Debug + 'static> ExtPayload for T {}
 
 /// External pointer body (`EXTPTRSXP`, used by connections and Milestone 4 C API).
-#[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) struct ExtPtrData {
     pub(crate) addr: usize,
-    pub(crate) rust: Option<Box<dyn ExtPayload>>,
     pub(crate) tag: SexpId,
     pub(crate) prot: SexpId,
 }
@@ -412,7 +410,6 @@ impl Attrs {
 }
 
 /// Tagged payload variants for [`RObject`].
-#[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) enum Body {
     Nil,
@@ -461,6 +458,15 @@ pub struct RObject {
 }
 
 impl RObject {
+    /// Return a type mismatch error with this object's R type name.
+    #[must_use]
+    pub fn type_mismatch(&self, expected: &'static str) -> crate::api::ValueError {
+        crate::api::ValueError::TypeMismatch {
+            expected,
+            actual: self.sexp_type().type_name(self.flags.s4),
+        }
+    }
+
     pub(crate) fn new(body: Body) -> Self {
         Self {
             gp: 0,

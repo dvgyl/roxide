@@ -247,8 +247,6 @@ impl AltVector<f64> for CompactRealSeq {
     }
 }
 
-/// Internal typed ALTREP dispatch enum (all base types reserved for M1-M4).
-#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub(crate) enum AltKind {
     Lgl(Rc<dyn AltVector<RLogical>>),
@@ -260,7 +258,6 @@ pub(crate) enum AltKind {
 }
 
 /// Materialized backing storage for an [`AltObj`].
-#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub(crate) enum AltMaterialized {
     Lgl(RVec<RLogical>),
@@ -512,10 +509,7 @@ macro_rules! atomic_dataptr {
         impl RSession {
             fn $prepare(&mut self, x: SexpId) -> Result<&mut RVec<$ty>, ValueError> {
                 let obj = self.heap.get(x)?;
-                let mismatch = ValueError::TypeMismatch {
-                    expected: <$ty as Elem>::TYPE.type_name(false),
-                    actual: obj.sexp_type().type_name(obj.flags.s4),
-                };
+                let mismatch = obj.type_mismatch(<$ty as Elem>::TYPE.type_name(false));
                 if let Body::Alt(alt) = &obj.body
                     && alt.materialized.is_none()
                 {

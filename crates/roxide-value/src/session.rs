@@ -34,7 +34,8 @@ pub const FALSE_SCALAR: SexpId = SexpId::permanent(10);
 pub const NA_LGL_SCALAR: SexpId = SexpId::permanent(11);
 /// Permanent S4 pseudo-NULL slot sentinel (`\x01NULL\x01`, index 12; ADR-0012).
 pub const SEXP_S4_NULL: SexpId = SexpId::permanent(12);
-// Index 13 is the permanent CHARSXP for `SEXP_S4_NULL`.
+const S4_NULL_CHAR: CharId = CharId(SexpId::permanent(13));
+const S4_NULL_BYTES: &[u8] = b"\x01NULL\x01";
 /// Permanent 1-element blank character vector `""` (`R_BlankScalarString`, index 14; ADR-0017).
 pub const BLANK_SCALAR_STRING: SexpId = SexpId::permanent(14);
 /// Permanent namespace registry environment (`R_NamespaceRegistry`, index 15; ADR-0017).
@@ -181,126 +182,64 @@ impl RSession {
     pub fn new(policy: GcPolicy) -> Result<Self, ValueError> {
         let mut heap = Heap::new(policy);
 
-        // Fixed permanent slot order (indices 0..=11, NEVER reorder):
-        let nil = heap.alloc_permanent(RObject::new(Body::Nil))?;
-        debug_assert_eq!(nil, SEXP_NIL);
-
-        let unbound = heap.alloc_permanent(RObject::new(Body::Sym {
-            name: CharId::BLANK,
-        }))?;
-        debug_assert_eq!(unbound, SEXP_UNBOUND);
-
-        let missing = heap.alloc_permanent(RObject::new(Body::Sym {
-            name: CharId::BLANK,
-        }))?;
-        debug_assert_eq!(missing, SEXP_MISSING);
-
-        let na_char = heap.alloc_permanent(RObject::new(Body::Char(RChar::new(
-            b"NA",
-            Encoding::Native,
-        ))))?;
-        debug_assert_eq!(na_char, CharId::NA.as_sexp());
-
-        let blank_char =
-            heap.alloc_permanent(RObject::new(Body::Char(RChar::new(b"", Encoding::Native))))?;
-        debug_assert_eq!(blank_char, CharId::BLANK.as_sexp());
-
-        let empty_env =
-            heap.alloc_permanent(RObject::new(Body::Env(Box::new(EnvData::new(SEXP_NIL)))))?;
-        debug_assert_eq!(empty_env, EMPTY_ENV);
-
-        let base_env =
-            heap.alloc_permanent(RObject::new(Body::Env(Box::new(EnvData::new(EMPTY_ENV)))))?;
-        debug_assert_eq!(base_env, BASE_ENV);
-
-        let global_env =
-            heap.alloc_permanent(RObject::new(Body::Env(Box::new(EnvData::new(BASE_ENV)))))?;
-        debug_assert_eq!(global_env, GLOBAL_ENV);
-
-        let base_ns =
-            heap.alloc_permanent(RObject::new(Body::Env(Box::new(EnvData::new(GLOBAL_ENV)))))?;
-        debug_assert_eq!(base_ns, BASE_NAMESPACE);
-
-        let true_s = heap.alloc_permanent(RObject::new(Body::Lgl(RVec::from_vec(vec![
-            RLogical::TRUE,
-        ]))))?;
-        debug_assert_eq!(true_s, TRUE_SCALAR);
-
-        let false_s = heap.alloc_permanent(RObject::new(Body::Lgl(RVec::from_vec(vec![
-            RLogical::FALSE,
-        ]))))?;
-        debug_assert_eq!(false_s, FALSE_SCALAR);
-
-        let na_lgl =
-            heap.alloc_permanent(RObject::new(Body::Lgl(RVec::from_vec(vec![RLogical::NA]))))?;
-        debug_assert_eq!(na_lgl, NA_LGL_SCALAR);
-
-        let s4_null = heap.alloc_permanent(RObject::new(Body::Sym {
-            name: CharId::BLANK,
-        }))?;
-        debug_assert_eq!(s4_null, SEXP_S4_NULL);
-
-        let s4_null_bytes: &[u8] = b"\x01NULL\x01";
-        let s4_null_char = CharId(heap.alloc_permanent(RObject::new(Body::Char(RChar::new(
-            s4_null_bytes,
-            Encoding::Native,
-        ))))?);
-        if let Body::Sym { name } = &mut heap.get_mut(SEXP_S4_NULL)?.body {
-            *name = s4_null_char;
-        }
+        let symbol = |name| Body::Sym { name };
+        let char_body = |bytes| Body::Char(RChar::new(bytes, Encoding::Native));
+        let env = |parent| Body::Env(Box::new(EnvData::new(parent)));
+        let logical = |value| Body::Lgl(RVec::from_vec(vec![value]));
+        let singletons = [
+            (SEXP_NIL, Body::Nil),
+            (SEXP_UNBOUND, symbol(CharId::BLANK)),
+            (SEXP_MISSING, symbol(CharId::BLANK)),
+            (CharId::NA.as_sexp(), char_body(b"NA")),
+            (CharId::BLANK.as_sexp(), char_body(b"")),
+            (EMPTY_ENV, env(SEXP_NIL)),
+            (BASE_ENV, env(EMPTY_ENV)),
+            (GLOBAL_ENV, env(BASE_ENV)),
+            (BASE_NAMESPACE, env(GLOBAL_ENV)),
+            (TRUE_SCALAR, logical(RLogical::TRUE)),
+            (FALSE_SCALAR, logical(RLogical::FALSE)),
+            (NA_LGL_SCALAR, logical(RLogical::NA)),
+            (SEXP_S4_NULL, symbol(S4_NULL_CHAR)),
+            (S4_NULL_CHAR.as_sexp(), char_body(S4_NULL_BYTES)),
+            (
+                BLANK_SCALAR_STRING,
+                Body::Str(RVec::from_vec(vec![CharId::BLANK])),
+            ),
+            (NAMESPACE_REGISTRY, env(EMPTY_ENV)),
+            (METHODS_NAMESPACE, env(BASE_NAMESPACE)),
+        ];
 
         let mut chars = HashMap::new();
         chars.insert((Box::from(&b""[..]), Encoding::Native), CharId::BLANK);
-        chars.insert((Box::from(s4_null_bytes), Encoding::Native), s4_null_char);
-
+        chars.insert((Box::from(S4_NULL_BYTES), Encoding::Native), S4_NULL_CHAR);
         let mut symbols = HashMap::new();
-        symbols.insert(Box::from(s4_null_bytes), Sym(SEXP_S4_NULL));
+        symbols.insert(Box::from(S4_NULL_BYTES), Sym(SEXP_S4_NULL));
 
-        let check_slot = |actual: SexpId, expected: SexpId| -> Result<(), ValueError> {
-            if actual == expected {
-                Ok(())
-            } else {
-                Err(ValueError::InvalidAttribute(format!(
+        let symbol_name = |sym: Sym| {
+            CharId(SexpId::permanent(
+                sym.as_sexp().index() + PERMANENT_SYMBOLS.len() as u32,
+            ))
+        };
+        let symbol_slots = PERMANENT_SYMBOLS
+            .iter()
+            .map(|&(sym, _)| (sym.as_sexp(), symbol(symbol_name(sym))));
+        let name_slots = PERMANENT_SYMBOLS.iter().map(|&(sym, text)| {
+            let name = symbol_name(sym);
+            let bytes = text.as_bytes();
+            chars.insert((Box::from(bytes), Encoding::Native), name);
+            symbols.insert(Box::from(bytes), sym);
+            (name.as_sexp(), char_body(bytes))
+        });
+
+        for (expected, body) in singletons.into_iter().chain(symbol_slots).chain(name_slots) {
+            let actual = heap.alloc_permanent(RObject::new(body))?;
+            if actual != expected {
+                return Err(ValueError::InvalidAttribute(format!(
                     "permanent slot mismatch: expected {}, got {}",
                     expected.index(),
                     actual.index()
-                )))
+                )));
             }
-        };
-
-        // Indices 14..=16: C-API permanent scalar & environment globals (ADR-0017).
-        let blank_scalar =
-            heap.alloc_permanent(RObject::new(Body::Str(RVec::from_vec(vec![CharId::BLANK]))))?;
-        check_slot(blank_scalar, BLANK_SCALAR_STRING)?;
-
-        let ns_registry =
-            heap.alloc_permanent(RObject::new(Body::Env(Box::new(EnvData::new(EMPTY_ENV)))))?;
-        check_slot(ns_registry, NAMESPACE_REGISTRY)?;
-
-        let methods_ns = heap.alloc_permanent(RObject::new(Body::Env(Box::new(EnvData::new(
-            BASE_NAMESPACE,
-        )))))?;
-        check_slot(methods_ns, METHODS_NAMESPACE)?;
-
-        // Indices 17..=56: permanent well-known R_*Symbol entries (ADR-0017).
-        for &(expected_sym, _) in PERMANENT_SYMBOLS {
-            let sym_id = heap.alloc_permanent(RObject::new(Body::Sym {
-                name: CharId::BLANK,
-            }))?;
-            check_slot(sym_id, expected_sym.as_sexp())?;
-        }
-        // Indices 57..=96: permanent CHARSXP names backing indices 17..=56.
-        for &(sym, text) in PERMANENT_SYMBOLS {
-            let bytes = text.as_bytes();
-            let cid = CharId(heap.alloc_permanent(RObject::new(Body::Char(RChar::new(
-                bytes,
-                Encoding::Native,
-            ))))?);
-            if let Body::Sym { name } = &mut heap.get_mut(sym.as_sexp())?.body {
-                *name = cid;
-            }
-            chars.insert((Box::from(bytes), Encoding::Native), cid);
-            symbols.insert(Box::from(bytes), sym);
         }
 
         let mut session = Self {
@@ -345,10 +284,7 @@ impl RSession {
     pub fn sym_name_of(&self, id: SexpId) -> Result<&str, ValueError> {
         let obj = self.heap.get(id)?;
         let Body::Sym { name } = obj.body else {
-            return Err(ValueError::TypeMismatch {
-                expected: "symbol",
-                actual: obj.sexp_type().type_name(obj.flags.s4),
-            });
+            return Err(obj.type_mismatch("symbol"));
         };
         let bytes = self.char_bytes(name)?;
         Ok(std::str::from_utf8(bytes).unwrap_or(""))
@@ -367,7 +303,6 @@ impl RSession {
         } else {
             enc
         };
-        // Fast lookup without allocating a Box<[u8]> if present via small scan or owned key.
         let key = (Box::<[u8]>::from(bytes), norm_enc);
         if let Some(&existing) = self.chars.get(&key) {
             return Ok(existing);
@@ -407,10 +342,7 @@ impl RSession {
     pub fn char_bytes(&self, c: CharId) -> Result<&[u8], ValueError> {
         let obj = self.heap.get(c.as_sexp())?;
         let Body::Char(rc) = &obj.body else {
-            return Err(ValueError::TypeMismatch {
-                expected: "char",
-                actual: obj.sexp_type().type_name(obj.flags.s4),
-            });
+            return Err(obj.type_mismatch("char"));
         };
         Ok(rc.bytes())
     }
@@ -419,10 +351,7 @@ impl RSession {
     pub fn char_encoding(&self, c: CharId) -> Result<Encoding, ValueError> {
         let obj = self.heap.get(c.as_sexp())?;
         let Body::Char(rc) = &obj.body else {
-            return Err(ValueError::TypeMismatch {
-                expected: "char",
-                actual: obj.sexp_type().type_name(obj.flags.s4),
-            });
+            return Err(obj.type_mismatch("char"));
         };
         Ok(rc.encoding())
     }

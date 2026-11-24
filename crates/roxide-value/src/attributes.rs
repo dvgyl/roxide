@@ -144,10 +144,7 @@ impl RSession {
         let obj = self.heap.get(target)?;
         match &obj.body {
             Body::Env(frame) => Ok(frame.entries.clone()),
-            _ => Err(ValueError::TypeMismatch {
-                expected: "environment",
-                actual: obj.sexp_type().type_name(obj.flags.s4),
-            }),
+            _ => Err(obj.type_mismatch("environment")),
         }
     }
 
@@ -201,10 +198,7 @@ impl RSession {
         let obj = self.heap.get(target)?;
         match &obj.body {
             Body::Env(frame) => Ok(frame.locked),
-            _ => Err(ValueError::TypeMismatch {
-                expected: "environment",
-                actual: obj.sexp_type().type_name(obj.flags.s4),
-            }),
+            _ => Err(obj.type_mismatch("environment")),
         }
     }
 
@@ -244,10 +238,7 @@ impl RSession {
                 .index
                 .get(&sym)
                 .map(|&idx| frame.entries[idx].1.locked)),
-            _ => Err(ValueError::TypeMismatch {
-                expected: "environment",
-                actual: obj.sexp_type().type_name(obj.flags.s4),
-            }),
+            _ => Err(obj.type_mismatch("environment")),
         }
     }
 
@@ -264,10 +255,7 @@ impl RSession {
                 .index
                 .get(&sym)
                 .map(|&idx| frame.entries[idx].1.active)),
-            _ => Err(ValueError::TypeMismatch {
-                expected: "environment",
-                actual: obj.sexp_type().type_name(obj.flags.s4),
-            }),
+            _ => Err(obj.type_mismatch("environment")),
         }
     }
 

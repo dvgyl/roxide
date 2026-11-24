@@ -149,6 +149,78 @@ impl<'h, T: Elem> VecView<'h, T> {
     }
 }
 
+pub(crate) trait AtomicBody: Elem {
+    fn into_body(vector: RVec<Self>) -> Body;
+    fn dense(body: &Body) -> Option<&[Self]>;
+    fn materialized(body: &AltMaterialized) -> Option<&[Self]>;
+    fn alt_class(_kind: &AltKind) -> Option<&dyn AltVector<Self>> {
+        None
+    }
+}
+
+macro_rules! atomic_body {
+    ($element:ty, $variant:ident $(, $class:ident)?) => {
+        impl AtomicBody for $element {
+            fn into_body(vector: RVec<Self>) -> Body {
+                Body::$variant(vector)
+            }
+
+            fn dense(body: &Body) -> Option<&[Self]> {
+                match body {
+                    Body::$variant(vector) => Some(vector.as_slice()),
+                    _ => None,
+                }
+            }
+
+            fn materialized(body: &AltMaterialized) -> Option<&[Self]> {
+                match body {
+                    AltMaterialized::$variant(vector) => Some(vector.as_slice()),
+                    _ => None,
+                }
+            }
+
+            $(
+                fn alt_class(kind: &AltKind) -> Option<&dyn AltVector<Self>> {
+                    match kind {
+                        AltKind::$class(class) => Some(class.as_ref()),
+                        _ => None,
+                    }
+                }
+            )?
+        }
+    };
+}
+
+atomic_body!(RLogical, Lgl, Lgl);
+atomic_body!(i32, Int, Int);
+atomic_body!(f64, Real, Real);
+atomic_body!(RComplex, Cplx, Cplx);
+atomic_body!(u8, Raw, Raw);
+atomic_body!(CharId, Str);
+
+impl RSession {
+    fn atomic_view<T: AtomicBody>(&self, x: SexpId) -> Result<VecView<'_, T>, ValueError> {
+        let obj = self.heap.get(x)?;
+        let view = match &obj.body {
+            Body::Alt(alt) => match &alt.materialized {
+                Some(body) => T::materialized(body).map(VecView::Slice),
+                None => T::alt_class(&alt.kind).map(|class| VecView::Alt {
+                    class,
+                    heap: &self.heap,
+                    len: class.length(&self.heap),
+                }),
+            },
+            body => T::dense(body).map(VecView::Slice),
+        };
+        view.ok_or_else(|| obj.type_mismatch(T::TYPE.type_name(false)))
+    }
+
+    fn alloc_atomic<T: AtomicBody>(&mut self, values: &[T]) -> Result<SexpId, ValueError> {
+        let body = T::into_body(RVec::from_vec(values.to_vec()));
+        Ok(self.heap.alloc(RObject::new(body))?)
+    }
+}
+
 /// Iterator over a `LISTSXP`, `LANGSXP`, or `DOTSXP` cons chain yielding `(Option<Sym>, SexpId)`.
 pub struct PairlistIter<'h> {
     heap: &'h RHeap,
@@ -349,135 +421,34 @@ impl ValueApi for RSession {
     }
 
     fn lgl(&self, x: SexpId) -> Result<VecView<'_, RLogical>, ValueError> {
-        let obj = self.heap.get(x)?;
-        match &obj.body {
-            Body::Lgl(v) => Ok(VecView::Slice(v.as_slice())),
-            Body::Alt(alt) => match (&alt.materialized, &alt.kind) {
-                (Some(AltMaterialized::Lgl(v)), _) => Ok(VecView::Slice(v.as_slice())),
-                (None, AltKind::Lgl(c)) => Ok(VecView::Alt {
-                    class: c.as_ref(),
-                    heap: &self.heap,
-                    len: c.length(&self.heap),
-                }),
-                _ => Err(ValueError::TypeMismatch {
-                    expected: "logical",
-                    actual: obj.sexp_type().type_name(obj.flags.s4),
-                }),
-            },
-            _ => Err(ValueError::TypeMismatch {
-                expected: "logical",
-                actual: obj.sexp_type().type_name(obj.flags.s4),
-            }),
-        }
+        self.atomic_view(x)
     }
 
     fn int(&self, x: SexpId) -> Result<VecView<'_, i32>, ValueError> {
-        let obj = self.heap.get(x)?;
-        match &obj.body {
-            Body::Int(v) => Ok(VecView::Slice(v.as_slice())),
-            Body::Alt(alt) => match (&alt.materialized, &alt.kind) {
-                (Some(AltMaterialized::Int(v)), _) => Ok(VecView::Slice(v.as_slice())),
-                (None, AltKind::Int(c)) => Ok(VecView::Alt {
-                    class: c.as_ref(),
-                    heap: &self.heap,
-                    len: c.length(&self.heap),
-                }),
-                _ => Err(ValueError::TypeMismatch {
-                    expected: "integer",
-                    actual: obj.sexp_type().type_name(obj.flags.s4),
-                }),
-            },
-            _ => Err(ValueError::TypeMismatch {
-                expected: "integer",
-                actual: obj.sexp_type().type_name(obj.flags.s4),
-            }),
-        }
+        self.atomic_view(x)
     }
 
     fn real(&self, x: SexpId) -> Result<VecView<'_, f64>, ValueError> {
-        let obj = self.heap.get(x)?;
-        match &obj.body {
-            Body::Real(v) => Ok(VecView::Slice(v.as_slice())),
-            Body::Alt(alt) => match (&alt.materialized, &alt.kind) {
-                (Some(AltMaterialized::Real(v)), _) => Ok(VecView::Slice(v.as_slice())),
-                (None, AltKind::Real(c)) => Ok(VecView::Alt {
-                    class: c.as_ref(),
-                    heap: &self.heap,
-                    len: c.length(&self.heap),
-                }),
-                _ => Err(ValueError::TypeMismatch {
-                    expected: "double",
-                    actual: obj.sexp_type().type_name(obj.flags.s4),
-                }),
-            },
-            _ => Err(ValueError::TypeMismatch {
-                expected: "double",
-                actual: obj.sexp_type().type_name(obj.flags.s4),
-            }),
-        }
+        self.atomic_view(x)
     }
 
     fn cplx(&self, x: SexpId) -> Result<VecView<'_, RComplex>, ValueError> {
-        let obj = self.heap.get(x)?;
-        match &obj.body {
-            Body::Cplx(v) => Ok(VecView::Slice(v.as_slice())),
-            Body::Alt(alt) => match (&alt.materialized, &alt.kind) {
-                (Some(AltMaterialized::Cplx(v)), _) => Ok(VecView::Slice(v.as_slice())),
-                (None, AltKind::Cplx(c)) => Ok(VecView::Alt {
-                    class: c.as_ref(),
-                    heap: &self.heap,
-                    len: c.length(&self.heap),
-                }),
-                _ => Err(ValueError::TypeMismatch {
-                    expected: "complex",
-                    actual: obj.sexp_type().type_name(obj.flags.s4),
-                }),
-            },
-            _ => Err(ValueError::TypeMismatch {
-                expected: "complex",
-                actual: obj.sexp_type().type_name(obj.flags.s4),
-            }),
-        }
+        self.atomic_view(x)
     }
 
     fn raw(&self, x: SexpId) -> Result<VecView<'_, u8>, ValueError> {
-        let obj = self.heap.get(x)?;
-        match &obj.body {
-            Body::Raw(v) => Ok(VecView::Slice(v.as_slice())),
-            Body::Alt(alt) => match (&alt.materialized, &alt.kind) {
-                (Some(AltMaterialized::Raw(v)), _) => Ok(VecView::Slice(v.as_slice())),
-                (None, AltKind::Raw(c)) => Ok(VecView::Alt {
-                    class: c.as_ref(),
-                    heap: &self.heap,
-                    len: c.length(&self.heap),
-                }),
-                _ => Err(ValueError::TypeMismatch {
-                    expected: "raw",
-                    actual: obj.sexp_type().type_name(obj.flags.s4),
-                }),
-            },
-            _ => Err(ValueError::TypeMismatch {
-                expected: "raw",
-                actual: obj.sexp_type().type_name(obj.flags.s4),
-            }),
-        }
+        self.atomic_view(x)
     }
 
     fn str_slice(&self, x: SexpId) -> Result<&[CharId], ValueError> {
         let obj = self.heap.get(x)?;
         match &obj.body {
-            Body::Str(v) => Ok(v.as_slice()),
-            Body::Alt(alt) => match &alt.materialized {
-                Some(AltMaterialized::Str(v)) => Ok(v.as_slice()),
-                _ => Err(ValueError::TypeMismatch {
-                    expected: "materialized character",
-                    actual: obj.sexp_type().type_name(obj.flags.s4),
-                }),
-            },
-            _ => Err(ValueError::TypeMismatch {
-                expected: "character",
-                actual: obj.sexp_type().type_name(obj.flags.s4),
-            }),
+            Body::Alt(alt) => alt
+                .materialized
+                .as_ref()
+                .and_then(CharId::materialized)
+                .ok_or_else(|| obj.type_mismatch("materialized character")),
+            body => CharId::dense(body).ok_or_else(|| obj.type_mismatch("character")),
         }
     }
 
@@ -485,10 +456,7 @@ impl ValueApi for RSession {
         let obj = self.heap.get(x)?;
         match &obj.body {
             Body::Vec(v) | Body::Expr(v) => Ok(v.as_slice()),
-            _ => Err(ValueError::TypeMismatch {
-                expected: "list",
-                actual: obj.sexp_type().type_name(obj.flags.s4),
-            }),
+            _ => Err(obj.type_mismatch("list")),
         }
     }
 
@@ -512,39 +480,27 @@ impl ValueApi for RSession {
     }
 
     fn alloc_lgl_from(&mut self, vals: &[RLogical]) -> Result<SexpId, ValueError> {
-        Ok(self
-            .heap
-            .alloc(RObject::new(Body::Lgl(RVec::from_vec(vals.to_vec()))))?)
+        self.alloc_atomic(vals)
     }
 
     fn alloc_int_from(&mut self, vals: &[i32]) -> Result<SexpId, ValueError> {
-        Ok(self
-            .heap
-            .alloc(RObject::new(Body::Int(RVec::from_vec(vals.to_vec()))))?)
+        self.alloc_atomic(vals)
     }
 
     fn alloc_real_from(&mut self, vals: &[f64]) -> Result<SexpId, ValueError> {
-        Ok(self
-            .heap
-            .alloc(RObject::new(Body::Real(RVec::from_vec(vals.to_vec()))))?)
+        self.alloc_atomic(vals)
     }
 
     fn alloc_cplx_from(&mut self, vals: &[RComplex]) -> Result<SexpId, ValueError> {
-        Ok(self
-            .heap
-            .alloc(RObject::new(Body::Cplx(RVec::from_vec(vals.to_vec()))))?)
+        self.alloc_atomic(vals)
     }
 
     fn alloc_str_from(&mut self, vals: &[CharId]) -> Result<SexpId, ValueError> {
-        Ok(self
-            .heap
-            .alloc(RObject::new(Body::Str(RVec::from_vec(vals.to_vec()))))?)
+        self.alloc_atomic(vals)
     }
 
     fn alloc_raw_from(&mut self, vals: &[u8]) -> Result<SexpId, ValueError> {
-        Ok(self
-            .heap
-            .alloc(RObject::new(Body::Raw(RVec::from_vec(vals.to_vec()))))?)
+        self.alloc_atomic(vals)
     }
 
     fn alloc_list(&mut self, n: usize) -> Result<SexpId, ValueError> {
@@ -611,14 +567,11 @@ impl ValueApi for RSession {
     fn list_set(&mut self, x: SexpId, i: usize, v: SexpId) -> Result<(), ValueError> {
         let old = {
             let obj = self.heap.get_mut(x)?;
-            let ty = obj.sexp_type().type_name(obj.flags.s4);
+            let mismatch = obj.type_mismatch("list");
             let slice = match &mut obj.body {
                 Body::Vec(vec) | Body::Expr(vec) => vec.as_mut_slice(),
                 _ => {
-                    return Err(ValueError::TypeMismatch {
-                        expected: "list",
-                        actual: ty,
-                    });
+                    return Err(mismatch);
                 }
             };
             let len = slice.len();
@@ -665,10 +618,7 @@ impl ValueApi for RSession {
         let obj = self.heap.get(x)?;
         match &obj.body {
             Body::List(c) | Body::Lang(c) | Body::Dots(c) => Ok((c.car, c.cdr, c.tag)),
-            _ => Err(ValueError::TypeMismatch {
-                expected: "pairlist/language",
-                actual: obj.sexp_type().type_name(obj.flags.s4),
-            }),
+            _ => Err(obj.type_mismatch("pairlist/language")),
         }
     }
 
@@ -697,10 +647,7 @@ impl ValueApi for RSession {
         let obj = self.heap.get(x)?;
         match obj.body {
             Body::Closure { formals, body, env } => Ok((formals, body, env)),
-            _ => Err(ValueError::TypeMismatch {
-                expected: "closure",
-                actual: obj.sexp_type().type_name(obj.flags.s4),
-            }),
+            _ => Err(obj.type_mismatch("closure")),
         }
     }
 
@@ -718,10 +665,7 @@ impl ValueApi for RSession {
         match obj.body {
             Body::Builtin(id) => Ok((id, false)),
             Body::Special(id) => Ok((id, true)),
-            _ => Err(ValueError::TypeMismatch {
-                expected: "primitive",
-                actual: obj.sexp_type().type_name(obj.flags.s4),
-            }),
+            _ => Err(obj.type_mismatch("primitive")),
         }
     }
 
@@ -748,10 +692,7 @@ impl ValueApi for RSession {
                 value,
                 state,
             } => Ok((expr, env, value, state)),
-            _ => Err(ValueError::TypeMismatch {
-                expected: "promise",
-                actual: obj.sexp_type().type_name(obj.flags.s4),
-            }),
+            _ => Err(obj.type_mismatch("promise")),
         }
     }
 
@@ -764,15 +705,12 @@ impl ValueApi for RSession {
     ) -> Result<(), ValueError> {
         let (old_env, old_val) = {
             let obj = self.heap.get_mut(x)?;
-            let ty = obj.sexp_type().type_name(obj.flags.s4);
+            let mismatch = obj.type_mismatch("promise");
             let Body::Promise {
                 env, value, state, ..
             } = &mut obj.body
             else {
-                return Err(ValueError::TypeMismatch {
-                    expected: "promise",
-                    actual: ty,
-                });
+                return Err(mismatch);
             };
             let old = (*env, *value);
             *state = new_state;
@@ -798,10 +736,7 @@ impl ValueApi for RSession {
         let obj = self.heap.get(env)?;
         match &obj.body {
             Body::Env(e) => Ok(e.enclos),
-            _ => Err(ValueError::TypeMismatch {
-                expected: "environment",
-                actual: obj.sexp_type().type_name(obj.flags.s4),
-            }),
+            _ => Err(obj.type_mismatch("environment")),
         }
     }
 
@@ -849,12 +784,9 @@ impl ValueApi for RSession {
         );
         let old_val = {
             let obj = self.heap.get_mut(target)?;
-            let ty = obj.sexp_type().type_name(obj.flags.s4);
+            let mismatch = obj.type_mismatch("environment");
             let Body::Env(e) = &mut obj.body else {
-                return Err(ValueError::TypeMismatch {
-                    expected: "environment",
-                    actual: ty,
-                });
+                return Err(mismatch);
             };
             if let Some(&idx) = e.index.get(&sym) {
                 let prev_entry = e.entries[idx].1;
