@@ -14,7 +14,11 @@ use roxide_eval::{
 use roxide_gc::SexpId;
 use roxide_value::{CharId, Encoding, RSession, SexpType, ValueApi, ValueError};
 
-use crate::ops::{attributes::has_class, common::attr, primitive};
+use crate::ops::{
+    attributes::has_class,
+    common::{attr, factor_labels},
+    primitive,
+};
 
 /// Primitives exported by the base string module.
 pub const MODULE: Module = Module {
@@ -43,8 +47,8 @@ pub const MODULE: Module = Module {
         primitive!("regmatches", patterns::regmatches),
         primitive!("Encoding", text::encoding),
         primitive!("Encoding<-", text::set_encoding),
-        primitive!("enc2utf8", text::enc2utf8),
-        primitive!("enc2native", text::enc2native),
+        primitive!("enc2utf8", text::transcode),
+        primitive!("enc2native", text::transcode),
         primitive!("charToRaw", text::char_to_raw),
         primitive!("rawToChar", text::raw_to_char),
     ],
@@ -54,17 +58,7 @@ pub const MODULE: Module = Module {
 fn character(s: &mut RSession, x: SexpId) -> EvalResult<Vec<CharId>> {
     if has_class(s, x, "factor") {
         let levels = s.str_slice(attr(s, x, "levels"))?;
-        return Ok(s
-            .int(x)?
-            .iter()
-            .map(|i| {
-                usize::try_from(i.saturating_sub(1))
-                    .ok()
-                    .and_then(|i| levels.get(i))
-                    .copied()
-                    .unwrap_or(CharId::NA)
-            })
-            .collect());
+        return Ok(factor_labels(s, x, levels)?);
     }
     let (x, _) = s.coerce(x, SexpType::Str)?;
     Ok(s.str_slice(x)?.to_vec())

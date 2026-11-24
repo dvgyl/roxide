@@ -652,15 +652,7 @@ pub(super) fn set_encoding(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalR
     Ok(out)
 }
 
-pub(super) fn enc2utf8(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
-    transcode(ctx, call, args)
-}
-
-pub(super) fn enc2native(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
-    transcode(ctx, call, args)
-}
-
-fn transcode(ctx: &mut Ctx, call: &Call, args: &Args) -> EvalResult {
+pub(super) fn transcode(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     let [x] = formals(ctx.session(), args, ["x"]);
     let s = ctx.session_mut();
     let Ok(ids) = s.str_slice(x) else {

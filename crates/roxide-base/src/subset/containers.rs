@@ -265,12 +265,14 @@ fn bind(ctx: &mut Ctx, call: &Call, args: &Args, rows: bool) -> EvalResult {
         }
     }
     let s = ctx.session_mut();
-    let mut data = Vec::with_capacity(inner * outer);
+    let (nr, nc) = if rows { (outer, inner) } else { (inner, outer) };
+    let mut data = vec![SEXP_NIL; nr * nc];
     let mut outer_names = Vec::new();
     let mut inner_names = SEXP_NIL;
     let mut named = false;
-    let mut values = Vec::new();
+    let mut outer_start = 0;
     for block in &blocks {
+        let outer_width = width(block);
         let dn = attr(s, block.x, "dimnames");
         let outer_axis = usize::from(!rows);
         let outer_labels = s.list_get(dn, outer_axis).unwrap_or(SEXP_NIL);
@@ -282,7 +284,7 @@ fn bind(ctx: &mut Ctx, call: &Call, args: &Args, rows: bool) -> EvalResult {
         } else {
             outer_names.extend(std::iter::repeat_n(
                 block.name.unwrap_or(CharId::BLANK),
-                width(block),
+                outer_width,
             ));
         }
         if inner_names == SEXP_NIL {
@@ -295,25 +297,23 @@ fn bind(ctx: &mut Ctx, call: &Call, args: &Args, rows: bool) -> EvalResult {
         let block_data: Vec<_> = (0..block.size)
             .map(|i| element(s, block.x, i))
             .collect::<Result<_, _>>()?;
-        for j in 0..width(block) {
-            for k in 0..inner {
-                let i = if let Some((nr, _)) = block.dim {
-                    if rows { k * nr + j } else { j * nr + k }
+        let (block_rows, block_cols, row_start, col_start) = if rows {
+            (outer_width, inner, outer_start, 0)
+        } else {
+            (inner, outer_width, 0, outer_start)
+        };
+        for col in 0..block_cols {
+            let start = (col_start + col) * nr + row_start;
+            for row in 0..block_rows {
+                let i = if block.dim.is_some() {
+                    col * block_rows + row
                 } else {
-                    k % block.size
+                    (if rows { col } else { row }) % block.size
                 };
-                values.push(block_data[i]);
+                data[start + row] = block_data[i];
             }
         }
-    }
-    if rows {
-        for k in 0..inner {
-            for j in 0..outer {
-                data.push(values[j * inner + k]);
-            }
-        }
-    } else {
-        data = values;
+        outer_start += outer_width;
     }
     let x = concatenate(s, &data, ty)?;
     let outer_names = if named {
@@ -321,10 +321,10 @@ fn bind(ctx: &mut Ctx, call: &Call, args: &Args, rows: bool) -> EvalResult {
     } else {
         SEXP_NIL
     };
-    let (nr, nc, axes) = if rows {
-        (outer, inner, [outer_names, inner_names])
+    let axes = if rows {
+        [outer_names, inner_names]
     } else {
-        (inner, outer, [inner_names, outer_names])
+        [inner_names, outer_names]
     };
     let dn = if axes == [SEXP_NIL; 2] {
         SEXP_NIL
@@ -496,18 +496,8 @@ fn make_factor(ctx: &mut Ctx, call: &Call, args: &Args, ordered: bool) -> EvalRe
 
 pub(super) fn factor_values(s: &mut RSession, x: SexpId) -> EvalResult {
     let levels = chars(s, attr(s, x, "levels"));
-    let v = s
-        .int(x)?
-        .iter()
-        .map(|v| {
-            usize::try_from(v.saturating_sub(1))
-                .ok()
-                .and_then(|i| levels.get(i))
-                .copied()
-                .unwrap_or(CharId::NA)
-        })
-        .collect::<Vec<_>>();
-    Ok(s.alloc_str_from(&v)?)
+    let labels = common::factor_labels(s, x, levels)?;
+    Ok(s.alloc_str_from(&labels)?)
 }
 
 struct Column {

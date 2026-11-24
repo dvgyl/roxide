@@ -9,7 +9,7 @@ use crate::ops::common::{
 };
 
 use super::index::{
-    Index, array_indices, coordinates, dollar_name, index_labels, indices, lookup,
+    Index, IndexPolicy, array_indices, coordinates, dollar_name, index_labels, indices, lookup,
     pairlist_as_list, selected, single,
 };
 
@@ -91,7 +91,12 @@ pub(super) fn replace(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult
         if let Some(pos) = coord {
             pos.into_iter().map(Index::position).collect()
         } else {
-            indices(ctx, call, sub, n, &labels, !matrix, matrix)?
+            let policy = if matrix {
+                IndexPolicy::Strict
+            } else {
+                IndexPolicy::Extend
+            };
+            indices(ctx, call, sub, n, &labels, policy)?
         }
     };
     assign(ctx, call, x, ix, value, false)
@@ -275,7 +280,7 @@ fn replace_frame(
     let nrow = row_count(s, x)?;
     let ncol = s.xlength(x)?;
     let column_names = names(s, x).to_vec();
-    let column_indices = indices(ctx, call, col_sub, ncol, &column_names, true, false)?;
+    let column_indices = indices(ctx, call, col_sub, ncol, &column_names, IndexPolicy::Extend)?;
     if column_indices.is_empty() {
         return Ok(x);
     }
@@ -299,7 +304,14 @@ fn replace_frame(
         let labels = s.attr_row_names(x)?;
         let (labels, _) = s.coerce(labels, SexpType::Str)?;
         let labels = chars(s, labels).to_vec();
-        Some(indices(ctx, call, row_sub, nrow, &labels, false, true)?)
+        Some(indices(
+            ctx,
+            call,
+            row_sub,
+            nrow,
+            &labels,
+            IndexPolicy::Strict,
+        )?)
     };
     let s = ctx.session_mut();
     let list_value = matches!(s.type_of(value)?, SexpType::Vec | SexpType::List);

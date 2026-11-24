@@ -34,6 +34,23 @@ pub(crate) fn chars(s: &RSession, x: SexpId) -> &[CharId] {
     s.str_slice(x).unwrap_or_default()
 }
 
+pub(crate) fn factor_labels(
+    s: &RSession,
+    x: SexpId,
+    levels: &[CharId],
+) -> Result<Vec<CharId>, ValueError> {
+    Ok(s.int(x)?
+        .iter()
+        .map(|code| {
+            usize::try_from(code.saturating_sub(1))
+                .ok()
+                .and_then(|i| levels.get(i))
+                .copied()
+                .unwrap_or(CharId::NA)
+        })
+        .collect())
+}
+
 pub(crate) fn ch(s: &mut RSession, text: &str) -> Result<CharId, ValueError> {
     s.mk_char(text.as_bytes(), Encoding::Utf8)
 }

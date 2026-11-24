@@ -114,6 +114,25 @@ fn containers_and_callbacks() {
 }
 
 #[test]
+fn rbind_recycles_a_vector_next_to_a_named_matrix() {
+    check(
+        &mut context(),
+        r#"
+        m <- matrix(1:6, nrow = 2L, dimnames = list(c("a", "b"), c("x", "y", "z")))
+        warnings <- character()
+        result <- withCallingHandlers(rbind(m, row = c(7L, 8L)), warning = function(w) {
+            warnings <<- c(warnings, conditionMessage(w))
+            invokeRestart("muffleWarning")
+        })
+        checks <- c(
+            identical(result, matrix(c(1L, 2L, 7L, 3L, 4L, 8L, 5L, 6L, 7L), nrow = 3L,
+                dimnames = list(c("a", "b", "row"), c("x", "y", "z")))),
+            identical(warnings, "number of columns of result is not a multiple of vector length (arg 2)"))
+        "#,
+    );
+}
+
+#[test]
 fn replacement_and_language_values() {
     let mut ctx = context();
     let s = ctx.session_mut();

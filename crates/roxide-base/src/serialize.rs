@@ -4,6 +4,7 @@
 
 mod files;
 mod read;
+mod session;
 mod write;
 
 use std::collections::HashMap;
@@ -34,6 +35,7 @@ const MISSING: u32 = 251;
 const BASE_NS: u32 = 250;
 const NAMESPACE: u32 = 249;
 const PACKAGE: u32 = 248;
+const PERSIST: u32 = 247;
 const EMPTY: u32 = 242;
 const BASE: u32 = 241;
 const ALTREP: u32 = 238;

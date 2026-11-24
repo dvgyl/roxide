@@ -1,4 +1,3 @@
-use super::read::{CodecSession, PERSIST};
 use std::collections::HashMap;
 
 use roxide_gc::SexpId;
@@ -10,9 +9,11 @@ use roxide_value::{
 
 use super::{
     ACTIVE_BINDING, ALTREP, ASCII, ATTR, BASE, BASE_NS, BYTES, EMPTY, GLOBAL, LATIN1,
-    LOCKED_BINDING, MAX_INLINE_REF, MISSING, NAMESPACE, NIL, OBJECT, PACKAGE, REF, Registry, S4,
-    TAG, UNBOUND, UTF8, WireResult, invalid,
+    LOCKED_BINDING, MAX_INLINE_REF, MISSING, NAMESPACE, NIL, OBJECT, PACKAGE, PERSIST, REF,
+    Registry, S4, TAG, UNBOUND, UTF8, WireResult, invalid,
 };
+
+use super::session::CodecSession;
 
 pub(super) fn encode(
     session: &mut RSession,

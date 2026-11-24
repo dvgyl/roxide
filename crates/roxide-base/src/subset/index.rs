@@ -22,14 +22,20 @@ impl Index {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum IndexPolicy {
+    PadMissing,
+    Extend,
+    Strict,
+}
+
 pub(super) fn indices(
     ctx: &mut Ctx,
     call: &Call,
     sub: SexpId,
     n: usize,
     labels: &[CharId],
-    allow_extend: bool,
-    strict: bool,
+    policy: IndexPolicy,
 ) -> EvalResult<Vec<Index>> {
     use SexpType::*;
     if sub == SEXP_MISSING {
@@ -45,7 +51,7 @@ pub(super) fn indices(
         Nil => vec![],
         Lgl => {
             let v = s.lgl(sub)?;
-            if strict && v.len() > n {
+            if policy == IndexPolicy::Strict && v.len() > n {
                 return Err(error(ctx, call, "(subscript) logical subscript too long"));
             }
             if v.is_empty() {
@@ -54,7 +60,9 @@ pub(super) fn indices(
             (0..n.max(v.len()))
                 .filter_map(|i| match v.get(i % v.len()).get() {
                     Some(false) => None,
-                    Some(true) => Some(Index::position((allow_extend || i < n).then_some(i))),
+                    Some(true) => Some(Index::position(
+                        (policy == IndexPolicy::Extend || i < n).then_some(i),
+                    )),
                     None => Some(Index::position(None)),
                 })
                 .collect()
@@ -90,10 +98,9 @@ pub(super) fn indices(
                     .map(|v| {
                         let pos = (v.is_finite() && v >= 1.0 && v < usize::MAX as f64)
                             .then(|| (v as usize) - 1);
-                        Index::position(if allow_extend || strict {
-                            pos
-                        } else {
-                            pos.filter(|&i| i < n)
+                        Index::position(match policy {
+                            IndexPolicy::PadMissing => pos.filter(|&i| i < n),
+                            IndexPolicy::Extend | IndexPolicy::Strict => pos,
                         })
                     })
                     .collect()
@@ -124,7 +131,7 @@ pub(super) fn indices(
             ));
         }
     };
-    if strict
+    if policy == IndexPolicy::Strict
         && index
             .iter()
             .any(|i| i.pos.is_some_and(|p| p >= n) || (i.pos.is_none() && i.name.is_some()))
@@ -225,7 +232,7 @@ fn subset_impl(ctx: &mut Ctx, call: &Call, args: &Args, x: SexpId) -> EvalResult
     let s = ctx.session();
     let n = s.xlength(x)?;
     let labels = index_labels(ctx.session_mut(), x)?;
-    let index = indices(ctx, call, sub, n, &labels, false, false)?;
+    let index = indices(ctx, call, sub, n, &labels, IndexPolicy::PadMissing)?;
     let pos: Vec<_> = index.iter().map(|i| i.pos).collect();
     if ty == SexpType::List {
         pairlist_as_list(ctx.session_mut(), x, &pos)
@@ -375,7 +382,7 @@ pub(super) fn array_indices(
     let mut axes = Vec::with_capacity(dims.len());
     for ((&d, &sub), &labels) in dims.iter().zip(subs).zip(&dn) {
         let labels = chars(ctx.session(), labels).to_vec();
-        let positions = indices(ctx, call, sub, d as usize, &labels, false, true)?;
+        let positions = indices(ctx, call, sub, d as usize, &labels, IndexPolicy::Strict)?;
         axes.push(positions.into_iter().map(|i| i.pos).collect::<Vec<_>>());
     }
     let count = axes
@@ -460,7 +467,7 @@ fn subset_frame(ctx: &mut Ctx, call: &Call, x: SexpId, subs: &[SexpId], drop: bo
     let s = ctx.session();
     let labels = names(s, x).to_vec();
     let n = s.xlength(x)?;
-    let ix = indices(ctx, call, cols, n, &labels, false, false)?;
+    let ix = indices(ctx, call, cols, n, &labels, IndexPolicy::PadMissing)?;
     let Some(positions) = ix.iter().map(|i| i.pos).collect::<Option<Vec<_>>>() else {
         return Err(error(ctx, call, "undefined columns selected"));
     };
@@ -471,7 +478,7 @@ fn subset_frame(ctx: &mut Ctx, call: &Call, x: SexpId, subs: &[SexpId], drop: bo
     let mut row_ids = None;
     if let Some(rows) = rows.filter(|&v| v != SEXP_MISSING) {
         let labels = chars(ctx.session(), row_labels).to_vec();
-        let idx = indices(ctx, call, rows, nrow, &labels, false, false)?;
+        let idx = indices(ctx, call, rows, nrow, &labels, IndexPolicy::PadMissing)?;
         row_ids = Some(idx.iter().map(|i| i.pos).collect::<Vec<_>>());
     }
     let mut out = Vec::new();

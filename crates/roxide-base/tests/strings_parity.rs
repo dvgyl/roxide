@@ -54,6 +54,7 @@ fn text_operations_count_code_points_and_preserve_encoding_marks() {
             identical(Encoding(latin), "latin1"),
             identical(Encoding(y), c("UTF-8", "unknown", "unknown")),
             identical(charToRaw(y[1L]), as.raw(c(0x63, 0x61, 0x66, 0xc3, 0xa9))),
+            identical(charToRaw(enc2native(latin)), as.raw(c(0x63, 0x61, 0x66, 0xc3, 0xa9))),
             identical(rawToChar(as.raw(c(0, 97, 0)), multiple = TRUE), c("", "a", "")),
             identical(nchar(c(latin, "界", "é", NA_character_), "width"), c(4L, 2L, 1L, 2L)),
             identical(nchar(c(latin, y[1L]), "bytes"), c(4L, 5L)),

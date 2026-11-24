@@ -10,10 +10,12 @@ use roxide_value::{
 
 use super::{
     ACTIVE_BINDING, ALTREP, ATTR, BASE, BASE_NS, BYTES, EMPTY, GLOBAL, LATIN1, LOCKED_BINDING,
-    MISSING, NAMESPACE, NIL, PACKAGE, REF, Registry, S4, TAG, UNBOUND, UTF8, WireResult, invalid,
+    MISSING, NAMESPACE, NIL, PACKAGE, PERSIST, REF, Registry, S4, TAG, UNBOUND, UTF8, WireResult,
+    invalid,
 };
 
-pub(super) const PERSIST: u32 = 247;
+use super::session::CodecSession;
+
 const BCODE: u32 = 21;
 const BCREPREF: u32 = 243;
 const BCREPDEF: u32 = 244;
@@ -208,7 +210,7 @@ impl Reader<'_, '_> {
         ))
     }
 
-    fn numeric<T>(
+    fn vector<T>(
         &mut self,
         width: usize,
         mut get: impl FnMut(&mut Self) -> WireResult<T>,
@@ -313,10 +315,10 @@ impl Reader<'_, '_> {
             7 | 8 => return self.primitive(session, ty),
             9 => return Ok(self.character(session, flags, depth)?.as_sexp()),
             10 => session
-                .alloc_lgl_from(&self.numeric(4, |r| Ok(RLogical::from_raw(r.word()? as i32)))?)?,
-            13 => session.alloc_int_from(&self.numeric(4, |r| Ok(r.word()? as i32))?)?,
-            14 => session.alloc_real_from(&self.numeric(8, Self::f64)?)?,
-            15 => session.alloc_cplx_from(&self.numeric(16, |r| {
+                .alloc_lgl_from(&self.vector(4, |r| Ok(RLogical::from_raw(r.word()? as i32)))?)?,
+            13 => session.alloc_int_from(&self.vector(4, |r| Ok(r.word()? as i32))?)?,
+            14 => session.alloc_real_from(&self.vector(8, Self::f64)?)?,
+            15 => session.alloc_cplx_from(&self.vector(16, |r| {
                 Ok(RComplex {
                     re: r.f64()?,
                     im: r.f64()?,
@@ -328,30 +330,12 @@ impl Reader<'_, '_> {
                 session.alloc_str_from(&chars)?
             }
             19 => {
-                let len = self.vector_len::<SexpId>(4)?;
-                let mut values = Vec::new();
-                self.reserve_vector(&mut values, len)?;
-                for _ in 0..len {
-                    let value = self.item(session, depth)?;
-                    values.try_reserve(1).map_err(invalid)?;
-                    values.push(value);
-                }
-                let list = session.alloc_list(len)?;
-                for (i, value) in values.into_iter().enumerate() {
-                    session.list_set(list, i, value)?;
-                }
-                list
+                let values = self.vector(4, |reader| reader.item(session, depth))?;
+                crate::ops::common::list(session, &values)?
             }
             20 => {
-                let len = self.vector_len::<SexpId>(4)?;
-                let mut exprs = Vec::new();
-                self.reserve_vector(&mut exprs, len)?;
-                for _ in 0..len {
-                    let value = self.item(session, depth)?;
-                    exprs.try_reserve(1).map_err(invalid)?;
-                    exprs.push(value);
-                }
-                session.alloc_expr_from(&exprs)?
+                let values = self.vector(4, |reader| reader.item(session, depth))?;
+                session.alloc_expr_from(&values)?
             }
             BCODE => {
                 let source = self.bytecode(session, depth)?;
@@ -947,80 +931,6 @@ fn apply_attributes(
 
 fn truncated() -> super::CodecError {
     invalid("truncated XDR stream")
-}
-
-// Keep the stream decoder usable by connections, which lend only an RSession.
-pub(super) enum CodecSession<'a, 'h> {
-    Plain(&'a mut RSession),
-    Hook {
-        ctx: &'a mut roxide_eval::Ctx,
-        hook: &'h mut dyn super::PersistHook,
-        error: Option<roxide_eval::Unwind>,
-    },
-}
-
-impl std::ops::Deref for CodecSession<'_, '_> {
-    type Target = RSession;
-
-    fn deref(&self) -> &Self::Target {
-        match self {
-            Self::Plain(session) => session,
-            Self::Hook { ctx, .. } => ctx.session(),
-        }
-    }
-}
-
-impl std::ops::DerefMut for CodecSession<'_, '_> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        match self {
-            Self::Plain(session) => session,
-            Self::Hook { ctx, .. } => ctx.session_mut(),
-        }
-    }
-}
-
-impl CodecSession<'_, '_> {
-    pub(super) fn root(&mut self, value: SexpId) {
-        if let Self::Hook { ctx, .. } = self {
-            ctx.protect(value);
-        }
-    }
-
-    fn restore(&mut self, key: SexpId) -> WireResult<SexpId> {
-        let Self::Hook { ctx, hook, error } = self else {
-            return Err(invalid("persistent reference requires a hook"));
-        };
-        ctx.scoped(|ctx| {
-            ctx.protect(key);
-            hook.read(ctx, key)
-        })
-        .map_err(|unwind| {
-            *error = Some(unwind);
-            invalid("persistent reference hook failed")
-        })
-    }
-
-    pub(super) fn persist(&mut self, value: SexpId) -> WireResult<Option<SexpId>> {
-        let Self::Hook { ctx, hook, error } = self else {
-            return Ok(None);
-        };
-        hook.write(ctx, value).map_err(|unwind| {
-            *error = Some(unwind);
-            invalid("persistent reference hook failed")
-        })
-    }
-
-    pub(super) fn finish<T>(&mut self, result: WireResult<T>) -> roxide_eval::EvalResult<T> {
-        let Self::Hook { ctx, error, .. } = self else {
-            return result.map_err(|error| {
-                roxide_eval::Unwind::Internal(roxide_eval::InternalError { message: error.0 })
-            });
-        };
-        if let Some(error) = error.take() {
-            return Err(error);
-        }
-        result.map_err(|error| ctx.stop(SEXP_NIL, error.0))
-    }
 }
 
 pub(super) fn decode_hook(

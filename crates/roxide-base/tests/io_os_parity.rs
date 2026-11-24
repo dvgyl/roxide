@@ -231,6 +231,18 @@ message <- tryCatch(
 )
 stopifnot(identical(message, "I/O result exceeds the vector size limit"))
 stopifnot(open_in_handler, isOpen(con), identical(textConnectionValue(con), character()))
+sink(con)
+open_in_handler <- FALSE
+message <- tryCatch(
+    withCallingHandlers(cat("\n\n\n\n\n\n\n\n\n\n\n", sep = ""),
+                        error = function(e) open_in_handler <<- isOpen(con)),
+    error = conditionMessage
+)
+stopifnot(identical(message, "I/O result exceeds the vector size limit"))
+stopifnot(open_in_handler, isOpen(con), identical(textConnectionValue(con), character()))
+cat("after sink error\n")
+sink()
+stopifnot(identical(textConnectionValue(con), "after sink error"))
 close(con)
 "#,
     );

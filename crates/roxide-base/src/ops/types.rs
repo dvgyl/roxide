@@ -425,17 +425,7 @@ pub(super) fn convert(ctx: &mut Ctx, call: &Call, x: SexpId, ty: SexpType) -> Ev
     }
     if ty == Str && has_class(s, x, "factor") {
         let levels = chars(s, get(s, x, "levels"));
-        let values: std::vec::Vec<_> = s
-            .int(x)?
-            .iter()
-            .map(|v| {
-                usize::try_from(v.saturating_sub(1))
-                    .ok()
-                    .and_then(|i| levels.get(i))
-                    .copied()
-                    .unwrap_or(CharId::NA)
-            })
-            .collect();
+        let values = common::factor_labels(s, x, levels)?;
         return Ok(s.alloc_str_from(&values)?);
     }
     if ty == Str && matches!(from, Sym | Lang) {
