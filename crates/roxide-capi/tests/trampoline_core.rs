@@ -1,12 +1,15 @@
 //! Exercise the native jump and exception paths under both GC policies.
 
-use std::ffi::{c_int, c_void};
+use std::ffi::{c_char, c_int, c_void};
 use std::ptr::{from_mut, null_mut};
 
 use roxide_capi::abi::Sexp;
+use roxide_capi::api::memory::{R_alloc, vmaxget};
 use roxide_capi::cx::{with_ctx_entered, with_full, with_heap, with_session};
 use roxide_capi::globals::{R_NilValue, R_TrueValue};
-use roxide_capi::jump::{FrameKind, VoidFn, boundary, enter_trampoline, enter_trampoline_with};
+use roxide_capi::jump::{
+    FrameKind, Rf_protect, Rf_unprotect, VoidFn, boundary, enter_trampoline, enter_trampoline_with,
+};
 use roxide_eval::{
     ArgEval, Args, Arity, Call, Ctx, Dispatch, EvalResult, Module, PrimDef, PrimKind, Visibility,
 };
@@ -57,6 +60,53 @@ fn capture(ctx: &mut Ctx, f: impl FnOnce(&mut Ctx)) -> String {
         })
         .unwrap();
     String::from_utf8(bytes).unwrap()
+}
+
+unsafe extern "C" fn method_allocates(data: *mut c_void) {
+    // SAFETY: The caller supplies writable pointer storage and an active method frame.
+    unsafe {
+        Rf_protect(R_TrueValue);
+        let storage = R_alloc(1, 1);
+        storage.write(42);
+        data.cast::<*mut c_char>().write(storage);
+    }
+}
+
+unsafe extern "C" fn method_caller(data: *mut c_void) {
+    let mut storage = null_mut::<c_char>();
+    // SAFETY: The caller supplies a native entry frame and a writable result byte.
+    unsafe {
+        Rf_protect(R_TrueValue);
+        boundary((), |ctx| {
+            let mark = ctx.session().heap.protect_depth();
+            enter_trampoline_with(
+                ctx,
+                FrameKind::Method,
+                method_allocates,
+                from_mut(&mut storage).cast(),
+            )?;
+            assert_eq!(ctx.session().heap.protect_depth(), mark);
+            Ok(())
+        });
+        // Check that the arena still owns the allocation before reading it.
+        if !storage.is_null() && vmaxget() == storage.cast() {
+            data.cast::<c_char>().write(storage.read());
+        }
+        Rf_unprotect(1);
+    }
+}
+
+#[test]
+fn method_restores_protections_silently_and_keeps_transient_storage() {
+    each_policy(|ctx| {
+        let mut saved: c_char = 0;
+        let stderr = capture(ctx, |ctx| {
+            // SAFETY: The result byte is writable for the duration of the call.
+            unsafe { enter_trampoline(ctx, method_caller, from_mut(&mut saved).cast()) }.unwrap();
+        });
+        assert!(stderr.is_empty(), "{stderr}");
+        assert_eq!(saved, 42);
+    });
 }
 
 #[repr(C)]

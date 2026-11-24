@@ -106,7 +106,7 @@ fn resolve(
     ctx: &mut Ctx,
     symbol: SexpId,
     package: Option<&str>,
-    kind: Interface,
+    kind: NativeCallKind,
     call: SexpId,
 ) -> EvalResult<Routine> {
     let address = match ctx.session().type_of(symbol)? {
@@ -116,26 +116,31 @@ fn resolve(
                 return Err(ctx.stop(call, "invalid native routine name"));
             }
             let name = String::from_utf8_lossy(ctx.session().char_bytes(ch)?).into_owned();
+            let interface = Interface::from(kind);
             let registry = ctx.ext::<Registry>();
             let routine = registry
-                .lookup(&name, package, Some(kind), true)
+                .lookup(&name, package, Some(interface), true)
                 .or_else(|| {
                     registry
                         .lookup(&name, package, None, true)
                         .filter(|routine| routine.registration.is_some())
                 });
             return routine.ok_or_else(|| {
-                ctx.stop(
-                    call,
-                    format!(
-                        r#"{} symbol name "{name}" not in load table"#,
-                        if kind == Interface::Fortran {
-                            "Fortran"
-                        } else {
-                            "C"
-                        }
-                    ),
-                )
+                let message = if let Some(package) = package {
+                    let label = Interface::label(match kind {
+                        NativeCallKind::External2 => NativeCallKind::External,
+                        kind => kind,
+                    });
+                    format!(r#""{name}" not available for {label}() for package "{package}""#)
+                } else {
+                    let language = if interface == Interface::Fortran {
+                        "Fortran"
+                    } else {
+                        "C"
+                    };
+                    format!(r#"{language} symbol name "{name}" not in load table"#)
+                };
+                ctx.stop(call, message)
             });
         }
         SexpType::ExtPtr => symbol,
@@ -205,13 +210,7 @@ pub(crate) fn dispatch(ctx: &mut Ctx, request: Invocation<'_>) -> EvalResult {
                 .try_protect(value)
                 .map_err(|err| ctx.stop(site, err.to_string()))?;
         }
-        let routine = resolve(
-            ctx,
-            symbol,
-            package.filter(|p| !p.is_empty()),
-            interface,
-            site,
-        )?;
+        let routine = resolve(ctx, symbol, package.filter(|p| !p.is_empty()), kind, site)?;
         if let Some((registered, arity)) = routine.registration {
             if registered != interface {
                 return Err(ctx.stop(site, "NULL value passed as symbol address"));
@@ -405,17 +404,19 @@ impl Buffer {
             SexpType::Str => {
                 let len = ctx.session().xlength(value)?;
                 if fortran {
-                    if len > 1 {
-                        ctx.warning_at(
-                            call,
-                            "only the first string in a char vector used in .Fortran",
-                        )?;
-                    }
-                    if len == 0 {
-                        return Err(
-                            ctx.stop(call, "character argument to .Fortran must have length one")
-                        );
-                    }
+                    let warning = match len {
+                        0 => {
+                            let message = "character argument to .Fortran must have length one";
+                            return Err(ctx.stop(call, message));
+                        }
+                        1 => "passing a char vector to .Fortran is not portable",
+                        _ => "only the first string in a char vector used in .Fortran",
+                    };
+                    let warning_call = ctx
+                        .current_frame_id()
+                        .and_then(|id| ctx.frame_info(id))
+                        .map_or(SEXP_NIL, |(call, _, _, _)| call);
+                    ctx.warning_at(warning_call, warning)?;
                     return Ok(Self::FortranString(text(ctx, value, 0, true, call)?));
                 }
                 let text = (0..len)

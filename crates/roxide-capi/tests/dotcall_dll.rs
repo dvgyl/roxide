@@ -428,12 +428,12 @@ fn sexp_calls(ctx: &mut Ctx) {
     );
 
     let missing = keep(ctx, |ctx| ctx.session_mut().scalar_str("absent").unwrap());
-    for (kind, language) in [
-        (NativeCallKind::Call, "C"),
-        (NativeCallKind::External, "C"),
-        (NativeCallKind::External2, "C"),
-        (NativeCallKind::C, "C"),
-        (NativeCallKind::Fortran, "Fortran"),
+    for (kind, label) in [
+        (NativeCallKind::Call, ".Call"),
+        (NativeCallKind::External, ".External"),
+        (NativeCallKind::External2, ".External"),
+        (NativeCallKind::C, ".C"),
+        (NativeCallKind::Fortran, ".Fortran"),
     ] {
         assert_eq!(
             message(ctx, |ctx| invoke(
@@ -443,7 +443,7 @@ fn sexp_calls(ctx: &mut Ctx) {
                 &Args::default(),
                 None
             )),
-            format!(r#"{language} symbol name "absent" not in load table"#)
+            format!(r#""absent" not available for {label}() for package "wave.test""#)
         );
     }
 
@@ -599,7 +599,18 @@ fn copy_calls(ctx: &mut Ctx) {
     });
     let f_text = info(ctx, "f_text");
     let args = one_arg(strings);
+    let single = keep(ctx, |ctx| ctx.session_mut().scalar_str("yes").unwrap());
     ctx.opts_mut().warn = 2;
+    assert_eq!(
+        message(ctx, |ctx| invoke(
+            ctx,
+            NativeCallKind::Fortran,
+            f_text,
+            &one_arg(single),
+            None
+        )),
+        "(converted from warning) passing a char vector to .Fortran is not portable"
+    );
     assert_eq!(
         message(ctx, |ctx| invoke(
             ctx,
@@ -732,7 +743,16 @@ fn exercise(policy: GcPolicy) {
             Some(NativeCallKind::Fortran)
         )?);
         let zero_name = keep(ctx, |ctx| ctx.session_mut().scalar_str("zero").unwrap());
-        assert!(invoke(ctx, NativeCallKind::Call, zero_name, &Args::default(), None).is_err());
+        assert_eq!(
+            message(ctx, |ctx| invoke(
+                ctx,
+                NativeCallKind::Call,
+                zero_name,
+                &Args::default(),
+                None
+            )),
+            r#""zero" not available for .Call() for package "wave.test""#
+        );
 
         sexp_calls(ctx);
         copy_calls(ctx);

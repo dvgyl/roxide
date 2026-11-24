@@ -36,6 +36,10 @@ pub enum FrameKind {
     /// Nested callback (`R_UnwindProtect` body/cleanup, `R_ToplevelExec`, `R_tryCatchError`).
     /// Inherits the enclosing protect floor and keeps protections made before normal return.
     Callback,
+    /// ALTREP method with its own protect floor.
+    /// Restores the protect stack without a warning. Its transient allocations
+    /// belong to the caller's frame.
+    Method,
 }
 
 #[repr(C)]
@@ -144,7 +148,7 @@ pub unsafe fn enter_trampoline(ctx: &mut Ctx, fun: VoidFn, data: *mut c_void) ->
 }
 
 /// Call a native void callback through a jump target and C++ exception handler with
-/// explicit frame semantics (entry point vs nested callback).
+/// the protect-stack and allocation rules for the specified frame kind.
 ///
 /// # Safety
 ///
@@ -158,7 +162,8 @@ pub unsafe fn enter_trampoline_with(
 ) -> EvalResult<()> {
     let expected_depth = cx::depth() as c_int;
     let entry = matches!(kind, FrameKind::Entry { .. });
-    let Some(frame) = ActiveFrame::push(&ctx.session().heap, !entry) else {
+    let inherit_floor = matches!(kind, FrameKind::Callback);
+    let Some(frame) = ActiveFrame::push(&ctx.session().heap, inherit_floor) else {
         return Err(ctx.signal_error_at(SEXP_NIL, "native trampoline depth limit exceeded"));
     };
     let depth = cx::depth();
@@ -191,16 +196,22 @@ pub unsafe fn enter_trampoline_with(
 
     match status {
         0 => {
-            if let FrameKind::Entry { label } = kind {
-                let heap = &mut ctx.session_mut().heap;
-                let after = heap.protect_depth();
-                heap.unprotect_to(mark);
-                if before != after {
-                    let _ = ctx.host().write_err(
-                        format!("Warning: stack imbalance in '{label}', {before} then {after}\n")
+            match kind {
+                FrameKind::Entry { label } => {
+                    let heap = &mut ctx.session_mut().heap;
+                    let after = heap.protect_depth();
+                    heap.unprotect_to(mark);
+                    if before != after {
+                        let _ = ctx.host().write_err(
+                            format!(
+                                "Warning: stack imbalance in '{label}', {before} then {after}\n"
+                            )
                             .as_bytes(),
-                    );
+                        );
+                    }
                 }
+                FrameKind::Callback => {}
+                FrameKind::Method => ctx.session_mut().heap.unprotect_to(mark),
             }
             Ok(())
         }
