@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use roxide_gc::SexpId;
 
-use crate::api::ValueError;
+use crate::api::{AltNeed, ValueError};
 use crate::object::{Body, RObject};
 use crate::session::RSession;
 
@@ -24,7 +24,7 @@ impl RSession {
             Body::Raw(v) => Body::Raw(v.clone()),
             Body::Vec(v) => Body::Vec(v.clone()),
             Body::Expr(v) => Body::Expr(v.clone()),
-            Body::Alt(v) => Body::Alt(v.clone()),
+            Body::Alt(v) => v.duplicate_body(x)?,
             Body::Closure { formals, body, env } => Body::Closure {
                 formals: *formals,
                 body: *body,
@@ -43,10 +43,11 @@ impl RSession {
         for_each_child(&mut copy, |child| edges.push(*child));
         match &copy.body {
             Body::Closure { env, .. } => edges.push(*env),
-            Body::Alt(alt) => edges.extend(alt.wrapped_target()),
+            Body::Str(v) => edges.extend(v.as_slice().iter().map(|c| c.as_sexp())),
             _ => {}
         }
         let id = self.heap.alloc(copy)?;
+        self.register_alt_edges(id)?;
         for edge in edges {
             self.heap.inc_ref(edge);
         }
@@ -69,7 +70,14 @@ impl RSession {
                 let replacement = if let Some(&id) = copies.get(&child) {
                     id
                 } else {
-                    let id = self.shallow_duplicate(child)?;
+                    let id = match self.shallow_duplicate(child) {
+                        Ok(id) => id,
+                        Err(ValueError::ForeignAltrep {
+                            need: AltNeed::Payload,
+                            ..
+                        }) => child,
+                        Err(err) => return Err(err),
+                    };
                     copies.insert(child, id);
                     if id != child {
                         pending.push(id);

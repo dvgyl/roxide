@@ -391,6 +391,7 @@ pub(crate) struct ObjFlags {
     pub(crate) object: bool,
     /// True iff this object is an S4 instance.
     pub(crate) s4: bool,
+    pub(crate) alt_class: bool,
 }
 
 /// Ordered attribute map preserving insertion order.
@@ -582,7 +583,7 @@ impl HeapSize for RObject {
             Body::Raw(v) => v.buf.len(),
             Body::Vec(v) | Body::Expr(v) => std::mem::size_of_val(&*v.buf),
             Body::Env(e) => e.entries.len() * 48 + 64,
-            Body::Alt(alt) => 128 + alt.buffer_bytes(),
+            Body::Alt(alt) => std::mem::size_of_val(alt.as_ref()) + alt.buffer_bytes(),
             _ => 0,
         };
         base + attr_bytes + body_bytes

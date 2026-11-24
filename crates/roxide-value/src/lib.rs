@@ -22,10 +22,11 @@ pub mod object;
 pub mod session;
 
 pub use alt::{
-    AltClass, AltRegistry, AltString, AltVector, AltWrapper, CompactIntSeq, CompactRealSeq,
-    Sortedness,
+    AltClass, AltString, AltVector, AltWrapper, CompactIntSeq, CompactRealSeq, Sortedness,
 };
-pub use api::{CoerceWarn, PairlistIter, ValueApi, ValueError, VecView};
+pub use api::{
+    AltNeed, AltSlot, CoerceWarn, ForeignAltInfo, PairlistIter, ValueApi, ValueError, VecView,
+};
 pub use deparse::{DeparseOpts, deparse, dput};
 pub use format::{FormatOpts, encode_string, format_int_vec, format_lgl_vec, format_real_vec};
 pub use identical::{IdenticalOpts, identical};

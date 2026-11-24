@@ -21,6 +21,41 @@ pub struct CoerceWarn {
     pub imaginary_discarded: bool,
 }
 
+/// Information the caller must supply for a lazy foreign ALTREP vector.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AltNeed {
+    /// Vector length.
+    Length,
+    /// Vector elements.
+    Payload,
+}
+
+/// A data slot of a foreign ALTREP vector.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AltSlot {
+    /// First data slot.
+    Data1,
+    /// Second data slot.
+    Data2,
+}
+
+/// Class, data slots, and storage state of a foreign ALTREP vector.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ForeignAltInfo {
+    /// External pointer class descriptor.
+    pub class: SexpId,
+    /// Base vector type.
+    pub ty: SexpType,
+    /// First data slot.
+    pub data1: SexpId,
+    /// Second data slot.
+    pub data2: SexpId,
+    /// Cached length, if known.
+    pub len: Option<usize>,
+    /// Whether the value layer owns the vector elements.
+    pub owned: bool,
+}
+
 /// Errors returned by [`RSession`] / [`ValueApi`] operations (translated to R conditions by `roxide-eval`).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum ValueError {
@@ -35,6 +70,13 @@ pub enum ValueError {
     },
     /// Attempted to mutate a shared object without calling [`ValueApi::unshare`] first.
     Shared(SexpId),
+    /// The requested information is unavailable in the value layer.
+    ForeignAltrep {
+        /// Foreign ALTREP vector.
+        id: SexpId,
+        /// Information the caller must supply.
+        need: AltNeed,
+    },
     /// Embedded NUL byte in a character string or symbol.
     EmbeddedNul,
     /// Attempted to modify a locked binding or locked environment.
@@ -66,6 +108,10 @@ impl fmt::Display for ValueError {
                 write!(f, "expected '{expected}', got '{actual}'")
             }
             Self::Shared(_) => f.write_str("cannot mutate shared R object in place"),
+            Self::ForeignAltrep { need, .. } => match need {
+                AltNeed::Length => f.write_str("foreign ALTREP length is unavailable"),
+                AltNeed::Payload => f.write_str("foreign ALTREP payload is unavailable"),
+            },
             Self::EmbeddedNul => f.write_str("embedded nul in string"),
             Self::LockedBinding(name) => {
                 write!(f, "cannot change value of locked binding for '{name}'")
@@ -202,14 +248,17 @@ impl RSession {
     fn atomic_view<T: AtomicBody>(&self, x: SexpId) -> Result<VecView<'_, T>, ValueError> {
         let obj = self.heap.get(x)?;
         let view = match &obj.body {
-            Body::Alt(alt) => match &alt.materialized {
-                Some(body) => T::materialized(body).map(VecView::Slice),
-                None => T::alt_class(&alt.kind).map(|class| VecView::Alt {
-                    class,
-                    heap: &self.heap,
-                    len: class.length(&self.heap),
-                }),
-            },
+            Body::Alt(alt) => {
+                alt.require_payload(x)?;
+                match &alt.materialized {
+                    Some(body) => T::materialized(body).map(VecView::Slice),
+                    None => T::alt_class(&alt.kind).map(|class| VecView::Alt {
+                        class,
+                        heap: &self.heap,
+                        len: class.length(&self.heap),
+                    }),
+                }
+            }
             body => T::dense(body).map(VecView::Slice),
         };
         view.ok_or_else(|| obj.type_mismatch(T::TYPE.type_name(false)))
@@ -413,7 +462,7 @@ impl ValueApi for RSession {
             Body::Str(v) => v.len(),
             Body::Raw(v) => v.len(),
             Body::Vec(v) | Body::Expr(v) => v.len(),
-            Body::Alt(a) => a.len(&self.heap),
+            Body::Alt(a) => a.len(&self.heap, x)?,
             Body::List(_) | Body::Lang(_) | Body::Dots(_) => self.pairlist_iter(x).count(),
             Body::Env(e) => e.entries.len(),
             _ => 1,
@@ -443,11 +492,13 @@ impl ValueApi for RSession {
     fn str_slice(&self, x: SexpId) -> Result<&[CharId], ValueError> {
         let obj = self.heap.get(x)?;
         match &obj.body {
-            Body::Alt(alt) => alt
-                .materialized
-                .as_ref()
-                .and_then(CharId::materialized)
-                .ok_or_else(|| obj.type_mismatch("materialized character")),
+            Body::Alt(alt) => {
+                alt.require_payload(x)?;
+                alt.materialized
+                    .as_ref()
+                    .and_then(CharId::materialized)
+                    .ok_or_else(|| obj.type_mismatch("materialized character"))
+            }
             body => CharId::dense(body).ok_or_else(|| obj.type_mismatch("character")),
         }
     }
@@ -456,6 +507,13 @@ impl ValueApi for RSession {
         let obj = self.heap.get(x)?;
         match &obj.body {
             Body::Vec(v) | Body::Expr(v) => Ok(v.as_slice()),
+            Body::Alt(alt) => {
+                alt.require_payload(x)?;
+                match &alt.materialized {
+                    Some(AltMaterialized::List(v)) => Ok(v.as_slice()),
+                    _ => Err(obj.type_mismatch("list")),
+                }
+            }
             _ => Err(obj.type_mismatch("list")),
         }
     }
@@ -496,7 +554,11 @@ impl ValueApi for RSession {
     }
 
     fn alloc_str_from(&mut self, vals: &[CharId]) -> Result<SexpId, ValueError> {
-        self.alloc_atomic(vals)
+        let id = self.alloc_atomic(vals)?;
+        for val in vals {
+            self.heap.inc_ref(val.as_sexp());
+        }
+        Ok(id)
     }
 
     fn alloc_raw_from(&mut self, vals: &[u8]) -> Result<SexpId, ValueError> {
@@ -552,6 +614,7 @@ impl ValueApi for RSession {
         obj.flags = ObjFlags {
             object: false,
             s4: true,
+            ..ObjFlags::default()
         };
         Ok(self.heap.alloc(obj)?)
     }
@@ -565,11 +628,17 @@ impl ValueApi for RSession {
     }
 
     fn list_set(&mut self, x: SexpId, i: usize, v: SexpId) -> Result<(), ValueError> {
+        self.require_alt_payload(x)?;
+        self.heap.get(v)?;
         let old = {
             let obj = self.heap.get_mut(x)?;
             let mismatch = obj.type_mismatch("list");
             let slice = match &mut obj.body {
                 Body::Vec(vec) | Body::Expr(vec) => vec.as_mut_slice(),
+                Body::Alt(alt) => match &mut alt.materialized {
+                    Some(AltMaterialized::List(v)) => v.as_mut_slice(),
+                    _ => return Err(mismatch),
+                },
                 _ => {
                     return Err(mismatch);
                 }

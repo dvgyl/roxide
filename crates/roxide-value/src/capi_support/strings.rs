@@ -28,6 +28,7 @@ impl RSession {
 
     /// Read character element `i` from a dense or `AltString` `STRSXP` (`STRING_ELT`).
     pub fn str_get(&mut self, x: SexpId, i: usize) -> Result<CharId, ValueError> {
+        self.require_alt_payload(x)?;
         let alt_class = {
             let obj = self.heap.get(x)?;
             match &obj.body {
@@ -62,6 +63,7 @@ impl RSession {
     /// Write character element `i` in a dense or `AltString` `STRSXP` (`SET_STRING_ELT`),
     /// maintaining `CHARSXP` reference counts cleanly.
     pub fn str_set(&mut self, x: SexpId, i: usize, val: CharId) -> Result<(), ValueError> {
+        self.require_alt_payload(x)?;
         self.sexp_as_char(val.as_sexp())?;
         let alt_class = {
             let obj = self.heap.get(x)?;
@@ -109,6 +111,7 @@ impl RSession {
     /// Return a contiguous read-only `&[CharId]` slice for a `STRSXP` (`STRING_PTR_RO`),
     /// materializing `AltString` vectors on demand into a pinned buffer.
     pub fn str_dataptr_ro(&mut self, x: SexpId) -> Result<&[CharId], ValueError> {
+        self.require_alt_payload(x)?;
         let to_materialize = {
             let obj = self.heap.get(x)?;
             match &obj.body {
@@ -164,12 +167,17 @@ impl RSession {
             };
             let _ = self.heap.update_size(tmp);
             self.heap.unprotect_to(mark);
-            if let Body::Alt(alt) = &mut self.heap.get_mut(x)?.body
+            if let Body::Alt(alt) = &self.heap.get(x)?.body
                 && alt.materialized.is_none()
             {
-                alt.materialized = Some(AltMaterialized::Str(rvec));
+                for c in rvec.as_slice() {
+                    self.heap.inc_ref(c.as_sexp());
+                }
+                if let Body::Alt(alt) = &mut self.heap.get_mut(x)?.body {
+                    alt.materialized = Some(AltMaterialized::Str(rvec));
+                }
+                self.heap.update_size(x)?;
             }
-            self.heap.update_size(x)?;
         }
         let obj = self.heap.get(x)?;
         match &obj.body {

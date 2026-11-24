@@ -10,7 +10,7 @@ impl RSession {
     /// Return `(raw_address, element_len)` for read-only direct buffer access (`DATAPTR_RO`, ADR-0017).
     ///
     /// Works for materialized atomic/list/expression vectors and `CHARSXP` (pointing to NUL-terminated bytes).
-    /// Returns `Err(ValueError::TypeMismatch)` for unmaterialized ALTREP or non-vector types.
+    /// A lazy foreign ALTREP vector requires a payload before this call can return a pointer.
     pub fn data_ptr_ro(&self, x: SexpId) -> Result<(usize, usize), ValueError> {
         let obj = self.heap.get(x)?;
         match &obj.body {
@@ -29,7 +29,11 @@ impl RSession {
                 Some(AltMaterialized::Cplx(v)) => Ok((v.as_slice().as_ptr() as usize, v.len())),
                 Some(AltMaterialized::Raw(v)) => Ok((v.as_slice().as_ptr() as usize, v.len())),
                 Some(AltMaterialized::Str(v)) => Ok((v.as_slice().as_ptr() as usize, v.len())),
-                None => Err(obj.type_mismatch("materialized vector")),
+                Some(AltMaterialized::List(v)) => Ok((v.as_slice().as_ptr() as usize, v.len())),
+                None => {
+                    alt.require_payload(x)?;
+                    Err(obj.type_mismatch("materialized vector"))
+                }
             },
             _ => Err(obj.type_mismatch("vector")),
         }
@@ -38,14 +42,14 @@ impl RSession {
     /// Return `(raw_address, element_len)` for writable direct buffer access (`INTEGER`, `REAL`,
     /// `LOGICAL`, `COMPLEX`, `RAW`).
     ///
-    /// Strictly restricted to atomic numeric/logical/raw vectors (ADR-0017); `STRSXP`/`VECSXP`/
-    /// `EXPRSXP` must be read via [`RSession::data_ptr_ro`] and mutated via `str_set`/`list_set`
-    /// so GC refcounts and `CharId` invariants are never bypassed.
+    /// This also exposes owned foreign ALTREP buffers. Use `str_set` and `list_set` to
+    /// change character and list elements so the heap can update reference counts.
     pub fn data_ptr_rw(&mut self, x: SexpId) -> Result<(usize, usize), ValueError> {
         let obj = self.heap.get(x)?;
         if let Body::Alt(alt) = &obj.body
             && alt.materialized.is_none()
         {
+            alt.require_payload(x)?;
             match alt.base_type() {
                 SexpType::Lgl => {
                     let s = self.lgl_dataptr_ro(x)?;
@@ -92,6 +96,12 @@ impl RSession {
                     Ok((v.as_mut_slice().as_mut_ptr() as usize, v.len()))
                 }
                 Some(AltMaterialized::Raw(v)) => {
+                    Ok((v.as_mut_slice().as_mut_ptr() as usize, v.len()))
+                }
+                Some(AltMaterialized::Str(v)) if matches!(alt.kind, AltKind::Foreign(_)) => {
+                    Ok((v.as_mut_slice().as_mut_ptr() as usize, v.len()))
+                }
+                Some(AltMaterialized::List(v)) => {
                     Ok((v.as_mut_slice().as_mut_ptr() as usize, v.len()))
                 }
                 _ => Err(mismatch),
@@ -236,6 +246,7 @@ impl RSession {
                     if new_len > v.len {
                         v.buf[v.len..new_len].fill(CharId::BLANK);
                     } else if new_len < v.len {
+                        dropped_sexps.extend(v.buf[new_len..v.len].iter().map(|c| c.as_sexp()));
                         v.buf[new_len..v.len].fill(CharId::BLANK);
                     }
                     v.len = new_len;
@@ -272,6 +283,7 @@ impl RSession {
                 AltKind::Cplx(c) => c.is_sorted(&self.heap),
                 AltKind::Raw(c) => c.is_sorted(&self.heap),
                 AltKind::Str(c) => c.is_sorted(),
+                AltKind::Foreign(_) => Sortedness::Unknown,
             },
             _ => Sortedness::Unknown,
         })
@@ -288,6 +300,7 @@ impl RSession {
                 AltKind::Cplx(c) => c.no_na(&self.heap),
                 AltKind::Raw(c) => c.no_na(&self.heap),
                 AltKind::Str(c) => c.no_na(),
+                AltKind::Foreign(_) => false,
             },
             _ => false,
         })

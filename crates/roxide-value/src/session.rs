@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use roxide_gc::{GcPolicy, GcStats, Heap, RootSet, SexpId};
 
-use crate::alt::AltRegistry;
+use crate::alt::AltDrops;
 use crate::api::{ValueApi, ValueError};
 use crate::na::RLogical;
 use crate::object::{Body, CharId, Encoding, EnvData, RChar, RObject, RVec, Sym};
@@ -167,14 +167,14 @@ const PERMANENT_SYMBOLS: &[(Sym, &str)] = &[
     (SYM_DOT_TARGET, ".target"),
 ];
 
-/// Owns the Roxide GC heap, permanent symbol table, weak `CHARSXP` table, and ALTREP registry.
+/// Owns the Roxide GC heap, permanent symbol table, and weak `CHARSXP` table.
 pub struct RSession {
     /// Main GC arena.
     pub heap: RHeap,
     symbols: HashMap<Box<[u8]>, Sym>,
     chars: HashMap<(Box<[u8]>, Encoding), CharId>,
-    /// ALTREP class unserializer registry.
-    pub alt: AltRegistry,
+    pub(crate) foreign_alt_seen: bool,
+    pub(crate) alt_drops: AltDrops,
 }
 
 impl RSession {
@@ -246,7 +246,8 @@ impl RSession {
             heap,
             symbols,
             chars,
-            alt: AltRegistry::new(),
+            foreign_alt_seen: false,
+            alt_drops: AltDrops::default(),
         };
         session.env_define(NAMESPACE_REGISTRY, SYM_BASE, BASE_NAMESPACE)?;
         Ok(session)
@@ -273,6 +274,10 @@ impl RSession {
         let sym = Sym(id);
         self.symbols.insert(bytes.into(), sym);
         Ok(sym)
+    }
+
+    pub(crate) fn interned_symbol(&self, name: &str) -> Option<Sym> {
+        self.symbols.get(name.as_bytes()).copied()
     }
 
     /// Look up the print name of a [`Sym`].
@@ -469,6 +474,9 @@ impl RSession {
         marked.resolve_ephemerons();
         self.chars.retain(|_, cid| marked.is_marked(cid.as_sexp()));
         let outcome = marked.sweep_outcome();
+        for id in self.alt_drops.borrow_mut().drain(..) {
+            self.heap.dec_ref(id);
+        }
         for wr_id in outcome.cleared_weakrefs {
             if let Ok(obj) = self.heap.get_mut(wr_id)
                 && let Body::WeakRef(wr) = &mut obj.body
