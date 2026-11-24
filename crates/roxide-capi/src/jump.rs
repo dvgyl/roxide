@@ -159,17 +159,29 @@ fn resolve_altrep(ctx: &mut Ctx, id: SexpId, need: AltNeed) -> EvalResult<bool> 
 fn run<R: Copy>(mut f: impl FnMut(&mut Ctx) -> EvalResult<R>) -> Result<R, c_int> {
     catch_api_panic(move || {
         cx::with_full(move |ctx| {
-            let result = f(ctx);
-            let Err(Unwind::Value(ValueError::ForeignAltrep { id, need })) = result else {
-                return result;
-            };
-            let result = match resolve_altrep(ctx, id, need) {
-                Ok(true) => f(ctx),
-                Ok(false) => Err(ValueError::ForeignAltrep { id, need }.into()),
-                Err(err) => Err(err),
-            };
+            const MAX_ALTREP_RETRIES: usize = 8;
+            let mut result = f(ctx);
+            for _ in 0..MAX_ALTREP_RETRIES {
+                let Err(Unwind::Value(ValueError::ForeignAltrep { id, need })) = result else {
+                    break;
+                };
+                match resolve_altrep(ctx, id, need) {
+                    Ok(true) => result = f(ctx),
+                    Ok(false) => break,
+                    Err(err) => {
+                        result = Err(err);
+                        break;
+                    }
+                }
+            }
             match result {
-                Err(Unwind::Value(err)) => Err(ctx.stop(SEXP_NIL, err.to_string())),
+                Err(Unwind::Value(ValueError::ForeignAltrep { need, .. })) => {
+                    let message = match need {
+                        AltNeed::Length => "cannot determine the length of this ALTREP vector",
+                        AltNeed::Payload => "cannot access the elements of this ALTREP vector",
+                    };
+                    Err(ctx.stop(SEXP_NIL, message))
+                }
                 result => result,
             }
         })
@@ -180,8 +192,8 @@ fn run<R: Copy>(mut f: impl FnMut(&mut Ctx) -> EvalResult<R>) -> Result<R, c_int
 /// Run one C API operation. On error, release Rust borrows and jump to the
 /// current foreign trampoline.
 ///
-/// The operation can run twice if it requests a foreign ALTREP length or
-/// payload. Return that request before any effects that must occur only once.
+/// Retry the operation up to eight times while foreign ALTREP requests make progress.
+/// Return each request before any effects that must occur only once.
 ///
 /// # Safety
 ///

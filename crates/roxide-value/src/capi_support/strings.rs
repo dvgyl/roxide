@@ -105,7 +105,7 @@ impl RSession {
         };
         self.heap.inc_ref(val.as_sexp());
         self.heap.dec_ref(old.as_sexp());
-        Ok(())
+        self.mark_foreign_alt_dirty(x)
     }
 
     /// Return a contiguous read-only `&[CharId]` slice for a `STRSXP` (`STRING_PTR_RO`),

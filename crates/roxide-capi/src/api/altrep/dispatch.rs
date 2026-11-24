@@ -2,7 +2,7 @@ use std::ffi::c_int;
 
 use roxide_eval::{AltOp, AltReply, Ctx, EvalResult};
 use roxide_gc::SexpId;
-use roxide_value::{AltNeed, SEXP_NIL, SexpType, ValueApi};
+use roxide_value::{AltNeed, SEXP_NIL, SYM_NAMES, SexpType, ValueApi};
 
 use super::payload::{Access, materialize};
 use super::registry::{class, class_error, foreign, latest, lazy_methods};
@@ -10,7 +10,7 @@ use super::vector::{c_flags, optional_value, protect};
 use crate::abi::{Rboolean, Sexp};
 use crate::api::memory::{release_transient_frame, save_transient_frame};
 use crate::api::pairlist::cells;
-use crate::api::vector::{alloc_vector, checked_len};
+use crate::api::vector::checked_len;
 
 fn method_length(ctx: &mut Ctx, x: SexpId) -> EvalResult<usize> {
     let info = foreign(ctx, x)?;
@@ -67,6 +67,9 @@ fn dispatch_method(ctx: &mut Ctx, op: AltOp) -> EvalResult<AltReply> {
         AltOp::Unserialize { .. } => return unserialize(ctx, op).map(AltReply::Value),
         AltOp::SerializedState(x) => {
             let info = foreign(ctx, x)?;
+            if ctx.session().foreign_alt_is_dirty(x)? {
+                return Ok(AltReply::Value(None));
+            }
             let result = class(ctx, info.class)?
                 .methods
                 .serialized_state(ctx, Sexp::from_id(x))?;
@@ -131,26 +134,12 @@ fn unserialize(ctx: &mut Ctx, op: AltOp) -> EvalResult<Option<SexpId>> {
     else {
         return Ok(None);
     };
-    let mut registered = latest(ctx, class, package);
-    if registered.is_none() {
-        let pkg = ctx.session().sym_name(package)?.to_owned();
-        ctx.with_native_error_handler(
-            |ctx| ctx.load_namespace(&pkg, SEXP_NIL),
-            |_, _| Ok(SEXP_NIL),
-        )?;
-        registered = latest(ctx, class, package);
-    }
-    let Some(class_info) = registered else {
-        let s = ctx.session();
-        let name = s.sym_name(class)?;
-        let pkg = s.sym_name(package)?;
-        let message = format!(
-            "cannot unserialize ALTVEC object of class '{name}' from package '{pkg}'; returning length zero vector"
-        );
-        ctx.warning_at(SEXP_NIL, &message)?;
-        return alloc_vector(ctx, ty, 0).map(Some);
+    let Some(class_info) = latest(ctx, class, package, ty) else {
+        return Ok(None);
     };
     ctx.scoped(|ctx| {
+        protect(ctx, state)?;
+        protect(ctx, attrs)?;
         let kind = ctx.session_mut().scalar_int(ty as c_int)?;
         protect(ctx, kind)?;
         let type_cell = ctx.session_mut().cons(kind, SEXP_NIL, SEXP_NIL)?;
@@ -169,7 +158,9 @@ fn unserialize(ctx: &mut Ctx, op: AltOp) -> EvalResult<Option<SexpId>> {
         if let Some(result) =
             methods.unserialize_ex(ctx, info, state, Sexp::from_id(attrs), objf, levels)?
         {
-            return optional_value(ctx, Some(result));
+            let result = optional_value(ctx, Some(result))?
+                .ok_or_else(|| ctx.stop(SEXP_NIL, "ALTREP UnserializeEX returned NULL"))?;
+            return Ok(Some(result));
         }
         let result = methods.unserialize(ctx, info, state)?;
         let Some(result) = optional_value(ctx, result)? else {
@@ -177,10 +168,13 @@ fn unserialize(ctx: &mut Ctx, op: AltOp) -> EvalResult<Option<SexpId>> {
         };
         protect(ctx, result)?;
         let attributes = cells(ctx, attrs)?;
-        let attributes = attributes
+        let attributes: Vec<_> = attributes
             .into_iter()
             .map(|(_, value, tag)| Ok((ctx.session().sexp_as_sym(tag)?, value)))
             .collect::<EvalResult<_>>()?;
+        if attributes.iter().any(|&(key, _)| key == SYM_NAMES) {
+            ctx.altrep_len(result)?;
+        }
         let s = ctx.session_mut();
         s.replace_attributes(result, attributes)?;
         s.set_object_flag(result, objf != 0)?;

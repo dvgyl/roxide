@@ -294,7 +294,7 @@ unsafe extern "C" fn restore_access(data: *mut c_void) {
 }
 
 #[test]
-fn restore_latest_class_and_keep_state_after_dataptr() {
+fn restore_latest_class_and_skip_stale_state_after_dataptr() {
     let _fixture = FIXTURE.lock().unwrap();
     let ctx = &mut context();
     let backing = int(ctx, &[2, 3, 5]);
@@ -341,6 +341,8 @@ fn restore_latest_class_and_keep_state_after_dataptr() {
         ctx.session().int(result).unwrap().as_slice().unwrap(),
         &[17]
     );
+    assert!(!ctx.session().is_object(result).unwrap());
+    assert_eq!(ctx.session().gp(result).unwrap(), 0);
 
     for (op, expected) in [
         (
@@ -369,6 +371,10 @@ fn restore_latest_class_and_keep_state_after_dataptr() {
         unsafe { inspect(ctx, old.id(), 2, 3, 4, None) }.unwrap(),
         Some(1)
     );
+    assert_eq!(
+        outcome(ctx, AltOp::SerializedState(old.id())),
+        AltReply::Value(Some(backing))
+    );
     let depth = ctx.session().heap.protect_depth();
     let (_, stderr) = ctx
         .capture_streams(false, true, false, |ctx| {
@@ -383,7 +389,7 @@ fn restore_latest_class_and_keep_state_after_dataptr() {
     );
     assert_eq!(
         outcome(ctx, AltOp::SerializedState(old.id())),
-        AltReply::Value(Some(backing))
+        AltReply::Value(None)
     );
     assert_eq!(
         ctx.session().int(backing).unwrap().as_slice().unwrap(),
@@ -442,4 +448,314 @@ unsafe extern "C" fn no_dataptr(data: *mut c_void) {
         let x = (*data.cast::<Probe>()).output;
         fixture_alt_no_pointer(x);
     }
+}
+
+fn make_vector(ctx: &mut Ctx, backing: SexpId, mode: SexpId, f: jump::VoidFn) -> Probe {
+    let mut probe = Probe::new(backing, mode);
+    entry(ctx, f, &mut probe).unwrap();
+    ctx.protect(probe.id());
+    probe
+}
+
+type DataPtr = unsafe extern "C" fn(Sexp) -> *mut c_void;
+
+unsafe extern "C" fn request_writable(data: *mut c_void) {
+    // SAFETY: The record contains a protected vector and a C API function.
+    unsafe {
+        let (x, accessor) = *data.cast::<(Sexp, DataPtr)>();
+        accessor(x);
+    }
+}
+
+unsafe extern "C" fn expect_read_only_slots(data: *mut c_void) {
+    // SAFETY: The probe contains a protected single-element list or character vector.
+    unsafe {
+        let probe = &*data.cast::<Probe>();
+        let read_only = DATAPTR_RO(probe.output).cast::<Sexp>();
+        assert_eq!(read_only, ALTVEC_DATAPTR_RO(probe.output).cast());
+        let expected = if TYPEOF(probe.backing) as u32 == STRSXP {
+            STRING_ELT(probe.backing, 0)
+        } else {
+            VECTOR_ELT(probe.backing, 0)
+        };
+        assert_eq!(read_only.read(), expected);
+    }
+}
+
+unsafe extern "C" fn slot_pointer(x: Sexp, _: Rboolean) -> *mut c_void {
+    use roxide_capi::api::memory::R_alloc;
+    // SAFETY: The backing vector has one slot. The byte buffer also has room for an offset.
+    unsafe {
+        let backing = R_altrep_data1(x);
+        let item = if TYPEOF(backing) as u32 == STRSXP {
+            STRING_ELT(backing, 0)
+        } else {
+            VECTOR_ELT(backing, 0)
+        };
+        let slot = R_alloc(size_of::<Sexp>() + 1, 1).add(1);
+        slot.cast::<Sexp>().write_unaligned(item);
+        slot.cast()
+    }
+}
+
+unsafe extern "C" fn install_slot_pointer(data: *mut c_void) {
+    // SAFETY: The record holds the protected fixture vector and its registered class.
+    unsafe {
+        let x = (*data.cast::<Probe>()).output;
+        R_set_altvec_Dataptr_method(
+            R_altrep_class_t {
+                ptr: ALTREP_CLASS(x),
+            },
+            Some(slot_pointer),
+        );
+    }
+}
+
+#[test]
+fn character_and_list_altreps_reject_writable_pointers() {
+    let _fixture = FIXTURE.lock().unwrap();
+    let ctx = &mut context();
+    let strings = ctx.session_mut().scalar_str("value").unwrap();
+    ctx.protect(strings);
+    let list = ctx.session_mut().alloc_list(1).unwrap();
+    ctx.protect(list);
+    ctx.session_mut().list_set(list, 0, strings).unwrap();
+
+    for backing in [strings, list] {
+        let mut probe = make_vector(ctx, backing, SEXP_NIL, make);
+        entry(ctx, install_slot_pointer, &mut probe).unwrap();
+        for owned in [false, true] {
+            if owned {
+                entry(ctx, expect_read_only_slots, &mut probe).unwrap();
+            }
+            for accessor in [DATAPTR as DataPtr, DATAPTR_RW, ALTVEC_DATAPTR] {
+                let (result, stderr) = ctx
+                    .capture_streams(false, true, false, |ctx| {
+                        Ok(entry(ctx, request_writable, &mut (probe.output, accessor)))
+                    })
+                    .unwrap();
+                assert!(result.is_err());
+                assert_eq!(
+                    String::from_utf8(stderr).unwrap(),
+                    "Error: writable data requires a numeric, logical or raw vector\n"
+                );
+                assert_eq!(
+                    ctx.session()
+                        .foreign_alt(probe.id())
+                        .unwrap()
+                        .unwrap()
+                        .owned,
+                    owned
+                );
+            }
+        }
+    }
+}
+
+unsafe extern "C" fn copy_vectors(data: *mut c_void) {
+    // SAFETY: Both handles refer to protected foreign integer vectors.
+    unsafe {
+        let [target, source] = *data.cast::<[Sexp; 2]>();
+        Rf_copyVector(target, source);
+    }
+}
+
+#[test]
+fn copy_vector_resolves_two_lazy_operands() {
+    let _fixture = FIXTURE.lock().unwrap();
+    let ctx = &mut context();
+    let target = int(ctx, &[0; 4]);
+    let source = int(ctx, &[2, 3]);
+    let target = make_vector(ctx, target, SEXP_NIL, make);
+    let source = make_vector(ctx, source, SEXP_NIL, make);
+    entry(ctx, copy_vectors, &mut [target.output, source.output]).unwrap();
+    assert_eq!(
+        ctx.session().int(target.id()).unwrap().as_slice(),
+        Some([2, 3, 2, 3].as_slice())
+    );
+    assert_eq!(
+        ctx.session().int(source.id()).unwrap().as_slice(),
+        Some([2, 3].as_slice())
+    );
+}
+
+unsafe extern "C" fn set_integer(data: *mut c_void) {
+    // SAFETY: The record holds a protected, nonempty integer vector.
+    unsafe { SET_INTEGER_ELT(*data.cast::<Sexp>(), 0, 999) };
+}
+
+unsafe extern "C" fn write_integer_pointer(data: *mut c_void) {
+    // SAFETY: The record holds a protected, nonempty integer vector.
+    unsafe { INTEGER(*data.cast::<Sexp>()).write(999) };
+}
+
+#[test]
+fn write_access_requires_dataptr_and_invalidates_serialized_state() {
+    let _fixture = FIXTURE.lock().unwrap();
+    let ctx = &mut context();
+    let backing = int(ctx, &[2, 3, 5]);
+    let mode = int(ctx, &[3]);
+    let mut no_pointer = make_vector(ctx, backing, mode, make);
+    let (result, stderr) = ctx
+        .capture_streams(false, true, false, |ctx| {
+            Ok(entry(ctx, set_integer, &mut no_pointer.output))
+        })
+        .unwrap();
+    assert!(result.is_err());
+    assert!(
+        String::from_utf8(stderr)
+            .unwrap()
+            .contains("cannot access data pointer for this ALTVEC object")
+    );
+    assert!(
+        !ctx.session()
+            .foreign_alt(no_pointer.id())
+            .unwrap()
+            .unwrap()
+            .owned
+    );
+
+    for write in [write_integer_pointer as jump::VoidFn, set_integer] {
+        let mut probe = make_vector(ctx, backing, SEXP_NIL, restore_old);
+        assert_eq!(
+            outcome(ctx, AltOp::SerializedState(probe.id())),
+            AltReply::Value(Some(backing))
+        );
+        entry(ctx, write, &mut probe.output).unwrap();
+        assert_eq!(
+            outcome(ctx, AltOp::SerializedState(probe.id())),
+            AltReply::Value(None)
+        );
+        assert_eq!(
+            ctx.session().int(probe.id()).unwrap().as_slice(),
+            Some([999, 3, 5].as_slice())
+        );
+    }
+}
+
+unsafe extern "C" fn backing_pointer(x: Sexp, _: Rboolean) -> *mut c_void {
+    // SAFETY: The backing value is a protected dense integer vector.
+    unsafe { INTEGER(R_altrep_data1(x)).cast() }
+}
+
+unsafe extern "C" fn nested_region(x: Sexp, _: R_xlen_t, _: R_xlen_t, out: *mut c_int) -> R_xlen_t {
+    // SAFETY: The callback receives a nonempty writable region. Nested materialization
+    // uses the new Dataptr method and keeps the backing vector and both buffers live.
+    unsafe {
+        let cls = R_altrep_class_t {
+            ptr: ALTREP_CLASS(x),
+        };
+        R_set_altvec_Dataptr_method(cls, Some(backing_pointer));
+        INTEGER(x).write(999);
+        Rf_allocVector(INTSXP, 1);
+        out.write(42);
+        1
+    }
+}
+
+unsafe extern "C" fn install_nested_region(data: *mut c_void) {
+    // SAFETY: The probe contains an integer ALTREP vector with a registered class.
+    unsafe {
+        let x = *data.cast::<Sexp>();
+        let cls = R_altrep_class_t {
+            ptr: ALTREP_CLASS(x),
+        };
+        R_set_altinteger_Get_region_method(cls, Some(nested_region));
+    }
+}
+
+#[test]
+fn nested_materialization_keeps_the_first_buffer_under_gc_torture() {
+    let _fixture = FIXTURE.lock().unwrap();
+    let ctx = &mut context();
+    let backing = int(ctx, &[2, 3, 5]);
+    let mut probe = make_vector(ctx, backing, SEXP_NIL, make_atomic);
+    entry(ctx, install_nested_region, &mut probe.output).unwrap();
+    assert_eq!(outcome(ctx, AltOp::Materialize(probe.id())), AltReply::Unit);
+    assert_eq!(
+        ctx.session().int(probe.id()).unwrap().as_slice(),
+        Some([999, 3, 5].as_slice())
+    );
+}
+
+unsafe extern "C" fn duplicate_and_change_name(data: *mut c_void) {
+    // SAFETY: The protected input and its duplicate have a single name.
+    unsafe {
+        let input = *data.cast::<Sexp>();
+        let duplicate = jump::Rf_protect(Rf_duplicate(input));
+        let names = Rf_install(c"names".as_ptr());
+        let new_name = Rf_mkChar(c"changed".as_ptr());
+        SET_STRING_ELT(Rf_getAttrib(duplicate, names), 0, new_name);
+        assert_eq!(STRING_ELT(Rf_getAttrib(duplicate, names), 0), new_name);
+        jump::Rf_unprotect(1);
+    }
+}
+
+#[test]
+fn duplicate_fallback_deep_copies_names() {
+    let _fixture = FIXTURE.lock().unwrap();
+    let ctx = &mut context();
+    let backing = int(ctx, &[2]);
+    let mut probe = make_vector(ctx, backing, SEXP_NIL, make);
+    let names = ctx.session_mut().scalar_str("original").unwrap();
+    ctx.protect(names);
+    ctx.altrep_len(probe.id()).unwrap();
+    ctx.session_mut()
+        .set_attrib(probe.id(), roxide_value::SYM_NAMES, names)
+        .unwrap();
+    entry(ctx, duplicate_and_change_name, &mut probe.output).unwrap();
+    let names = ctx.session().attr(probe.id(), roxide_value::SYM_NAMES);
+    let first = ctx.session_mut().str_get(names, 0).unwrap();
+    assert_eq!(ctx.session().char_bytes(first).unwrap(), b"original");
+}
+
+#[test]
+fn unserialize_dispatch_attaches_plain_attributes_and_leaves_unknown_classes_to_the_reader() {
+    let _fixture = FIXTURE.lock().unwrap();
+    let ctx = &mut context();
+    let state = int(ctx, &[2, 3, 5]);
+    let probe = make_vector(ctx, state, SEXP_NIL, restore_old);
+    let (class, package) = ctx.session().alt_class_names(probe.id()).unwrap().unwrap();
+    let names = ctx.session_mut().scalar_str("one").unwrap();
+    ctx.protect(names);
+    let first = ctx.session_mut().str_get(names, 0).unwrap();
+    let names = ctx.session_mut().alloc_str_from(&[first; 3]).unwrap();
+    ctx.protect(names);
+    let attrs = ctx
+        .session_mut()
+        .cons(names, SEXP_NIL, roxide_value::SYM_NAMES.as_sexp())
+        .unwrap();
+    ctx.protect(attrs);
+    let restore = |class, ty| AltOp::Unserialize {
+        class,
+        package,
+        ty,
+        state,
+        attrs,
+        objf: 1,
+        levels: 17,
+    };
+
+    let AltReply::Value(Some(restored)) = outcome(ctx, restore(class, SexpType::Int)) else {
+        panic!("Expected a restored integer vector.");
+    };
+    assert_eq!(ctx.session().attr(restored, roxide_value::SYM_NAMES), names);
+    assert!(ctx.session().is_object(restored).unwrap());
+    assert_eq!(ctx.session().gp(restored).unwrap(), 17);
+
+    let unknown = ctx.session_mut().intern("unknown_fixture_class").unwrap();
+    let ((), stderr) = ctx
+        .capture_streams(false, true, false, |ctx| {
+            assert_eq!(
+                outcome(ctx, restore(unknown, SexpType::Int)),
+                AltReply::Value(None)
+            );
+            assert_eq!(
+                outcome(ctx, restore(class, SexpType::Real)),
+                AltReply::Value(None)
+            );
+            Ok(())
+        })
+        .unwrap();
+    assert!(stderr.is_empty());
 }

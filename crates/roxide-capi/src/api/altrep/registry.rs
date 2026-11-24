@@ -103,7 +103,7 @@ pub(super) fn methods_mut(ctx: &mut Ctx, index: usize) -> &mut Methods {
     &mut ctx.ext::<AltrepRegistry>().classes[index].methods
 }
 
-pub(super) fn latest(ctx: &mut Ctx, name: Sym, package: Sym) -> Option<Class> {
+pub(super) fn latest(ctx: &mut Ctx, name: Sym, package: Sym, ty: SexpType) -> Option<Class> {
     let registry = ctx.ext::<AltrepRegistry>();
     let indices = registry.registered.get(&(name, package))?;
     let candidates: Vec<_> = indices
@@ -113,7 +113,7 @@ pub(super) fn latest(ctx: &mut Ctx, name: Sym, package: Sym) -> Option<Class> {
         .collect();
     candidates
         .into_iter()
-        .find(|class| active(ctx, class.owner))
+        .find(|class| class.ty == ty && active(ctx, class.owner))
 }
 
 pub(super) fn foreign(ctx: &mut Ctx, x: SexpId) -> EvalResult<ForeignAltInfo> {

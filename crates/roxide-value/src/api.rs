@@ -653,7 +653,7 @@ impl ValueApi for RSession {
         };
         self.heap.inc_ref(v);
         self.heap.dec_ref(old);
-        Ok(())
+        self.mark_foreign_alt_dirty(x)
     }
 
     fn cons(&mut self, car: SexpId, cdr: SexpId, tag: SexpId) -> Result<SexpId, ValueError> {

@@ -3,7 +3,7 @@ use std::ptr;
 
 use roxide_eval::{Ctx, EvalResult};
 use roxide_gc::SexpId;
-use roxide_value::{SEXP_NIL, SexpType, ValueApi};
+use roxide_value::{SEXP_NIL, SYM_NAMES, SexpType, ValueApi};
 
 use super::payload::{Access, materialize};
 use super::registry::{class_error, lazy_methods};
@@ -29,8 +29,14 @@ pub(super) fn optional_value(ctx: &mut Ctx, x: Option<Sexp>) -> EvalResult<Optio
 }
 
 pub(crate) fn c_dataptr(ctx: &mut Ctx, x: SexpId, writable: Rboolean) -> EvalResult<Option<usize>> {
-    if ctx.session().foreign_alt(x)?.is_none() {
+    let Some(info) = ctx.session().foreign_alt(x)? else {
         return Ok(None);
+    };
+    if writable != 0 && matches!(info.ty, SexpType::Str | SexpType::Vec) {
+        return Err(ctx.stop(
+            SEXP_NIL,
+            "writable data requires a numeric, logical or raw vector",
+        ));
     }
     let access = if writable != 0 {
         Access::Write
@@ -40,7 +46,9 @@ pub(crate) fn c_dataptr(ctx: &mut Ctx, x: SexpId, writable: Rboolean) -> EvalRes
     materialize(ctx, x, access)?;
     let s = ctx.session_mut();
     let (addr, _) = if writable != 0 {
-        s.data_ptr_rw(x)?
+        let data = s.data_ptr_rw(x)?;
+        s.mark_foreign_alt_dirty(x)?;
+        data
     } else {
         s.data_ptr_ro(x)?
     };
@@ -238,14 +246,32 @@ pub(crate) fn c_duplicate(ctx: &mut Ctx, x: SexpId, deep: bool) -> EvalResult<Op
         return Ok(None);
     };
     let obj = Sexp::from_id(x);
-    let deep = Rboolean::from(deep);
-    let result = methods.duplicate_ex(ctx, obj, deep)?;
+    let flag = Rboolean::from(deep);
+    let result = methods.duplicate_ex(ctx, obj, flag)?;
     if result.is_none() {
-        let result = methods.duplicate(ctx, obj, deep)?;
+        let result = methods.duplicate(ctx, obj, flag)?;
         if let Some(duplicate) = optional_value(ctx, result)? {
             return ctx.scoped(|ctx| {
                 protect(ctx, duplicate)?;
-                crate::api::attrib::copy_attrs(ctx, x, duplicate, false)?;
+                if duplicate == SEXP_NIL || duplicate == x {
+                    return Ok(Some(duplicate));
+                }
+                if ctx.session().attr(x, SYM_NAMES) != SEXP_NIL {
+                    ctx.altrep_len(duplicate)?;
+                }
+                if !deep {
+                    crate::api::attrib::copy_attrs(ctx, x, duplicate, false)?;
+                    return Ok(Some(duplicate));
+                }
+                let mut attrs = ctx.session().attrs(x)?;
+                for (_, value) in &mut attrs {
+                    *value = ctx.session_mut().deep_duplicate(*value)?;
+                    protect(ctx, *value)?;
+                }
+                let s = ctx.session_mut();
+                s.replace_attributes(duplicate, attrs)?;
+                s.set_object_flag(duplicate, s.is_object(x)?)?;
+                s.set_s4_flag(duplicate, s.is_s4(x)?)?;
                 Ok(Some(duplicate))
             });
         }

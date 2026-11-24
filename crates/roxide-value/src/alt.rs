@@ -228,6 +228,7 @@ pub(crate) struct ForeignAlt {
     pub(crate) data1: SexpId,
     pub(crate) data2: SexpId,
     pub(crate) len: Option<usize>,
+    pub(crate) dirty: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -807,6 +808,7 @@ impl RSession {
                 data1,
                 data2,
                 len: None,
+                dirty: false,
             }),
             None,
         )?;
@@ -829,6 +831,25 @@ impl RSession {
             }));
         }
         Ok(None)
+    }
+
+    /// Return whether native code can have changed the owned foreign ALTREP elements.
+    pub fn foreign_alt_is_dirty(&self, x: SexpId) -> Result<bool, ValueError> {
+        Ok(matches!(
+            &self.heap.get(x)?.body,
+            Body::Alt(alt) if matches!(&alt.kind, AltKind::Foreign(foreign) if foreign.dirty)
+        ))
+    }
+
+    /// Record a write to owned foreign ALTREP elements or the issue of a writable pointer.
+    pub fn mark_foreign_alt_dirty(&mut self, x: SexpId) -> Result<(), ValueError> {
+        if let Body::Alt(alt) = &mut self.heap.get_mut(x)?.body
+            && alt.materialized.is_some()
+            && let AltKind::Foreign(foreign) = &mut alt.kind
+        {
+            foreign.dirty = true;
+        }
+        Ok(())
     }
 
     /// Replace a data slot and update the reference counts.

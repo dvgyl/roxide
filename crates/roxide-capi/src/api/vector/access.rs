@@ -292,6 +292,11 @@ api! {
         read_ptr(ctx, x, ty)
     }
     /// Return writable data for a vector with writable element storage.
+    fn DATAPTR(x: Sexp) -> *mut c_void = null_mut(); |ctx| {
+        let x = id(ctx, x, "DATAPTR")?;
+        Ok(write_ptr(ctx, x)? as *mut c_void)
+    }
+    /// Return writable data for a vector with writable element storage.
     fn DATAPTR_RW(x: Sexp) -> *mut c_void = null_mut(); |ctx| {
         let x = id(ctx, x, "DATAPTR_RW")?;
         Ok(write_ptr(ctx, x)? as *mut c_void)

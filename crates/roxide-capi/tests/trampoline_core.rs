@@ -16,7 +16,7 @@ use roxide_eval::{
 };
 use roxide_gc::{GcPolicy, SexpId};
 use roxide_host::PureHost;
-use roxide_value::{AltNeed, GLOBAL_ENV, SEXP_NIL, SexpType, ValueApi, ValueError};
+use roxide_value::{AltNeed, GLOBAL_ENV, SEXP_NIL, SexpType, ValueApi};
 
 #[link(name = "roxide_capi_fixture", kind = "static")]
 unsafe extern "C" {
@@ -231,11 +231,6 @@ fn boundary_signals_an_error_when_the_payload_stays_lazy() {
         ] {
             set_altrep_resolver(ctx, resolver);
             let mut probe = alloc_altrep_probe(ctx, AltNeed::Payload);
-            let expected = ValueError::ForeignAltrep {
-                id: probe.id,
-                need: probe.need,
-            }
-            .to_string();
             let msg = ctx
                 .with_native_error_handler(
                     |ctx| {
@@ -249,7 +244,10 @@ fn boundary_signals_an_error_when_the_payload_stays_lazy() {
                 )
                 .unwrap();
             assert_eq!(probe.attempts, 1);
-            assert_eq!(message(ctx, msg), expected);
+            assert_eq!(
+                message(ctx, msg),
+                "cannot access the elements of this ALTREP vector"
+            );
         }
     });
 }
@@ -268,27 +266,24 @@ unsafe extern "C" fn probe_altrep_length_then_payload(data: *mut c_void) {
 }
 
 #[test]
-fn boundary_signals_an_error_on_a_second_altrep_request() {
+fn boundary_resolves_length_and_payload_in_one_operation() {
     each_policy(|ctx| {
         set_altrep_resolver(ctx, Some(resolve_altrep_probe));
         let mut probe = alloc_altrep_probe(ctx, AltNeed::Length);
-        let stderr = capture(ctx, |ctx| {
-            // SAFETY: The probe stays live during the call.
-            let result = unsafe {
-                enter_trampoline(
-                    ctx,
-                    probe_altrep_length_then_payload,
-                    from_mut(&mut probe).cast(),
-                )
-            };
-            assert!(result.is_err());
-        });
-        assert_eq!(probe.attempts, 2);
-        let expected = ValueError::ForeignAltrep {
-            id: probe.id,
-            need: AltNeed::Payload,
-        };
-        assert_eq!(stderr, format!("Error: {expected}\n"));
+        // SAFETY: The probe stays live during the call.
+        unsafe {
+            enter_trampoline(
+                ctx,
+                probe_altrep_length_then_payload,
+                from_mut(&mut probe).cast(),
+            )
+        }
+        .unwrap();
+        assert_eq!(probe.attempts, 3);
+        assert_eq!(
+            ctx.session().int(probe.id).unwrap().as_slice(),
+            Some([10, 11, 12].as_slice())
+        );
     });
 }
 

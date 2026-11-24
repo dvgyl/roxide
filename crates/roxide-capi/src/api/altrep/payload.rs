@@ -34,6 +34,9 @@ pub(in crate::api) fn materialize(ctx: &mut Ctx, x: SexpId, access: Access) -> E
     ctx.scoped(|ctx| {
         protect(ctx, x)?;
         let len = super::dispatch::ensure_length(ctx, x)?;
+        if foreign(ctx, x)?.owned {
+            return Ok(());
+        }
         let width = element_width(info.ty);
         check_capacity(ctx, len, width)?;
         let dense = alloc_vector(ctx, info.ty, len)?;
@@ -63,6 +66,9 @@ pub(in crate::api) fn materialize(ctx: &mut Ctx, x: SexpId, access: Access) -> E
             for i in 0..len {
                 let item = object_elt(ctx, x, info.ty, i)?
                     .ok_or_else(|| ctx.stop(SEXP_NIL, "ALTREP class has no Elt method"))?;
+                if foreign(ctx, x)?.owned {
+                    break;
+                }
                 set_slot(ctx, dense, info.ty, i, item)?;
             }
         } else if len != 0 {
@@ -76,7 +82,9 @@ pub(in crate::api) fn materialize(ctx: &mut Ctx, x: SexpId, access: Access) -> E
                 out as *mut c_void,
             )?;
         }
-        ctx.session_mut().adopt_foreign_alt_payload(x, dense)?;
+        if !ctx.session_mut().adopt_foreign_alt_payload(x, dense)? {
+            ctx.session().data_ptr_ro(x)?;
+        }
         Ok(())
     })
 }
@@ -90,7 +98,7 @@ fn copy_slots(
 ) -> EvalResult<()> {
     for i in 0..len {
         // SAFETY: Dataptr supplies len readable SEXP handles for this vector type.
-        let item = unsafe { data.cast::<Sexp>().add(i).read() };
+        let item = unsafe { data.cast::<Sexp>().add(i).read_unaligned() };
         let item = value(ctx, item)?;
         set_slot(ctx, dense, ty, i, item)?;
     }
@@ -115,7 +123,7 @@ fn fill_atomic(
     len: R_xlen_t,
     out: *mut c_void,
 ) -> EvalResult<()> {
-    let x = Sexp::from_id(x);
+    let object = Sexp::from_id(x);
     macro_rules! fill {
         ($region:ident, $fill:ident, $elt:ident, $ty:ty) => {{
             let out = out.cast::<$ty>();
@@ -123,12 +131,19 @@ fn fill_atomic(
             while start < len {
                 // SAFETY: The private dense buffer has len elements and start is in bounds.
                 let target = unsafe { out.add(start as usize) };
-                match methods.$region(ctx, x, start, len - start, target)? {
+                let got = methods.$region(ctx, object, start, len - start, target)?;
+                if got.is_some() && foreign(ctx, x)?.owned {
+                    break;
+                }
+                match got {
                     Some(n) if checked_region(ctx, n, len - start)? != 0 => start += n,
-                    _ if start == 0 && methods.$fill(ctx, x, len, out)? => break,
+                    _ if start == 0 && methods.$fill(ctx, object, len, out)? => break,
                     _ => {
-                        let item = methods.$elt(ctx, x, start)?
+                        let item = methods.$elt(ctx, object, start)?
                             .ok_or_else(|| ctx.stop(SEXP_NIL, "ALTREP class cannot supply its elements"))?;
+                        if foreign(ctx, x)?.owned {
+                            break;
+                        }
                         // SAFETY: target points to one writable element in the private dense buffer.
                         unsafe { target.write(item) };
                         start += 1;
