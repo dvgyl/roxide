@@ -63,6 +63,41 @@ Sys.info <- function() .Internal(C_rx_sys_info())
 R.version <- list(platform = .Internal(C_rx_platform_id()), arch = Sys.info()[["machine"]],
                   os = Sys.info()[["sysname"]], major = "4", minor = "6.2",
                   version.string = "R version 4.6.2 (2026-10-29)")
+.userHooksEnv <- new.env(parent = emptyenv())
+packageEvent <- function(pkgname, event = c("onLoad", "attach", "detach", "onUnload")) {
+    event <- match.arg(event)
+    paste0("UserHook::", pkgname, "::", event)
+}
+getHook <- function(hookName) {
+    if (exists(hookName, envir = .userHooksEnv, inherits = FALSE)) {
+        get(hookName, envir = .userHooksEnv, inherits = FALSE)
+    } else {
+        list()
+    }
+}
+setHook <- function(hookName, value, action = c("append", "prepend", "replace")) {
+    action <- match.arg(action)
+    if (is.null(value)) {
+        if (exists(hookName, envir = .userHooksEnv, inherits = FALSE)) {
+            rm(list = hookName, envir = .userHooksEnv)
+        }
+        return(invisible(NULL))
+    }
+    new <- if (is.list(value)) value else list(value)
+    old <- if (identical(action, "replace")) list() else getHook(hookName)
+    combined <- if (identical(action, "prepend")) c(new, old) else c(old, new)
+    assign(hookName, combined, envir = .userHooksEnv)
+    invisible(NULL)
+}
+.rx_run_user_hooks <- function(pkgname, event, libpath = "") {
+    hooks <- getHook(packageEvent(pkgname, event))
+    for (hook in hooks) {
+        if (is.function(hook)) {
+            hook(pkgname, libpath)
+        }
+    }
+    invisible(NULL)
+}
 R.version.string <- R.version$version.string
 packageStartupMessage <- function(..., domain = NULL, appendLF = TRUE)
     message(..., domain = domain, appendLF = appendLF)

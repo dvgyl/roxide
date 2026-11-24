@@ -203,6 +203,11 @@ fn install_source(
     host: &mut dyn FnMut() -> Box<dyn Host>,
     boot: Boot<'_>,
 ) -> EvalResult<()> {
+    let source = ctx
+        .host()
+        .canonicalize(source)
+        .unwrap_or_else(|_| source.to_path_buf());
+    let source = source.as_path();
     let text = read_text(ctx, &source.join("DESCRIPTION"))?;
     let description =
         Description::parse(&text, is_windows(ctx)).map_err(|error| ctx.stop(SEXP_NIL, error))?;
@@ -235,15 +240,7 @@ fn install_source(
         create_dir(ctx, &path.join("Meta"), false)?;
         let mut stage_paths = vec![stage.clone()];
         stage_paths.extend_from_slice(paths);
-        build(
-            ctx,
-            source,
-            &path,
-            &text,
-            &description,
-            &stage_paths,
-            options,
-        )?;
+        build(ctx, source, &path, &text, &description, paths, options)?;
         if !options.no_test && !options.no_staged_install && !options.no_lock {
             test_load(ctx, package, &stage_paths, host, boot)?;
         }
@@ -337,7 +334,13 @@ fn build(
         let sysdata = ctx.session_mut().alloc_env(EMPTY_ENV)?;
         ctx.protect(sysdata);
         crate::data::load_source_sysdata(ctx, source, sysdata)?;
-        let ns = build_namespace(ctx, source, description, paths, sysdata)?;
+        let prev_cwd = ctx.host().cwd().ok();
+        let _ = ctx.host().set_cwd(source);
+        let ns_res = build_namespace(ctx, source, description, paths, sysdata);
+        if let Some(dir) = prev_cwd {
+            let _ = ctx.host().set_cwd(&dir);
+        }
+        let ns = ns_res?;
         if !ctx.session().env_entries(sysdata)?.is_empty() {
             write_lazyload_db(ctx, &dest.join("R/sysdata"), sysdata)?;
         }

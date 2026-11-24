@@ -717,3 +717,13 @@ summary.matrix <- function(object, ..., digits = max(3L, getOption("digits") - 3
     dimnames(out) <- list(rep("", rows), format(labels, justify = "centre", width = max(nchar(out))))
     structure(out, class = "table")
 }
+
+as.list.environment <- function(x, all.names = FALSE, sorted = FALSE, ...) {
+    nms <- ls(envir = x, all.names = all.names, sorted = sorted)
+    res <- vector("list", length(nms))
+    names(res) <- nms
+    for (nm in nms) {
+        res[nm] <- list(get(nm, envir = x, inherits = FALSE))
+    }
+    res
+}

@@ -24,7 +24,7 @@ pub(crate) fn coerce(
     x: SexpId,
     to: SexpType,
 ) -> Result<(SexpId, CoerceWarn), ValueError> {
-    use SexpType::{Cplx, Int, Lgl, Nil, Raw, Real, Str, Vec};
+    use SexpType::{Cplx, Int, Lang, Lgl, List, Nil, Raw, Real, Str, Sym, Vec};
 
     let from = session.type_of(x)?;
     let mut warn = CoerceWarn::default();
@@ -35,6 +35,32 @@ pub(crate) fn coerce(
         expected: to.type_name(false),
         actual: from.type_name(false),
     };
+    if from == Sym && to == Str {
+        let name = session.sym_name_of(x)?.to_owned();
+        let id = store_string(session, &name)?;
+        return Ok((session.alloc_str_from(&[id])?, warn));
+    }
+    if matches!(from, List | Lang) && to == Str {
+        let items: std::vec::Vec<SexpId> = session.pairlist_iter(x).map(|(_, v)| v).collect();
+        let mut out = std::vec::Vec::with_capacity(items.len());
+        for item in items {
+            let ty = session.type_of(item)?;
+            let value = if ty == Str && session.xlength(item)? == 1 {
+                session.str_slice(item)?[0]
+            } else {
+                let opts = DeparseOpts {
+                    keep_integer: false,
+                    keep_na: false,
+                    width_cutoff: usize::MAX,
+                    ..DeparseOpts::default()
+                };
+                let text = deparse(session, item, opts)?.join(" ");
+                store_string(session, &text)?
+            };
+            out.push(value);
+        }
+        return Ok((session.alloc_str_from(&out)?, warn));
+    }
     if !matches!(from, Nil | Raw | Lgl | Int | Real | Cplx | Str | Vec)
         || !matches!(to, Raw | Lgl | Int | Real | Cplx | Str | Vec)
     {

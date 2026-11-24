@@ -208,6 +208,12 @@ impl<T: Trace + HeapSize> Heap<T> {
         self.max_bytes = max_bytes;
     }
 
+    /// Return the active GC policy.
+    #[must_use]
+    pub fn policy(&self) -> GcPolicy {
+        self.policy
+    }
+
     /// Update the active GC policy.
     pub fn set_policy(&mut self, policy: GcPolicy) {
         self.policy = policy;

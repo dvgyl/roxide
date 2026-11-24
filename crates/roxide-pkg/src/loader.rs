@@ -98,13 +98,7 @@ fn load_new(
     let path = valid_package(name)
         .then(|| find(ctx, name, paths))
         .flatten()
-        .ok_or_else(|| {
-            ctx.stop_with_class(
-                call,
-                format!("there is no package called ‘{name}’"),
-                &["packageNotFoundError"],
-            )
-        })?;
+        .ok_or_else(|| ctx.stop_package_not_found(call, name, SEXP_NIL))?;
     let description = Description::read(ctx, &path)?;
     if description.package != name {
         return Err(ctx.stop(call, format!("package ‘{name}’ has an invalid DESCRIPTION")));
@@ -190,6 +184,12 @@ fn load_new(
                 name,
             ],
         )?;
+        let pkg_s = ctx.session_mut().scalar_str(name)?;
+        let ev_s = ctx.session_mut().scalar_str("onLoad")?;
+        let lib_s = ctx
+            .session_mut()
+            .scalar_str(&path.parent().unwrap_or(&path).to_string_lossy())?;
+        base_call(ctx, ".rx_run_user_hooks", &[pkg_s, ev_s, lib_s])?;
         imports::export(ctx, ns, imports, &spec)?;
         ctx.session_mut().env_lock_all_bindings(ns)?;
         ctx.session_mut().env_set_locked(ns, true)?;
@@ -224,7 +224,6 @@ pub(crate) fn build_namespace(
         crate::library::check_dependency(ctx, dependency, crate::library::R_VERSION)?;
     }
     crate::data::copy_bindings(ctx, sysdata, ns)?;
-    source_files(ctx, path, &description.collate, ns)?;
     ctx.ns_register(NsRecord {
         name: name.clone(),
         ns,
@@ -233,6 +232,10 @@ pub(crate) fn build_namespace(
         path: Some(path.to_path_buf()),
         builtin: false,
     })?;
+    if let Err(err) = source_files(ctx, path, &description.collate, ns) {
+        ctx.ns_unregister(name);
+        return Err(err);
+    }
     Ok(ns)
 }
 

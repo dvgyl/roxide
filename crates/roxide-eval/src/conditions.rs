@@ -264,6 +264,44 @@ impl Ctx {
         }
     }
 
+    /// Signal a `packageNotFoundError` condition carrying `package` and `lib.loc` fields.
+    pub fn stop_package_not_found(
+        &mut self,
+        call: SexpId,
+        package: &str,
+        lib_loc: SexpId,
+    ) -> Unwind {
+        let text = format!("there is no package called ‘{package}’");
+        let result = self.scoped(|ctx| {
+            ctx.protect(call);
+            ctx.protect(lib_loc);
+            let message = ctx.session.scalar_str(&text)?;
+            ctx.protect(message);
+            let pkg = ctx.session.scalar_str(package)?;
+            ctx.protect(pkg);
+            let classes = ctx.strings(["packageNotFoundError", "error", "condition"])?;
+            ctx.protect(classes);
+            let message_tag = ctx.session.intern("message")?;
+            let call_tag = ctx.session.intern("call")?;
+            let pkg_tag = ctx.session.intern("package")?;
+            let lib_tag = ctx.session.intern("lib.loc")?;
+            let cond = ctx.list(&Args::from_pairs(vec![
+                (Some(message_tag), message),
+                (Some(call_tag), call),
+                (Some(pkg_tag), pkg),
+                (Some(lib_tag), lib_loc),
+            ]))?;
+            ctx.protect(cond);
+            let tag = ctx.session.intern("class")?;
+            ctx.session.set_attrib(cond, tag, classes)?;
+            ctx.raise_condition(cond, call, &text)
+        });
+        match result {
+            Err(err) => err,
+            Ok(()) => Unwind::TopLevel,
+        }
+    }
+
     fn raise_condition(&mut self, cond: SexpId, call: SexpId, text: &str) -> EvalResult<()> {
         self.conditions.last_error = text.to_owned();
         self.signal_condition(cond)?;

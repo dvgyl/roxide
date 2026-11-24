@@ -267,3 +267,16 @@ combn <- function(x, m, FUN = NULL, simplify = TRUE, ...) {
     dim(result) <- c(d, count)
     result
 }
+
+.DollarNames <- function(x, pattern = "") UseMethod(".DollarNames")
+.DollarNames.default <- function(x, pattern = "") {
+    nms <- names(x)
+    if (is.null(nms)) character() else grep(pattern, nms, value = TRUE)
+}
+.DollarNames.list <- function(x, pattern = "") {
+    nms <- names(x)
+    if (is.null(nms)) character() else grep(pattern, nms, value = TRUE)
+}
+.DollarNames.environment <- function(x, pattern = "") {
+    grep(pattern, ls(envir = x, all.names = TRUE), value = TRUE)
+}

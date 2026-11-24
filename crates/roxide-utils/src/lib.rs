@@ -12,6 +12,7 @@ pub mod tools_license;
 pub mod tools_rd;
 
 use roxide_eval::{Ctx, InternalError, Module, Package};
+use roxide_value::ValueApi;
 
 /// Submodules registered into `namespace:utils`.
 pub const UTILS_MODULES: &[&Module] = &[
@@ -46,6 +47,31 @@ pub const TOOLS_PACKAGE: Package = Package {
 /// Register `utils` (attached) and `tools` (namespace-only) on `ctx`.
 pub fn register(ctx: &mut Ctx) -> Result<(), InternalError> {
     ctx.register_package(&UTILS_PACKAGE)?;
+    // `.DollarNames` begins with `.` so `exports: None` skips it; export it explicitly and
+    // register its built-in S3 methods in `namespace:utils` to match GNU R 4.6.2.
+    if let Some(rec) = ctx.ns_record("utils").cloned() {
+        let sym = ctx.session_mut().intern(".DollarNames")?;
+        if let Some(binding) = ctx.session().env_get(rec.ns, sym) {
+            if let Ok(Some(exports_env)) = ctx.ns_exports_env(rec.ns) {
+                let label = ctx.session_mut().scalar_str(".DollarNames")?;
+                ctx.session_mut().env_define(exports_env, sym, label)?;
+            }
+            if let Some(attached) = rec.attached {
+                ctx.session_mut()
+                    .env_define_binding(attached, sym, binding)?;
+            }
+        }
+        for class in ["default", "list", "environment"] {
+            let mname = format!(".DollarNames.{class}");
+            let msym = ctx.session_mut().intern(&mname)?;
+            if let Some(mbinding) = ctx.session().env_get(rec.ns, msym) {
+                ctx.ns_register_s3("utils", ".DollarNames", class, mbinding.value)
+                    .map_err(|err| InternalError {
+                        message: format!("failed to register {mname}: {err:?}"),
+                    })?;
+            }
+        }
+    }
     ctx.register_package(&TOOLS_PACKAGE)?;
     Ok(())
 }

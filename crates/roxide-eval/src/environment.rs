@@ -125,8 +125,30 @@ pub(crate) const MODULE: Module = Module {
             dispatch: Dispatch::None,
             visibility: Visibility::On,
         },
+        PrimDef {
+            name: "rox_gctorture",
+            fun: gctorture_internal,
+            kind: PrimKind::Internal,
+            args: ArgEval::Eval,
+            arity: Arity::Exact(1),
+            dispatch: Dispatch::None,
+            visibility: Visibility::Off,
+        },
+        PrimDef {
+            name: "rox_gctorture2",
+            fun: gctorture2_internal,
+            kind: PrimKind::Internal,
+            args: ArgEval::Eval,
+            arity: Arity::Exact(3),
+            dispatch: Dispatch::None,
+            visibility: Visibility::On,
+        },
     ],
-    prelude: "gc <- function(verbose = getOption(\"verbose\"), reset = FALSE, full = TRUE) .Internal(rox_gc(verbose, reset, full))",
+    prelude: concat!(
+        "gc <- function(verbose = getOption(\"verbose\"), reset = FALSE, full = TRUE) .Internal(rox_gc(verbose, reset, full))\n",
+        "gctorture <- function(on = TRUE) .Internal(rox_gctorture(on))\n",
+        "gctorture2 <- function(step, wait = step, inhibit_release = FALSE) .Internal(rox_gctorture2(step, wait, inhibit_release))\n",
+    ),
 };
 
 impl Ctx {
@@ -649,6 +671,33 @@ fn gc_internal(ctx: &mut Ctx, _call: &Call, _args: &mut Args) -> EvalResult {
     })
 }
 
+fn gctorture_internal(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    let on = scalar_flag(ctx, Some(args.get(0)), true, call)?;
+    let prev = ctx.session.heap.wants_collection()
+        && matches!(ctx.session.heap.policy(), roxide_gc::GcPolicy::Torture);
+    ctx.session.heap.set_policy(if on {
+        roxide_gc::GcPolicy::Torture
+    } else {
+        roxide_gc::GcPolicy::default()
+    });
+    Ok(ctx.session.scalar_lgl(logical(prev))?)
+}
+
+fn gctorture2_internal(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    let step = ctx.integer(args.get(0), call.err_call())?;
+    let prev = if matches!(ctx.session.heap.policy(), roxide_gc::GcPolicy::Torture) {
+        1
+    } else {
+        0
+    };
+    ctx.session.heap.set_policy(if step > 0 {
+        roxide_gc::GcPolicy::Torture
+    } else {
+        roxide_gc::GcPolicy::default()
+    });
+    Ok(ctx.session.scalar_int(prev)?)
+}
+
 impl Ctx {
     /// Run pending GC finalizers and any remaining `onexit = TRUE` finalizers once,
     /// in reverse registration order.
@@ -819,6 +868,8 @@ fn ls(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     }
     if sorted {
         names.sort();
+    } else {
+        names.reverse();
     }
     let names = ctx.strings(names.iter().map(String::as_str))?;
     if let Some(pattern) = ctx.matched_arg(args, &matched, 4) {
