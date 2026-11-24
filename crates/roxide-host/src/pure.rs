@@ -19,6 +19,8 @@ struct MemFile {
     append: bool,
 }
 
+impl HostFile for MemFile {}
+
 impl Read for MemFile {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if !self.readable {

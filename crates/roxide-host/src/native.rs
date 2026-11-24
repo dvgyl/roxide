@@ -1,16 +1,29 @@
 //! Real OS-backed [`Host`] implementation for CLI execution.
 
 use std::collections::BTreeMap;
-use std::fs::{self, OpenOptions};
-use std::io::{self, BufRead, IsTerminal, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::{
     CommandSpec, CpuTimes, DirEntry, FileMeta, Host, HostError, HostErrorKind, HostFile,
     HostResult, Limits, LocaleInfo, OpenMode, ProcessOutput, StdStream, SysInfo, WallTime,
 };
+
+impl HostFile for File {
+    #[cfg(unix)]
+    fn add_executable_bits(&self, bits: u32) -> HostResult<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut permissions = self.metadata().map_err(HostError::from_io)?.permissions();
+        permissions.set_mode((permissions.mode() & 0o7777) | (bits & 0o111));
+        self.set_permissions(permissions)
+            .map_err(HostError::from_io)
+    }
+}
 
 /// Native OS implementation of [`Host`].
 pub struct NativeHost {
@@ -310,17 +323,12 @@ impl Host for NativeHost {
             cmd.stdin(Stdio::null());
         }
         let mut child = cmd.spawn().map_err(HostError::from_io)?;
-        if let Some(input) = &spec.stdin
-            && let Some(mut stdin) = child.stdin.take()
-        {
-            stdin.write_all(input).map_err(HostError::from_io)?;
+        let result = capture_output(&mut child, spec, self.limits.max_vector_bytes);
+        if result.is_err() {
+            let _ = child.kill();
+            let _ = child.wait();
         }
-        let output = child.wait_with_output().map_err(HostError::from_io)?;
-        Ok(ProcessOutput {
-            status: output.status.code().unwrap_or(1),
-            stdout: output.stdout,
-            stderr: output.stderr,
-        })
+        result.map_err(HostError::from_io)
     }
 
     fn poll_interrupt(&mut self) -> bool {
@@ -330,6 +338,77 @@ impl Host for NativeHost {
     fn limits(&self) -> &Limits {
         &self.limits
     }
+}
+
+fn capture_output(
+    child: &mut Child,
+    spec: &CommandSpec,
+    limit: usize,
+) -> io::Result<ProcessOutput> {
+    let start = Instant::now();
+    let stdout = read_pipe(child.stdout.take(), limit)?;
+    let stderr = read_pipe(child.stderr.take(), limit)?;
+    let stdin = if let (Some(input), Some(mut pipe)) = (&spec.stdin, child.stdin.take()) {
+        let input = input.clone();
+        Some(thread::Builder::new().spawn(move || pipe.write_all(&input))?)
+    } else {
+        None
+    };
+    let status = if let Some(timeout) = spec.timeout {
+        loop {
+            if let Some(status) = child.try_wait()?
+                && stdout.is_finished()
+                && stderr.is_finished()
+                && stdin.as_ref().is_none_or(JoinHandle::is_finished)
+            {
+                break status;
+            }
+            let remaining = timeout.saturating_sub(start.elapsed());
+            if remaining.is_zero() {
+                // A descendant can keep a pipe open after the child exits.
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("Process timed out after {} ms", timeout.as_millis()),
+                ));
+            }
+            thread::sleep(remaining.min(Duration::from_millis(5)));
+        }
+    } else {
+        child.wait()?
+    };
+    if let Some(stdin) = stdin {
+        join_io(stdin)?;
+    }
+    Ok(ProcessOutput {
+        status: status.code().unwrap_or(1),
+        stdout: join_io(stdout)?,
+        stderr: join_io(stderr)?,
+    })
+}
+
+fn read_pipe(
+    pipe: Option<impl Read + Send + 'static>,
+    limit: usize,
+) -> io::Result<JoinHandle<io::Result<Vec<u8>>>> {
+    let pipe = pipe.ok_or_else(|| io::Error::other("Cannot open the process output pipe"))?;
+    thread::Builder::new().spawn(move || {
+        let mut bytes = Vec::new();
+        pipe.take((limit as u64).saturating_add(1))
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > limit {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Process output exceeds the vector size limit",
+            ));
+        }
+        Ok(bytes)
+    })
+}
+
+fn join_io<T>(worker: JoinHandle<io::Result<T>>) -> io::Result<T> {
+    worker
+        .join()
+        .map_err(|_| io::Error::other("Process I/O thread stopped unexpectedly"))?
 }
 
 fn read_line_bounded(input: impl BufRead, buf: &mut Vec<u8>, limit: usize) -> HostResult<usize> {
@@ -351,6 +430,45 @@ fn read_line_bounded(input: impl BufRead, buf: &mut Vec<u8>, limit: usize) -> Ho
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn spawn_times_out_before_the_child_finishes() {
+        let mut host = NativeHost::new();
+        let start = Instant::now();
+        let error = host
+            .spawn(&CommandSpec {
+                program: "/bin/sleep".into(),
+                args: vec!["5".into()],
+                stdin: None,
+                timeout: Some(Duration::from_millis(150)),
+            })
+            .unwrap_err();
+        assert_eq!(error.kind, HostErrorKind::TimedOut);
+        assert!(start.elapsed() < Duration::from_secs(3));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spawn_drains_both_streams_while_sending_input() {
+        let mut host = NativeHost::new();
+        let input = vec![b'x'; 128 * 1024];
+        let output = host
+            .spawn(&CommandSpec {
+                program: "/bin/sh".into(),
+                args: vec![
+                    "-c".into(),
+                    "head -c 131072 /dev/zero >&2; printf ready; exec cat".into(),
+                ],
+                stdin: Some(input.clone()),
+                timeout: Some(Duration::from_secs(5)),
+            })
+            .unwrap();
+        assert_eq!(output.status, 0);
+        assert_eq!(output.stderr, vec![0; 128 * 1024]);
+        assert_eq!(&output.stdout[..5], b"ready");
+        assert_eq!(&output.stdout[5..], input);
+    }
 
     #[test]
     fn read_line_rejects_input_after_one_byte_past_the_limit() {

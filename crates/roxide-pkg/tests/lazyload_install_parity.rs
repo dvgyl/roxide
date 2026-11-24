@@ -152,8 +152,13 @@ fn malformed_records_fail_when_forced() {
 }
 
 fn tar_entry(path: &str, kind: u8, data: &[u8]) -> Vec<u8> {
+    tar_entry_with_mode(path, kind, 0o644, data)
+}
+
+fn tar_entry_with_mode(path: &str, kind: u8, mode: u32, data: &[u8]) -> Vec<u8> {
     let mut header = [0; 512];
     header[..path.len()].copy_from_slice(path.as_bytes());
+    header[100..108].copy_from_slice(format!("{mode:07o}\0").as_bytes());
     header[124..136].copy_from_slice(format!("{:011o}\0", data.len()).as_bytes());
     header[148..156].fill(b' ');
     header[156] = kind;
@@ -164,6 +169,48 @@ fn tar_entry(path: &str, kind: u8, data: &[u8]) -> Vec<u8> {
     bytes.extend_from_slice(data);
     bytes.resize(bytes.len().next_multiple_of(512), 0);
     bytes
+}
+
+#[cfg(unix)]
+#[test]
+fn archive_preserves_unix_executable_bits() {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    use roxide_host::NativeHost;
+
+    let mut archive = tar_entry_with_mode("mypkg/configure", b'0', 0o755, b"#!/bin/sh\n");
+    archive.extend(tar_entry("mypkg/DESCRIPTION", b'0', b"Package: mypkg\n"));
+    archive.extend(tar_entry_with_mode(
+        "mypkg/helper",
+        b'0',
+        0o710,
+        b"#!/bin/sh\n",
+    ));
+    archive.extend([0; 1024]);
+    let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    gzip.write_all(&archive).expect("compress gzip");
+
+    let host = NativeHost::new();
+    let temp = host.session_temp_dir().to_path_buf();
+    let mut ctx = Ctx::new(Box::new(host), GcPolicy::Torture).expect("create context");
+    for (name, bytes) in [
+        ("tar", archive),
+        ("tgz", gzip.finish().expect("finish gzip")),
+    ] {
+        let source = temp.join(format!("permissions.{name}"));
+        let root = temp.join(name);
+        fs::write(&source, bytes).expect("write archive");
+        fs::create_dir(&root).expect("create extraction root");
+        let dest = roxide_pkg::tar::extract(ctx.host(), &source, &root).expect("extract archive");
+        for (file, bits) in [("configure", 0o111), ("DESCRIPTION", 0), ("helper", 0o110)] {
+            let mode = fs::metadata(dest.join(file))
+                .expect("stat file")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o111, bits, "{name}: {file}");
+        }
+    }
 }
 
 #[test]

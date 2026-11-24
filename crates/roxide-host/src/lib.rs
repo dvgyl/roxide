@@ -71,8 +71,13 @@ impl OpenMode {
 }
 
 /// Abstract open file handle supporting read, write, and seek.
-pub trait HostFile: Read + Write + Seek {}
-impl<T: Read + Write + Seek> HostFile for T {}
+pub trait HostFile: Read + Write + Seek {
+    /// Add the specified Unix owner, group, and other execute bits.
+    /// The default implementation returns success without changing permissions.
+    fn add_executable_bits(&self, _bits: u32) -> HostResult<()> {
+        Ok(())
+    }
+}
 
 /// File metadata snapshot.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -169,7 +174,7 @@ pub struct CommandSpec {
     pub args: Vec<String>,
     /// Optional stdin bytes.
     pub stdin: Option<Vec<u8>>,
-    /// Optional timeout.
+    /// Optional time limit for the child process and its input and output.
     pub timeout: Option<Duration>,
 }
 

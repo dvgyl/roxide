@@ -3,10 +3,10 @@
 /// individual calls.
 ///
 /// ```
-/// use roxide_host::{PureHost, forward_host};
+/// use roxide_host::{Host, PureHost, forward_host};
 ///
 /// struct Wrapper {
-///     inner: PureHost,
+///     inner: Box<dyn Host>,
 /// }
 ///
 /// forward_host!(Wrapper, inner;
@@ -15,18 +15,20 @@
 ///     }
 /// );
 ///
-/// let wrapper = Wrapper { inner: PureHost::new() };
-/// assert_eq!(roxide_host::Host::pid(&wrapper), 42);
+/// let mut wrapper = Wrapper { inner: Box::new(PureHost::new()) };
+/// assert_eq!(wrapper.pid(), 42);
+/// wrapper.set_env_var("KEY", Some(b"value")).unwrap();
+/// assert_eq!(wrapper.env_var("KEY").as_deref(), Some(b"value".as_slice()));
 /// ```
 #[macro_export]
 macro_rules! forward_host {
     ($wrapper:ty, $field:ident $(; $(fn $name:ident $args:tt $(-> $result:ty)? $body:block)*)?) => {
-        $crate::forward_host!(@impl ($), $wrapper, $field, [
+        $crate::forward_host!(@impl ($), $wrapper, [$field], [
             $($(fn $name $args $(-> $result)? $body)*)?
         ]);
     };
 
-    (@impl ($d:tt), $wrapper:ty, $field:ident, [
+    (@impl ($d:tt), $wrapper:ty, $target:tt, [
         $(fn $name:ident $args:tt $(-> $result:ty)? $body:block)*
     ]) => {
         const _: () = {
@@ -36,21 +38,24 @@ macro_rules! forward_host {
             }
 
             impl $crate::Host for $wrapper {
-                $crate::forward_host!(@methods $field, emit);
+                $crate::forward_host!(@methods $target, emit);
                 $(fn $name $args $(-> $result)? $body)*
             }
         };
     };
 
-    (@method $field:ident, $emit:ident, [$($mutable:tt)?]
+    (@target $this:ident [$field:ident]) => { $this.$field };
+    (@target $this:ident []) => { **$this };
+
+    (@method $field:tt, $emit:ident, [$($mutable:tt)?]
         $name:ident($($arg:ident: $type:ty),*) $(-> $result:ty)?
     ) => {
         $emit!($name, fn $name(&$($mutable)? self $(, $arg: $type)*) $(-> $result)? {
-            $crate::Host::$name(&$($mutable)? self.$field $(, $arg)*)
+            $crate::Host::$name(&$($mutable)? $crate::forward_host!(@target self $field) $(, $arg)*)
         });
     };
 
-    (@methods $field:ident, $emit:ident) => {
+    (@methods $field:tt, $emit:ident) => {
         $crate::forward_host!(@method $field, $emit, [mut] write_out(bytes: &[u8]) -> $crate::HostResult<()>);
         $crate::forward_host!(@method $field, $emit, [mut] write_err(bytes: &[u8]) -> $crate::HostResult<()>);
         $crate::forward_host!(@method $field, $emit, [mut] flush(stream: $crate::StdStream) -> $crate::HostResult<()>);
@@ -84,6 +89,8 @@ macro_rules! forward_host {
         $crate::forward_host!(@method $field, $emit, [] limits() -> &$crate::Limits);
     };
 }
+
+forward_host!(@impl ($), Box<dyn crate::Host + '_>, [], []);
 
 #[cfg(test)]
 mod tests {

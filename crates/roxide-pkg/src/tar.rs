@@ -141,13 +141,15 @@ pub fn extract(host: &mut dyn Host, archive: &Path, root: &Path) -> HostResult<P
                         Err(err) => return Err(err),
                         Ok(_) => return Err(invalid("duplicate tar path")),
                     }
-                    // Keep the executable bits available for a host with file mode support.
-                    let _executable_mode = number(&header[100..108])? & 0o111;
+                    let executable_bits = (number(&header[100..108])? & 0o111) as u32;
                     let mut dest = host.open(&path, OpenMode::write_truncate())?;
                     let copied = io::copy(&mut (&mut input).take(size as u64), &mut dest)
                         .map_err(HostError::from_io)?;
                     if copied != size as u64 {
                         return Err(invalid("truncated tar file"));
+                    }
+                    if executable_bits != 0 {
+                        dest.add_executable_bits(executable_bits)?;
                     }
                 }
             }
