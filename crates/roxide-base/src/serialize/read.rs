@@ -342,6 +342,16 @@ impl Reader<'_, '_> {
                 self.optional_attributes(session, flags, depth)?;
                 return Ok(source);
             }
+            22 => {
+                let ptr = session.alloc_extptr(0, SEXP_NIL, SEXP_NIL)?;
+                session.root(ptr);
+                self.reference(ptr)?;
+                let prot = self.item(session, depth)?;
+                session.set_extptr_prot(ptr, prot)?;
+                let tag = self.item(session, depth)?;
+                session.set_extptr_tag(ptr, tag)?;
+                ptr
+            }
             24 => {
                 let len = self.vector_len::<u8>(1)?;
                 session.alloc_raw_from(self.take(len)?)?

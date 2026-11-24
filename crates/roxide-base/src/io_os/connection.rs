@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use roxide_eval::{Args, Call, Ctx, CtxExt, EvalResult};
 use roxide_gc::{SexpId, Trace, Tracer};
 use roxide_host::{HostFile, OpenMode};
-use roxide_value::{Encoding, RSession, SEXP_NIL, SexpType, Sym, ValueApi};
+use roxide_value::{CharId, Encoding, RSession, SEXP_NIL, SexpType, Sym, ValueApi};
 
 use super::codec::{self, Compression};
 use super::{
@@ -43,6 +43,8 @@ impl CtxExt for ConnTable {}
 
 struct Connection {
     description: String,
+    kind: String,
+    open_mode: String,
     path: Option<FilePath>,
     mode: Mode,
     stream: Option<Stream>,
@@ -109,6 +111,12 @@ impl Mode {
             flags: OpenMode::write_truncate(),
             binary,
         }
+    }
+
+    fn closed_file() -> Self {
+        let mut mode = Self::read(false);
+        mode.flags.write = true;
+        mode
     }
 }
 
@@ -230,10 +238,10 @@ fn check_slot(ctx: &mut Ctx, call: &Call) -> EvalResult<()> {
     Ok(())
 }
 
-fn register(ctx: &mut Ctx, call: &Call, kind: &str, connection: Connection) -> EvalResult {
+fn register(ctx: &mut Ctx, call: &Call, connection: Connection) -> EvalResult {
     check_slot(ctx, call)?;
     let next = ctx.ext::<ConnTable>().last_id.max(2) + 1;
-    let value = handle(ctx, kind, next)?;
+    let value = handle(ctx, &connection.kind, next)?;
     let table = ctx.ext::<ConnTable>();
     table.last_id = next;
     table.entries.insert(next, connection);
@@ -302,7 +310,7 @@ pub(super) fn file(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
         &open
     };
     let mode = if open.is_empty() {
-        Mode::read(false)
+        Mode::closed_file()
     } else {
         Mode::parse(open).ok_or_else(|| ctx.stop(call.err_call(), "invalid 'open' argument"))?
     };
@@ -314,9 +322,14 @@ pub(super) fn file(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     register(
         ctx,
         call,
-        &kind,
         Connection {
             description: name,
+            open_mode: if open.is_empty() {
+                if format.is_some() { "rb" } else { "r" }.to_owned()
+            } else {
+                open.to_owned()
+            },
+            kind,
             path: Some(path),
             mode,
             stream,
@@ -357,9 +370,10 @@ pub(super) fn raw(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     register(
         ctx,
         call,
-        "rawConnection",
         Connection {
             description,
+            kind: "rawConnection".into(),
+            open_mode: open,
             path: None,
             mode,
             stream: Some(Stream::Raw(buffer)),
@@ -471,9 +485,10 @@ pub(super) fn text(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     register(
         ctx,
         call,
-        "textConnection",
         Connection {
             description,
+            kind: "textConnection".into(),
+            open_mode: open,
             path: None,
             mode,
             stream: Some(stream),
@@ -527,7 +542,13 @@ fn close_connection(ctx: &mut Ctx, call: &Call, id: i32) -> EvalResult<()> {
 
 pub(super) fn is_open(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     let id = id(ctx, call, args.get(0))?;
-    let rw = super::text(ctx, call, args.get(1), "rw")?;
+    let s = ctx.session();
+    let Some(&rw) = s.str_slice(args.get(1))?.first() else {
+        return Err(ctx.stop(call.err_call(), "unknown 'rw' value"));
+    };
+    let rw = s.char_bytes(rw)?;
+    let read_mode = !rw.is_empty() && b"read".starts_with(rw);
+    let write_mode = !rw.is_empty() && b"write".starts_with(rw);
     let (open, read, write) = if (0..=2).contains(&id) {
         (true, id == 0, id != 0)
     } else {
@@ -540,24 +561,86 @@ pub(super) fn is_open(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult
             connection.mode.flags.write,
         )
     };
-    let result = match rw.as_str() {
-        "" => open,
-        "read" => open && read,
-        "write" => open && write,
-        _ => return Err(ctx.stop(call.err_call(), "invalid 'rw' argument")),
-    };
+    let result = open && (!read_mode || read) && (!write_mode || write);
     Ok(ctx
         .session_mut()
         .alloc_lgl_from(&[roxide_value::RLogical::from_option(Some(result))])?)
 }
 
+pub(super) fn summary(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    let id = id(ctx, call, args.get(0))?;
+    let (description, kind, mode, binary, open, read, write) = if let Some(name) = standard_name(id)
+    {
+        let input = id == 0;
+        (
+            name.into(),
+            "terminal".into(),
+            if input { "r" } else { "w" }.into(),
+            false,
+            true,
+            input,
+            !input,
+        )
+    } else {
+        let Some(connection) = ctx.ext::<ConnTable>().entries.get(&id) else {
+            return Err(ctx.stop(call.err_call(), "invalid connection"));
+        };
+        let open = connection.stream.is_some();
+        (
+            connection.description.clone(),
+            connection.kind.clone(),
+            connection.open_mode.clone(),
+            connection.mode.binary,
+            open,
+            connection.mode.flags.read,
+            connection.mode.flags.write,
+        )
+    };
+    let yes_no = |flag| if flag { "yes" } else { "no" };
+    let s = ctx.session_mut();
+    let values = [
+        description.as_str(),
+        &kind,
+        &mode,
+        if binary { "binary" } else { "text" },
+        if open { "opened" } else { "closed" },
+        yes_no(read),
+        yes_no(write),
+    ]
+    .map(|text| s.scalar_str(text))
+    .into_iter()
+    .collect::<Result<Vec<_>, _>>()?;
+    let result = crate::ops::common::list(s, &values)?;
+    let names = [
+        "description",
+        "class",
+        "mode",
+        "text",
+        "opened",
+        "can read",
+        "can write",
+    ]
+    .map(|name| s.mk_char(name.as_bytes(), Encoding::Native))
+    .into_iter()
+    .collect::<Result<Vec<CharId>, _>>()?;
+    crate::ops::common::set_names(s, result, &names)?;
+    Ok(result)
+}
+
+fn standard_name(id: i32) -> Option<&'static str> {
+    match id {
+        0 => Some("stdin"),
+        1 => Some("stdout"),
+        2 => Some("stderr"),
+        _ => None,
+    }
+}
+
 pub(super) fn description(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     let id = id(ctx, call, args.get(0))?;
-    let description = match id {
-        0 => "stdin".to_owned(),
-        1 => "stdout".to_owned(),
-        2 => "stderr".to_owned(),
-        _ => {
+    let description = match standard_name(id) {
+        Some(name) => name.to_owned(),
+        None => {
             let Some(connection) = ctx.ext::<ConnTable>().entries.get(&id) else {
                 return Err(ctx.stop(call.err_call(), "invalid connection"));
             };
@@ -779,6 +862,9 @@ fn operate<T>(
             return Err(ctx.stop(call.err_call(), "invalid connection"));
         };
         let mut stream = path.open(ctx, call, mode)?;
+        if let Some(connection) = ctx.ext::<ConnTable>().entries.get_mut(&id) {
+            connection.mode = mode;
+        }
         let mut empty = Cursor::default();
         let result = operation(ctx, &mut stream, &mut empty);
         let closed = finish(ctx, stream);

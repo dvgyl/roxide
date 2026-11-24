@@ -1,8 +1,8 @@
 use roxide_eval::{Args, Call, Ctx, EvalResult};
 use roxide_gc::SexpId;
 use roxide_value::{
-    CharId, NA_INTEGER, RComplex, RLogical, SEXP_NIL, SexpType, ValueApi, int_add, int_mul,
-    int_sub, nan_propagate,
+    CharId, Encoding, NA_INTEGER, RComplex, RLogical, SEXP_NIL, SexpType, ValueApi, int_add,
+    int_mul, int_sub, nan_propagate,
 };
 use std::cmp::Ordering;
 
@@ -460,16 +460,36 @@ fn compare_values(
             let (b, _) = s.coerce(y, kind)?;
             let a = s.str_slice(a)?;
             let b = s.str_slice(b)?;
-            let out: Vec<_> = (0..len)
-                .map(|i| {
-                    let (a, b) = (a[i % nx], b[i % ny]);
-                    combine(if a == CharId::NA || b == CharId::NA {
-                        None
+            let equality = matches!(op, Op::Eq | Op::Ne);
+            let mut out = Vec::with_capacity(len);
+            for i in 0..len {
+                let (a, b) = (a[i % nx], b[i % ny]);
+                let order = if a == CharId::NA || b == CharId::NA {
+                    None
+                } else if a == b {
+                    Some(Ordering::Equal)
+                } else {
+                    let a_bytes = s.char_encoding(a)? == Encoding::Bytes;
+                    let b_bytes = s.char_encoding(b)? == Encoding::Bytes;
+                    if a_bytes || b_bytes {
+                        if !equality {
+                            return Err(error(
+                                ctx,
+                                call,
+                                "translating strings with \"bytes\" encoding is not allowed",
+                            ));
+                        }
+                        Some(if a_bytes && b_bytes {
+                            s.char_bytes(a)?.cmp(s.char_bytes(b)?)
+                        } else {
+                            Ordering::Less
+                        })
                     } else {
-                        Some(s.char_bytes(a).ok().cmp(&s.char_bytes(b).ok()))
-                    })
-                })
-                .collect();
+                        Some(crate::strings::utf8(s, a)?.cmp(&crate::strings::utf8(s, b)?))
+                    }
+                };
+                out.push(combine(order));
+            }
             s.alloc_lgl_from(&out)?
         }
         SexpType::Cplx => {

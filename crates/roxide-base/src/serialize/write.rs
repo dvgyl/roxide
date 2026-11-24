@@ -208,7 +208,9 @@ impl Writer<'_> {
                 session.root(key);
                 return self.persistent(session, key);
             }
-            if matches!(ty, SexpType::Sym | SexpType::Env) && self.reference(id)? {
+            if matches!(ty, SexpType::Sym | SexpType::Env | SexpType::ExtPtr)
+                && self.reference(id)?
+            {
                 return Ok(());
             }
             if ty == SexpType::Sym {
@@ -349,6 +351,12 @@ impl Writer<'_> {
                     .as_bytes();
                 self.length(name.len())?;
                 self.push(name)?;
+            }
+            SexpType::ExtPtr => {
+                let prot = session.extptr_prot(id)?;
+                let tag = session.extptr_tag(id)?;
+                self.item(session, prot, depth)?;
+                self.item(session, tag, depth)?;
             }
             SexpType::Obj => {}
             _ => {

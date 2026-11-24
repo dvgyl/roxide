@@ -78,6 +78,7 @@ impl NativeHooks for Mock {
         } else {
             assert_eq!(op, SEXP_NIL);
         }
+        ctx.set_visible(false);
         Ok(symbol)
     }
 
@@ -210,6 +211,22 @@ fn run(ctx: &mut Ctx, script: &str) {
         let bytes = ctx.session().char_bytes(chars[0]).expect("message bytes");
         panic!("{}", String::from_utf8_lossy(bytes));
     }
+}
+
+#[test]
+fn external2_preserves_native_visibility_and_call_returns_visibly() {
+    run(
+        &mut context(),
+        r#"
+        check <- function() {
+            marker <- "native"
+            a <- withVisible(.External2(marker, NAOK=1L, PACK=2L, 3L, .NAME="other"))
+            b <- withVisible(.Call(marker, NAOK=1L, PACK=2L, 3L, .NAME="other"))
+            stopifnot(identical(a$value, marker), identical(b$value, marker), !a$visible, b$visible)
+        }
+        check()
+        "#,
+    );
 }
 
 #[test]

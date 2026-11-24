@@ -64,7 +64,7 @@ fn character(s: &mut RSession, x: SexpId) -> EvalResult<Vec<CharId>> {
     Ok(s.str_slice(x)?.to_vec())
 }
 
-fn utf8(s: &RSession, id: CharId) -> Result<Cow<'_, [u8]>, ValueError> {
+pub(crate) fn utf8(s: &RSession, id: CharId) -> Result<Cow<'_, [u8]>, ValueError> {
     let bytes = s.char_bytes(id)?;
     if s.char_encoding(id)? == Encoding::Latin1 {
         return Ok(Cow::Owned(

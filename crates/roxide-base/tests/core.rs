@@ -27,6 +27,155 @@ fn check(ctx: &mut Ctx, script: &str) {
 }
 
 #[test]
+fn replace_uses_subset_assignment() {
+    check(
+        &mut context(),
+        r#"
+        x <- setNames(1:3, c("a", "b", "c"))
+        checks <- c(
+            identical(base::replace(x, c("b", "d"), 9L), c(a=1L, b=9L, c=3L, d=9L)),
+            identical(x, c(a=1L, b=2L, c=3L)),
+            identical(base::replace(list(a=1, b=2), "a", NULL), list(b=2)),
+            identical(base::replace(x, FALSE, 0L), x)
+        )
+        "#,
+    );
+}
+
+#[test]
+fn as_data_frame_dispatches_and_converts_vectors() {
+    check(
+        &mut context(),
+        r#"
+        x <- setNames(1:2, c("first", "second"))
+        f <- base::as.data.frame(x)
+        optional <- base::as.data.frame(x, optional=TRUE)
+        as.data.frame.packet <- function(x, row.names=NULL, optional=FALSE, ...)
+            list(row.names, optional)
+        checks <- c(
+            identical(class(f), "data.frame"),
+            identical(names(f), "x"),
+            identical(attr(f, "row.names"), c("first", "second")),
+            identical(attr(base::as.data.frame(integer()), "row.names"), character()),
+            identical(f[[1L]], 1:2),
+            is.null(names(optional)),
+            identical(attr(base::as.data.frame(x, row.names=c("a", "a")), "row.names"), c("a", "a")),
+            identical(base::as.data.frame(structure(1L, class="packet"), c("r"), TRUE),
+                      list("r", TRUE)),
+            is.character(base::as.data.frame(c("b", "a"))[[1L]]),
+            identical(names(base::as.data.frame("b", nm="column")), "column"),
+            is.factor(base::as.data.frame(c("b", "a"), stringsAsFactors=TRUE)[[1L]]),
+            identical(base::as.data.frame(f), f),
+            identical(class(base::as.data.frame(structure(f, class=c("a", "data.frame", "b")))),
+                      c("data.frame", "b")),
+            inherits(base::as.data.frame(as.Date("2020-01-01"))[[1L]], "Date"),
+            inherits(base::as.data.frame(as.POSIXlt("2020-01-01", tz="UTC"))[[1L]], "POSIXct"),
+            inherits(base::as.data.frame(as.POSIXct("2020-01-01", tz="UTC"))[[1L]], "POSIXct"),
+            identical(base::as.data.frame(as.raw(1:2))[[1L]], as.raw(1:2)),
+            identical(base::as.data.frame(c(TRUE, FALSE))[[1L]], c(TRUE, FALSE)),
+            identical(base::as.data.frame(c(1.5, 2.5))[[1L]], c(1.5, 2.5)),
+            identical(base::as.data.frame(1+2i)[[1L]], 1+2i)
+        )
+        "#,
+    );
+}
+
+#[test]
+fn as_data_frame_builds_list_matrix_and_table_columns() {
+    check(
+        &mut context(),
+        r#"
+        empty <- base::as.data.frame(list(), row.names=c("i", "j"))
+        x <- list("a b"=1:2, label=c("b", "a"))
+        m <- matrix(c("a", "b", "a", "c"), 2,
+                    dimnames=list(c("r", "r"), c("x y", "x y")))
+        t <- structure(c(1L, 1L, 0L, 1L), dim=c(2L, 2L),
+                       dimnames=list(x=c("a", "b"), y=c("u", "v")), class="table")
+        f <- base::as.data.frame(m)
+        tf <- base::as.data.frame(t)
+        a <- array(1:8, c(2, 2, 2), dimnames=list(c("r", "s"), c("A", "B"), c("x", "y")))
+        compact <- structure(list(x=1:3), class="data.frame", row.names=c(NA_integer_, 3L))
+        checks <- c(
+            identical(names(empty), character()),
+            identical(dim(empty), c(2L, 0L)),
+            identical(dim(base::as.data.frame(NULL)), c(0L, 0L)),
+            identical(names(base::as.data.frame(x)), c("a.b", "label")),
+            identical(names(base::as.data.frame(x, optional=TRUE)), c("a b", "label")),
+            identical(names(base::as.data.frame(x, col.names=c("d e", "f g"))), c("d.e", "f.g")),
+            identical(names(base::as.data.frame(list("Long label text"=1:2), cut.names=10)),
+                      "Long...."),
+            identical(names(base::as.data.frame(list(1:2, 3:4), optional=TRUE)), c("1:2", "3:4")),
+            identical(names(base::as.data.frame(list(1:2, 3:4), fix.empty.names=FALSE)), c("", "")),
+            identical(names(base::as.data.frame(list(a=data.frame(b=1:2)))), "b"),
+            identical(names(base::as.data.frame(list(a=data.frame(b=1:2, c=3:4)))), c("a.b", "a.c")),
+            identical(attr(base::as.data.frame(list(compact)), "row.names"), 1:3),
+            identical(base::as.data.frame(x)$label, c("b", "a")),
+            is.factor(base::as.data.frame(x, stringsAsFactors=TRUE)$label),
+            identical(attr(base::as.data.frame(x, row.names="label"), "row.names"), c("b", "a")),
+            identical(base::as.data.frame(list(a=1:2, b=3L))$b, c(3L, 3L)),
+            inherits(base::as.data.frame(list(a=1:2, b=as.Date("2020-01-01")))$b, "Date"),
+            identical(names(f), c("x y", "x y")),
+            identical(attr(f, "row.names"), c("r", "r.1")),
+            identical(names(base::as.data.frame(a)), c("A.x", "B.x", "A.y", "B.y")),
+            identical(attr(base::as.data.frame(a), "row.names"), c("r", "s")),
+            identical(attr(base::as.data.frame(m, make.names=NA), "row.names"), c(1L, 2L)),
+            identical(f[[2L]], c("a", "c")),
+            is.factor(base::as.data.frame(m, stringsAsFactors=TRUE)[[1L]]),
+            is.null(names(base::as.data.frame(matrix(1:4, 2), optional=TRUE))),
+            identical(names(base::as.data.frame(matrix(1:4, 2, dimnames=list(NULL, c("", ""))),
+                                                optional=TRUE)), c("V1", "V2")),
+            identical(names(tf), c("x", "y", "Freq")),
+            identical(as.character(tf$x), c("a", "b", "a", "b")),
+            identical(as.character(tf$y), c("u", "u", "v", "v")),
+            identical(tf$Freq, c(1L, 1L, 0L, 1L)),
+            identical(base::as.data.frame(t, stringsAsFactors=FALSE, responseName="n")$x,
+                      c("a", "b", "a", "b"))
+        )
+        "#,
+    );
+}
+
+#[test]
+fn character_comparison_and_concatenation_preserve_encoding() {
+    check(
+        &mut context(),
+        r#"
+        latin <- rawToChar(as.raw(233))
+        Encoding(latin) <- "latin1"
+        utf <- rawToChar(as.raw(c(195, 169)))
+        Encoding(utf) <- "UTF-8"
+        next_utf <- rawToChar(as.raw(c(195, 170)))
+        Encoding(next_utf) <- "UTF-8"
+        bytes <- latin
+        Encoding(bytes) <- "bytes"
+        labels <- names(c(setNames(1, latin), setNames(2, utf), setNames(3, bytes)))
+        qualified <- names(c(prefix=setNames(1, latin)))
+        numbered <- names(c(setNames(list(1:2), latin), recursive=TRUE))
+        checks <- c(
+            latin == utf, !(latin != utf), !(latin < utf), latin <= utf, !(latin > utf), latin >= utf,
+            latin < next_utf, next_utf > latin,
+            identical(c(latin, NA_character_) == utf, c(TRUE, NA)),
+            latin != bytes, bytes == bytes, bytes <= bytes,
+            identical(tryCatch(bytes < latin, error=conditionMessage),
+                      'translating strings with "bytes" encoding is not allowed'),
+            identical(tryCatch(c(prefix=setNames(1, bytes)), error=conditionMessage),
+                      'translating strings with "bytes" encoding is not allowed'),
+            identical(Encoding(labels), c("latin1", "UTF-8", "bytes")),
+            identical(charToRaw(labels[[1L]]), as.raw(233)),
+            identical(charToRaw(labels[[2L]]), as.raw(c(195, 169))),
+            identical(Encoding(qualified), "UTF-8"),
+            identical(charToRaw(qualified), c(charToRaw("prefix."), as.raw(c(195, 169)))),
+            identical(Encoding(numbered), c("UTF-8", "UTF-8")),
+            identical(charToRaw(numbered[[2L]]), as.raw(c(195, 169, 50))),
+            identical(names(c(setNames(1, NA_character_), q=setNames(2, NA_character_))),
+                      c(NA_character_, "q.NA")),
+            is.null(names(c(setNames(1, bytes), use.names=FALSE)))
+        )
+        "#,
+    );
+}
+
+#[test]
 fn arithmetic_and_logic() {
     check(
         &mut context(),

@@ -1,8 +1,10 @@
+use std::borrow::Cow;
+
 use roxide_eval::{Args, Call, Ctx, EvalResult};
 use roxide_gc::SexpId;
 use roxide_value::{
-    CharId, IdenticalOpts, NA_INTEGER, RComplex, RLogical, RSession, SEXP_MISSING, SEXP_NIL,
-    SexpType, ValueApi, identical as same, is_nan_not_na,
+    CharId, Encoding, IdenticalOpts, NA_INTEGER, RComplex, RLogical, RSession, SEXP_MISSING,
+    SEXP_NIL, SexpType, ValueApi, ValueError, identical as same, is_nan_not_na,
 };
 
 use super::common::{
@@ -515,34 +517,37 @@ pub(super) fn combine(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult
         vector_limit(ctx, call, len, if ty == Cplx { 16 } else { 8 })?;
         return Ok(concatenate(ctx.session_mut(), &values, ty)?);
     }
-    let limit = ctx.host().limits().max_vector_bytes / size_of::<(SexpId, String)>();
+    let limit = ctx.host().limits().max_vector_bytes / size_of::<(CharId, SexpId)>();
     let s = ctx.session_mut();
     let mut parts = Parts {
         values: std::vec::Vec::new(),
         ty: Nil,
         recursive,
+        use_names,
         limit,
     };
     for (name, val) in work {
-        parts.push(s, val, name, 0, true)?;
+        let prefix = if use_names {
+            ch(s, &name)?
+        } else {
+            CharId::BLANK
+        };
+        parts.push(s, val, prefix, 0, true)?;
     }
     let (names, values): (std::vec::Vec<_>, std::vec::Vec<_>) = parts.values.into_iter().unzip();
     let out = concatenate(s, &values, parts.ty)?;
-    if use_names && out != SEXP_NIL && names.iter().any(|n| !n.is_empty()) {
-        let ids = names
-            .iter()
-            .map(|n| ch(s, n))
-            .collect::<Result<std::vec::Vec<_>, _>>()?;
-        common::set_names(s, out, &ids)?;
+    if use_names && out != SEXP_NIL && names.iter().any(|&n| n != CharId::BLANK) {
+        common::set_names(s, out, &names)?;
     }
     vector_limit(ctx, call, values.len(), size_of::<SexpId>())?;
     Ok(out)
 }
 
 struct Parts {
-    values: std::vec::Vec<(String, SexpId)>,
+    values: std::vec::Vec<(CharId, SexpId)>,
     ty: SexpType,
     recursive: bool,
+    use_names: bool,
     limit: usize,
 }
 
@@ -551,7 +556,7 @@ impl Parts {
         &mut self,
         s: &mut RSession,
         x: SexpId,
-        prefix: String,
+        prefix: CharId,
         depth: usize,
         flatten: bool,
     ) -> Result<(), roxide_value::ValueError> {
@@ -583,7 +588,7 @@ impl Parts {
             ));
         }
         let start = self.values.len();
-        let pair_tags: std::vec::Vec<_> = if ty == List {
+        let pair_tags: std::vec::Vec<_> = if self.use_names && ty == List {
             s.pairlist_iter(x)
                 .map(|(n, _)| tag(s, n).unwrap_or("").to_owned())
                 .collect()
@@ -592,37 +597,43 @@ impl Parts {
         };
         let mut generated = std::vec::Vec::new();
         for i in 0..len {
-            let name = common::names(s, x)
-                .get(i)
-                .copied()
-                .filter(|id| *id != CharId::NA)
-                .map(|id| text(s, id))
-                .or_else(|| pair_tags.get(i).cloned())
-                .unwrap_or_default();
+            let name = if !self.use_names {
+                CharId::BLANK
+            } else if let Some(&name) = common::names(s, x).get(i) {
+                name
+            } else if let Some(name) = pair_tags.get(i) {
+                ch(s, name)?
+            } else {
+                CharId::BLANK
+            };
             let val = element(s, x, i)?;
             if container && self.recursive {
-                let path = join_name(&prefix, &name);
+                let path = join_name(s, prefix, name)?;
                 let from = self.values.len();
                 self.push(s, val, path, depth + 1, true)?;
-                if name.is_empty() && !prefix.is_empty() {
+                if name == CharId::BLANK && prefix != CharId::BLANK {
+                    let bytes = crate::strings::utf8(s, prefix)?;
                     for j in from..self.values.len() {
-                        if self.values[j].0.starts_with(&prefix)
-                            && !self.values[j].0[prefix.len()..].starts_with('.')
+                        if crate::strings::utf8(s, self.values[j].0)?
+                            .strip_prefix(bytes.as_ref())
+                            .is_some_and(|suffix| !suffix.starts_with(b"."))
                         {
                             generated.push(j);
                         }
                     }
                 }
-            } else if name.is_empty() && !prefix.is_empty() {
+            } else if name == CharId::BLANK && prefix != CharId::BLANK {
                 generated.push(self.values.len());
-                self.values.push((prefix.clone(), val));
+                self.values.push((prefix, val));
             } else {
-                self.values.push((join_name(&prefix, &name), val));
+                self.values.push((join_name(s, prefix, name)?, val));
             }
         }
         if self.values.len() - start > 1 {
             for j in generated {
-                self.values[j].0 = format!("{prefix}{}", j - start + 1);
+                let mut bytes = name_utf8(s, prefix)?.into_owned();
+                bytes.extend_from_slice((j - start + 1).to_string().as_bytes());
+                self.values[j].0 = s.mk_char(&bytes, Encoding::Utf8)?;
             }
         } else if let [j] = generated.as_slice() {
             self.values[*j].0 = prefix;
@@ -631,14 +642,26 @@ impl Parts {
     }
 }
 
-fn join_name(prefix: &str, suffix: &str) -> String {
-    if prefix.is_empty() {
-        return suffix.to_owned();
+fn join_name(s: &mut RSession, prefix: CharId, suffix: CharId) -> Result<CharId, ValueError> {
+    if prefix == CharId::BLANK {
+        return Ok(suffix);
     }
-    if suffix.is_empty() {
-        return prefix.to_owned();
+    if suffix == CharId::BLANK {
+        return Ok(prefix);
     }
-    format!("{prefix}.{suffix}")
+    let mut name = name_utf8(s, prefix)?.into_owned();
+    name.push(b'.');
+    name.extend_from_slice(&name_utf8(s, suffix)?);
+    s.mk_char(&name, Encoding::Utf8)
+}
+
+fn name_utf8(s: &RSession, name: CharId) -> Result<Cow<'_, [u8]>, ValueError> {
+    if s.char_encoding(name)? == Encoding::Bytes {
+        return Err(ValueError::InvalidAttribute(
+            "translating strings with \"bytes\" encoding is not allowed".into(),
+        ));
+    }
+    crate::strings::utf8(s, name)
 }
 
 pub(super) fn as_vector(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {

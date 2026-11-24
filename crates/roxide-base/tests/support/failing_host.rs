@@ -11,6 +11,8 @@ use roxide_host::{
 
 struct FailingFile(Cursor<Vec<u8>>);
 
+impl HostFile for FailingFile {}
+
 impl Read for FailingFile {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.0.read(buf)

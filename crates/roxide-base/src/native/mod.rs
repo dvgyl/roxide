@@ -15,11 +15,11 @@ use crate::ops::common::{chars, text};
 /// Native call and DLL management functions in the base package.
 pub const MODULE: Module = Module {
     prims: &[
-        primitive(".Call", call::dot_call),
-        primitive(".External", call::external),
-        primitive(".External2", call::external2),
-        primitive(".C", call::dot_c),
-        primitive(".Fortran", call::fortran),
+        primitive(".Call", call::dot_call, Visibility::On),
+        primitive(".External", call::external, Visibility::On),
+        primitive(".External2", call::external2, Visibility::SetByFn),
+        primitive(".C", call::dot_c, Visibility::On),
+        primitive(".Fortran", call::fortran, Visibility::On),
         internal("rox_dyn_load", dll::load, 3, Visibility::Off),
         internal("rox_dyn_unload", dll::unload, 1, Visibility::Off),
         internal("rox_is_loaded", dll::is_loaded, 3, Visibility::On),
@@ -40,7 +40,7 @@ pub const MODULE: Module = Module {
     prelude: include_str!("prelude.R"),
 };
 
-const fn primitive(name: &'static str, fun: PrimFn) -> PrimDef {
+const fn primitive(name: &'static str, fun: PrimFn, visibility: Visibility) -> PrimDef {
     PrimDef {
         name,
         fun,
@@ -48,7 +48,7 @@ const fn primitive(name: &'static str, fun: PrimFn) -> PrimDef {
         args: ArgEval::EvalKeepMissing,
         arity: Arity::Any,
         dispatch: Dispatch::None,
-        visibility: Visibility::On,
+        visibility,
     }
 }
 

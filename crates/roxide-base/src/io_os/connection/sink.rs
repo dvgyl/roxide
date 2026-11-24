@@ -25,7 +25,7 @@ struct OutputSink {
 #[derive(Clone, Copy)]
 enum SinkClose {
     Keep,
-    Stream(Mode),
+    Stream,
     Connection,
 }
 
@@ -138,7 +138,6 @@ fn push_output_sink(
                 }
                 SinkClose::Keep
             } else {
-                let previous = connection.mode;
                 let path = connection
                     .path
                     .clone()
@@ -149,7 +148,7 @@ fn push_output_sink(
                 connection.mode = mode;
                 connection.stream = Some(stream);
                 ctx.ext::<ConnTable>().entries.insert(id, connection);
-                SinkClose::Stream(previous)
+                SinkClose::Stream
             }
         };
         (id, close)
@@ -170,9 +169,10 @@ fn push_output_sink(
         register(
             ctx,
             call,
-            "file",
             Connection {
                 description,
+                kind: "file".into(),
+                open_mode: if append { "a" } else { "w" }.into(),
                 path: Some(path),
                 mode,
                 stream: Some(stream),
@@ -198,12 +198,12 @@ fn pop_output_sink(ctx: &mut Ctx, call: &Call) -> EvalResult<()> {
     let flushed = ctx.pop_stream_sink(false);
     let closed = match sink.close {
         SinkClose::Connection => close_connection(ctx, call, sink.id),
-        SinkClose::Stream(mode) => {
+        SinkClose::Stream => {
             let table = ctx.ext::<ConnTable>();
-            let stream = table.entries.get_mut(&sink.id).and_then(|con| {
-                con.mode = mode;
-                con.stream.take()
-            });
+            let stream = table
+                .entries
+                .get_mut(&sink.id)
+                .and_then(|con| con.stream.take());
             let result = stream.map_or(Ok(()), |stream| finish(ctx, stream));
             io_result(ctx, call, result)
         }

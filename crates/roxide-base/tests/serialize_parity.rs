@@ -14,7 +14,7 @@ use roxide_eval::{
 };
 use roxide_gc::{GcPolicy, Trace, Tracer};
 use roxide_host::{Host, Limits, NativeHost, PureHost};
-use roxide_value::{DeparseOpts, GLOBAL_ENV, ValueApi, dput};
+use roxide_value::{DeparseOpts, GLOBAL_ENV, SEXP_NIL, ValueApi, dput};
 
 const CASES: &str = include_str!("../../../conformance/layer1/07_rds_rdata_roundtrip.rcase");
 
@@ -351,6 +351,97 @@ fn xdr_body(words: &[u32]) -> Vec<u8> {
     let mut bytes = b"X\n\0\0\0\x02\0\x04\x06\x02\0\x02\x03\0".to_vec();
     bytes.extend(words.iter().flat_map(|n| n.to_be_bytes()));
     bytes
+}
+
+#[test]
+fn external_pointers_round_trip_with_attributes_and_reference_cycles() {
+    let mut ctx = context(Box::new(PureHost::new()));
+    let s = ctx.session_mut();
+    let tag = s.scalar_int(9).unwrap();
+    let ptr = s.alloc_extptr(123, tag, SEXP_NIL).unwrap();
+    s.set_extptr_prot(ptr, ptr).unwrap();
+    let stamp = s.intern("stamp").unwrap();
+    s.set_attrib(ptr, stamp, ptr).unwrap();
+    let binding = s.intern("ptr").unwrap();
+    ctx.assign(binding, ptr, GLOBAL_ENV).unwrap();
+
+    for version in [2, 3] {
+        run(
+            &mut ctx,
+            "External pointer round trip",
+            &format!(
+                r#"
+                output <- serialize(list(ptr, ptr), NULL, version={version}L)
+                restored <- unserialize(output)
+                stopifnot(identical(serialize(restored, NULL, version={version}L), output))
+                "#,
+            ),
+        );
+        let get = |ctx: &mut Ctx, name| {
+            let sym = ctx.session_mut().intern(name).unwrap();
+            ctx.get_var(sym, GLOBAL_ENV).unwrap().unwrap()
+        };
+        let restored = get(&mut ctx, "restored");
+        let output = get(&mut ctx, "output");
+        let s = ctx.session();
+        let ptr = s.list_get(restored, 0).unwrap();
+        assert_eq!(s.list_get(restored, 1).unwrap(), ptr);
+        assert_eq!(s.extptr_addr(ptr).unwrap(), 0);
+        assert_eq!(s.extptr_prot(ptr).unwrap(), ptr);
+        assert_eq!(s.attr(ptr, stamp), ptr);
+        assert_eq!(s.int(s.extptr_tag(ptr).unwrap()).unwrap().get(0), 9);
+
+        let mut expected = xdr_body(&[]);
+        if version == 3 {
+            expected[5] = 3;
+            expected[10..14].copy_from_slice(&0x00030500_u32.to_be_bytes());
+            expected.extend_from_slice(b"\0\0\0\x05UTF-8");
+        }
+        for word in [19_u32, 2, 0x216, 0x1ff, 13, 1, 9, 0x402, 1, 0x40009, 5] {
+            expected.extend(word.to_be_bytes());
+        }
+        expected.extend_from_slice(b"stamp");
+        for word in [0x1ff_u32, 254, 0x1ff] {
+            expected.extend(word.to_be_bytes());
+        }
+        let actual = s.raw(output).unwrap().to_vec();
+        assert_eq!(actual, expected, "XDR version {version}");
+
+        if let Some(executable) = env::var_os("ROXIDE_ORACLE_RSCRIPT") {
+            let input = actual
+                .iter()
+                .map(u8::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            let response = oracle(
+                Path::new(&executable),
+                &format!(
+                    r#"
+                    input <- as.raw(c({input}))
+                    decoded <- unserialize(input)
+                    stopifnot(typeof(decoded[[1L]]) == "externalptr",
+                              identical(attr(decoded[[1L]], "stamp"), decoded[[1L]]),
+                              identical(serialize(decoded, NULL, version={version}L), input))
+                    p <- new("externalptr")
+                    attr(p, "stamp") <- 42L
+                    cat(as.integer(serialize(list(p, p), NULL, version={version}L)), sep=",")
+                    "#,
+                ),
+            );
+            run(
+                &mut ctx,
+                "GNU R external pointer stream",
+                &format!(
+                    r#"
+                    input <- as.raw(c({response}))
+                    decoded <- unserialize(input)
+                    stopifnot(identical(attr(decoded[[2L]], "stamp"), 42L),
+                              identical(serialize(decoded, NULL, version={version}L), input))
+                    "#,
+                ),
+            );
+        }
+    }
 }
 
 #[test]

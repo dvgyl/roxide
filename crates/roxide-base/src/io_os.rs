@@ -31,6 +31,7 @@ pub const MODULE: Module = Module {
         ),
         internal("rox_io_close", connection::close, 1, Visibility::Off),
         internal("rox_io_is_open", connection::is_open, 2, Visibility::On),
+        internal("rox_io_summary", connection::summary, 1, Visibility::On),
         internal("rox_io_std", connection::standard, 1, Visibility::On),
         internal(
             "rox_io_description",
@@ -116,7 +117,8 @@ textConnection <- function(object, open = "r", local = FALSE, name = deparse1(su
 textConnectionValue <- function(con) .Internal(rox_io_text_value(con))
 close <- function(con, ...) UseMethod("close")
 close.connection <- function(con, ...) .Internal(rox_io_close(con))
-isOpen <- function(con, rw = "") .Internal(rox_io_is_open(con, rw))
+isOpen <- function(con, rw = "") .Internal(rox_io_is_open(con, as.character(rw)))
+summary.connection <- function(object, ...) .Internal(rox_io_summary(object))
 stdin <- function() .Internal(rox_io_std(0L))
 stdout <- function() .Internal(rox_io_std(1L))
 stderr <- function() .Internal(rox_io_std(2L))

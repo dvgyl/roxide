@@ -16,7 +16,7 @@ pub(crate) const MODULE: Module = Module {
         internal("rox_expression_vector", expression_vector, 1),
         internal("rox_transform_row_names", transform_row_names, 2),
     ],
-    prelude: include_str!("tier_a.R"),
+    prelude: concat!(include_str!("tier_a.R"), include_str!("data_frame.R")),
 };
 
 const fn internal(name: &'static str, fun: PrimFn, n: usize) -> PrimDef {

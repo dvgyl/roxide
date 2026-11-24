@@ -114,6 +114,10 @@ append <- function(x, values, after = length(x)) {
     if (after >= length(x)) return(c(x, values))
     c(x[seq_len(after)], values, x[seq.int(after + 1L, length(x))])
 }
+replace <- function(x, list, values) {
+    x[list] <- values
+    x
+}
 lengths <- function(x, use.names = TRUE) {
     out <- vapply(x, length, 0L, USE.NAMES = FALSE)
     if (use.names) names(out) <- names(x)

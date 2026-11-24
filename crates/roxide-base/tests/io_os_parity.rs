@@ -22,6 +22,48 @@ fn context(host: Box<dyn Host>) -> Ctx {
     ctx
 }
 
+#[test]
+fn connection_modes_and_summary_match_gnu_r() {
+    run(
+        &mut context(Box::new(PureHost::new())),
+        r#"
+        con <- textConnection("x")
+        stopifnot(isOpen(con, "r"), isOpen(con, "re"), isOpen(con, "rea"), isOpen(con, "read"),
+                  !isOpen(con, "w"), !isOpen(con, "wr"), !isOpen(con, "write"),
+                  isOpen(con, "writer"), isOpen(con, "R"), isOpen(con, "other"),
+                  isOpen(con, NA_character_), isOpen(con, c("r", "w")))
+        stopifnot(identical(summary(con),
+            list(description='"x"', class="textConnection", mode="r", text="text",
+                 opened="opened", "can read"="yes", "can write"="no")))
+        close(con)
+        stopifnot(identical(tryCatch(summary(con), error=conditionMessage), "invalid connection"))
+        con <- rawConnection(raw(), "r+")
+        stopifnot(isOpen(con, "r"), isOpen(con, "w"),
+                  identical(summary(con),
+                    list(description="raw()", class="rawConnection", mode="r+", text="binary",
+                         opened="opened", "can read"="yes", "can write"="yes")))
+        close(con)
+        con <- gzfile("sample")
+        stopifnot(!isOpen(con), !isOpen(con, "r"), !isOpen(con, "unknown"),
+                  identical(summary(con),
+                    list(description="sample", class="gzfile", mode="rb", text="text",
+                         opened="closed", "can read"="yes", "can write"="yes")))
+        close(con)
+        path <- tempfile()
+        con <- file(path)
+        stopifnot(summary(con)[["can read"]] == "yes", summary(con)[["can write"]] == "yes")
+        writeLines("line", con)
+        stopifnot(!isOpen(con), summary(con)[["mode"]] == "r", summary(con)[["can read"]] == "no")
+        stopifnot(identical(readLines(con), "line"), summary(con)[["can write"]] == "no")
+        close(con)
+        unlink(path)
+        stopifnot(identical(summary(stdout()),
+            list(description="stdout", class="terminal", mode="w", text="text",
+                 opened="opened", "can read"="no", "can write"="yes")))
+        "#,
+    );
+}
+
 fn roundtrips(ctx: &mut Ctx) {
     run(
         ctx,
