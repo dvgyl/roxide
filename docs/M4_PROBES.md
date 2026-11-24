@@ -40,6 +40,15 @@ Verified all 41 exported `R_*Symbol` / `R_dot_*` data symbols (`R_BaseSymbol == 
 | `.C(..., NAOK = FALSE)` on `NA_character_` | Allowed (no error) |
 | Missing `R_GetCCallable(pkg, sym)` | Error: `function '<sym>' not provided by package '<pkg>'` |
 | `.C` buffer over-run / under-run | GNU R has no canaries (silently corrupts heap); Roxide enforces 64-byte guard canaries and raises `array over-run in .C("<name>") argument N` (ADR-0018) |
+| Registered arity mismatch | Error: `Incorrect number of arguments (<got>), expecting <want> for '<name>'` |
+| Registered interface mismatch (`.C` symbol called via `.Call`/`.External2`) | Error: `NULL value passed as symbol address` |
+| Foreign call with `> 65` arguments | Error: `too many arguments in foreign function call` |
+| Missing symbol in `.Call` / `.External` / `.External2` / `.C` | Error: `C symbol name "<name>" not in load table` |
+| Missing symbol in `.Fortran` | Error: `Fortran symbol name "<name>" not in load table` |
+| `.Fortran` character vector of length `> 1` | Warning: `only the first string in a char vector used in .Fortran` (passes first string only) |
+| `R_forceSymbols(dll, TRUE)` with `is.loaded` / `R_FindSymbol` | Both return `FALSE` / `NULL` for string lookup when symbols are forced |
+| `dyn.load` failure format | Error: `unable to load shared object '<path>':\n  <os reason>` |
+| `dyn.load` on already-loaded path | Reloads/replaces entry cleanly so DLL count for that name stays `1` |
 
 ## 5. Wave 2-G / 2-H / 2-V2 Black-Box Probes (`SHLIB` and `R_ENABLE_JIT=1/2`)
 
