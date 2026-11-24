@@ -1,5 +1,6 @@
 //! Color conversion, palettes, device control, and plot range functions.
 
+mod color_spaces;
 mod colors;
 mod dev;
 mod palette;
@@ -23,6 +24,9 @@ pub const MODULE: Module = Module {
         internal("C_gd_hcl", 5, colors::hcl),
         internal("C_gd_gray", 2, colors::gray),
         internal("C_gd_lab", 2, colors::lab),
+        internal("C_gd_srgb_transfer", 2, color_spaces::srgb_transfer),
+        internal("C_gd_color_named_rows", 1, color_spaces::named_rows),
+        internal("C_gd_perceptual_color", 4, color_spaces::perceptual_color),
         internal("C_gd_series", 3, palette::series),
         internal("C_gd_palette", 1, palette::palette),
         internal("C_gd_palette_names", 1, palette::names),
@@ -37,7 +41,11 @@ pub const MODULE: Module = Module {
         internal("C_gd_graphics_off", 0, dev::close_all),
         internal("C_gd_pretty", 9, ranges::pretty),
     ],
-    prelude: include_str!("prelude.R"),
+    prelude: concat!(
+        include_str!("prelude.R"),
+        "\n",
+        include_str!("color_spaces.R")
+    ),
 };
 
 const fn internal(name: &'static str, arity: usize, fun: PrimFn) -> PrimDef {

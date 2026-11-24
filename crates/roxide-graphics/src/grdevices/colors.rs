@@ -6,6 +6,7 @@ use roxide_value::{CharId, SEXP_NIL, SexpType, ValueApi, is_na_real};
 
 use crate::engine::{GraphicsExt, Rgba};
 
+use super::color_spaces::{lab_to_xyz, linear_to_srgb, srgb_to_linear, xyz_to_lab};
 use super::{
     attr, flag, limit, matrix_attributes, number, numbers, optional_numbers, recycled, set_attr,
     strings,
@@ -344,22 +345,6 @@ pub(super) fn hsv(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
 
 const WHITE: [f64; 3] = [0.95047, 1.0, 1.08883];
 
-fn linear_to_srgb(channel: f64) -> f64 {
-    if channel <= 0.0031308 {
-        12.92 * channel
-    } else {
-        1.055 * channel.powf(1.0 / 2.4) - 0.055
-    }
-}
-
-fn srgb_to_linear(channel: f64) -> f64 {
-    if channel <= 0.04045 {
-        channel / 12.92
-    } else {
-        ((channel + 0.055) / 1.055).powf(2.4)
-    }
-}
-
 fn xyz_to_rgb([x, y, z]: [f64; 3]) -> [f64; 3] {
     [
         3.240479 * x - 1.537150 * y - 0.498535 * z,
@@ -451,32 +436,14 @@ fn rgb_to_lab(rgb: [f64; 3]) -> [f64; 3] {
         0.214923504409617 * r + 0.713153434155949 * g + 0.0719230614344342 * b,
         0.0195385004008742 * r + 0.118858905692658 * g + 0.946986975553383 * b,
     ];
-    let f = |t: f64| {
-        if t > (6.0_f64 / 29.0).powi(3) {
-            t.cbrt()
-        } else {
-            t / (3.0 * (6.0_f64 / 29.0).powi(2)) + 4.0 / 29.0
-        }
-    };
-    let [x, y, z] = std::array::from_fn(|i| f(xyz[i] / LAB_WHITE[i]));
-    [116.0 * y - 16.0, 500.0 * (x - y), 200.0 * (y - z)]
+    xyz_to_lab(xyz, LAB_WHITE)
 }
 
 fn lab_to_rgb([l, a, b]: [f64; 3]) -> [f64; 3] {
     if [l, a, b].iter().any(|v| v.is_nan()) {
         return [roxide_value::NA_REAL; 3];
     }
-    let lightness = (l + 16.0) / 116.0;
-    let f = |t: f64| {
-        if t > 6.0 / 29.0 {
-            t.powi(3)
-        } else {
-            3.0 * (6.0_f64 / 29.0).powi(2) * (t - 4.0 / 29.0)
-        }
-    };
-    let x = LAB_WHITE[0] * f(lightness + a / 500.0);
-    let y = f(lightness);
-    let z = LAB_WHITE[2] * f(lightness - b / 200.0);
+    let [x, y, z] = lab_to_xyz([l, a, b], LAB_WHITE);
     [
         3.206520517144467 * x - 1.52104178377366 * y - 0.493310848791455 * z,
         -0.971982546201235 * x + 1.88126865160849 * y + 0.0416724845995893 * z,
