@@ -77,7 +77,8 @@ fn print_default(
     prefix: &str,
     depth: usize,
 ) -> EvalResult<()> {
-    if depth >= ctx.opts().expressions.min(128) {
+    let stack_cap = (ctx.stack_budget() / 4096).clamp(128, 2048);
+    if depth >= ctx.opts().expressions.min(stack_cap) {
         return Err(error(ctx, call, "evaluation nested too deeply"));
     }
     let s = ctx.session_mut();
@@ -183,7 +184,43 @@ fn print_element(
 fn print_vector(s: &mut RSession, x: SexpId, settings: &PrintSettings) -> EvalResult<String> {
     let ty = s.type_of(x)?;
     let values = display(s, x, settings.fmt, settings.quote)?;
-    let named = attr(s, x, "names") != SEXP_NIL;
+    let dim = attr(s, x, "dim");
+    let is_1d_array = dim != SEXP_NIL && s.type_of(dim)? == SexpType::Int && s.int(dim)?.len() == 1;
+    let mut array_header: Option<String> = None;
+    let mut dim1_labels: Option<Vec<String>> = None;
+    if is_1d_array {
+        let dimnames = attr(s, x, "dimnames");
+        if dimnames != SEXP_NIL
+            && s.type_of(dimnames)? == SexpType::Vec
+            && s.xlength(dimnames)? >= 1
+        {
+            if let Some(&hdr_id) = names(s, dimnames).first()
+                && hdr_id != CharId::BLANK
+                && hdr_id != CharId::NA
+            {
+                let h = text(s, hdr_id);
+                if !h.is_empty() {
+                    array_header = Some(h);
+                }
+            }
+            let first = s.list_get(dimnames, 0)?;
+            if first != SEXP_NIL && s.type_of(first)? == SexpType::Str {
+                dim1_labels = Some(
+                    s.str_slice(first)?
+                        .iter()
+                        .map(|&id| {
+                            if id == CharId::NA {
+                                "<NA>".to_owned()
+                            } else {
+                                text(s, id)
+                            }
+                        })
+                        .collect(),
+                );
+            }
+        }
+    }
+    let named = dim1_labels.is_some() || attr(s, x, "names") != SEXP_NIL;
     if values.is_empty() {
         let kind = if ty == SexpType::Real {
             "numeric"
@@ -192,16 +229,20 @@ fn print_vector(s: &mut RSession, x: SexpId, settings: &PrintSettings) -> EvalRe
         };
         return Ok(format!("{}{kind}(0)\n", if named { "named " } else { "" }));
     }
-    let labels: Vec<_> = names(s, x)
-        .iter()
-        .map(|&id| {
-            if id == CharId::NA {
-                "<NA>".to_owned()
-            } else {
-                text(s, id)
-            }
-        })
-        .collect();
+    let labels: Vec<_> = if let Some(lbls) = dim1_labels {
+        lbls
+    } else {
+        names(s, x)
+            .iter()
+            .map(|&id| {
+                if id == CharId::NA {
+                    "<NA>".to_owned()
+                } else {
+                    text(s, id)
+                }
+            })
+            .collect()
+    };
     let width = values
         .iter()
         .chain(&labels)
@@ -210,6 +251,10 @@ fn print_vector(s: &mut RSession, x: SexpId, settings: &PrintSettings) -> EvalRe
         .unwrap_or(0);
     let gap = " ".repeat(settings.gap);
     let mut out = String::new();
+    if let Some(hdr) = array_header {
+        out.push_str(&hdr);
+        out.push('\n');
+    }
     if named {
         let across = (settings.width / (width + settings.gap).max(1)).max(1);
         for (row, values) in values.chunks(across).enumerate() {

@@ -10,18 +10,11 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::process::ExitCode;
 
-use roxide_eval::{Ctx, InternalError, Package, Unwind};
+use roxide_eval::{Ctx, InternalError, Unwind};
 use roxide_gc::GcPolicy;
 use roxide_host::{Host, NativeHost};
 
 const VERSION_LINE: &str = "Roxide 0.1.0 (targeting GNU R 4.6.2)";
-
-const DATASETS_PACKAGE: Package = Package {
-    name: "datasets",
-    attach: true,
-    exports: None,
-    modules: &[],
-};
 
 #[derive(Default)]
 struct CliOpts {
@@ -156,7 +149,7 @@ pub(crate) fn bootstrap(host: Box<dyn Host>, policy: GcPolicy) -> Result<Ctx, In
     roxide_base::register_all(&mut ctx)?;
     roxide_pkg::register(&mut ctx)?;
     roxide_methods::register(&mut ctx)?;
-    ctx.register_package(&DATASETS_PACKAGE)?;
+    roxide_utils::datasets::register(&mut ctx)?;
     roxide_utils::register(&mut ctx)?;
     roxide_graphics::register(&mut ctx)?;
     roxide_stats::register(&mut ctx)?;
