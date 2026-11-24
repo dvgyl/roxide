@@ -137,7 +137,7 @@ fn compile_object(ctx: &mut Ctx, expr: SexpId) -> EvalResult {
     if source(ctx, expr).is_some() {
         return Ok(expr);
     }
-    let program = Rc::new(vm::compile_expr(ctx.session(), expr)?);
+    let program = Rc::new(vm::compile_expr(ctx.session_mut(), expr)?);
     let ns = ctx
         .ns_lookup("compiler")
         .ok_or_else(|| ctx.stop(SEXP_NIL, "compiler namespace is unavailable"))?;
@@ -177,7 +177,7 @@ fn program(ctx: &mut Ctx, object: SexpId, expr: SexpId) -> EvalResult<Rc<Compile
     {
         return Ok(Rc::clone(program));
     }
-    let program = Rc::new(vm::compile_expr(ctx.session(), expr)?);
+    let program = Rc::new(vm::compile_expr(ctx.session_mut(), expr)?);
     cache_program(ctx, object, Rc::clone(&program));
     Ok(program)
 }
@@ -267,7 +267,7 @@ fn write_file(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
                 &format!("compiling expression {} ...\n", lines.join("\n")),
             )?;
         }
-        vm::compile_expr(ctx.session(), expr)?;
+        vm::compile_expr(ctx.session_mut(), expr)?;
         exprs.push(expr);
     }
     let payload = crate::ops::common::list(ctx.session_mut(), &exprs)?;
@@ -294,7 +294,7 @@ fn load_file(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     }
     for i in 0..ctx.session().xlength(payload)? {
         let expr = ctx.session().list_get(payload, i)?;
-        let program = vm::compile_expr(ctx.session(), expr)?;
+        let program = vm::compile_expr(ctx.session_mut(), expr)?;
         vm::run_compiled(ctx, &program, env)?;
     }
     Ok(SEXP_NIL)

@@ -6,10 +6,10 @@
 //! and never access private [`Ctx`] fields directly (ADR-0007).
 
 macro_rules! primitive {
-    ($name:literal, $fun:ident, $args:ident, $arity:expr, $visible:ident) => {
+    ($name:literal, $fun:expr, $args:ident, $arity:expr, $visible:ident) => {
         primitive!($name, $fun, $args, $arity, $visible, $crate::Dispatch::None)
     };
-    ($name:literal, $fun:ident, $args:ident, $arity:expr, $visible:ident, $dispatch:expr) => {
+    ($name:literal, $fun:expr, $args:ident, $arity:expr, $visible:ident, $dispatch:expr) => {
         $crate::PrimDef {
             name: $name,
             kind: $crate::PrimKind::Primitive,
