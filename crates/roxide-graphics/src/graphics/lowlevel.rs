@@ -1,23 +1,31 @@
-use std::f64::consts::{PI, TAU};
+use std::f64::consts::TAU;
 
 use roxide_eval::{Args, Call, Ctx, EvalResult};
 use roxide_gc::SexpId;
 use roxide_value::{CharId, SEXP_NIL, SexpType, ValueApi};
 
-use crate::engine::{Device, GContext, LineEnd, LineJoin, Rect, Rgba};
+use crate::{
+    engine::{Device, GContext, LineEnd, LineJoin, Rect, Rgba},
+    grdevices::parse_rgba,
+    stroke::{dash_pattern, line_end, line_join},
+};
 
 use super::{
     active,
     coords::{rect, require_frame, user_point},
     element, flag, names, nums,
-    par::{GPar, Geometry, Param, choice, line_type, parse_color, state},
+    par::{GPar, Geometry, Param, choice, line_type, state},
     record, string, strings,
 };
+
+mod endpoints;
+
+use endpoints::EndpointCommand;
 
 type Point = (f64, f64);
 
 pub(super) fn context(p: &GPar) -> GContext {
-    let mut gc = GContext {
+    GContext {
         col: p.color("col"),
         lwd: p.real("lwd"),
         cex: p.real("cex"),
@@ -26,45 +34,11 @@ pub(super) fn context(p: &GPar) -> GContext {
         fontfamily: p.text("family").to_owned(),
         lineheight: p.real("lheight"),
         lmitre: p.real("lmitre"),
-        lend: cap(p.text("lend")),
-        ljoin: join(p.text("ljoin")),
+        lend: line_end(p.text("lend")),
+        ljoin: line_join(p.text("ljoin")),
+        lty: dash_pattern(p.text("lty")),
         ..GContext::default()
-    };
-    dashes(&mut gc, p.text("lty"));
-    gc
-}
-
-fn cap(x: &str) -> LineEnd {
-    match x {
-        "butt" => LineEnd::Butt,
-        "square" => LineEnd::Square,
-        _ => LineEnd::Round,
     }
-}
-
-fn join(x: &str) -> LineJoin {
-    match x {
-        "mitre" => LineJoin::Mitre,
-        "bevel" => LineJoin::Bevel,
-        _ => LineJoin::Round,
-    }
-}
-
-fn dashes(gc: &mut GContext, lty: &str) {
-    let pattern = match lty {
-        "solid" | "blank" => "",
-        "dashed" => "44",
-        "dotted" => "13",
-        "dotdash" => "1343",
-        "longdash" => "73",
-        "twodash" => "2262",
-        other => other,
-    };
-    gc.lty = pattern
-        .chars()
-        .filter_map(|c| c.to_digit(16))
-        .map(f64::from)
-        .collect();
 }
 
 fn recycle<T>(x: &[T], i: usize) -> Option<&T> {
@@ -106,7 +80,7 @@ fn colors(ctx: &mut Ctx, x: SexpId) -> EvalResult<Vec<Rgba>> {
                 let scalar = ctx.session_mut().alloc_real_from(&[value])?;
                 ctx.scoped(|ctx| {
                     ctx.protect(scalar);
-                    parse_color(ctx, scalar)
+                    parse_rgba(ctx, scalar)
                 })
             })
             .collect();
@@ -116,7 +90,7 @@ fn colors(ctx: &mut Ctx, x: SexpId) -> EvalResult<Vec<Rgba>> {
             ctx.scoped(|ctx| {
                 let scalar = scalar_at(ctx, x, i)?;
                 ctx.protect(scalar);
-                parse_color(ctx, scalar)
+                parse_rgba(ctx, scalar)
             })
         })
         .collect()
@@ -194,12 +168,12 @@ impl Style {
                 Some("lend") => {
                     style.cap = choice(ctx, value, &["round", "butt", "square"])?
                         .as_deref()
-                        .map(cap)
+                        .map(line_end)
                 }
                 Some("ljoin") => {
                     style.join = choice(ctx, value, &["round", "mitre", "bevel"])?
                         .as_deref()
-                        .map(join)
+                        .map(line_join)
                 }
                 Some("xpd") => style.xpd = Some(flag(ctx, value)?),
                 Some("lty") => {
@@ -258,7 +232,7 @@ impl Style {
             gc.ljoin = join;
         }
         let lty = self.line_type(p, i);
-        dashes(&mut gc, lty);
+        gc.lty = dash_pattern(lty);
         if lty == "blank" {
             gc.col = Rgba::TRANSPARENT;
         }
@@ -474,7 +448,6 @@ impl Drawing<'_> {
                 },
                 ..border.clone()
             };
-            // Pair the intersections along each line to fill concave polygons.
             let mut intersections = Vec::new();
             let limit = 1_000_000 / pts.len();
             for line in 0..count.min(limit as f64) as usize {
@@ -500,64 +473,6 @@ impl Drawing<'_> {
             }
         }
         self.d.polygon(pts, &border);
-    }
-
-    fn endpoints(&mut self, data: &[Vec<f64>], kind: &str) -> bool {
-        let x0 = &data[0];
-        let y0 = &data[1];
-        let x1 = &data[2];
-        let y1 = &data[3];
-        if [x0, y0, x1, y1].iter().any(|x| x.is_empty()) {
-            return false;
-        }
-        let mut indeterminate = false;
-        for i in 0..x0.len().max(y0.len()).max(x1.len()).max(y1.len()) {
-            let a = self.point(n(x0, i, 0.0), n(y0, i, 0.0));
-            let b = self.point(n(x1, i, 0.0), n(y1, i, 0.0));
-            if !finite(a) || !finite(b) {
-                continue;
-            }
-            let mut gc = self.gc(i);
-            if kind == "rect" {
-                gc.fill = recycle(&self.style.col, i)
-                    .copied()
-                    .unwrap_or(Rgba::TRANSPARENT);
-                gc.col = recycle(&self.style.border, i)
-                    .copied()
-                    .unwrap_or_else(|| self.p.color("fg"));
-                let density = n(&data[4], i, -1.0);
-                if density >= 0.0 {
-                    let r = Rect::normalized(a.0, a.1, b.0, b.1);
-                    let pts = [(r.x0, r.y0), (r.x1, r.y0), (r.x1, r.y1), (r.x0, r.y1)];
-                    self.fill_polygon(&pts, density, n(&data[5], i, 45.0), &gc);
-                } else {
-                    self.d.rect(Rect::normalized(a.0, a.1, b.0, b.1), &gc);
-                }
-            } else {
-                self.d.polyline(&[a, b], &gc);
-            }
-            if kind == "arrows" {
-                let length = n(&data[4], 0, 0.25) * 72.0;
-                let angle = n(&data[5], 0, 30.0).to_radians();
-                let code = n(&data[6], 0, 2.0) as i32;
-                if length <= 0.0 || code == 0 {
-                    continue;
-                }
-                let (dx, dy) = (b.0 - a.0, b.1 - a.1);
-                if dx.hypot(dy) < 0.072 {
-                    indeterminate = true;
-                    continue;
-                }
-                let dir = dy.atan2(dx);
-                for (bit, p, d) in [(1, a, dir), (2, b, dir + PI)] {
-                    if code & bit != 0 {
-                        let step = |t: f64| (p.0 + length * t.cos(), p.1 + length * t.sin());
-                        self.d.polyline(&[step(d - angle), p, step(d + angle)], &gc);
-                    }
-                }
-            }
-        }
-        indeterminate
     }
 
     fn polygons(&mut self, pts: &[Point], kind: &str, winding: bool, data: &[Vec<f64>]) {
@@ -816,14 +731,14 @@ pub(super) fn draw(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     let data = args.get(1);
     let options = args.get(2);
     let mut style = Style::parse(ctx, call, options)?;
-    let mut values = Vec::with_capacity(7);
+    let mut values: [Vec<f64>; 7] = std::array::from_fn(|_| Vec::new());
     let mut label_values = Vec::new();
     let mut mode = String::new();
     let mut variant = String::new();
     let mut raster = Vec::new();
-    for i in 0..7 {
+    for (i, numbers) in values.iter_mut().enumerate() {
         let value = element(ctx, data, i)?;
-        values.push(match (op.as_str(), i) {
+        *numbers = match (op.as_str(), i) {
             ("plot_xy" | "polypath", 2) | ("box", 0) | ("symbols", 4) => {
                 mode = string(ctx, value)?;
                 Vec::new()
@@ -860,14 +775,12 @@ pub(super) fn draw(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
                 Vec::new()
             }
             _ => nums(ctx, value)?,
-        });
+        };
     }
     if op == "plot_xy" && !["p", "l", "b", "c", "o", "s", "S", "h", "n"].contains(&mode.as_str()) {
         return Err(ctx.stop(call.err_call(), format!("invalid plot type '{mode}'")));
     }
-    if op == "arrows" && !(0.0..=3.0).contains(&n(&values[6], 0, 2.0)) {
-        return Err(ctx.stop(call.err_call(), "invalid arrow head specification"));
-    }
+    let endpoints = EndpointCommand::parse(ctx, call, &op, &values)?;
     let slot = active(ctx, call, false)?;
     let (g, base, crop, custom) = {
         let p = state(slot)?;
@@ -928,45 +841,46 @@ pub(super) fn draw(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
             style,
             base,
         };
-        match op.as_str() {
-            "plot_xy" => drawing.plot_xy(&values[0], &values[1], &mode),
-            "segments" | "arrows" | "rect" => {
-                if drawing.endpoints(&values, &op) {
-                    ctx.warn_now(
-                        call.err_call(),
-                        "zero-length arrow is of indeterminate angle and so skipped",
-                    )?;
+        if let Some(command) = endpoints {
+            if drawing.endpoints(command) {
+                ctx.warn_now(
+                    call.err_call(),
+                    "zero-length arrow is of indeterminate angle and so skipped",
+                )?;
+            }
+        } else {
+            match op.as_str() {
+                "plot_xy" => drawing.plot_xy(&values[0], &values[1], &mode),
+                "polygon" | "polypath" => {
+                    let pts = drawing.xy(&values[0], &values[1]);
+                    drawing.polygons(&pts, &op, mode == "winding", &values);
                 }
+                "text" => {
+                    let pts = drawing.xy(&values[0], &values[1]);
+                    drawing.text(
+                        &pts,
+                        &label_values,
+                        &values[3],
+                        &values[4],
+                        n(&values[5], 0, 0.5),
+                    );
+                }
+                "margin" => drawing.margin(&values, &label_values, n(&values[6], 0, 0.0) != 0.0),
+                "box" => drawing.draw_box(
+                    &mode,
+                    if variant.is_empty() {
+                        p.text("bty")
+                    } else {
+                        &variant
+                    },
+                ),
+                "symbols" => {
+                    let pts = drawing.xy(&values[0], &values[1]);
+                    drawing.symbols(&pts, &values[2], &values[3], &mode);
+                }
+                "raster" | "native_raster" => drawing.raster(&values, &raster),
+                _ => {}
             }
-            "polygon" | "polypath" => {
-                let pts = drawing.xy(&values[0], &values[1]);
-                drawing.polygons(&pts, &op, mode == "winding", &values);
-            }
-            "text" => {
-                let pts = drawing.xy(&values[0], &values[1]);
-                drawing.text(
-                    &pts,
-                    &label_values,
-                    &values[3],
-                    &values[4],
-                    n(&values[5], 0, 0.5),
-                );
-            }
-            "margin" => drawing.margin(&values, &label_values, n(&values[6], 0, 0.0) != 0.0),
-            "box" => drawing.draw_box(
-                &mode,
-                if variant.is_empty() {
-                    p.text("bty")
-                } else {
-                    &variant
-                },
-            ),
-            "symbols" => {
-                let pts = drawing.xy(&values[0], &values[1]);
-                drawing.symbols(&pts, &values[2], &values[3], &mode);
-            }
-            "raster" | "native_raster" => drawing.raster(&values, &raster),
-            _ => {}
         }
     }
     record(ctx, call, "C_rx_draw", &[args.get(0), data, options])?;

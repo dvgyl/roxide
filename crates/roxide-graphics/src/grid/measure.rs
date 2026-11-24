@@ -8,51 +8,39 @@ use crate::engine::{GContext, GraphicsExt};
 
 use super::{fields::*, unit::string_metric};
 
-const DEFAULT_INCHES: &[(i32, f64)] = &[
-    (1, 1.0 / 2.54),
-    (2, 1.0),
-    (7, 1.0 / 25.4),
-    (8, 1.0 / 72.27),
-    (9, 12.0 / 72.27),
-    (10, 1.0 / 72.0),
-    (11, (1238.0 / 1157.0) / 72.27),
-    (12, (12.0 * 1238.0 / 1157.0) / 72.27),
-    (13, 1.0 / (65536.0 * 72.27)),
-];
-
-pub(super) const NAMES: &[&str] = &[
-    "npc",
-    "cm",
-    "inches",
-    "lines",
-    "native",
-    "null",
-    "snpc",
-    "mm",
-    "points",
-    "picas",
-    "bigpts",
-    "dida",
-    "cicero",
-    "scaledpts",
-    "strwidth",
-    "strheight",
-    "strascent",
-    "strdescent",
-    "char",
-    "grobx",
-    "groby",
-    "grobwidth",
-    "grobheight",
-    "grobascent",
-    "grobdescent",
-    "mylines",
-    "mychar",
-    "mystrwidth",
-    "mystrheight",
-    "sum",
-    "min",
-    "max",
+const UNIT_CODES: &[(i32, &str, Option<f64>)] = &[
+    (0, "npc", None),
+    (1, "cm", Some(1.0 / 2.54)),
+    (2, "inches", Some(1.0)),
+    (3, "lines", None),
+    (4, "native", None),
+    (5, "null", None),
+    (6, "snpc", None),
+    (7, "mm", Some(1.0 / 25.4)),
+    (8, "points", Some(1.0 / 72.27)),
+    (9, "picas", Some(12.0 / 72.27)),
+    (10, "bigpts", Some(1.0 / 72.0)),
+    (11, "dida", Some((1238.0 / 1157.0) / 72.27)),
+    (12, "cicero", Some((12.0 * 1238.0 / 1157.0) / 72.27)),
+    (13, "scaledpts", Some(1.0 / (65536.0 * 72.27))),
+    (14, "strwidth", None),
+    (15, "strheight", None),
+    (16, "strascent", None),
+    (17, "strdescent", None),
+    (18, "char", None),
+    (19, "grobx", None),
+    (20, "groby", None),
+    (21, "grobwidth", None),
+    (22, "grobheight", None),
+    (23, "grobascent", None),
+    (24, "grobdescent", None),
+    (103, "mylines", None),
+    (104, "mychar", None),
+    (105, "mystrwidth", None),
+    (106, "mystrheight", None),
+    (SummaryOp::Sum as i32, "sum", None),
+    (SummaryOp::Min as i32, "min", None),
+    (SummaryOp::Max as i32, "max", None),
 ];
 
 fn codes(ctx: &mut Ctx, call: &Call, value: SexpId) -> EvalResult<Vec<i32>> {
@@ -67,14 +55,9 @@ fn codes(ctx: &mut Ctx, call: &Call, value: SexpId) -> EvalResult<Vec<i32>> {
                 "pt" | "point" => Some(8),
                 "centimeter" | "centimeters" | "centimetre" | "centimetres" => Some(1),
                 "millimeter" | "millimeters" | "millimetre" | "millimetres" => Some(7),
-                _ => NAMES
+                _ => UNIT_CODES
                     .iter()
-                    .position(|&unit| unit == name)
-                    .map(|i| match i {
-                        0..=24 => i as i32,
-                        25..=28 => i as i32 + 78,
-                        _ => i as i32 + 172,
-                    }),
+                    .find_map(|&(code, unit, _)| (unit == name).then_some(code)),
             };
             code.ok_or_else(|| ctx.stop(call.err_call(), "Invalid unit"))
         })
@@ -200,29 +183,58 @@ impl Units {
     }
 }
 
-fn summary(code: i32, a: f64, b: f64) -> f64 {
-    if a.is_nan() || b.is_nan() {
-        return a + b;
+#[derive(Clone, Copy)]
+enum SummaryOp {
+    Sum = 201,
+    Min = 202,
+    Max = 203,
+}
+
+impl SummaryOp {
+    fn from_code(code: i32) -> Option<Self> {
+        match code {
+            x if x == Self::Sum as i32 => Some(Self::Sum),
+            x if x == Self::Min as i32 => Some(Self::Min),
+            x if x == Self::Max as i32 => Some(Self::Max),
+            _ => None,
+        }
     }
-    match code {
-        202 => a.min(b),
-        203 => a.max(b),
-        _ => a + b,
+
+    fn identity(self) -> f64 {
+        match self {
+            Self::Sum => 0.0,
+            Self::Min => f64::INFINITY,
+            Self::Max => f64::NEG_INFINITY,
+        }
+    }
+
+    fn combine(self, a: f64, b: f64) -> f64 {
+        if a.is_nan() || b.is_nan() {
+            return a + b;
+        }
+        match self {
+            Self::Sum => a + b,
+            Self::Min => a.min(b),
+            Self::Max => a.max(b),
+        }
     }
 }
 
 impl Item {
     pub(super) fn weight(self, ctx: &mut Ctx, depth: usize) -> EvalResult<f64> {
-        match self.code {
-            5 => Ok(self.value),
-            201..=203 => self.reduce(ctx, depth, |ctx, item| item.weight(ctx, depth + 1)),
-            _ => Ok(f64::NAN),
+        if self.code == 5 {
+            Ok(self.value)
+        } else if let Some(op) = SummaryOp::from_code(self.code) {
+            self.reduce(ctx, op, depth, |ctx, item| item.weight(ctx, depth + 1))
+        } else {
+            Ok(f64::NAN)
         }
     }
 
     fn reduce(
         self,
         ctx: &mut Ctx,
+        op: SummaryOp,
         depth: usize,
         mut term: impl FnMut(&mut Ctx, Item) -> EvalResult<f64>,
     ) -> EvalResult<f64> {
@@ -230,14 +242,10 @@ impl Item {
             return Err(ctx.stop(SEXP_NIL, "unit expression is too deeply nested"));
         }
         let units = Units::read(ctx, self.data)?;
-        let mut result = match self.code {
-            202 => f64::INFINITY,
-            203 => f64::NEG_INFINITY,
-            _ => 0.0,
-        };
+        let mut result = op.identity();
         for i in 0..units.len {
             let item = units.at(ctx, i)?;
-            result = summary(self.code, result, term(ctx, item)?);
+            result = op.combine(result, term(ctx, item)?);
         }
         Ok(self.value * result)
     }
@@ -281,7 +289,7 @@ impl Space {
         position: bool,
         i: usize,
     ) -> EvalResult<f64> {
-        self.inches(ctx, item, axis, position, i, (201, 0))
+        self.inches(ctx, item, axis, position, i, (SummaryOp::Sum, 0))
     }
 
     fn inches(
@@ -291,7 +299,7 @@ impl Space {
         axis: usize,
         position: bool,
         i: usize,
-        (mode, depth): (i32, usize),
+        (mode, depth): (SummaryOp, usize),
     ) -> EvalResult<f64> {
         let size = self.size[axis];
         let [a, b] = self.scale[axis];
@@ -301,9 +309,9 @@ impl Space {
             4 => return Ok((value - if position { a } else { 0.0 }) / (b - a) * size),
             5 => {
                 return Ok(match mode {
-                    202 => size * 2.54,
-                    203 => f64::MIN_POSITIVE,
-                    _ => 0.0,
+                    SummaryOp::Min => size * 2.54,
+                    SummaryOp::Max => f64::MIN_POSITIVE,
+                    SummaryOp::Sum => 0.0,
                 });
             }
             6 => self.size[0].min(self.size[1]),
@@ -342,16 +350,17 @@ impl Space {
                     real(ctx, result, 0, f64::NAN)
                 });
             }
-            201..=203 => {
-                return item.reduce(ctx, depth, |ctx, child| {
-                    self.inches(ctx, child, axis, position, i, (item.code, depth + 1))
-                });
-            }
             code => {
-                let Some((_, scale)) = DEFAULT_INCHES.iter().find(|(key, _)| *key == code) else {
-                    return Err(ctx.stop(SEXP_NIL, "invalid unit or unit not yet implemented"));
-                };
-                *scale
+                if let Some(op) = SummaryOp::from_code(code) {
+                    return item.reduce(ctx, op, depth, |ctx, child| {
+                        self.inches(ctx, child, axis, position, i, (op, depth + 1))
+                    });
+                }
+                let scale = UNIT_CODES
+                    .iter()
+                    .find_map(|&(key, _, scale)| if key == code { scale } else { None });
+                scale
+                    .ok_or_else(|| ctx.stop(SEXP_NIL, "invalid unit or unit not yet implemented"))?
             }
         };
         Ok(value * scale)
@@ -513,7 +522,7 @@ pub(super) fn items(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
 }
 
 fn terms(ctx: &mut Ctx, item: Item, result: &mut Vec<Item>) -> EvalResult<()> {
-    if item.code == 201 && item.data != SEXP_NIL {
+    if item.code == SummaryOp::Sum as i32 && item.data != SEXP_NIL {
         let children = Units::read(ctx, item.data)?;
         for i in 0..children.len {
             let mut child = children.at(ctx, i)?;
@@ -546,7 +555,7 @@ pub(super) fn add(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     for i in 0..n {
         let mut first = a.at(ctx, i)?;
         let second = b.at(ctx, i)?;
-        if first.code < 201
+        if first.code < SummaryOp::Sum as i32
             && first.code == second.code
             && roxide_value::identical::identical(
                 ctx.session(),
@@ -562,7 +571,7 @@ pub(super) fn add(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
             terms(ctx, second, &mut sum)?;
             first = Item {
                 value: 1.0,
-                code: 201,
+                code: SummaryOp::Sum as i32,
                 data: vector(ctx, sum)?,
             };
         }
@@ -572,13 +581,10 @@ pub(super) fn add(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
 }
 
 fn unit_name(ctx: &mut Ctx, code: i32) -> EvalResult<&'static str> {
-    let index = match code {
-        0..=24 => code,
-        103..=106 => code - 78,
-        201..=203 => code - 172,
-        _ => return Err(ctx.stop(SEXP_NIL, "invalid unit")),
-    } as usize;
-    Ok(NAMES[index])
+    UNIT_CODES
+        .iter()
+        .find_map(|&(key, name, _)| (key == code).then_some(name))
+        .ok_or_else(|| ctx.stop(SEXP_NIL, "invalid unit"))
 }
 
 fn format_unit(ctx: &mut Ctx, item: Item, depth: usize) -> EvalResult<String> {
@@ -589,7 +595,7 @@ fn format_unit(ctx: &mut Ctx, item: Item, depth: usize) -> EvalResult<String> {
     let numeric = ctx.session_mut().scalar_real(item.value)?;
     let (string, _) = ctx.session_mut().coerce(numeric, SexpType::Str)?;
     let value = text(ctx, string, 0)?.unwrap_or_else(|| "NA".into());
-    if item.code < 201 {
+    if item.code < SummaryOp::Sum as i32 {
         return Ok(format!("{value}{name}"));
     }
     let items = Units::read(ctx, item.data)?;
@@ -645,12 +651,14 @@ fn unit_types(ctx: &mut Ctx, units: Units, recursive: bool, depth: usize) -> Eva
         let name = unit_name(ctx, item.code)?;
         labels.push(name);
         if recursive {
-            values.push(if item.code >= 201 && item.data != SEXP_NIL {
-                let children = Units::read(ctx, item.data)?;
-                unit_types(ctx, children, true, depth + 1)?
-            } else {
-                ctx.session_mut().scalar_str(name)?
-            });
+            values.push(
+                if item.code >= SummaryOp::Sum as i32 && item.data != SEXP_NIL {
+                    let children = Units::read(ctx, item.data)?;
+                    unit_types(ctx, children, true, depth + 1)?
+                } else {
+                    ctx.session_mut().scalar_str(name)?
+                },
+            );
         }
     }
     let labels = strings(ctx, &labels)?;
@@ -679,7 +687,8 @@ fn identical_data(ctx: &Ctx, a: Item, b: Item) -> EvalResult<bool> {
 
 pub(super) fn extrema(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     let values = ctx.session().list_slice(args.get(0))?.to_vec();
-    let code = real(ctx, args.get(1), 0, 202.0)? as i32;
+    let code = real(ctx, args.get(1), 0, f64::from(SummaryOp::Min as i32))? as i32;
+    let op = SummaryOp::from_code(code).unwrap_or(SummaryOp::Sum);
     let units = values
         .iter()
         .map(|&value| {
@@ -706,7 +715,7 @@ pub(super) fn extrema(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult
         for unit in &units {
             items.push(unit.at(ctx, i)?);
         }
-        same_run &= item.code < 201;
+        same_run &= item.code < SummaryOp::Sum as i32;
         if same_run {
             for &candidate in &items {
                 same_run &= identical_data(ctx, item, candidate)?;
@@ -716,7 +725,7 @@ pub(super) fn extrema(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult
             item.value = items
                 .iter()
                 .skip(1)
-                .fold(item.value, |x, child| summary(code, x, child.value));
+                .fold(item.value, |x, child| op.combine(x, child.value));
         } else {
             item = Item {
                 value: 1.0,

@@ -4,8 +4,9 @@ use roxide_eval::{Args, Call, Ctx, EvalResult, InternalError, Unwind};
 use roxide_gc::SexpId;
 use roxide_value::{SEXP_NIL, SexpType, ValueApi};
 
-use crate::engine::{Device, GContext, GraphicsExt, LineEnd, LineJoin, Rect, Rgba};
+use crate::engine::{Device, GContext, GraphicsExt, Rect, Rgba};
 use crate::grdevices::parse_rgba;
+use crate::stroke::{LINE_TYPES, dash_pattern, line_end, line_join};
 
 use super::{
     fields::*,
@@ -14,10 +15,18 @@ use super::{
     viewport::Transform,
 };
 
+mod bounds;
+
+use bounds::{Bounds, Box2, boundary};
+
 type Point = (f64, f64);
 
 fn finite((x, y): Point) -> bool {
     x.is_finite() && y.is_finite()
+}
+
+fn delta(a: Point, b: Point) -> Point {
+    (a.0 - b.0, a.1 - b.1)
 }
 
 fn scalar(ctx: &mut Ctx, value: SexpId, i: usize) -> EvalResult {
@@ -53,36 +62,18 @@ fn style(ctx: &mut Ctx, gp: SexpId, i: usize) -> EvalResult<GContext> {
     let lty = scalar(ctx, lty, i)?;
     let (lty, _) = ctx.session_mut().coerce(lty, SexpType::Str)?;
     let lty = text(ctx, lty, 0)?.unwrap_or_default();
-    let dashes = match lty.as_str() {
-        "0" | "blank" => {
-            gc.col = Rgba::TRANSPARENT;
-            ""
-        }
-        "1" | "solid" => "",
-        "2" | "dashed" => "44",
-        "3" | "dotted" => "13",
-        "4" | "dotdash" => "1343",
-        "5" | "longdash" => "73",
-        "6" | "twodash" => "2262",
-        other => other,
+    let lty = match lty.as_bytes() {
+        [digit @ b'0'..=b'6'] => LINE_TYPES[usize::from(digit - b'0')],
+        _ => lty.as_str(),
     };
-    gc.lty = dashes
-        .chars()
-        .filter_map(|c| c.to_digit(16))
-        .map(f64::from)
-        .collect();
+    if lty == "blank" {
+        gc.col = Rgba::TRANSPARENT;
+    }
+    gc.lty = dash_pattern(lty);
     let end = get(ctx, gp, "lineend")?;
-    gc.lend = match text(ctx, end, i)?.as_deref() {
-        Some("butt") => LineEnd::Butt,
-        Some("square") => LineEnd::Square,
-        _ => LineEnd::Round,
-    };
+    gc.lend = line_end(text(ctx, end, i)?.as_deref().unwrap_or_default());
     let join = get(ctx, gp, "linejoin")?;
-    gc.ljoin = match text(ctx, join, i)?.as_deref() {
-        Some("mitre") => LineJoin::Mitre,
-        Some("bevel") => LineJoin::Bevel,
-        _ => LineJoin::Round,
-    };
+    gc.ljoin = line_join(text(ctx, join, i)?.as_deref().unwrap_or_default());
     gc.lmitre = num(ctx, gp, "linemitre", i, 10.0)?;
     Ok(gc)
 }
@@ -101,6 +92,53 @@ enum Shape {
     Points,
     Raster,
     Null,
+}
+
+struct Position {
+    x: Units,
+    y: Units,
+}
+
+impl Position {
+    fn max_len(&self) -> usize {
+        self.x.len.max(self.y.len)
+    }
+}
+
+struct Extent {
+    width: Units,
+    height: Units,
+}
+
+enum Geometry {
+    Box { at: Position, extent: Extent },
+    Circle { at: Position, radius: Units },
+    Segments { start: Position, end: Position },
+    Points { at: Position, size: Units },
+    Position(Position),
+}
+
+impl Geometry {
+    fn position(&self) -> &Position {
+        match self {
+            Self::Box { at, .. }
+            | Self::Circle { at, .. }
+            | Self::Points { at, .. }
+            | Self::Position(at) => at,
+            Self::Segments { start, .. } => start,
+        }
+    }
+
+    fn max_len(&self) -> usize {
+        let len = self.position().max_len();
+        match self {
+            Self::Box { extent, .. } => len.max(extent.width.len).max(extent.height.len),
+            Self::Circle { radius, .. } => len.max(radius.len),
+            Self::Segments { end, .. } => len.max(end.max_len()),
+            Self::Points { size, .. } => len.max(size.len),
+            Self::Position(_) => len,
+        }
+    }
 }
 
 struct Grob {
@@ -140,14 +178,16 @@ impl Grob {
         })
     }
 
-    fn coords(&self, ctx: &mut Ctx, names: &[&str]) -> EvalResult<Vec<Units>> {
-        names
-            .iter()
-            .map(|name| {
-                let value = get(ctx, self.value, name)?;
-                Units::read(ctx, value)
-            })
-            .collect()
+    fn units(&self, ctx: &mut Ctx, name: &str) -> EvalResult<Units> {
+        let value = get(ctx, self.value, name)?;
+        Units::read(ctx, value)
+    }
+
+    fn position(&self, ctx: &mut Ctx, x: &str, y: &str) -> EvalResult<Position> {
+        Ok(Position {
+            x: self.units(ctx, x)?,
+            y: self.units(ctx, y)?,
+        })
     }
 
     fn inches(
@@ -162,10 +202,10 @@ impl Grob {
         self.space.measure(ctx, item, axis, pos, i)
     }
 
-    fn point(&self, ctx: &mut Ctx, units: &[Units], i: usize) -> EvalResult<Point> {
+    fn point(&self, ctx: &mut Ctx, at: &Position, i: usize) -> EvalResult<Point> {
         Ok((
-            self.inches(ctx, &units[0], 0, true, i)?,
-            self.inches(ctx, &units[1], 1, true, i)?,
+            self.inches(ctx, &at.x, 0, true, i)?,
+            self.inches(ctx, &at.y, 1, true, i)?,
         ))
     }
 
@@ -183,39 +223,55 @@ impl Grob {
             .abs())
     }
 
-    fn coords_for_shape(&self, ctx: &mut Ctx) -> EvalResult<Vec<Units>> {
-        self.coords(
-            ctx,
-            match self.shape {
-                Shape::Rect | Shape::Raster => &["x", "y", "width", "height"],
-                Shape::Circle => &["x", "y", "r"],
-                Shape::Segments => &["x0", "y0", "x1", "y1"],
-                Shape::Points => &["x", "y", "size"],
-                _ => &["x", "y"],
+    fn geometry(&self, ctx: &mut Ctx) -> EvalResult<Geometry> {
+        if matches!(self.shape, Shape::Segments) {
+            return Ok(Geometry::Segments {
+                start: self.position(ctx, "x0", "y0")?,
+                end: self.position(ctx, "x1", "y1")?,
+            });
+        }
+        let at = self.position(ctx, "x", "y")?;
+        Ok(match self.shape {
+            Shape::Rect | Shape::Raster => Geometry::Box {
+                at,
+                extent: Extent {
+                    width: self.units(ctx, "width")?,
+                    height: self.units(ctx, "height")?,
+                },
             },
-        )
+            Shape::Circle => Geometry::Circle {
+                at,
+                radius: self.units(ctx, "r")?,
+            },
+            Shape::Points => Geometry::Points {
+                at,
+                size: self.units(ctx, "size")?,
+            },
+            _ => Geometry::Position(at),
+        })
     }
 
-    fn rect(&self, ctx: &mut Ctx, units: &[Units], (x, y): Point, i: usize) -> EvalResult<Box2> {
+    fn rect(&self, ctx: &mut Ctx, extent: &Extent, (x, y): Point, i: usize) -> EvalResult<Box2> {
         let (jx, jy) = self.just(ctx, i)?;
-        let mut w = if units[2].len == 0 {
+        let mut w = if extent.width.len == 0 {
             self.space.size[0]
         } else {
-            self.inches(ctx, &units[2], 0, false, i)?
+            self.inches(ctx, &extent.width, 0, false, i)?
         };
-        let mut h = if units[3].len == 0 {
+        let mut h = if extent.height.len == 0 {
             self.space.size[1]
         } else {
-            self.inches(ctx, &units[3], 1, false, i)?
+            self.inches(ctx, &extent.height, 1, false, i)?
         };
-        if matches!(self.shape, Shape::Raster) && (units[2].len == 0 || units[3].len == 0) {
+        if matches!(self.shape, Shape::Raster) && (extent.width.len == 0 || extent.height.len == 0)
+        {
             let image = get(ctx, self.value, "raster")?;
             let d = attr(ctx, image, "dim")?;
             let ratio = real(ctx, d, 1, 1.0)? / real(ctx, d, 0, 1.0)?;
-            if units[2].len == 0 && (units[3].len != 0 || w > h * ratio) {
+            if extent.width.len == 0 && (extent.height.len != 0 || w > h * ratio) {
                 w = h * ratio;
             }
-            if units[3].len == 0 {
+            if extent.height.len == 0 {
                 h = w / ratio;
             }
         }
@@ -269,121 +325,6 @@ struct TextBox {
     jx: f64,
     ascent: f64,
     descent: f64,
-}
-
-#[derive(Clone, Copy)]
-struct Box2 {
-    low: Point,
-    high: Point,
-}
-
-impl Box2 {
-    fn new(x: f64, y: f64, w: f64, h: f64) -> Self {
-        if ![x, y, w, h].into_iter().all(f64::is_finite) {
-            return Self {
-                low: (f64::NAN, f64::NAN),
-                high: (f64::NAN, f64::NAN),
-            };
-        }
-        Self {
-            low: (x.min(x + w), y.min(y + h)),
-            high: (x.max(x + w), y.max(y + h)),
-        }
-    }
-
-    fn corners(self) -> [Point; 4] {
-        let (x0, y0) = self.low;
-        let (x1, y1) = self.high;
-        [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
-    }
-
-    fn width(self) -> f64 {
-        self.high.0 - self.low.0
-    }
-
-    fn height(self) -> f64 {
-        self.high.1 - self.low.1
-    }
-
-    fn overlaps(self, other: Self) -> bool {
-        self.low.0 < other.high.0
-            && self.high.0 > other.low.0
-            && self.low.1 < other.high.1
-            && self.high.1 > other.low.1
-    }
-}
-
-#[derive(Default)]
-struct Bounds(Option<Box2>);
-
-impl Bounds {
-    fn add(&mut self, points: impl IntoIterator<Item = Point>) {
-        for (x, y) in points.into_iter().filter(|&pt| finite(pt)) {
-            let b = self.0.get_or_insert(Box2::new(x, y, 0.0, 0.0));
-            b.low = (b.low.0.min(x), b.low.1.min(y));
-            b.high = (b.high.0.max(x), b.high.1.max(y));
-        }
-    }
-}
-
-fn cross(a: Point, b: Point) -> f64 {
-    a.0 * b.1 - a.1 * b.0
-}
-
-fn delta(a: Point, b: Point) -> Point {
-    (a.0 - b.0, a.1 - b.1)
-}
-
-fn hull_half(points: impl Iterator<Item = Point>) -> Vec<Point> {
-    let mut hull = Vec::new();
-    for point in points {
-        while let [.., a, b] = hull.as_slice() {
-            if cross(delta(*b, *a), delta(point, *b)) > 0.0 {
-                break;
-            }
-            hull.pop();
-        }
-        hull.push(point);
-    }
-    hull.pop();
-    hull
-}
-
-fn boundary(bounds: Box2, mut points: Vec<Point>, angle: f64) -> Point {
-    let center = (
-        (bounds.high.0 + bounds.low.0) / 2.0,
-        (bounds.high.1 + bounds.low.1) / 2.0,
-    );
-    let (sin, cos) = angle.to_radians().sin_cos();
-    let ray = (cos, sin);
-    points.retain(|&pt| finite(pt));
-    points.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.total_cmp(&b.1)));
-    points.dedup();
-    let mut hull = hull_half(points.iter().copied());
-    hull.extend(hull_half(points.iter().rev().copied()));
-    let mut distance = f64::INFINITY;
-    for (&a, &b) in hull.iter().zip(hull.iter().cycle().skip(1)) {
-        let start = delta(a, center);
-        let edge = delta(b, a);
-        let denominator = cross(ray, edge);
-        if denominator.abs() <= 1e-12 {
-            continue;
-        }
-        let t = cross(start, edge) / denominator;
-        let u = cross(start, ray) / denominator;
-        if t >= 0.0 && (-1e-12..=1.0 + 1e-12).contains(&u) {
-            distance = distance.min(t);
-        }
-    }
-    if !distance.is_finite() && hull.len() == 2 && cross(ray, delta(hull[0], center)).abs() <= 1e-12
-    {
-        distance = (hull[0].0 - center.0).hypot(hull[0].1 - center.1);
-    }
-    if distance.is_finite() {
-        (center.0 + distance * cos, center.1 + distance * sin)
-    } else {
-        center
-    }
 }
 
 fn checked_size(ctx: &mut Ctx, n: usize) -> EvalResult<usize> {
@@ -509,7 +450,7 @@ impl Arrow {
     }
 }
 
-fn draw_lines(ctx: &mut Ctx, g: &Grob, xy: &[Units], n: usize) -> EvalResult<()> {
+fn draw_lines(ctx: &mut Ctx, g: &Grob, xy: &Position, n: usize) -> EvalResult<()> {
     let arrow = Arrow::read(ctx, g.value)?;
     let mut points = Vec::with_capacity(n);
     for i in 0..n {
@@ -648,52 +589,47 @@ pub(super) fn draw(ctx: &mut Ctx, _: &Call, args: &mut Args) -> EvalResult {
     if matches!(g.shape, Shape::Empty | Shape::Null) {
         return Ok(SEXP_NIL);
     }
-    let xy = g.coords_for_shape(ctx)?;
+    let geometry = g.geometry(ctx)?;
     let label = if matches!(g.shape, Shape::Text) {
         get(ctx, g.value, "label")?
     } else {
         SEXP_NIL
     };
-    let n = xy
-        .iter()
-        .map(|u| u.len)
-        .max()
-        .unwrap_or(0)
-        .max(ctx.session().xlength(label)?);
+    let n = geometry.max_len().max(ctx.session().xlength(label)?);
     let n = checked_size(ctx, n)?;
     if matches!(
         g.shape,
         Shape::Lines | Shape::Polyline | Shape::Polygon | Shape::Path
     ) {
-        draw_lines(ctx, &g, &xy, n)?;
+        draw_lines(ctx, &g, geometry.position(), n)?;
         return Ok(SEXP_NIL);
     }
     let arrow = Arrow::read(ctx, g.value)?;
     let mut text_bounds: Vec<Box2> = Vec::new();
     let overlap = num(ctx, g.value, "check.overlap", 0, 0.0)? == 1.0;
     for i in 0..n {
-        let at = g.point(ctx, &xy, i)?;
+        let at = g.point(ctx, geometry.position(), i)?;
         if !finite(at) {
             continue;
         }
         let mut gc = style(ctx, g.space.gp, i)?;
-        match g.shape {
-            Shape::Rect | Shape::Raster => {
-                let bounds = g.rect(ctx, &xy, at, i)?;
+        match &geometry {
+            Geometry::Box { extent, .. } => {
+                let bounds = g.rect(ctx, extent, at, i)?;
                 if matches!(g.shape, Shape::Raster) {
                     draw_raster(ctx, &g, bounds, gc)?;
                 } else {
                     draw_box(device(ctx)?, &g, bounds, &gc);
                 }
             }
-            Shape::Circle => {
-                let r = g.radius(ctx, &xy[2], i)? * 72.0;
+            Geometry::Circle { radius, .. } => {
+                let r = g.radius(ctx, radius, i)? * 72.0;
                 if r.is_finite() {
                     device(ctx)?.circle(g.device_point(at), r, &gc);
                 }
             }
-            Shape::Segments => {
-                let end = g.point(ctx, &xy[2..], i)?;
+            Geometry::Segments { end, .. } => {
+                let end = g.point(ctx, end, i)?;
                 if finite(end) {
                     let points = [g.device_point(at), g.device_point(end)];
                     device(ctx)?.polyline(&points, &gc);
@@ -702,8 +638,8 @@ pub(super) fn draw(ctx: &mut Ctx, _: &Call, args: &mut Args) -> EvalResult {
                     }
                 }
             }
-            Shape::Points => {
-                let size = g.radius(ctx, &xy[2], i)? * 72.0;
+            Geometry::Points { size, .. } => {
+                let size = g.radius(ctx, size, i)? * 72.0;
                 let symbols = get(ctx, g.value, "pch")?;
                 if ctx.session().type_of(symbols)? == SexpType::Str {
                     if let Some(label) = text(ctx, symbols, i)? {
@@ -716,7 +652,7 @@ pub(super) fn draw(ctx: &mut Ctx, _: &Call, args: &mut Args) -> EvalResult {
                     }
                 }
             }
-            Shape::Text => {
+            Geometry::Position(_) if matches!(g.shape, Shape::Text) => {
                 let Some(label) = text(ctx, label, i)? else {
                     continue;
                 };
@@ -751,7 +687,7 @@ pub(super) fn bounds(ctx: &mut Ctx, _: &Call, args: &mut Args) -> EvalResult {
     let target = Transform::read(ctx, target_node)?;
     let target_rotation = num(ctx, target_node, "rotation", 0, 0.0)?;
     let angle = real(ctx, args.get(3), 0, 0.0)? + target_rotation - g.rotation;
-    let xy = g.coords_for_shape(ctx)?;
+    let geometry = g.geometry(ctx)?;
     let label = if matches!(g.shape, Shape::Text) {
         get(ctx, g.value, "label")?
     } else {
@@ -760,11 +696,7 @@ pub(super) fn bounds(ctx: &mut Ctx, _: &Call, args: &mut Args) -> EvalResult {
     let n = if matches!(g.shape, Shape::Empty) {
         0
     } else {
-        xy.iter()
-            .map(|u| u.len)
-            .max()
-            .unwrap_or(0)
-            .max(ctx.session().xlength(label)?)
+        geometry.max_len().max(ctx.session().xlength(label)?)
     };
     let n = checked_size(ctx, n)?;
     let mut bounds = Bounds::default();
@@ -773,21 +705,21 @@ pub(super) fn bounds(ctx: &mut Ctx, _: &Call, args: &mut Args) -> EvalResult {
     let (mut ascent, mut descent) = (0.0_f64, 0.0_f64);
     let mut circle = None;
     for i in 0..n {
-        let at = g.point(ctx, &xy, i)?;
+        let at = g.point(ctx, geometry.position(), i)?;
         if !finite(at) {
             continue;
         }
-        match g.shape {
-            Shape::Rect | Shape::Raster => points.extend(g.rect(ctx, &xy, at, i)?.corners()),
-            Shape::Circle => {
-                let r = g.radius(ctx, &xy[2], i)?;
+        match &geometry {
+            Geometry::Box { extent, .. } => points.extend(g.rect(ctx, extent, at, i)?.corners()),
+            Geometry::Circle { radius, .. } => {
+                let r = g.radius(ctx, radius, i)?;
                 points.extend(Box2::new(at.0 - r, at.1 - r, 2.0 * r, 2.0 * r).corners());
                 if n == 1 {
                     circle = Some((at, r));
                 }
             }
-            Shape::Segments => points.extend([at, g.point(ctx, &xy[2..], i)?]),
-            Shape::Text => {
+            Geometry::Segments { end, .. } => points.extend([at, g.point(ctx, end, i)?]),
+            Geometry::Position(_) if matches!(g.shape, Shape::Text) => {
                 if anchor == Some(at) {
                     continue;
                 }

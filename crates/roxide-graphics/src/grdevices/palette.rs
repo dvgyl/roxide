@@ -294,20 +294,22 @@ fn hcl_point(h: f64, c: f64, l: f64, fixup: bool) -> Option<Rgba> {
     Some(Rgba::new(r, g, b, 255))
 }
 
-#[allow(clippy::too_many_arguments)]
-fn eval_seq_hcl(
-    ts: &[f64],
-    h1: f64,
-    h2: f64,
-    c1: f64,
-    c2: f64,
-    l1: f64,
-    l2: f64,
-    p1: f64,
-    p2: f64,
-    cmax: Option<f64>,
-    fixup: bool,
-) -> Vec<Option<Rgba>> {
+struct HclTrajectory {
+    hue: [f64; 2],
+    chroma: [f64; 2],
+    luminance: [f64; 2],
+    power: [f64; 2],
+    max_chroma: Option<f64>,
+}
+
+fn eval_seq_hcl(ts: &[f64], trajectory: HclTrajectory, fixup: bool) -> Vec<Option<Rgba>> {
+    let HclTrajectory {
+        hue: [h1, h2],
+        chroma: [c1, c2],
+        luminance: [l1, l2],
+        power: [p1, p2],
+        max_chroma: cmax,
+    } = trajectory;
     let j = cmax.and_then(|cm| {
         let denom = (cm - c2).abs();
         let val = if denom == 0.0 {
@@ -368,7 +370,17 @@ fn eval_hcl_palette(entry: HclEntry, n: usize, fixup: bool) -> Vec<Option<Rgba>>
                     .map(|i| 1.0 - (i as f64) / ((n - 1) as f64))
                     .collect()
             };
-            eval_seq_hcl(&ts, h1, h2, c1, c2, l1, l2, p1, p2, cmax, fixup)
+            eval_seq_hcl(
+                &ts,
+                HclTrajectory {
+                    hue: [h1, h2],
+                    chroma: [c1, c2],
+                    luminance: [l1, l2],
+                    power: [p1, p2],
+                    max_chroma: cmax,
+                },
+                fixup,
+            )
         }
         HclKind::Diverging => {
             let h1 = get(0).unwrap_or(0.0);
@@ -387,8 +399,28 @@ fn eval_hcl_palette(entry: HclEntry, n: usize, fixup: bool) -> Vec<Option<Rgba>>
                     .map(|k| (1.0 - 2.0 * (k as f64) / ((n - 1) as f64)).max(0.0))
                     .collect()
             };
-            let mut left = eval_seq_hcl(&ts, h1, h1, c1, 0.0, l1, l2, p1, p2, cmax, fixup);
-            let mut right = eval_seq_hcl(&ts, h2, h2, c1, 0.0, l1, l2, p1, p2, cmax, fixup);
+            let mut left = eval_seq_hcl(
+                &ts,
+                HclTrajectory {
+                    hue: [h1, h1],
+                    chroma: [c1, 0.0],
+                    luminance: [l1, l2],
+                    power: [p1, p2],
+                    max_chroma: cmax,
+                },
+                fixup,
+            );
+            let mut right = eval_seq_hcl(
+                &ts,
+                HclTrajectory {
+                    hue: [h2, h2],
+                    chroma: [c1, 0.0],
+                    luminance: [l1, l2],
+                    power: [p1, p2],
+                    max_chroma: cmax,
+                },
+                fixup,
+            );
             right.reverse();
             if n % 2 == 1 {
                 left.pop();
@@ -422,28 +454,24 @@ fn eval_hcl_palette(entry: HclEntry, n: usize, fixup: bool) -> Vec<Option<Rgba>>
             };
             let mut left = eval_seq_hcl(
                 &ts,
-                h1,
-                h2.unwrap_or(h1),
-                c1,
-                c2,
-                l1,
-                l2,
-                p1,
-                p2,
-                cmax1,
+                HclTrajectory {
+                    hue: [h1, h2.unwrap_or(h1)],
+                    chroma: [c1, c2],
+                    luminance: [l1, l2],
+                    power: [p1, p2],
+                    max_chroma: cmax1,
+                },
                 fixup,
             );
             let mut right = eval_seq_hcl(
                 &ts,
-                h3,
-                h2.unwrap_or(h3),
-                c3,
-                c2,
-                l3,
-                l2,
-                p3,
-                p4,
-                cmax2,
+                HclTrajectory {
+                    hue: [h3, h2.unwrap_or(h3)],
+                    chroma: [c3, c2],
+                    luminance: [l3, l2],
+                    power: [p3, p4],
+                    max_chroma: cmax2,
+                },
                 fixup,
             );
             right.reverse();

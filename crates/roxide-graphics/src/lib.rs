@@ -7,6 +7,7 @@ pub mod engine;
 pub mod graphics;
 pub mod grdevices;
 pub mod grid;
+mod stroke;
 
 use roxide_eval::{Ctx, InternalError, Package};
 

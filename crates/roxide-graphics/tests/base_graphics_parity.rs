@@ -183,3 +183,40 @@ fn record_and_replay_restore_state_and_keep_one_copy_of_the_calls() {
         "#,
     );
 }
+
+#[test]
+fn base_and_grid_distinguish_blank_solid_and_numeric_dash_lines() {
+    let mut ctx = context(GcPolicy::Torture);
+    run(
+        &mut ctx,
+        r#"
+        svg("/tmp/base-lines.svg", 2, 2)
+        par(mar = rep(0, 4))
+        plot.new()
+        plot.window(c(0, 1), c(0, 1))
+        lines(c(.2, .8), c(.2, .2), lty = 0)
+        lines(c(.2, .8), c(.4, .4), lty = 1)
+        lines(c(.2, .8), c(.6, .6), lty = 2)
+        dev.off()
+        svg("/tmp/grid-lines.svg", 2, 2)
+        grid::grid.newpage()
+        grid::grid.lines(c(.2, .8), c(.2, .2), gp = grid::gpar(lty = "blank"))
+        grid::grid.lines(c(.2, .8), c(.4, .4), gp = grid::gpar(lty = 1))
+        grid::grid.lines(c(.2, .8), c(.6, .6), gp = grid::gpar(lty = 2))
+        dev.off()
+        "#,
+    );
+    for path in ["/tmp/base-lines.svg", "/tmp/grid-lines.svg"] {
+        let svg = String::from_utf8(output(&mut ctx, path)).expect("SVG text");
+        let visible: Vec<_> = svg
+            .lines()
+            .filter(|line| line.contains("<polyline ") && line.contains(r##"stroke="#000000""##))
+            .collect();
+        assert_eq!(visible.len(), 2, "{path}\n{svg}");
+        assert!(!visible[0].contains("stroke-dasharray"), "{path}\n{svg}");
+        assert!(
+            visible[1].contains(r#"stroke-dasharray="3 3""#),
+            "{path}\n{svg}"
+        );
+    }
+}

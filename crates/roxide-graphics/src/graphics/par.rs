@@ -2,40 +2,17 @@ use std::collections::BTreeMap;
 
 use roxide_eval::{Args, Call, Ctx, EvalResult};
 use roxide_gc::SexpId;
-use roxide_value::{NA_REAL, RLogical, SEXP_NIL, SexpType, ValueApi};
+use roxide_value::{NA_REAL, SEXP_NIL, SexpType, ValueApi};
 
-use crate::{
-    engine::{DeviceSlot, GContext, Rgba},
-    grdevices::parse_rgba,
-};
+use crate::engine::{DeviceSlot, GContext, Rgba};
 
 use super::{active, alloc_strings, flag, layout::Layout, names, nums, record, string, strings};
 
-#[derive(Clone)]
-pub(super) enum Param {
-    Real(f64),
-    Int(i32),
-    Flag(Option<bool>),
-    Text(String),
-    Color(String, Rgba),
-    Reals(Vec<f64>),
-    Ints(Vec<i32>),
-}
+mod snapshot;
+mod stored;
 
-impl Param {
-    fn alloc(&self, ctx: &mut Ctx) -> EvalResult {
-        Ok(match self {
-            Self::Real(x) => ctx.session_mut().alloc_real_from(&[*x])?,
-            Self::Int(x) => ctx.session_mut().alloc_int_from(&[*x])?,
-            Self::Flag(x) => ctx
-                .session_mut()
-                .alloc_lgl_from(&[RLogical::from_option(*x)])?,
-            Self::Text(x) | Self::Color(x, _) => alloc_strings(ctx, [x.as_str()])?,
-            Self::Reals(x) => ctx.session_mut().alloc_real_from(x)?,
-            Self::Ints(x) => ctx.session_mut().alloc_int_from(x)?,
-        })
-    }
-}
+pub(super) use snapshot::{restore, snapshot};
+pub(super) use stored::{Param, choice, line_type};
 
 const READ_ONLY: &[&str] = &["cin", "cra", "csi", "cxy", "din", "page"];
 const UNIT: [f64; 4] = [0.0, 1.0, 0.0, 1.0];
@@ -157,56 +134,8 @@ pub(super) struct GPar {
 
 impl GPar {
     fn new(din: [f64; 2], ps: f64, bg: Rgba) -> Self {
-        use Param::*;
-        let mut params = BTreeMap::from([
-            ("adj", Real(0.5)),
-            ("ann", Flag(Some(true))),
-            ("ask", Flag(Some(false))),
-            ("bg", Color(color_name(bg), bg)),
-            ("bty", Text("o".into())),
-            ("cex", Real(1.0)),
-            ("cex.axis", Real(1.0)),
-            ("cex.lab", Real(1.0)),
-            ("cex.main", Real(1.2)),
-            ("cex.sub", Real(1.0)),
-            ("crt", Real(0.0)),
-            ("err", Int(0)),
-            ("family", Text(String::new())),
-            ("font", Int(1)),
-            ("font.axis", Int(1)),
-            ("font.lab", Int(1)),
-            ("font.main", Int(2)),
-            ("font.sub", Int(1)),
-            ("lab", Ints(vec![5, 5, 7])),
-            ("las", Int(0)),
-            ("lend", Text("round".into())),
-            ("lheight", Real(1.0)),
-            ("ljoin", Text("round".into())),
-            ("lmitre", Real(10.0)),
-            ("lty", Text("solid".into())),
-            ("lwd", Real(1.0)),
-            ("mex", Real(1.0)),
-            ("mgp", Reals(vec![3.0, 1.0, 0.0])),
-            ("mkh", Real(0.001)),
-            ("pch", Int(1)),
-            ("ps", Int(ps as i32)),
-            ("pty", Text("m".into())),
-            ("smo", Real(1.0)),
-            ("srt", Real(0.0)),
-            ("tck", Real(NA_REAL)),
-            ("tcl", Real(-0.5)),
-            ("xaxs", Text("r".into())),
-            ("xaxt", Text("s".into())),
-            ("xpd", Flag(Some(false))),
-            ("yaxs", Text("r".into())),
-            ("yaxt", Text("s".into())),
-            ("ylbias", Real(0.2)),
-        ]);
-        for name in ["col", "col.axis", "col.lab", "col.main", "col.sub", "fg"] {
-            params.insert(name, Color("black".into(), Rgba::BLACK));
-        }
         Self {
-            params,
+            params: stored::defaults(ps, bg),
             din,
             cin: [ps / 80.0, ps / 60.0],
             csi: ps / 60.0,
@@ -509,167 +438,6 @@ fn vector<const N: usize>(
     Ok(values)
 }
 
-pub(super) fn parse_color(ctx: &mut Ctx, value: SexpId) -> EvalResult<Rgba> {
-    parse_rgba(ctx, value)
-}
-
-pub(super) fn choice(ctx: &mut Ctx, x: SexpId, choices: &[&str]) -> EvalResult<Option<String>> {
-    let kind = ctx.session().type_of(x)?;
-    let selected = if matches!(kind, SexpType::Int | SexpType::Real) {
-        let x = nums(ctx, x)?.first().copied().unwrap_or(NA_REAL);
-        if x.is_finite() && x >= 0.0 {
-            choices.get(x as usize).copied()
-        } else {
-            None
-        }
-    } else {
-        let x = string(ctx, x)?;
-        choices.iter().copied().find(|&name| name == x)
-    };
-    Ok(selected.map(str::to_owned))
-}
-
-const LTY: &[&str] = &[
-    "blank", "solid", "dashed", "dotted", "dotdash", "longdash", "twodash",
-];
-
-pub(super) fn line_type(ctx: &mut Ctx, value: SexpId) -> EvalResult<Option<String>> {
-    if matches!(
-        ctx.session().type_of(value)?,
-        SexpType::Int | SexpType::Real
-    ) {
-        let value = nums(ctx, value)?.first().copied().unwrap_or(NA_REAL);
-        return Ok(if value == 0.0 {
-            Some("blank".into())
-        } else if value.is_finite() && value >= 1.0 && value <= f64::from(i32::MAX) {
-            Some(LTY[1 + (value as usize - 1) % (LTY.len() - 1)].into())
-        } else {
-            None
-        });
-    }
-    if let Some(name) = choice(ctx, value, LTY)? {
-        return Ok(Some(name));
-    }
-    let text = string(ctx, value)?;
-    Ok((matches!(text.len(), 2 | 4 | 6 | 8)
-        && text.bytes().all(|b| b.is_ascii_hexdigit() && b != b'0'))
-    .then(|| text.to_ascii_uppercase()))
-}
-
-fn color_name(color: Rgba) -> String {
-    let Rgba { r, g, b, a } = color;
-    match a {
-        0 => "transparent".into(),
-        255 => {
-            let hex = format!("{r:02X}{g:02X}{b:02X}");
-            include_str!("../grdevices/named_colors.tsv")
-                .lines()
-                .filter_map(|line| line.split_once('\t'))
-                .find_map(|(name, value)| (value == hex).then(|| name.to_owned()))
-                .unwrap_or_else(|| format!("#{hex}"))
-        }
-        _ => format!("#{r:02X}{g:02X}{b:02X}{a:02X}"),
-    }
-}
-
-fn parse(
-    ctx: &mut Ctx,
-    call: &Call,
-    name: &str,
-    template: &Param,
-    value: SexpId,
-) -> EvalResult<Param> {
-    use Param::*;
-    let result = match template {
-        Color(..) => {
-            let rgba = parse_color(ctx, value)?;
-            let spelling = string(ctx, value)?;
-            let rgba = if spelling.parse::<f64>().is_ok_and(|x| x.trunc() == 0.0) {
-                state(active(ctx, call, true)?)?.color("bg")
-            } else {
-                rgba
-            };
-            let selected = color_name(rgba);
-            Color(selected, rgba)
-        }
-        Flag(_) => {
-            let flag = flag(ctx, value)?;
-            if flag.is_none() && name != "xpd" {
-                return Err(invalid(ctx, call, name));
-            }
-            Flag(flag)
-        }
-        Int(_) if name != "pch" || ctx.session().type_of(value)? != SexpType::Str => {
-            let x = vector::<1>(ctx, call, name, value)?[0];
-            if x <= i32::MIN as f64 || x > i32::MAX as f64 {
-                return Err(invalid(ctx, call, name));
-            }
-            let x = x as i32;
-            let valid = match name {
-                "las" => (0..=3).contains(&x),
-                "err" => matches!(x, -1 | 0),
-                "ps" => x >= 0,
-                n if n.starts_with("font") => x >= 1,
-                _ => true,
-            };
-            if !valid {
-                return Err(invalid(ctx, call, name));
-            }
-            Int(x)
-        }
-        Text(_) | Int(_) => {
-            let text = match name {
-                "lend" => choice(ctx, value, &["round", "butt", "square"])?,
-                "ljoin" => choice(ctx, value, &["round", "mitre", "bevel"])?,
-                "lty" => line_type(ctx, value)?,
-                "family" => Some(string(ctx, value)?),
-                _ => {
-                    let first = string(ctx, value)?.chars().next();
-                    let valid = match name {
-                        "bty" => "ol7cun]OLCU",
-                        "pty" => "ms",
-                        "xaxs" | "yaxs" => "riesd",
-                        "xaxt" | "yaxt" => "sln",
-                        _ => "",
-                    };
-                    first
-                        .filter(|c| name == "pch" || valid.contains(*c))
-                        .map(|c| c.to_string())
-                }
-            };
-            Text(text.ok_or_else(|| invalid(ctx, call, name))?)
-        }
-        Real(_) => {
-            let x = nums(ctx, value)?;
-            let [x] = x.as_slice() else {
-                return Err(invalid(ctx, call, name));
-            };
-            let valid = match name {
-                "tck" | "tcl" => !x.is_infinite(),
-                "adj" => (0.0..=1.0).contains(x),
-                "lmitre" => x.is_finite() && *x >= 1.0,
-                n if n.starts_with("cex") || matches!(n, "mex" | "lwd" | "lheight") => {
-                    x.is_finite() && *x > 0.0
-                }
-                _ => x.is_finite(),
-            };
-            if !valid {
-                return Err(invalid(ctx, call, name));
-            }
-            Real(*x)
-        }
-        Ints(_) => {
-            let x = vector::<3>(ctx, call, name, value)?;
-            if x.iter().any(|x| *x < 0.0 || *x > i32::MAX as f64) {
-                return Err(invalid(ctx, call, name));
-            }
-            Ints(x.map(|x| x as i32).to_vec())
-        }
-        Reals(_) => Reals(vector::<3>(ctx, call, name, value)?.to_vec()),
-    };
-    Ok(result)
-}
-
 fn set(ctx: &mut Ctx, call: &Call, name: &str, value: SexpId) -> EvalResult<()> {
     let slot = active(ctx, call, true)?;
     let initialized = slot.frame_open;
@@ -680,14 +448,8 @@ fn set(ctx: &mut Ctx, call: &Call, name: &str, value: SexpId) -> EvalResult<()> 
             format!("graphical parameter \"{name}\" cannot be set"),
         );
     }
-    let old = par.value(name).cloned();
-    if let Some(template) = old {
-        let template = if name == "pch" {
-            Param::Int(1)
-        } else {
-            template
-        };
-        let value = parse(ctx, call, name, &template, value)?;
+    if let Some(kind) = par.value(name).map(Param::kind) {
+        let value = stored::parse(ctx, call, name, kind, value)?;
         let par = state(active(ctx, call, true)?)?;
         if name == "fg" {
             par.params.insert("col", value.clone());
@@ -933,162 +695,4 @@ pub(super) fn par(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
         ctx.session_mut().set_attrib(result, key, names)?;
         Ok(result)
     })
-}
-
-pub(super) fn snapshot(ctx: &mut Ctx, call: &Call) -> EvalResult {
-    let slot = active(ctx, call, true)?;
-    let layout = slot.par_state;
-    let frame = slot.frame_open;
-    let par = state(slot)?;
-    let mut params: Vec<_> = par
-        .params
-        .iter()
-        .map(|(name, value)| (*name, value.clone()))
-        .collect();
-    let mut geometry = vec![
-        (if matches!(par.mar, Margins::Lines(_)) {
-            "mar"
-        } else {
-            "mai"
-        }),
-        (if par.omd.is_some() {
-            "omd"
-        } else if matches!(par.oma, Margins::Lines(_)) {
-            "oma"
-        } else {
-            "omi"
-        }),
-    ];
-    match &par.panel {
-        Panel::Grid { by_row, .. } => geometry.insert(0, if *by_row { "mfrow" } else { "mfcol" }),
-        Panel::Custom(Region::Size(_)) => geometry.insert(0, "fin"),
-        Panel::Custom(Region::Normalized(_)) => geometry.insert(0, "fig"),
-        Panel::Layout(_) => {}
-    }
-    match par.plot {
-        Some(Region::Normalized(_)) => geometry.push("plt"),
-        Some(Region::Size(_)) => geometry.push("pin"),
-        None => {}
-    }
-    geometry.extend(["mfg", "xlog", "ylog", "xaxp", "yaxp", "new"]);
-    let layout = if matches!(par.panel, Panel::Layout(_)) {
-        layout
-    } else {
-        SEXP_NIL
-    };
-    let layout_and_margins = geometry
-        .into_iter()
-        .filter_map(|name| par.get(name).map(|v| (name, v)));
-    params.splice(..0, layout_and_margins);
-    params.extend([
-        (".usr", Param::Reals(par.usr.to_vec())),
-        (".logusr", Param::Reals(par.logusr.to_vec())),
-        (".frame", Param::Flag(Some(frame))),
-        (".csi", Param::Real(par.csi)),
-    ]);
-    let clip = par.clip;
-    ctx.scoped(|ctx| {
-        ctx.protect(layout);
-        let result = ctx.session_mut().alloc_list(params.len() + 2)?;
-        ctx.protect(result);
-        for (i, (_, param)) in params.iter().enumerate() {
-            let value = param.alloc(ctx)?;
-            ctx.session_mut().list_set(result, i, value)?;
-        }
-        ctx.session_mut().list_set(result, params.len(), layout)?;
-        if let Some(clip) = clip {
-            let value = ctx.session_mut().alloc_real_from(&clip)?;
-            ctx.session_mut()
-                .list_set(result, params.len() + 1, value)?;
-        }
-        let labels = alloc_strings(
-            ctx,
-            params
-                .iter()
-                .map(|(name, _)| *name)
-                .chain([".layout", ".clip"]),
-        )?;
-        ctx.protect(labels);
-        let key = ctx.session_mut().intern("names")?;
-        ctx.session_mut().set_attrib(result, key, labels)?;
-        Ok(result)
-    })
-}
-
-pub(super) fn restore(ctx: &mut Ctx, call: &Call, input: SexpId) -> EvalResult<()> {
-    let labels = names(ctx, input)?;
-    if ctx.session().type_of(input)? != SexpType::Vec
-        || ctx.session().xlength(input)? != labels.len()
-    {
-        return Err(ctx.stop(call.err_call(), "invalid recorded graphics state"));
-    }
-    let slot = active(ctx, call, false)?;
-    slot.par_data = None;
-    slot.par_state = SEXP_NIL;
-    let layout = labels.iter().position(|x| x.as_deref() == Some(".layout"));
-    if let Some(i) = layout {
-        let expr = ctx.session().list_get(input, i)?;
-        if expr != SEXP_NIL {
-            ctx.eval(expr, call.env)?;
-        }
-    }
-    for (i, name) in labels.iter().enumerate() {
-        let Some(name) = name.as_deref() else {
-            continue;
-        };
-        let value = ctx.session().list_get(input, i)?;
-        let template = state(active(ctx, call, false)?)?.value(name).cloned();
-        if let Some(template) = template {
-            let key = state(active(ctx, call, false)?)?
-                .params
-                .get_key_value(name)
-                .map(|(&key, _)| key);
-            let template = if name == "pch" {
-                Param::Int(1)
-            } else {
-                template
-            };
-            let param = parse(ctx, call, name, &template, value)?;
-            if let Some(key) = key {
-                state(active(ctx, call, false)?)?.params.insert(key, param);
-            }
-        } else {
-            match name {
-                ".usr" | ".logusr" => {
-                    let range = <[f64; 4]>::try_from(nums(ctx, value)?)
-                        .map_err(|_| invalid(ctx, call, name))?;
-                    let par = state(active(ctx, call, false)?)?;
-                    if name == ".usr" {
-                        par.usr = range;
-                    } else {
-                        par.logusr = range;
-                    }
-                }
-                ".clip" => {
-                    let clip = if value == SEXP_NIL {
-                        None
-                    } else {
-                        Some(vector::<4>(ctx, call, name, value)?)
-                    };
-                    state(active(ctx, call, false)?)?.clip = clip;
-                }
-                ".csi" => {
-                    let [csi] = vector::<1>(ctx, call, name, value)?;
-                    state(active(ctx, call, false)?)?.csi = csi;
-                }
-                ".frame" => active(ctx, call, false)?.frame_open = flag(ctx, value)? == Some(true),
-                ".layout" => {}
-                "new" => {
-                    let new = flag(ctx, value)? == Some(true);
-                    state(active(ctx, call, false)?)?.new = new;
-                }
-                _ => set(ctx, call, name, value)?,
-            }
-        }
-    }
-    let slot = active(ctx, call, false)?;
-    let par = state(slot)?;
-    let clip = par.clip.unwrap_or_else(|| par.geometry().plot);
-    slot.device.clip(super::coords::rect(clip));
-    Ok(())
 }
