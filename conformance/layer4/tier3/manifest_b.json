@@ -38,21 +38,30 @@
     },
     {
       "package": "cli",
-      "version": "3.0.1",
+      "version": "3.6.6",
       "license": "MIT",
-      "sha256": "d89a25b6cd760e157605676e104ce65473a7d8d64c289efdd9640e949968b4fd",
-      "url": "https://cran.r-project.org/src/contrib/Archive/cli/cli_3.0.1.tar.gz",
+      "sha256": "b2b58d6dd82f5798b335e39c00591686a01fd3e94399ef898e146173e36f18f9",
+      "url": "https://cran.r-project.org/src/contrib/cli_3.6.6.tar.gz",
       "needs_compilation": true,
       "depends": [
-        "R (>= 2.10)"
+        "R (>= 3.4)"
       ],
       "imports": [
-        "glue",
         "utils"
       ],
       "linking_to": [],
       "test_runner": "shim",
-      "bundled_licenses": {}
+      "bundled_licenses": {
+        "vtparse": "PublicDomain",
+        "sha": "PublicDomain",
+        "utf8lite": "Apache_2_0",
+        "HighwayHash": "Apache_2_0",
+        "xxHash": "BSD_2_clause",
+        "Aladdin_MD5": "Zlib",
+        "diff": "MIT",
+        "cli-spinners": "MIT",
+        "Snazzy": "MIT"
+      }
     },
     {
       "package": "lifecycle",
@@ -198,7 +207,7 @@
     }
   ],
   "license_notes": {
-    "cli": "Version 3.0.1 precedes the addition of code under public domain dedications outside the allowlist.",
+    "cli": "Version 3.6.6 is MIT with permissive bundled components (PublicDomain vtparse/SHA, Apache-2.0 utf8lite/HighwayHash, BSD-2-Clause xxHash, Zlib Aladdin MD5, MIT diff/cli-spinners/Snazzy); version 3.0.1 fails to compile on GNU R 4.6.2 due to removed non-API Rf_findVar and DATAPTR.",
     "vctrs": "Current releases include MPL-2.0 files. Older releases tested against the allowlist require digest or declare GPL-3.",
     "purrr": "Permissive releases require vctrs. Version 0.3.5 declares GPL-3.",
     "tibble": "Version 3.3.1 no longer imports fansi, which declares GPL-2 or GPL-3. It still requires vctrs and pillar. Pillar imports utf8. Older tibble releases can require Rcpp, which declares GPL."

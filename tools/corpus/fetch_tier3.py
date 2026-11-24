@@ -25,7 +25,7 @@ CACHE = ROOT / "target" / "corpus" / "tier3"
 MANIFEST_DIR = ROOT / "conformance" / "layer4" / "tier3"
 CRAN = "https://cran.r-project.org"
 MIRROR = "https://raw.githubusercontent.com/cran"
-LICENSES = {"MIT", "BSD_2_clause", "BSD_3_clause", "Apache_2_0", "ISC", "CC0", "Unlicense"}
+LICENSES = {"MIT", "BSD_2_clause", "BSD_3_clause", "Apache_2_0", "ISC", "CC0", "Unlicense", "PublicDomain", "Zlib"}
 BASE = frozenset("""
     R base compiler datasets grDevices graphics grid methods parallel splines stats
     stats4 tcltk tools utils
