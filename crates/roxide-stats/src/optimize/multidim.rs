@@ -269,19 +269,11 @@ impl Anneal for RObjective<'_> {
     }
 }
 
-fn bounds(
-    ctx: &mut Ctx,
-    call: &Call,
-    lower: SexpId,
-    upper: SexpId,
-    n: usize,
-) -> EvalResult<Vec<(f64, f64)>> {
-    let lower = numbers(ctx, call, lower)?;
-    let upper = numbers(ctx, call, upper)?;
+fn bounds(lower: &[f64], upper: &[f64], n: usize) -> Vec<(f64, f64)> {
     if lower.is_empty() || upper.is_empty() {
-        return Ok(vec![(f64::NEG_INFINITY, f64::INFINITY); n]);
+        return vec![(f64::NEG_INFINITY, f64::INFINITY); n];
     }
-    Ok(lower
+    lower
         .iter()
         .copied()
         .cycle()
@@ -297,7 +289,7 @@ fn bounds(
                 (lo, hi)
             }
         })
-        .collect())
+        .collect()
 }
 
 fn hessian_matrix(f: &mut RObjective<'_>, par: &[f64]) -> EvalResult {
@@ -388,15 +380,18 @@ pub(super) fn optim(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
             "SANN" => Method::Anneal,
             _ => Method::Brent,
         };
-        if !matches!(method, Method::Bounded | Method::Brent) {
-            for index in [4, 5] {
-                if numbers(ctx, call, args.get(index))?.iter().any(|v| v.is_nan()) {
-                    return Err(ctx.stop(call.err_call(), "missing value where TRUE/FALSE needed"));
-                }
+        let unbounded = !matches!(method, Method::Bounded | Method::Brent);
+        let mut read_bound = |index| {
+            let bound = numbers(ctx, call, args.get(index))?;
+            if unbounded && bound.iter().any(|v| v.is_nan()) {
+                return Err(ctx.stop(call.err_call(), "missing value where TRUE/FALSE needed"));
             }
-        }
-        let interval = bounds(ctx, call, args.get(4), args.get(5), n)?;
-        if !matches!(method, Method::Bounded | Method::Brent)
+            Ok(bound)
+        };
+        let lower = read_bound(4)?;
+        let upper = read_bound(5)?;
+        let interval = bounds(&lower, &upper, n);
+        if unbounded
             && interval.iter().any(|(lo, hi)| lo.is_finite() || hi.is_finite())
         {
             ctx.warn_now(call.err_call(), "bounds can only be used with method L-BFGS-B (or Brent)")?;

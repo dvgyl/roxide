@@ -9,11 +9,72 @@ use crate::distn::support::{attr, limit, logical, set_attr, set_dim, set_dimname
 
 type Term = Vec<usize>;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Operator {
+    Tilde,
+    Group,
+    Add,
+    Subtract,
+    Multiply,
+    Interact,
+    Nest,
+    Power,
+    In,
+    Offset,
+    Other,
+}
+
+impl Operator {
+    fn read(s: &RSession, expr: SexpId) -> Self {
+        match operator_name(s, expr) {
+            "~" => Self::Tilde,
+            "(" => Self::Group,
+            "+" => Self::Add,
+            "-" => Self::Subtract,
+            "*" => Self::Multiply,
+            ":" => Self::Interact,
+            "/" => Self::Nest,
+            "^" => Self::Power,
+            "%in%" => Self::In,
+            "offset" => Self::Offset,
+            _ => Self::Other,
+        }
+    }
+
+    fn is_algebra(self) -> bool {
+        !matches!(self, Self::Tilde | Self::Offset | Self::Other)
+    }
+
+    fn chain_name(self) -> Option<&'static str> {
+        match self {
+            Self::Add => Some("+"),
+            Self::Multiply => Some("*"),
+            Self::Interact => Some(":"),
+            _ => None,
+        }
+    }
+}
+
+enum Operands {
+    Unary(SexpId),
+    Binary(SexpId, SexpId),
+    Other,
+}
+
+fn operands(s: &RSession, expr: SexpId) -> Operands {
+    let mut args = s.pairlist_iter(expr).skip(1).map(|(_, x)| x);
+    match (args.next(), args.next(), args.next()) {
+        (Some(x), None, None) => Operands::Unary(x),
+        (Some(left), Some(right), None) => Operands::Binary(left, right),
+        _ => Operands::Other,
+    }
+}
+
 fn args(s: &RSession, expr: SexpId) -> Vec<SexpId> {
     s.pairlist_iter(expr).skip(1).map(|(_, x)| x).collect()
 }
 
-fn operator(s: &RSession, expr: SexpId) -> &str {
+fn operator_name(s: &RSession, expr: SexpId) -> &str {
     s.cons_parts(expr)
         .ok()
         .and_then(|(head, _, _)| s.sym_name_of(head).ok())
@@ -21,11 +82,11 @@ fn operator(s: &RSession, expr: SexpId) -> &str {
 }
 
 fn parts(ctx: &mut Ctx, call: &Call, formula: SexpId) -> EvalResult<(SexpId, SexpId)> {
-    if operator(ctx.session(), formula) == "~" {
-        match args(ctx.session(), formula).as_slice() {
-            [rhs] => return Ok((SEXP_NIL, *rhs)),
-            [lhs, rhs] => return Ok((*lhs, *rhs)),
-            _ => {}
+    if Operator::read(ctx.session(), formula) == Operator::Tilde {
+        match operands(ctx.session(), formula) {
+            Operands::Unary(rhs) => return Ok((SEXP_NIL, rhs)),
+            Operands::Binary(lhs, rhs) => return Ok((lhs, rhs)),
+            Operands::Other => {}
         }
     }
     Err(ctx.stop(call.err_call(), "invalid formula"))
@@ -144,7 +205,7 @@ impl Algebra<'_> {
         Ok(())
     }
 
-    fn variable(&mut self, expr: SexpId) -> EvalResult<usize> {
+    fn variable(&mut self, expr: SexpId, op: Operator) -> EvalResult<usize> {
         let name = label(self.ctx.session(), expr)?;
         if let Some(&index) = self.indices.get(&name) {
             return Ok(index);
@@ -153,7 +214,7 @@ impl Algebra<'_> {
         self.indices.insert(name.clone(), index);
         self.variables.push(expr);
         self.labels.push(name);
-        if operator(self.ctx.session(), expr) == "offset" {
+        if op == Operator::Offset {
             self.offsets.push(index);
         }
         Ok(index)
@@ -191,26 +252,27 @@ impl Algebra<'_> {
         Ok(())
     }
 
-    fn binary(&self, expr: SexpId, op: &str) -> Option<(SexpId, SexpId)> {
-        let s = self.ctx.session();
-        if operator(s, expr) == op
-            && let [left, right] = args(s, expr).as_slice()
-        {
-            return Some((*left, *right));
-        }
-        None
-    }
-
-    fn chain(&mut self, expr: SexpId, op: &str, add: bool, depth: usize) -> EvalResult<Vec<Term>> {
-        let mut pending = vec![expr];
+    fn chain(
+        &mut self,
+        left: SexpId,
+        right: SexpId,
+        add: bool,
+        depth: usize,
+    ) -> EvalResult<Vec<Term>> {
+        self.spend(1)?;
+        let mut pending = vec![right, left];
         let mut output = Vec::new();
         let mut seen = HashSet::new();
         while let Some(node) = pending.pop() {
-            if let Some((left, right)) = self.binary(node, op) {
+            let s = self.ctx.session();
+            let op = Operator::read(s, node);
+            if op == Operator::Add
+                && let Operands::Binary(left, right) = operands(s, node)
+            {
                 self.spend(1)?;
                 pending.extend([right, left]);
             } else {
-                let terms = self.walk(node, add, depth + 1)?;
+                let terms = self.walk_operator(node, op, add, depth + 1)?;
                 self.spend(terms.len())?;
                 append_terms(&mut output, &mut seen, terms);
             }
@@ -226,6 +288,17 @@ impl Algebra<'_> {
     }
 
     fn walk(&mut self, expr: SexpId, add: bool, depth: usize) -> EvalResult<Vec<Term>> {
+        let op = Operator::read(self.ctx.session(), expr);
+        self.walk_operator(expr, op, add, depth)
+    }
+
+    fn walk_operator(
+        &mut self,
+        expr: SexpId,
+        op: Operator,
+        add: bool,
+        depth: usize,
+    ) -> EvalResult<Vec<Term>> {
         self.spend(1)?;
         if depth >= 128 {
             return Err(self.error("formula nesting is too deep"));
@@ -244,7 +317,7 @@ impl Algebra<'_> {
                 if let Some(dot) = self.dot.clone() {
                     return dot
                         .into_iter()
-                        .map(|x| Ok(vec![self.variable(x)?]))
+                        .map(|x| Ok(vec![self.variable(x, Operator::Other)?]))
                         .collect();
                 }
                 if !self.allow_dot {
@@ -255,24 +328,27 @@ impl Algebra<'_> {
             _ => return Err(self.error("invalid model formula in ExtractVars")),
         }
 
-        let op = operator(s, expr).to_owned();
-        if matches!(
-            op.as_str(),
-            "(" | "+" | "-" | "*" | ":" | "/" | "^" | "%in%"
-        ) {
-            match args(s, expr).as_slice() {
-                [inner] if matches!(op.as_str(), "(" | "+" | "-") => {
-                    let terms = self.walk(*inner, if op == "-" { !add } else { add }, depth + 1)?;
-                    return Ok(if op == "-" { Vec::new() } else { terms });
+        if op.is_algebra() {
+            match operands(s, expr) {
+                Operands::Unary(inner)
+                    if matches!(op, Operator::Group | Operator::Add | Operator::Subtract) =>
+                {
+                    let subtract = op == Operator::Subtract;
+                    let terms = self.walk(inner, if subtract { !add } else { add }, depth + 1)?;
+                    return Ok(if subtract { Vec::new() } else { terms });
                 }
-                [_, _] if op == "+" => return self.chain(expr, &op, add, depth),
-                [_, _] if matches!(op.as_str(), "*" | ":") => {
-                    return self.products(expr, &op, add, depth);
+                Operands::Binary(left, right) if op == Operator::Add => {
+                    return self.chain(left, right, add, depth);
                 }
-                [lhs, rhs] => {
-                    let mut left = self.walk(*lhs, add, depth + 1)?;
-                    if op == "^" {
-                        let Some(degree) = number(self.ctx.session(), *rhs)
+                Operands::Binary(left, right)
+                    if matches!(op, Operator::Multiply | Operator::Interact) =>
+                {
+                    return self.products(left, right, op, add, depth);
+                }
+                Operands::Binary(lhs, rhs) => {
+                    let mut left = self.walk(lhs, add, depth + 1)?;
+                    if op == Operator::Power {
+                        let Some(degree) = number(self.ctx.session(), rhs)
                             .filter(|n| n.is_finite() && *n > 0.0 && n.fract() == 0.0)
                         else {
                             return Err(self.error("invalid power in formula"));
@@ -282,62 +358,85 @@ impl Algebra<'_> {
                         self.power_terms(&left, degree, 0, &[], &mut HashSet::new(), &mut result)?;
                         return Ok(result);
                     }
-                    let right = self.walk(*rhs, if op == "-" { !add } else { add }, depth + 1)?;
-                    return match op.as_str() {
-                        "-" => {
+                    let right = self.walk(
+                        rhs,
+                        if op == Operator::Subtract { !add } else { add },
+                        depth + 1,
+                    )?;
+                    return match op {
+                        Operator::Subtract => {
                             let removed: HashSet<_> = right.into_iter().collect();
                             left.retain(|term| !removed.contains(term));
                             Ok(left)
                         }
-                        "/" => {
+                        Operator::Nest => {
                             if !left.is_empty() {
                                 let nested = self.cross(&[all_variables(&left)], &right)?;
                                 self.merge(&mut left, nested)?;
                             }
                             Ok(left)
                         }
-                        "%in%" => self.cross(&left, &[all_variables(&right)]),
+                        Operator::In => self.cross(&left, &[all_variables(&right)]),
                         _ => Err(self.error("invalid model formula")),
                     };
                 }
                 _ => {}
             }
         }
-        Ok(vec![vec![self.variable(expr)?]])
+        Ok(vec![vec![self.variable(expr, op)?]])
     }
 
     fn products(
         &mut self,
-        expr: SexpId,
-        op: &str,
+        left: SexpId,
+        right: SexpId,
+        op: Operator,
         add: bool,
         depth: usize,
     ) -> EvalResult<Vec<Term>> {
-        let mut pending = vec![(expr, false)];
+        self.spend(1)?;
+        let mut pending = vec![None, Some(right), Some(left)];
         let mut values: Vec<Vec<Term>> = Vec::new();
-        while let Some((node, combine)) = pending.pop() {
-            if combine {
+        while let Some(step) = pending.pop() {
+            if let Some(node) = step {
+                let s = self.ctx.session();
+                let node_op = Operator::read(s, node);
+                if node_op == op
+                    && let Operands::Binary(left, right) = operands(s, node)
+                {
+                    self.spend(1)?;
+                    pending.extend([None, Some(right), Some(left)]);
+                } else {
+                    values.push(self.walk_operator(node, node_op, add, depth + 1)?);
+                }
+            } else {
                 let right = values.pop().unwrap_or_default();
                 let mut left = values.pop().unwrap_or_default();
                 let cross = self.cross(&left, &right)?;
-                if op == "*" {
+                if op == Operator::Multiply {
                     self.merge(&mut left, right)?;
                     self.merge(&mut left, cross)?;
                     values.push(left);
                 } else {
                     values.push(cross);
                 }
-            } else if let Some((left, right)) = self.binary(node, op) {
-                self.spend(1)?;
-                pending.extend([(node, true), (right, false), (left, false)]);
-            } else {
-                values.push(self.walk(node, add, depth + 1)?);
             }
         }
         Ok(values.pop().unwrap_or_default())
     }
 
     fn expanded(&mut self, expr: SexpId, nested: bool, depth: usize) -> EvalResult {
+        let op = Operator::read(self.ctx.session(), expr);
+        self.expand_operator(expr, op, nested, depth)
+    }
+
+    fn expand_operator(
+        &mut self,
+        expr: SexpId,
+        op: Operator,
+        nested: bool,
+        depth: usize,
+    ) -> EvalResult {
         self.spend(1)?;
         if depth >= 128 {
             return Err(self.error("formula nesting is too deep"));
@@ -352,43 +451,71 @@ impl Algebra<'_> {
             }
             return Ok(expr);
         }
-        let op = operator(s, expr);
-        if !matches!(op, "(" | "+" | "-" | "*" | ":" | "/" | "^" | "%in%") {
+        if !op.is_algebra() {
             return Ok(expr);
         }
-        let op = op.to_owned();
-        if matches!(op.as_str(), "+" | "*" | ":") && self.binary(expr, &op).is_some() {
-            return self.expand_chain(expr, &op, nested, depth);
-        }
         let (head, _, _) = s.cons_parts(expr)?;
-        let children = args(s, expr)
-            .into_iter()
-            .enumerate()
-            .map(|(i, arg)| self.expanded(arg, op != "(" && (op != "+" || i != 0), depth + 1))
-            .collect::<EvalResult<Vec<_>>>()?;
-        call(
-            self.ctx.session_mut(),
-            head,
-            children.into_iter().map(|x| (SEXP_NIL, x)),
-        )
+        let child_nested = |i| op != Operator::Group && (op != Operator::Add || i != 0);
+        match operands(s, expr) {
+            Operands::Unary(arg) => {
+                let arg = self.expanded(arg, child_nested(0), depth + 1)?;
+                call(self.ctx.session_mut(), head, [(SEXP_NIL, arg)].into_iter())
+            }
+            Operands::Binary(left, right) => {
+                if let Some(name) = op.chain_name() {
+                    return self.expand_chain(expr, op, name, left, right, depth);
+                }
+                let left = self.expanded(left, child_nested(0), depth + 1)?;
+                let right = self.expanded(right, child_nested(1), depth + 1)?;
+                call(
+                    self.ctx.session_mut(),
+                    head,
+                    [(SEXP_NIL, left), (SEXP_NIL, right)].into_iter(),
+                )
+            }
+            Operands::Other => {
+                let children = args(s, expr)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, arg)| self.expanded(arg, child_nested(i), depth + 1))
+                    .collect::<EvalResult<Vec<_>>>()?;
+                call(
+                    self.ctx.session_mut(),
+                    head,
+                    children.into_iter().map(|x| (SEXP_NIL, x)),
+                )
+            }
+        }
     }
-    fn expand_chain(&mut self, expr: SexpId, op: &str, nested: bool, depth: usize) -> EvalResult {
-        let mut pending = vec![(expr, nested, false)];
+    fn expand_chain(
+        &mut self,
+        expr: SexpId,
+        op: Operator,
+        name: &str,
+        left: SexpId,
+        right: SexpId,
+        depth: usize,
+    ) -> EvalResult {
+        self.spend(1)?;
+        let nested_left = op != Operator::Add;
+        let mut pending = vec![None, Some((right, true)), Some((left, nested_left))];
         let mut values = Vec::new();
-        while let Some((node, nested, combine)) = pending.pop() {
-            if combine {
+        while let Some(step) = pending.pop() {
+            if let Some((node, nested)) = step {
+                let s = self.ctx.session();
+                let node_op = Operator::read(s, node);
+                if node_op == op
+                    && let Operands::Binary(left, right) = operands(s, node)
+                {
+                    self.spend(1)?;
+                    pending.extend([None, Some((right, true)), Some((left, nested_left))]);
+                } else {
+                    values.push(self.expand_operator(node, node_op, nested, depth + 1)?);
+                }
+            } else {
                 let right = values.pop().unwrap_or(SEXP_NIL);
                 let left = values.pop().unwrap_or(SEXP_NIL);
-                values.push(lang(self.ctx.session_mut(), op, &[left, right])?);
-            } else if let Some((left, right)) = self.binary(node, op) {
-                self.spend(1)?;
-                pending.extend([
-                    (node, nested, true),
-                    (right, true, false),
-                    (left, op != "+", false),
-                ]);
-            } else {
-                values.push(self.expanded(node, nested, depth + 1)?);
+                values.push(lang(self.ctx.session_mut(), name, &[left, right])?);
             }
         }
         Ok(values.pop().unwrap_or(expr))
@@ -431,13 +558,16 @@ fn symbols(s: &RSession, expr: SexpId, out: &mut Vec<SexpId>) {
         }
         match s.type_of(expr).ok() {
             Some(SexpType::Sym) => out.push(expr),
-            Some(SexpType::Lang) => {
-                let op = operator(s, expr);
-                let children = args(s, expr);
-                let depth =
-                    depth + usize::from(!matches!(op, "+" | "*" | ":") || children.len() != 2);
-                pending.extend(children.into_iter().rev().map(|x| (x, depth)));
-            }
+            Some(SexpType::Lang) => match operands(s, expr) {
+                Operands::Binary(left, right) => {
+                    let depth = depth + usize::from(Operator::read(s, expr).chain_name().is_none());
+                    pending.extend([(right, depth), (left, depth)]);
+                }
+                Operands::Unary(arg) => pending.push((arg, depth + 1)),
+                Operands::Other => {
+                    pending.extend(args(s, expr).into_iter().rev().map(|x| (x, depth + 1)));
+                }
+            },
             _ => {}
         }
     }
@@ -517,7 +647,8 @@ pub(super) fn terms(ctx: &mut Ctx, site: &Call, args: &mut Args) -> EvalResult {
         budget,
     };
     if lhs != SEXP_NIL {
-        algebra.variable(lhs)?;
+        let op = Operator::read(algebra.ctx.session(), lhs);
+        algebra.variable(lhs, op)?;
         algebra.offsets.clear();
     }
     let mut terms = algebra.walk(rhs, true, 0)?;
@@ -623,7 +754,7 @@ pub(super) fn terms(ctx: &mut Ctx, site: &Call, args: &mut Args) -> EvalResult {
             let matches = variables
                 .iter()
                 .enumerate()
-                .filter_map(|(i, &expr)| (operator(ctx.session(), expr) == name).then_some(i))
+                .filter_map(|(i, &expr)| (operator_name(ctx.session(), expr) == name).then_some(i))
                 .collect::<Vec<_>>();
             let value = if matches.is_empty() {
                 SEXP_NIL

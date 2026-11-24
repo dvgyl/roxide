@@ -463,7 +463,50 @@ struct ResultState {
     sample: Sample,
     g: Vec<f64>,
     iterations: i32,
-    code: i32,
+    reason: StopReason,
+}
+
+enum StopReason {
+    GradientTolerance,
+    BoundedGradientTolerance,
+    StepTolerance,
+    RelativeFunctionTolerance,
+    AbsoluteFunctionTolerance,
+    NoProgress,
+    IterationLimit,
+    EvaluationLimit,
+    RepeatedMaximumSteps,
+}
+
+impl StopReason {
+    fn nlm_code(&self) -> i32 {
+        match self {
+            Self::GradientTolerance => 1,
+            Self::StepTolerance | Self::RelativeFunctionTolerance => 2,
+            Self::NoProgress => 3,
+            Self::IterationLimit => 4,
+            Self::BoundedGradientTolerance | Self::RepeatedMaximumSteps => 5,
+            Self::AbsoluteFunctionTolerance => 6,
+            Self::EvaluationLimit => 9,
+        }
+    }
+
+    fn port_status(&self) -> (i32, &'static str) {
+        match self {
+            Self::GradientTolerance | Self::StepTolerance => (0, "X-convergence (3)"),
+            Self::RelativeFunctionTolerance => (0, "relative convergence (4)"),
+            Self::NoProgress => (1, "false convergence (8)"),
+            Self::BoundedGradientTolerance | Self::RepeatedMaximumSteps => {
+                (0, "both X-convergence and relative convergence (5)")
+            }
+            Self::AbsoluteFunctionTolerance => (0, "absolute function convergence (6)"),
+            Self::EvaluationLimit => (
+                1,
+                "function evaluation limit reached without convergence (9)",
+            ),
+            Self::IterationLimit => (1, "iteration limit reached without convergence (10)"),
+        }
+    }
 }
 
 fn scaled_gradient(c: &Control, x: &[f64], g: &[f64], value: f64) -> f64 {
@@ -488,12 +531,13 @@ fn minimize(f: &mut Objective<'_>, c: &Control, mut x: Vec<f64>) -> EvalResult<R
     let mut iterations = 0;
     let mut max_steps = 0;
     let mut radius = if f.port { 1.0 } else { c.stepmax };
-    let mut code = 4;
-    'search: while iterations < c.iter {
+    let reason = 'search: loop {
+        if iterations >= c.iter {
+            break StopReason::IterationLimit;
+        }
         if f.port && f.evals[0] >= c.eval {
-            code = 9;
             iterations = iterations.max(1);
-            break;
+            break StopReason::EvaluationLimit;
         }
         let projected = c.projected(&x, &g);
         let relative_grad = if f.port {
@@ -504,8 +548,11 @@ fn minimize(f: &mut Objective<'_>, c: &Control, mut x: Vec<f64>) -> EvalResult<R
         let analytic = f.analytic_hessian(&x, &sm)?;
         if relative_grad <= c.gradtol {
             let bounded = c.lower.iter().chain(&c.upper).any(|v| v.is_finite());
-            code = if f.port && bounded { 5 } else { 1 };
-            break;
+            break if f.port && bounded {
+                StopReason::BoundedGradientTolerance
+            } else {
+                StopReason::GradientTolerance
+            };
         }
         let free: Vec<_> = projected
             .iter()
@@ -563,8 +610,7 @@ fn minimize(f: &mut Objective<'_>, c: &Control, mut x: Vec<f64>) -> EvalResult<R
                 break;
             }
             if f.port && f.evals[0] >= c.eval {
-                code = 9;
-                break 'search;
+                break 'search StopReason::EvaluationLimit;
             }
             let denominator = 2.0 * (trial.value - sm.value - slope);
             let fraction = if denominator > 0.0 {
@@ -585,8 +631,7 @@ fn minimize(f: &mut Objective<'_>, c: &Control, mut x: Vec<f64>) -> EvalResult<R
                 g = f.slopes(&x, &sm, c, true)?;
                 continue;
             }
-            code = 3;
-            break;
+            break StopReason::NoProgress;
         };
         let step: Vec<_> = point.iter().zip(&x).map(|(a, b)| a - b).collect();
         let step_size = c.norm(&step);
@@ -627,24 +672,22 @@ fn minimize(f: &mut Objective<'_>, c: &Control, mut x: Vec<f64>) -> EvalResult<R
         if f.port {
             radius = (step_size * 2.0).max(c.steptol);
             if sm.value.abs() < c.abstol {
-                code = 6;
-                break;
+                break StopReason::AbsoluteFunctionTolerance;
             }
-            if relative_step < c.steptol
-                || (value_change <= c.reltol * sm.value.abs()
-                    && scaled_gradient(c, &x, &c.projected(&x, &g), 0.0) <= c.gradtol)
+            if relative_step < c.steptol {
+                break StopReason::StepTolerance;
+            }
+            if value_change <= c.reltol * sm.value.abs()
+                && scaled_gradient(c, &x, &c.projected(&x, &g), 0.0) <= c.gradtol
             {
-                code = if relative_step < c.steptol { 1 } else { 2 };
-                break;
+                break StopReason::RelativeFunctionTolerance;
             }
         } else {
             if scaled_gradient(c, &x, &g, sm.value) <= c.gradtol {
-                code = 1;
-                break;
+                break StopReason::GradientTolerance;
             }
             if relative_step <= c.steptol {
-                code = 2;
-                break;
+                break StopReason::StepTolerance;
             }
             max_steps = if step_size >= 0.99 * c.stepmax {
                 max_steps + 1
@@ -652,17 +695,16 @@ fn minimize(f: &mut Objective<'_>, c: &Control, mut x: Vec<f64>) -> EvalResult<R
                 0
             };
             if max_steps >= 5 {
-                code = 5;
-                break;
+                break StopReason::RepeatedMaximumSteps;
             }
         }
-    }
+    };
     Ok(ResultState {
         x,
         sample: sm,
         g,
         iterations,
-        code,
+        reason,
     })
 }
 
@@ -709,18 +751,7 @@ pub(super) fn fit(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
         if names != SEXP_NIL {
             set_attr(ctx, par, "names", names)?;
         }
-        let (code, message) = match out.code {
-            1 => (0, "X-convergence (3)"),
-            2 => (0, "relative convergence (4)"),
-            3 => (1, "false convergence (8)"),
-            5 => (0, "both X-convergence and relative convergence (5)"),
-            6 => (0, "absolute function convergence (6)"),
-            9 => (
-                1,
-                "function evaluation limit reached without convergence (9)",
-            ),
-            _ => (1, "iteration limit reached without convergence (10)"),
-        };
+        let (code, message) = out.reason.port_status();
         let code = ctx.session_mut().alloc_int_from(&[code])?;
         ctx.protect(code);
         let counts = ctx.session_mut().alloc_int_from(&counts)?;
@@ -730,7 +761,7 @@ pub(super) fn fit(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
         list(ctx, &[par, value, code, iter, counts, message])
     } else {
         let g = reals(ctx, &out.g)?;
-        let code = ctx.session_mut().alloc_int_from(&[out.code])?;
+        let code = ctx.session_mut().alloc_int_from(&[out.reason.nlm_code()])?;
         ctx.protect(code);
         let mut values = vec![value, par, g];
         if let Some(h) = hessian {

@@ -17,15 +17,17 @@ struct Model {
     parametric: Vec<bool>,
     terms: Vec<(usize, usize)>,
     stats: usize,
-    approximate_trace: bool,
     iterations: usize,
-    interpolate: bool,
     normalize: bool,
+}
+
+struct Interpolation {
     cell: f64,
+    approximate_trace: bool,
 }
 
 impl Model {
-    fn read(ctx: &mut Ctx, call: &Call, args: &Args) -> EvalResult<Self> {
+    fn read(ctx: &mut Ctx, call: &Call, args: &Args) -> EvalResult<(Self, Option<Interpolation>)> {
         let x = numbers(ctx, call, args.get(0))?;
         let y = numbers(ctx, call, args.get(1))?;
         let weights = numbers(ctx, call, args.get(2))?;
@@ -69,7 +71,7 @@ impl Model {
                 row
             })
             .collect();
-        Ok(Self {
+        let model = Self {
             x,
             y,
             weights,
@@ -77,14 +79,23 @@ impl Model {
             degree,
             span: options[2],
             stats: options[3] as usize,
-            approximate_trace: options[5] != 0.0 && options[8] != 0.0,
             iterations: options[4] as usize,
-            interpolate: options[5] != 0.0,
             normalize: options[6] != 0.0,
-            cell: options[7],
             parametric,
             terms,
-        })
+        };
+        let n = model.x.len();
+        limit::<f64>(ctx, call, n.saturating_mul(1 + d + model.terms.len()))?;
+        let interpolation = if options[5] != 0.0 {
+            limit::<f64>(ctx, call, n.saturating_mul((d + 1) * (1 << d)))?;
+            Some(Interpolation {
+                cell: options[7],
+                approximate_trace: options[8] != 0.0,
+            })
+        } else {
+            None
+        };
+        Ok((model, interpolation))
     }
 
     fn divisor(&mut self) -> Vec<f64> {
@@ -193,6 +204,28 @@ struct Cell {
 struct Tree {
     cells: Vec<Cell>,
     vertices: Vec<Point>,
+    observed_lo: Point,
+    observed_hi: Point,
+    approximate_trace: bool,
+}
+
+enum Surface {
+    Direct,
+    Interpolated(Tree),
+}
+
+impl Surface {
+    fn new(
+        ctx: &mut Ctx,
+        call: &Call,
+        m: &Model,
+        interpolation: Option<Interpolation>,
+    ) -> EvalResult<Self> {
+        match interpolation {
+            Some(options) => Ok(Self::Interpolated(Tree::new(ctx, call, m, options)?)),
+            None => Ok(Self::Direct),
+        }
+    }
 }
 
 fn corners(lo: Point, hi: Point, d: usize) -> impl Iterator<Item = Point> {
@@ -208,14 +241,18 @@ fn corners(lo: Point, hi: Point, d: usize) -> impl Iterator<Item = Point> {
 }
 
 impl Tree {
-    fn new(ctx: &mut Ctx, call: &Call, m: &Model) -> EvalResult<Self> {
+    fn new(ctx: &mut Ctx, call: &Call, m: &Model, options: Interpolation) -> EvalResult<Self> {
         limit::<Cell>(ctx, call, 1)?;
         limit::<Point>(ctx, call, 1 << m.d)?;
+        let mut observed_lo = [0.0; 4];
+        let mut observed_hi = [0.0; 4];
         let mut lo = [0.0; 4];
         let mut hi = [0.0; 4];
         for j in 0..m.d {
             lo[j] = m.x.iter().map(|x| x[j]).fold(f64::INFINITY, f64::min);
             hi[j] = m.x.iter().map(|x| x[j]).fold(f64::NEG_INFINITY, f64::max);
+            observed_lo[j] = lo[j];
+            observed_hi[j] = hi[j];
             let pad = 0.005 * (hi[j] - lo[j]).max(1e-10 * lo[j].abs().max(hi[j].abs()) + 1e-30);
             lo[j] -= pad;
             hi[j] += pad;
@@ -228,6 +265,9 @@ impl Tree {
         let mut tree = Self {
             cells: vec![root],
             vertices: corners(lo, hi, m.d).collect(),
+            observed_lo,
+            observed_hi,
+            approximate_trace: options.approximate_trace,
         };
         let mut seen: BTreeMap<_, _> = tree
             .vertices
@@ -235,7 +275,7 @@ impl Tree {
             .map(|v| (v.map(f64::to_bits), ()))
             .collect();
         let mut groups = vec![(0, (0..m.x.len()).collect::<Vec<_>>())];
-        let threshold = (m.x.len() as f64 * m.span * m.cell).floor() as usize;
+        let threshold = (m.x.len() as f64 * m.span * options.cell).floor() as usize;
         let mut cursor = 0;
         while cursor < groups.len() {
             let (index, mut rows) = std::mem::take(&mut groups[cursor]);
@@ -372,12 +412,12 @@ fn blend_edges(
     true
 }
 
-fn row(m: &Model, tree: Option<&Tree>, q: Point, robust: &[f64], weights: &mut [f64]) -> bool {
+fn row(m: &Model, surface: &Surface, q: Point, robust: &[f64], weights: &mut [f64]) -> bool {
     weights.fill(0.0);
     if q[..m.d].iter().any(|x| !x.is_finite()) {
         return false;
     }
-    let Some(tree) = tree else {
+    let Surface::Interpolated(tree) = surface else {
         return m.local(q, robust, weights, &[1.0]);
     };
     let root = &tree.cells[0];
@@ -424,8 +464,8 @@ fn dot(x: &[f64], y: &[f64]) -> f64 {
     x.iter().zip(y).map(|(x, y)| x * y).sum()
 }
 
-fn kd(ctx: &mut Ctx, call: &Call, m: &Model, tree: Option<&Tree>, robust: &[f64]) -> EvalResult {
-    let Some(tree) = tree else {
+fn kd(ctx: &mut Ctx, call: &Call, m: &Model, surface: &Surface, robust: &[f64]) -> EvalResult {
+    let Surface::Interpolated(tree) = surface else {
         return Ok(SEXP_NIL);
     };
     let vertices = 1 << m.d;
@@ -548,12 +588,12 @@ const DELTA_COEFFICIENTS: [[DeltaCoefficients; 2]; 4] = [
     ],
 ];
 
-fn approximate_deltas(m: &Model, trace: &mut f64) -> [f64; 2] {
+fn approximate_deltas(m: &Model, surface: &Surface, trace: &mut f64) -> [f64; 2] {
     let n = m.x.len() as f64;
     let linear = (1 + m.d) as f64;
     let quadratic_terms = m.d * (m.d + 1) / 2;
     let terms = linear + m.terms.len() as f64;
-    if m.approximate_trace {
+    if matches!(surface, Surface::Interpolated(tree) if tree.approximate_trace) {
         let span_factor = [1.09875, 0.985, 0.70875, 0.27][m.d - 1];
         *trace = terms * (span_factor / m.span).max(1.0);
     }
@@ -582,22 +622,10 @@ fn approximate_deltas(m: &Model, trace: &mut f64) -> [f64; 2] {
     })
 }
 
-fn check_space(ctx: &mut Ctx, call: &Call, m: &Model) -> EvalResult<()> {
-    limit::<f64>(ctx, call, m.x.len().saturating_mul(1 + m.d + m.terms.len()))?;
-    if m.interpolate {
-        limit::<f64>(ctx, call, m.x.len().saturating_mul((m.d + 1) * (1 << m.d)))?;
-    }
-    Ok(())
-}
-
 pub(super) fn fit(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
-    let mut m = Model::read(ctx, call, args)?;
-    check_space(ctx, call, &m)?;
+    let (mut m, interpolation) = Model::read(ctx, call, args)?;
     let divisor = m.divisor();
-    let tree = m
-        .interpolate
-        .then(|| Tree::new(ctx, call, &m))
-        .transpose()?;
+    let surface = Surface::new(ctx, call, &m, interpolation)?;
     let n = m.x.len();
     let mut fitted = vec![0.0; n];
     let mut residuals = vec![0.0; n];
@@ -614,7 +642,7 @@ pub(super) fn fit(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     }
     for iter in 0..m.iterations {
         for i in 0..n {
-            if !row(&m, tree.as_ref(), m.x[i], &robust, &mut buffer) {
+            if !row(&m, &surface, m.x[i], &robust, &mut buffer) {
                 return Err(ctx.stop(call.err_call(), "cannot fit local polynomial"));
             }
             fitted[i] = dot(&buffer, &m.y);
@@ -651,7 +679,7 @@ pub(super) fn fit(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
             }
         }
     } else if m.stats == 1 {
-        [delta1, delta2] = approximate_deltas(&m, &mut trace);
+        [delta1, delta2] = approximate_deltas(&m, &surface, &mut trace);
     }
     let enp = delta1 + 2.0 * trace - n as f64;
     let ss = if m.iterations > 1 {
@@ -680,7 +708,7 @@ pub(super) fn fit(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
                 .iter()
                 .enumerate()
                 .map(|(i, y)| {
-                    row(&m, tree.as_ref(), m.x[i], &prior, &mut buffer);
+                    row(&m, &surface, m.x[i], &prior, &mut buffer);
                     m.weights[i] * (y - dot(&buffer, &pseudo)).powi(2)
                 })
                 .sum()
@@ -696,13 +724,12 @@ pub(super) fn fit(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     let divisor = reals(ctx, &divisor)?;
     let robust_id = reals(ctx, &robust)?;
     let stats = reals(ctx, &[enp, s, delta1, delta2, trace])?;
-    let kd = kd(ctx, call, &m, tree.as_ref(), &robust)?;
+    let kd = kd(ctx, call, &m, &surface, &robust)?;
     list(ctx, &[fit, residuals, divisor, robust_id, stats, kd])
 }
 
 pub(super) fn predict(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
-    let mut m = Model::read(ctx, call, args)?;
-    check_space(ctx, call, &m)?;
+    let (mut m, interpolation) = Model::read(ctx, call, args)?;
     let query = numbers(ctx, call, args.get(4))?;
     let options = numbers(ctx, call, args.get(5))?;
     if options.len() != m.x.len() + 2 || query.len() % m.d != 0 {
@@ -712,22 +739,9 @@ pub(super) fn predict(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult
     let se = options[1] != 0.0;
     let robust = &options[2..];
     let divisor = m.divisor();
-    let tree = m
-        .interpolate
-        .then(|| Tree::new(ctx, call, &m))
-        .transpose()?;
+    let surface = Surface::new(ctx, call, &m, interpolation)?;
     let mut buffer = vec![0.0; m.x.len()];
     let prior = vec![1.0; robust.len()];
-    let mut lower = [f64::INFINITY; 4];
-    let mut upper = [f64::NEG_INFINITY; 4];
-    if m.interpolate {
-        for x in &m.x {
-            for j in 0..m.d {
-                lower[j] = lower[j].min(x[j]);
-                upper[j] = upper[j].max(x[j]);
-            }
-        }
-    }
     let size = query.len() / m.d;
     let mut fitted = vec![NA_REAL; size];
     let mut error = vec![NA_REAL; if se { size } else { 0 }];
@@ -735,13 +749,15 @@ pub(super) fn predict(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult
         let mut point = [0.0; 4];
         for j in 0..m.d {
             point[j] = query[j * size + i] / divisor[j];
-            if m.interpolate && (point[j] < lower[j] || point[j] > upper[j]) {
-                point[j] = NA_REAL;
-            }
         }
-        if row(&m, tree.as_ref(), point, robust, &mut buffer) {
+        if let Surface::Interpolated(tree) = &surface
+            && (0..m.d).any(|j| point[j] < tree.observed_lo[j] || point[j] > tree.observed_hi[j])
+        {
+            continue;
+        }
+        if row(&m, &surface, point, robust, &mut buffer) {
             fitted[i] = dot(&buffer, &m.y);
-            if se && row(&m, tree.as_ref(), point, &prior, &mut buffer) {
+            if se && row(&m, &surface, point, &prior, &mut buffer) {
                 let variance = buffer
                     .iter()
                     .zip(&m.weights)
