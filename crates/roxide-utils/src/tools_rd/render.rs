@@ -334,16 +334,8 @@ impl Renderer<'_> {
     ) -> EvalResult<()> {
         let mut buffer = String::new();
         let mut prefix = prefix;
-        let mut skip_newline = false;
+        let mut spacing = InlineSpacing::default();
         for node in nodes {
-            if node.tag == "COMMENT" {
-                let line = buffer.rsplit('\n').next().unwrap_or_default();
-                if line.trim().is_empty() {
-                    buffer.truncate(buffer.len() - line.len());
-                    skip_newline = true;
-                }
-                continue;
-            }
             if is_block(node) {
                 self.paragraphs(&buffer, indent, continuation, prefix)?;
                 buffer.clear();
@@ -355,12 +347,7 @@ impl Renderer<'_> {
                 }
                 continue;
             }
-            let start = buffer.len();
-            append_node(node, &self.options, &mut buffer);
-            if skip_newline && buffer[start..].starts_with('\n') {
-                buffer.remove(start);
-            }
-            skip_newline = false;
+            spacing.append(node, &self.options, &mut buffer);
         }
         self.paragraphs(&buffer, indent, continuation, prefix)
     }
@@ -374,7 +361,7 @@ impl Renderer<'_> {
     ) -> EvalResult<()> {
         let mut paragraph = String::new();
         let mut initial = true;
-        for (index, line) in text.split('\n').enumerate() {
+        for line in text.split('\n') {
             if line.trim().is_empty() {
                 if !paragraph.is_empty() {
                     self.wrap(
@@ -389,7 +376,7 @@ impl Renderer<'_> {
                 }
                 continue;
             }
-            if !paragraph.is_empty() && index != 0 {
+            if !paragraph.is_empty() {
                 paragraph.push('\n');
             }
             paragraph.push_str(line);
@@ -672,23 +659,37 @@ fn append_inline<'a>(
     options: &Options,
     out: &mut String,
 ) {
-    let mut skip_newline = false;
-    let start = out.len();
+    let mut spacing = InlineSpacing {
+        start: out.len(),
+        ..InlineSpacing::default()
+    };
     for node in nodes {
+        spacing.append(node, options, out);
+    }
+}
+
+#[derive(Default)]
+struct InlineSpacing {
+    start: usize,
+    skip_newline: bool,
+}
+
+impl InlineSpacing {
+    fn append(&mut self, node: &Node, options: &Options, out: &mut String) {
         if node.tag == "COMMENT" {
-            let line = out[start..].rsplit('\n').next().unwrap_or_default();
+            let line = out[self.start..].rsplit('\n').next().unwrap_or_default();
             if line.trim().is_empty() {
                 out.truncate(out.len() - line.len());
-                skip_newline = true;
+                self.skip_newline = true;
             }
-            continue;
+            return;
         }
         let offset = out.len();
         append_node(node, options, out);
-        if skip_newline && out[offset..].starts_with('\n') {
+        if self.skip_newline && out[offset..].starts_with('\n') {
             out.remove(offset);
         }
-        skip_newline = false;
+        self.skip_newline = false;
     }
 }
 

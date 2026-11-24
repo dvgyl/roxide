@@ -1,44 +1,8 @@
 use std::collections::BTreeMap;
 
-#[derive(Clone, Copy)]
-enum Mode {
-    Text,
-    Code,
-    Verbatim,
-    Equation,
-}
+mod grammar;
 
-impl Mode {
-    fn tag(self) -> &'static str {
-        match self {
-            Self::Text => "TEXT",
-            Self::Code => "RCODE",
-            Self::Verbatim | Self::Equation => "VERB",
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-enum Item {
-    None,
-    Marker,
-    Pair,
-}
-
-#[derive(Clone, Copy)]
-struct Grammar {
-    mode: Mode,
-    item: Item,
-    sections: bool,
-}
-
-impl Grammar {
-    const TEXT: Self = Self {
-        mode: Mode::Text,
-        item: Item::None,
-        sections: false,
-    };
-}
+use grammar::{Grammar, Mode, Placement, Spec};
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Position {
@@ -394,12 +358,9 @@ impl Parser {
             }
             return Ok(false);
         };
-        if spec.section != grammar.sections && tag != "\\Sexpr" {
-            let kind = if spec.section {
-                "section header"
-            } else {
-                "macro"
-            };
+        let section = matches!(spec.placement, Placement::Section);
+        if section != grammar.sections && !matches!(spec.placement, Placement::Anywhere) {
+            let kind = if section { "section header" } else { "macro" };
             self.warning(start, format!("unexpected {kind} '{tag}'"));
             return Ok(false);
         }
@@ -418,39 +379,44 @@ impl Parser {
 
         let mut children = Vec::new();
         for (i, &mode) in spec.args.iter().enumerate() {
-            if c.peek() != Some('{') {
-                if spec.optional_last && i == 1 {
-                    break;
+            let opening = c.peek();
+            let argument = match opening {
+                Some('{') => {
+                    c.next();
+                    let inner = Grammar {
+                        mode,
+                        item: spec.item,
+                        sections: false,
+                    };
+                    let argument = self.nodes(c, inner, End::Brace, depth + 1)?;
+                    self.close(c, '}');
+                    argument
                 }
-                if self.permissive && i == 0 && !spec.section && c.peek().is_some() {
+                _ if spec.optional_last && i + 1 == spec.args.len() => break,
+                Some(_) if self.permissive && i == 0 && !section => {
                     let arg_start = c.pos;
                     let text = c.leaf(mode, End::Input, &mut CodeState::default(), self.depth)?;
-                    let arg = Node::new(mode.tag(), Body::Text(text), Some(c.span(arg_start)));
-                    if spec.args.len() == 1 {
-                        children.push(arg);
-                    } else {
-                        children.push(group(vec![arg]));
-                    }
-                } else {
-                    self.warning(c.pos, format!("expected '{{' after '{tag}'"));
+                    vec![Node::new(
+                        mode.tag(),
+                        Body::Text(text),
+                        Some(c.span(arg_start)),
+                    )]
                 }
-                break;
-            }
-            c.next();
-            let inner = Grammar {
-                mode,
-                item: spec.item,
-                sections: false,
+                _ => {
+                    self.warning(c.pos, format!("expected '{{' after '{tag}'"));
+                    break;
+                }
             };
-            let argument = self.nodes(c, inner, End::Brace, depth + 1)?;
-            self.close(c, '}');
             if spec.args.len() == 1 {
                 children = argument;
             } else {
                 children.push(group(argument));
             }
+            if opening != Some('{') {
+                break;
+            }
         }
-        if !self.keep_empty && spec.section && children.is_empty() {
+        if !self.keep_empty && section && children.is_empty() {
             return Ok(false);
         }
         let mut node = Node::new(tag, Body::Children(children), Some(c.span(start)));
@@ -766,62 +732,6 @@ impl<'a> Cursor<'a> {
             }
         }
         Ok(text)
-    }
-}
-
-struct Spec {
-    args: &'static [Mode],
-    item: Item,
-    section: bool,
-    option: bool,
-    optional_last: bool,
-}
-
-impl Spec {
-    fn get(tag: &str, item: Item) -> Option<Self> {
-        use Mode::{Code, Equation, Text, Verbatim};
-        let (args, section): (&'static [Mode], bool) = match tag {
-            "\\name" | "\\alias" | "\\Rdversion" | "\\synopsis" => (&[Verbatim], true),
-            "\\title" | "\\description" | "\\arguments" | "\\value" | "\\details" | "\\note"
-            | "\\author" | "\\references" | "\\seealso" | "\\keyword" | "\\concept"
-            | "\\docType" | "\\encoding" | "\\format" | "\\source" => (&[Text], true),
-            "\\usage" | "\\examples" => (&[Code], true),
-            "\\section" => (&[Text, Text], true),
-            "\\code" | "\\special" | "\\donttest" | "\\dontshow" | "\\testonly" | "\\Sexpr" => {
-                (&[Code], false)
-            }
-            "\\preformatted" | "\\verb" | "\\url" | "\\env" | "\\out" | "\\dontrun" | "\\kbd" => {
-                (&[Verbatim], false)
-            }
-            "\\emph" | "\\strong" | "\\bold" | "\\sQuote" | "\\dQuote" | "\\pkg" | "\\file"
-            | "\\option" | "\\command" | "\\dfn" | "\\cite" | "\\email" | "\\link"
-            | "\\linkS4class" | "\\itemize" | "\\enumerate" | "\\describe" | "\\acronym"
-            | "\\var" | "\\abbr" => (&[Text], false),
-            "\\href" => (&[Verbatim, Text], false),
-            "\\eqn" | "\\deqn" => (&[Equation, Verbatim], false),
-            "\\enc" | "\\tabular" | "\\method" | "\\S3method" | "\\S4method" | "\\if" => {
-                (&[Text, Text], false)
-            }
-            "\\ifelse" => (&[Text, Text, Text], false),
-            "\\R" | "\\dots" | "\\ldots" | "\\cr" | "\\tab" => (&[], false),
-            "\\item" => match item {
-                Item::None => return None,
-                Item::Marker => (&[], false),
-                Item::Pair => (&[Text, Text], false),
-            },
-            _ => return None,
-        };
-        Some(Self {
-            args,
-            item: match tag {
-                "\\arguments" | "\\value" | "\\describe" => Item::Pair,
-                "\\itemize" | "\\enumerate" => Item::Marker,
-                _ => Item::None,
-            },
-            section,
-            option: matches!(tag, "\\link" | "\\linkS4class" | "\\Sexpr"),
-            optional_last: matches!(tag, "\\eqn" | "\\deqn"),
-        })
     }
 }
 
