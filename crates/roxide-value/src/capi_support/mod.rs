@@ -60,6 +60,23 @@ mod tests {
     }
 
     #[test]
+    fn grow_vector_geometric_reuses_buffer_and_hides_spare_capacity() {
+        let mut s = RSession::new(GcPolicy::default()).unwrap();
+        let v0 = s.alloc_real_from(&[1.0, 2.0]).unwrap();
+        let v1 = s.grow_vector_geometric(v0, 3).unwrap().unwrap();
+        assert_ne!(v0, v1);
+        assert!(!s.is_resizable(v1).unwrap());
+        assert_eq!(s.xlength(v1).unwrap(), 3);
+        assert!(s.real(v1).unwrap().get(2).is_nan());
+        let (p1, _) = s.data_ptr_ro(v1).unwrap();
+        let v2 = s.grow_vector_geometric(v1, 10).unwrap().unwrap();
+        assert_eq!(v1, v2);
+        let (p2, l2) = s.data_ptr_ro(v2).unwrap();
+        assert_eq!(p1, p2);
+        assert_eq!(l2, 10);
+    }
+
+    #[test]
     fn extptr_weakref_and_env_shape_version() {
         let mut s = RSession::new(GcPolicy::Torture).unwrap();
         let env = s.alloc_env(EMPTY_ENV).unwrap();

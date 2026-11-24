@@ -269,6 +269,17 @@ impl<T> RVec<T> {
         }
     }
 
+    /// Create a non-resizable vector with logical length `len` and internal spare capacity.
+    #[must_use]
+    pub(crate) fn with_capacity(buf: Box<[T]>, len: usize) -> Self {
+        debug_assert!(len <= buf.len());
+        Self {
+            buf,
+            len,
+            resizable: false,
+        }
+    }
+
     /// Logical length.
     #[inline]
     #[must_use]

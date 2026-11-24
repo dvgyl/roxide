@@ -2,7 +2,7 @@ use roxide_gc::{HeapError, SexpId};
 
 use crate::alt::{AltKind, AltMaterialized, Sortedness};
 use crate::api::ValueError;
-use crate::na::{RComplex, RLogical};
+use crate::na::{NA_INTEGER, NA_REAL, RComplex, RLogical};
 use crate::object::{Body, CharId, RObject, RVec, SexpType};
 use crate::session::{RSession, SEXP_NIL};
 
@@ -268,6 +268,191 @@ impl RSession {
             self.heap.dec_ref(old);
         }
         Ok(())
+    }
+
+    /// Extend a dense vector to `new_len` using geometric backing capacity.
+    ///
+    /// Extends unshared vectors in place when `new_len` fits in existing backing storage so the
+    /// pinned buffer address never changes (ADR-0002). Otherwise allocates a new non-resizable
+    /// vector with geometric capacity and preserves attributes. Returns `Ok(None)` for ALTREP or
+    /// non-vector objects.
+    pub fn grow_vector_geometric(
+        &mut self,
+        x: SexpId,
+        new_len: usize,
+    ) -> Result<Option<SexpId>, ValueError> {
+        let shared = self.heap.maybe_shared(x);
+        if !shared {
+            let mut inc_str = 0usize;
+            let in_place = {
+                let obj = self.heap.get_mut(x)?;
+                match &mut obj.body {
+                    Body::Lgl(v) if new_len <= v.buf.len() => {
+                        if new_len > v.len {
+                            v.buf[v.len..new_len].fill(RLogical::NA);
+                            v.len = new_len;
+                        }
+                        true
+                    }
+                    Body::Int(v) if new_len <= v.buf.len() => {
+                        if new_len > v.len {
+                            v.buf[v.len..new_len].fill(NA_INTEGER);
+                            v.len = new_len;
+                        }
+                        true
+                    }
+                    Body::Real(v) if new_len <= v.buf.len() => {
+                        if new_len > v.len {
+                            v.buf[v.len..new_len].fill(NA_REAL);
+                            v.len = new_len;
+                        }
+                        true
+                    }
+                    Body::Cplx(v) if new_len <= v.buf.len() => {
+                        if new_len > v.len {
+                            v.buf[v.len..new_len].fill(RComplex::NA);
+                            v.len = new_len;
+                        }
+                        true
+                    }
+                    Body::Raw(v) if new_len <= v.buf.len() => {
+                        if new_len > v.len {
+                            v.buf[v.len..new_len].fill(0);
+                            v.len = new_len;
+                        }
+                        true
+                    }
+                    Body::Str(v) if new_len <= v.buf.len() => {
+                        if new_len > v.len {
+                            inc_str = new_len - v.len;
+                            v.buf[v.len..new_len].fill(CharId::NA);
+                            v.len = new_len;
+                        }
+                        true
+                    }
+                    Body::Vec(v) | Body::Expr(v) if new_len <= v.buf.len() => {
+                        if new_len > v.len {
+                            v.buf[v.len..new_len].fill(SEXP_NIL);
+                            v.len = new_len;
+                        }
+                        true
+                    }
+                    _ => false,
+                }
+            };
+            if in_place {
+                for _ in 0..inc_str {
+                    self.heap.inc_ref(CharId::NA.as_sexp());
+                }
+                return Ok(Some(x));
+            }
+        }
+
+        fn grow_slice<T: Copy>(
+            src: &[T],
+            new_len: usize,
+            cap: usize,
+            fill: T,
+        ) -> Result<Box<[T]>, ValueError> {
+            let mut v = Vec::new();
+            v.try_reserve_exact(cap)
+                .map_err(|_| HeapError::OutOfMemory {
+                    requested: cap.saturating_mul(std::mem::size_of::<T>()),
+                })?;
+            v.extend_from_slice(src);
+            v.resize(cap, fill);
+            debug_assert!(new_len <= cap);
+            Ok(v.into_boxed_slice())
+        }
+
+        let (body, gp, flags, attrs, copied_refs): (Body, _, _, _, Vec<SexpId>) = {
+            let obj = self.heap.get(x)?;
+            let next_cap = |cap: usize| new_len.max(cap.saturating_mul(2)).max(16);
+            let mut refs = Vec::new();
+            let body = match &obj.body {
+                Body::Lgl(v) => {
+                    let cap = next_cap(v.buf.len());
+                    Body::Lgl(RVec::with_capacity(
+                        grow_slice(v.as_slice(), new_len, cap, RLogical::NA)?,
+                        new_len.max(v.len),
+                    ))
+                }
+                Body::Int(v) => {
+                    let cap = next_cap(v.buf.len());
+                    Body::Int(RVec::with_capacity(
+                        grow_slice(v.as_slice(), new_len, cap, NA_INTEGER)?,
+                        new_len.max(v.len),
+                    ))
+                }
+                Body::Real(v) => {
+                    let cap = next_cap(v.buf.len());
+                    Body::Real(RVec::with_capacity(
+                        grow_slice(v.as_slice(), new_len, cap, NA_REAL)?,
+                        new_len.max(v.len),
+                    ))
+                }
+                Body::Cplx(v) => {
+                    let cap = next_cap(v.buf.len());
+                    Body::Cplx(RVec::with_capacity(
+                        grow_slice(v.as_slice(), new_len, cap, RComplex::NA)?,
+                        new_len.max(v.len),
+                    ))
+                }
+                Body::Raw(v) => {
+                    let cap = next_cap(v.buf.len());
+                    Body::Raw(RVec::with_capacity(
+                        grow_slice(v.as_slice(), new_len, cap, 0)?,
+                        new_len.max(v.len),
+                    ))
+                }
+                Body::Str(v) => {
+                    let cap = next_cap(v.buf.len());
+                    let out_len = new_len.max(v.len);
+                    refs.extend(v.as_slice().iter().map(|c| c.as_sexp()));
+                    refs.extend(std::iter::repeat_n(
+                        CharId::NA.as_sexp(),
+                        out_len.saturating_sub(v.len),
+                    ));
+                    Body::Str(RVec::with_capacity(
+                        grow_slice(v.as_slice(), new_len, cap, CharId::NA)?,
+                        out_len,
+                    ))
+                }
+                Body::Vec(v) => {
+                    let cap = next_cap(v.buf.len());
+                    refs.extend_from_slice(v.as_slice());
+                    Body::Vec(RVec::with_capacity(
+                        grow_slice(v.as_slice(), new_len, cap, SEXP_NIL)?,
+                        new_len.max(v.len),
+                    ))
+                }
+                Body::Expr(v) => {
+                    let cap = next_cap(v.buf.len());
+                    refs.extend_from_slice(v.as_slice());
+                    Body::Expr(RVec::with_capacity(
+                        grow_slice(v.as_slice(), new_len, cap, SEXP_NIL)?,
+                        new_len.max(v.len),
+                    ))
+                }
+                _ => return Ok(None),
+            };
+            let attrs = obj.attrs.clone();
+            for (sym, val) in attrs.iter() {
+                refs.push(sym.as_sexp());
+                refs.push(val);
+            }
+            (body, obj.gp, obj.flags, attrs, refs)
+        };
+        let new_obj = RObject {
+            body,
+            gp,
+            flags,
+            attrs,
+        };
+        for id in copied_refs {
+            self.heap.inc_ref(id);
+        }
+        Ok(Some(self.heap.alloc(new_obj)?))
     }
 
     /// Return known ALTREP sortedness metadata (`*_IS_SORTED`; `Sortedness::Unknown` for non-ALTREP).
