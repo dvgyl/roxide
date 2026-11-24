@@ -1,4 +1,4 @@
-use roxide_eval::{Args, Call, Ctx, EvalResult};
+use roxide_eval::{AltOp, Args, Call, Ctx, EvalResult};
 use roxide_gc::SexpId;
 use roxide_value::{
     BASE_NAMESPACE, CharId, NA_INTEGER, RLogical, RSession, SEXP_MISSING, SEXP_NIL, SexpType,
@@ -46,7 +46,8 @@ pub(super) fn indices(
     let s = ctx.session();
     let ty = s.type_of(sub)?;
     let len = s.xlength(sub)?;
-    vector_limit(ctx, call, len.max(n), size_of::<Index>())?;
+    let capacity = if ty == Lgl { len.max(n) } else { len };
+    vector_limit(ctx, call, capacity, size_of::<Index>())?;
     let s = ctx.session_mut();
     let index = match ty {
         Nil => vec![],
@@ -69,8 +70,8 @@ pub(super) fn indices(
                 .collect()
         }
         Int | Real => {
-            let (v, _) = s.coerce(sub, Real)?;
-            let v = s.real(v)?;
+            let (real, _) = s.coerce(sub, Real)?;
+            let v = s.real(real)?;
             let negative = v.iter().any(|v| v.trunc() < 0.0);
             if negative {
                 if v.iter().any(|v| v.is_nan() || v.trunc() > 0.0) {
@@ -80,8 +81,11 @@ pub(super) fn indices(
                         "only 0's may be mixed with negative subscripts",
                     ));
                 }
+                vector_limit(ctx, call, n, size_of::<Index>())?;
                 let mut excluded = vec![false; n];
-                for v in v
+                for v in ctx
+                    .session()
+                    .real(real)?
                     .iter()
                     .filter(|v| v.trunc() < 0.0 && -v < (n as f64 + 1.0))
                 {
@@ -184,14 +188,32 @@ fn subset_impl(ctx: &mut Ctx, call: &Call, args: &Args, x: SexpId) -> EvalResult
     if x == SEXP_NIL {
         return Ok(x);
     }
+    for &arg in args.values().iter().skip(1) {
+        ctx.resolve_altrep(arg)?;
+    }
     let ty = ctx.session().type_of(x)?;
     let drop_arg = args.named(ctx.session(), "drop").unwrap_or(SEXP_MISSING);
     let subs = argument_indices(ctx, args, &["drop"]);
+    ctx.resolve_altrep(attr(ctx.session(), x, "class"))?;
     let drop = flag(
         ctx,
         drop_arg,
         !has_class(ctx.session(), x, "data.frame") || subs.len() > 1,
     )?;
+    if let &[sub] = subs.as_slice()
+        && sub != SEXP_MISSING
+        && !ctx.session().is_object(x)?
+        && !ctx.session().is_s4(x)?
+        && attr(ctx.session(), x, "dim") == SEXP_NIL
+        && ctx
+            .session()
+            .foreign_alt(x)?
+            .is_some_and(|info| !info.owned)
+        && let Some(out) = subset_foreign(ctx, call, x, sub)?
+    {
+        return Ok(out);
+    }
+    ctx.resolve_altrep(x)?;
     if ty != SexpType::Env && has_class(ctx.session(), x, "data.frame") {
         return subset_frame(ctx, call, x, &subs, drop);
     }
@@ -225,6 +247,8 @@ fn subset_impl(ctx: &mut Ctx, call: &Call, args: &Args, x: SexpId) -> EvalResult
             SexpType::Int | SexpType::Real | SexpType::Str
         )
     {
+        ctx.resolve_altrep_deep(attr(ctx.session(), x, "dimnames"))?;
+        let s = ctx.session();
         let dims = s.int(dim)?.to_vec();
         if let Some(index) = coordinates(ctx, call, x, sub, &dims)? {
             return selected(ctx, x, &index);
@@ -240,6 +264,48 @@ fn subset_impl(ctx: &mut Ctx, call: &Call, args: &Args, x: SexpId) -> EvalResult
     } else {
         selected(ctx, x, &pos)
     }
+}
+
+fn subset_foreign(
+    ctx: &mut Ctx,
+    call: &Call,
+    x: SexpId,
+    sub: SexpId,
+) -> EvalResult<Option<SexpId>> {
+    ctx.resolve_altrep(attr(ctx.session(), x, "names"))?;
+    let n = ctx.altrep_len(x)?;
+    let labels = names(ctx.session(), x).to_vec();
+    let positions: Vec<_> = indices(ctx, call, sub, n, &labels, IndexPolicy::Extend)?
+        .into_iter()
+        .map(|index| index.pos)
+        .collect();
+    let s = ctx.session_mut();
+    let indx = if positions.iter().flatten().all(|&i| i < i32::MAX as usize) {
+        let values: Vec<_> = positions
+            .iter()
+            .map(|i| i.map_or(NA_INTEGER, |i| (i + 1) as i32))
+            .collect();
+        s.alloc_int_from(&values)?
+    } else {
+        let values: Vec<_> = positions
+            .iter()
+            .map(|i| i.map_or(roxide_value::NA_REAL, |i| (i + 1) as f64))
+            .collect();
+        s.alloc_real_from(&values)?
+    };
+    let result = ctx.altrep_method(AltOp::ExtractSubset {
+        x,
+        indx,
+        call: call.err_call(),
+    })?;
+    if let Some(out) = result
+        && out != SEXP_NIL
+        && attr(ctx.session(), out, "names") == SEXP_NIL
+    {
+        ctx.protect(out);
+        attach_subset_names(ctx.session_mut(), x, out, &positions)?;
+    }
+    Ok(result)
 }
 
 pub(super) fn pairlist_as_list(s: &mut RSession, x: SexpId, pos: &[Option<usize>]) -> EvalResult {
@@ -272,6 +338,20 @@ pub(super) fn pairlist_as_list(s: &mut RSession, x: SexpId, pos: &[Option<usize>
 pub(super) fn selected(ctx: &mut Ctx, x: SexpId, pos: &[Option<usize>]) -> EvalResult {
     let s = ctx.session_mut();
     let out = gather(s, x, pos)?;
+    attach_subset_names(s, x, out, pos)?;
+    if has_class(s, x, "factor") {
+        copy_attrs(s, x, out, |n| matches!(n, "levels" | "class"))?;
+        s.set_s4_flag(out, false)?;
+    }
+    Ok(out)
+}
+
+fn attach_subset_names(
+    s: &mut RSession,
+    x: SexpId,
+    out: SexpId,
+    pos: &[Option<usize>],
+) -> EvalResult<()> {
     let labels = names(s, x);
     if attr(s, x, "names") != SEXP_NIL {
         let values: Vec<_> = pos
@@ -280,11 +360,7 @@ pub(super) fn selected(ctx: &mut Ctx, x: SexpId, pos: &[Option<usize>]) -> EvalR
             .collect();
         set_names(s, out, &values)?;
     }
-    if has_class(s, x, "factor") {
-        copy_attrs(s, x, out, |n| matches!(n, "levels" | "class"))?;
-        s.set_s4_flag(out, false)?;
-    }
-    Ok(out)
+    Ok(())
 }
 
 pub(super) fn coordinates(
@@ -371,6 +447,7 @@ pub(super) fn array_indices(
     x: SexpId,
     subs: &[SexpId],
 ) -> EvalResult<ArraySelection> {
+    ctx.resolve_altrep_deep(attr(ctx.session(), x, "dimnames"))?;
     let s = ctx.session();
     let dims = s.int(attr(s, x, "dim"))?.to_vec();
     if dims.len() != subs.len() {

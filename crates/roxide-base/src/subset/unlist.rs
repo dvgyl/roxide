@@ -32,6 +32,7 @@ pub(crate) fn unlist(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult 
     if !container(ctx.session().type_of(x)?) {
         return Ok(x);
     }
+    ctx.resolve_altrep_deep(x)?;
     let mut flat = Flat {
         groups: vec![Group::default()],
         leaves: Vec::new(),

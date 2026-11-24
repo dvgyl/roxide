@@ -31,6 +31,7 @@ pub(super) fn print(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     if ctx.session().is_s4(x)? && ctx.show_s4(x, call.env)? {
         return Ok(x);
     }
+    ctx.resolve_altrep_deep(x)?;
     let digits = if matches!(digits, SEXP_MISSING | SEXP_NIL) {
         ctx.opts().digits
     } else {

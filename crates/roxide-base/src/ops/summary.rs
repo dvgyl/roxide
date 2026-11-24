@@ -1,4 +1,4 @@
-use roxide_eval::{Args, Call, Ctx, EvalResult};
+use roxide_eval::{AltOp, Args, Call, Ctx, EvalResult};
 use roxide_value::{
     CharId, NA_INTEGER, NA_REAL, RComplex, RLogical, SEXP_MISSING, SexpType, ValueApi, int_add,
     is_na_real, nan_propagate,
@@ -29,12 +29,42 @@ reduce!(all:All, any:Any, sum:Sum, prod:Prod, min:Min, max:Max, range:Range);
 
 fn reduction(ctx: &mut Ctx, call: &Call, args: &Args, op: Reduce) -> EvalResult {
     let na = args.named(ctx.session(), "na.rm").unwrap_or(SEXP_MISSING);
+    let aware = matches!(op, Reduce::Sum | Reduce::Min | Reduce::Max);
+    if aware {
+        ctx.resolve_altrep(na)?;
+    }
     let rm = flag(ctx, na, false)?;
     let inputs: Vec<_> = args
         .iter()
         .filter(|(name, _)| tag(ctx.session(), *name) != Some("na.rm"))
         .map(|(_, v)| v)
         .collect();
+    if aware {
+        if let &[x] = inputs.as_slice()
+            && !ctx.session().is_object(x)?
+            && !ctx.session().is_s4(x)?
+            && ctx
+                .session()
+                .foreign_alt(x)?
+                .is_some_and(|info| !info.owned)
+        {
+            use SexpType::{Int, Lgl, Real};
+            let method = match (op, ctx.session().type_of(x)?) {
+                (Reduce::Sum, Int | Real | Lgl) => Some(AltOp::Sum { x, na_rm: rm }),
+                (Reduce::Min, Int | Real) => Some(AltOp::Min { x, na_rm: rm }),
+                (Reduce::Max, Int | Real) => Some(AltOp::Max { x, na_rm: rm }),
+                _ => None,
+            };
+            if let Some(method) = method
+                && let Some(result) = ctx.altrep_method(method)?
+            {
+                return Ok(result);
+            }
+        }
+        for &x in &inputs {
+            ctx.resolve_altrep(x)?;
+        }
+    }
     if matches!(op, Reduce::All | Reduce::Any) {
         let all = op == Reduce::All;
         let mut missing = false;

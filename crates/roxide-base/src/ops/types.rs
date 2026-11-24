@@ -1,10 +1,14 @@
 use std::borrow::Cow;
 
-use roxide_eval::{Args, Call, Ctx, EvalResult};
+use roxide_eval::{
+    AltOp, AltReply, ArgEval, Args, Arity, Call, Ctx, Dispatch, EvalResult, InternalError, Module,
+    PrimDef, PrimKind, Unwind, Visibility,
+};
 use roxide_gc::SexpId;
 use roxide_value::{
     CharId, Encoding, IdenticalOpts, NA_INTEGER, RComplex, RLogical, RSession, SEXP_MISSING,
-    SEXP_NIL, SexpType, Sym as Symbol, ValueApi, ValueError, identical as same, is_nan_not_na,
+    SEXP_NIL, SexpType, Sortedness, Sym as Symbol, ValueApi, ValueError, identical as same,
+    is_nan_not_na,
 };
 
 use super::common::{
@@ -25,6 +29,195 @@ macro_rules! predicate {
 }
 
 use super::attributes::has_class;
+
+/// Primitives with default implementations that read ALTREP metadata.
+pub(crate) const ALTREP_MODULE: Module = Module {
+    prims: &[
+        super::primitive!(
+            "length",
+            length,
+            Eval,
+            Arity::Exact(1),
+            Dispatch::Internal("length"),
+            On
+        ),
+        super::primitive!(
+            "is.unsorted",
+            is_unsorted,
+            Eval,
+            Arity::Range(1, 3),
+            Dispatch::None,
+            On
+        ),
+    ],
+    prelude: "",
+};
+
+fn length(ctx: &mut Ctx, _: &Call, args: &mut Args) -> EvalResult {
+    let n = ctx.altrep_len(args.get(0))?;
+    let s = ctx.session_mut();
+    Ok(match i32::try_from(n) {
+        Ok(n) => s.scalar_int(n)?,
+        Err(_) => s.scalar_real(n as f64)?,
+    })
+}
+
+fn is_unsorted(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    let [x, na_rm, strictly] = formals(ctx.session(), args, ["x", "na.rm", "strictly"]);
+    if x == SEXP_MISSING {
+        return Err(error(
+            ctx,
+            call,
+            "argument \"x\" is missing, with no default",
+        ));
+    }
+    let len = ctx.altrep_len(x)?;
+    if len < 2 {
+        return Ok(roxide_value::FALSE_SCALAR);
+    }
+    ctx.resolve_altrep(na_rm)?;
+    let rm = if na_rm == SEXP_MISSING {
+        Some(false)
+    } else {
+        let s = ctx.session_mut();
+        let n = s.xlength(na_rm)?;
+        if n > 1 {
+            return Err(error(
+                ctx,
+                call,
+                format!("'length = {n}' in coercion to 'logical(1)'"),
+            ));
+        }
+        if n == 0 || !matches!(s.type_of(na_rm)?, Lgl | Int | Real | Cplx) {
+            return Err(error(ctx, call, "invalid argument type"));
+        }
+        let (value, _) = s.coerce(na_rm, Lgl)?;
+        s.lgl(value)?.get(0).get()
+    };
+    let ty = ctx.session().type_of(x)?;
+    let metadata = atomic(ty) && !ctx.session().is_object(x)? && !ctx.session().is_s4(x)?;
+    let sorted = if metadata {
+        sortedness(ctx, x)?
+    } else {
+        Sortedness::Unknown
+    };
+    let increasing = matches!(
+        sorted,
+        Sortedness::Increasing | Sortedness::IncreasingNaFirst
+    );
+    let no_na = if metadata && !(increasing && rm == Some(true)) {
+        ctx.altrep_no_na(x)?
+    } else {
+        false
+    };
+    if rm != Some(true) && !no_na {
+        ctx.resolve_altrep(x)?;
+        if any_na_value(ctx, call, x, false, 1)? {
+            if rm.is_none() {
+                return Err(error(ctx, call, "missing value where TRUE/FALSE needed"));
+            }
+            return Ok(roxide_value::NA_LGL_SCALAR);
+        }
+    }
+    ctx.resolve_altrep(strictly)?;
+    let strict = if strictly == SEXP_MISSING {
+        false
+    } else {
+        let (value, _) = ctx.session_mut().coerce(strictly, Lgl)?;
+        let value = ctx
+            .session()
+            .lgl(value)?
+            .iter()
+            .next()
+            .and_then(RLogical::get);
+        value.ok_or_else(|| error(ctx, call, "invalid 'strictly' argument"))?
+    };
+    let known = match sorted {
+        Sortedness::Increasing | Sortedness::IncreasingNaFirst if !strict => Some(false),
+        Sortedness::Unsorted if no_na || rm != Some(true) => Some(true),
+        Sortedness::Decreasing | Sortedness::DecreasingNaFirst
+            if strict && (no_na || rm != Some(true)) =>
+        {
+            Some(true)
+        }
+        _ => None,
+    };
+    let unsorted = if let Some(known) = known {
+        known
+    } else {
+        ctx.resolve_altrep(x)?;
+        let s = ctx.session();
+        match ty {
+            Lgl => scan_order(s.lgl(x)?.iter().filter_map(RLogical::get), strict),
+            Int => scan_order(s.int(x)?.iter().filter(|&v| v != NA_INTEGER), strict),
+            Real => scan_order(s.real(x)?.iter().filter(|v| !v.is_nan()), strict),
+            Cplx => scan_order(
+                s.cplx(x)?
+                    .iter()
+                    .filter(|v| !v.re.is_nan() && !v.im.is_nan())
+                    .map(|v| (v.re, v.im)),
+                strict,
+            ),
+            Raw => scan_order(s.raw(x)?.iter(), strict),
+            Str => scan_order(
+                s.str_slice(x)?
+                    .iter()
+                    .filter(|&&v| v != CharId::NA)
+                    .map(|&v| s.char_bytes(v).ok()),
+                strict,
+            ),
+            _ => return Ok(roxide_value::NA_LGL_SCALAR),
+        }
+    };
+    Ok(ctx
+        .session_mut()
+        .scalar_lgl(RLogical::from_option(Some(unsorted)))?)
+}
+
+fn sortedness(ctx: &mut Ctx, x: SexpId) -> EvalResult<Sortedness> {
+    if !ctx
+        .session()
+        .foreign_alt(x)?
+        .is_some_and(|info| !info.owned)
+    {
+        return ctx.altrep_sorted(x);
+    }
+    // Ctx::altrep_sorted maps both KNOWN_UNSORTED and UNKNOWN_SORTEDNESS to Unknown.
+    let invalid = || {
+        Unwind::Internal(InternalError {
+            message: "foreign ALTREP sortedness callback unavailable".into(),
+        })
+    };
+    let hooks = ctx.native_hooks().ok_or_else(invalid)?;
+    let reply = ctx.scoped(|ctx| {
+        ctx.protect(x);
+        hooks.altrep(ctx, AltOp::IsSorted(x))
+    })?;
+    let AltReply::Flag(code) = reply else {
+        return Err(invalid());
+    };
+    Ok(match code {
+        0 => Sortedness::Unsorted,
+        1 => Sortedness::Increasing,
+        2 => Sortedness::IncreasingNaFirst,
+        -1 => Sortedness::Decreasing,
+        -2 => Sortedness::DecreasingNaFirst,
+        _ => Sortedness::Unknown,
+    })
+}
+
+fn scan_order<T: PartialOrd>(mut values: impl Iterator<Item = T>, strict: bool) -> bool {
+    let Some(mut previous) = values.next() else {
+        return false;
+    };
+    for value in values {
+        if value < previous || (strict && value == previous) {
+            return true;
+        }
+        previous = value;
+    }
+    false
+}
 
 use SexpType::*;
 predicate!(
@@ -89,7 +282,8 @@ pub(super) fn any_na(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult 
     let s = ctx.session();
     let recurse =
         if recursive != SEXP_MISSING && matches!(s.type_of(x)?, Vec | List) && !s.is_object(x)? {
-            let len = s.xlength(recursive)?;
+            ctx.resolve_altrep(recursive)?;
+            let len = ctx.session().xlength(recursive)?;
             if len > 1 {
                 return Err(error(
                     ctx,
@@ -138,6 +332,11 @@ fn any_na_value(
     match ty {
         Nil | Raw => Ok(false),
         ty if atomic(ty) => {
+            if ctx.altrep_no_na(x)? {
+                return Ok(false);
+            }
+            ctx.resolve_altrep(x)?;
+            let s = ctx.session();
             for i in 0..s.xlength(x)? {
                 if test_at(s, x, i, MissingTest::Na)? {
                     return Ok(true);
@@ -149,6 +348,7 @@ fn any_na_value(
             if remaining == 0 {
                 return Err(error(ctx, call, "evaluation nested too deeply"));
             }
+            ctx.resolve_altrep(x)?;
             let mut tail = x;
             for i in 0..ctx.session().xlength(x)? {
                 let value = if ty == List {
@@ -163,12 +363,11 @@ fn any_na_value(
                         return Ok(true);
                     }
                 } else {
-                    let s = ctx.session();
-                    if atomic(s.type_of(value)?)
-                        && s.xlength(value)? == 1
-                        && test_at(s, value, 0, MissingTest::Na)?
-                    {
-                        return Ok(true);
+                    if atomic(ctx.session().type_of(value)?) && ctx.altrep_len(value)? == 1 {
+                        ctx.resolve_altrep(value)?;
+                        if test_at(ctx.session(), value, 0, MissingTest::Na)? {
+                            return Ok(true);
+                        }
                     }
                 }
             }
@@ -186,8 +385,11 @@ fn any_na_value(
 }
 
 fn missing(ctx: &mut Ctx, call: &Call, x: SexpId, op: MissingTest) -> EvalResult {
+    let ty = ctx.session().type_of(x)?;
+    if matches!(op, MissingTest::Na) && matches!(ty, Vec | List | Expr) {
+        ctx.resolve_altrep_deep(x)?;
+    }
     let s = ctx.session_mut();
-    let ty = s.type_of(x)?;
     let len = s.xlength(x)?;
     let mut out = std::vec::Vec::with_capacity(len);
     for i in 0..len {
@@ -317,6 +519,8 @@ pub(super) fn identical(ctx: &mut Ctx, _: &Call, args: &mut Args) -> EvalResult 
         ignore_environment: flag(ctx, env, false)?,
         ignore_srcref: flag(ctx, src, true)?,
     };
+    ctx.resolve_altrep_deep(x)?;
+    ctx.resolve_altrep_deep(y)?;
     let s = ctx.session_mut();
     let yes = same(s, x, y, opts)?;
     Ok(s.scalar_lgl(RLogical::from_option(Some(yes)))?)
@@ -391,6 +595,9 @@ pub(super) fn complex(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult
 macro_rules! coercion {
     ($($name:ident:$ty:ident),*) => {$(
         pub(super) fn $name(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+            for &arg in args.values().iter().skip(1) {
+                ctx.resolve_altrep(arg)?;
+            }
             convert(ctx, call, args.get(0), SexpType::$ty)
         }
     )*};
@@ -400,6 +607,9 @@ coercion!(as_logical:Lgl, as_integer:Int, as_double:Real, as_complex:Cplx,
 
 pub(super) fn as_list(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     let x = args.get(0);
+    for &arg in args.values().iter().skip(1) {
+        ctx.resolve_altrep(arg)?;
+    }
     let s = ctx.session_mut();
     if s.type_of(x)? != Clo {
         return convert(ctx, call, x, Vec);
@@ -432,8 +642,16 @@ fn tagged_list(
 }
 
 pub(super) fn convert(ctx: &mut Ctx, call: &Call, x: SexpId, ty: SexpType) -> EvalResult {
+    let from = ctx.session().type_of(x)?;
+    if let Some(result) = foreign_coerce(ctx, x, from, ty)? {
+        return Ok(result);
+    }
+    if (from == Vec && atomic(ty)) || (matches!(from, List | Lang) && ty == Str) {
+        ctx.resolve_altrep_deep(x)?;
+    } else if from != ty || !ctx.session().attrs(x)?.is_empty() {
+        ctx.resolve_altrep(x)?;
+    }
     let s = ctx.session_mut();
-    let from = s.type_of(x)?;
     if ty == Vec && matches!(from, List | Lang | Expr | Env) {
         let pairs: std::vec::Vec<_> = match from {
             Env => s
@@ -512,6 +730,29 @@ pub(super) fn convert(ctx: &mut Ctx, call: &Call, x: SexpId, ty: SexpType) -> Ev
     Ok(out)
 }
 
+fn foreign_coerce(
+    ctx: &mut Ctx,
+    x: SexpId,
+    from: SexpType,
+    to: SexpType,
+) -> EvalResult<Option<SexpId>> {
+    if from == to
+        || !ctx
+            .session()
+            .foreign_alt(x)?
+            .is_some_and(|info| !info.owned)
+    {
+        return Ok(None);
+    }
+    if matches!(to, Str | Vec) && ctx.session().is_object(x)? {
+        ctx.resolve_altrep(get(ctx.session(), x, "class"))?;
+        if has_class(ctx.session(), x, "factor") {
+            return Ok(None);
+        }
+    }
+    ctx.altrep_method(AltOp::Coerce { x, to })
+}
+
 pub(super) fn combine(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     let option = |ctx: &Ctx, name| args.named(ctx.session(), name).unwrap_or(SEXP_MISSING);
     let recursive = flag(ctx, option(ctx, "recursive"), false)?;
@@ -523,6 +764,11 @@ pub(super) fn combine(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult
             (!matches!(name, "recursive" | "use.names")).then(|| (name.to_owned(), v))
         })
         .collect();
+    if recursive {
+        for &(_, val) in &work {
+            ctx.resolve_altrep_deep(val)?;
+        }
+    }
     let s = ctx.session();
     if work.iter().all(|(name, v)| {
         s.type_of(*v).is_ok_and(|ty| {
@@ -693,6 +939,7 @@ fn name_utf8(s: &RSession, name: CharId) -> Result<Cow<'_, [u8]>, ValueError> {
 
 pub(super) fn as_vector(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     let [x, mode] = formals(ctx.session(), args, ["x", "mode"]);
+    ctx.resolve_altrep(mode)?;
     let named = if mode == SEXP_MISSING {
         "any".to_owned()
     } else {
@@ -709,6 +956,11 @@ pub(super) fn as_vector(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResu
         "list" => Vec,
         "expression" => Expr,
         "pairlist" => {
+            let from = ctx.session().type_of(x)?;
+            if let Some(result) = foreign_coerce(ctx, x, from, List)? {
+                return Ok(result);
+            }
+            ctx.resolve_altrep(x)?;
             let items = convert(ctx, call, x, Vec)?;
             let s = ctx.session_mut();
             let ids = chars(s, get(s, items, "names")).to_vec();
@@ -725,9 +977,14 @@ pub(super) fn as_vector(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResu
             return Ok(out);
         }
         "name" | "symbol" => {
-            if ctx.session().type_of(x)? == Sym {
+            let from = ctx.session().type_of(x)?;
+            if from == Sym {
                 return Ok(x);
             }
+            if let Some(result) = foreign_coerce(ctx, x, from, Sym)? {
+                return Ok(result);
+            }
+            ctx.resolve_altrep(x)?;
             let value = convert(ctx, call, x, Str)?;
             let name = string(ctx.session(), value)
                 .filter(|name| !name.is_empty())

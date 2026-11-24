@@ -24,6 +24,8 @@ pub mod subset;
 mod constants;
 #[path = "strings/default_format.rs"]
 mod default_format;
+#[path = "ops/display.rs"]
+mod display;
 #[path = "strings/numbers.rs"]
 mod numbers;
 #[path = "io_os/tier_a.rs"]
@@ -38,6 +40,7 @@ use roxide_eval::{Ctx, InternalError, Module};
 /// Ordered list of `roxide-base` submodules registered into `BASE_ENV`.
 pub const MODULES: &[&Module] = &[
     &ops::MODULE,
+    &ops::types::ALTREP_MODULE,
     &subset::MODULE,
     &strings::MODULE,
     &io_os::MODULE,
@@ -61,5 +64,26 @@ pub fn register_all(ctx: &mut Ctx) -> Result<(), InternalError> {
     for module in MODULES {
         ctx.register_module(module)?;
     }
+    display::register(ctx)?;
+    ctx.mark_altrep_aware(&[
+        "length",
+        "sum",
+        "min",
+        "max",
+        "anyNA",
+        "is.unsorted",
+        "[",
+        "as.vector",
+        "as.logical",
+        "as.integer",
+        "as.double",
+        "as.numeric",
+        "as.complex",
+        "as.character",
+        "as.raw",
+        "as.list",
+        "rox_serialize",
+        "rox_save_rds",
+    ]);
     ctx.register_package(&compiler::PACKAGE)
 }
