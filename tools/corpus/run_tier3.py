@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import ast
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 import json
 import math
@@ -17,17 +19,31 @@ import subprocess
 import sys
 import tarfile
 from tempfile import TemporaryDirectory, TemporaryFile
+from typing import BinaryIO
 
-from fetch_tier3 import CACHE, Package, clauses, packages, unpack
+from fetch_tier3 import BASE, CACHE, DEPENDENCY, NAME, Package, clauses, packages, unpack
 from run_tier2 import SHIM, SUMMARY
 
 ORACLE_VERSION = "4.6.2"
 TAIL_BYTES = 8000
 DONE = "ROXIDE_TIER3_DONE"
+R_TOKEN = re.compile(r'''"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`|'''
+                     r"#[^\n]*|:::?|[\w.]+|[^\s]", re.S)
+MISSING_PACKAGE = re.compile(
+    rf"(?:^| did not have the expected error result\. )there is no package called ['\"?‘]({NAME})['\"?’]$"
+    rf"|^Required package ({NAME}) not found(?:[.!]|$)")
+MISSING_FUNCTION = re.compile(r"object ['\"?‘](.+?)['\"?’] of mode ['\"?‘]function['\"?’] "
+                              r"(?:was )?not found$")
 
 
 def literal(value: str | Path) -> str:
     return json.dumps(str(value), ensure_ascii=False)
+
+
+def log_tail(output: BinaryIO) -> str:
+    size = output.seek(0, os.SEEK_END)
+    output.seek(max(0, size - TAIL_BYTES))
+    return output.read().decode("utf-8", errors="replace").strip()
 
 
 def check_timeout(value: str) -> float:
@@ -103,15 +119,17 @@ class Engine:
     def library(self) -> Path:
         return self.root / "library"
 
-    def run(self, command: list[str | Path], cwd: Path) -> Stage:
+    def run(self, command: list[str | Path], cwd: Path,
+            read_log: Callable[[BinaryIO], str] = log_tail) -> Stage:
         env = {key: value for key, value in os.environ.items()
                if key not in ("R_HOME", "R_TESTS") and
                not key.startswith(("R_LIBS", "R_PROFILE", "R_ENVIRON"))}
         env.update({
             "R_LIBS": str(self.library), "R_LIBS_USER": str(self.library), "R_LIBS_SITE": "NULL",
             "R_MAKEVARS_USER": os.devnull, "R_MAX_VSIZE": "1G", "MAKEFLAGS": "-j1",
-            "NOT_CRAN": "false", "CI": "false", "LC_ALL": "C", "R_DEFAULT_PACKAGES":
-            "datasets,utils,grDevices,graphics,stats,methods",
+            "NOT_CRAN": "false", "CI": "false",
+            "LC_ALL": "en_US.UTF-8" if sys.platform == "darwin" else "C.UTF-8",
+            "R_DEFAULT_PACKAGES": "datasets,utils,grDevices,graphics,stats,methods",
         })
         if self.name == "roxide":
             env["R_HOME"] = str(self.r.parent.parent)
@@ -133,17 +151,16 @@ class Engine:
                         detail = f"Time limit reached ({self.timeout:g} seconds).\n"
             except OSError as error:
                 return Stage("error", str(error))
-            size = output.tell()
-            output.seek(max(0, size - TAIL_BYTES))
-            return Stage(status, detail + output.read().decode("utf-8", errors="replace").strip())
+            return Stage(status, detail + read_log(output))
 
     def install(self, source: Path) -> Stage:
         startup = ["--use-vanilla"] if self.name == "oracle" else []
         return self.run([self.r, "CMD", "INSTALL", *startup, "--no-multiarch", "--no-byte-compile",
                          f"--library={self.library}", source], self.root)
 
-    def evaluate(self, expression: str, cwd: Path) -> Stage:
-        return self.run([*self.script, "--vanilla", "-e", expression], cwd)
+    def evaluate(self, expression: str, cwd: Path,
+                 read_log: Callable[[BinaryIO], str] = log_tail) -> Stage:
+        return self.run([*self.script, "--vanilla", "-e", expression], cwd, read_log)
 
     def namespace(self, pin: Package) -> Stage:
         name = literal(pin.package)
@@ -161,29 +178,122 @@ def has_marker(log: str) -> bool:
     return DONE in log.splitlines()
 
 
-def test_plan(source: Path, pin: Package) -> dict[str, bool]:
+def r_tokens(path: Path) -> list[str]:
+    return [token for token in R_TOKEN.findall(path.read_text(encoding="utf-8", errors="replace"))
+            if not token.startswith("#")]
+
+
+def check_filter(path: Path) -> tuple[re.Pattern[str], bool] | None:
+    if not path.is_file():
+        return None
+    tokens = r_tokens(path)
+    for index in range(len(tokens) - 1):
+        if tokens[index:index + 2] != ["test_check", "("]:
+            continue
+        arguments = {}
+        argument = []
+        depth = 0
+        for token in tokens[index + 2:]:
+            if depth == 0 and token in (",", ")"):
+                if len(argument) >= 3 and argument[1] == "=":
+                    arguments[argument[0]] = argument[2] if len(argument) == 3 else ""
+                if token == ")":
+                    break
+                argument = []
+                continue
+            depth += (token in ("(", "[", "{")) - (token in (")", "]", "}"))
+            argument.append(token)
+        pattern = arguments.get("filter", "")
+        invert = arguments.get("invert", "FALSE")
+        if not pattern.startswith(('"', "'")) or invert not in ("TRUE", "FALSE"):
+            continue
+        try:
+            return re.compile(ast.literal_eval(pattern)), invert == "TRUE"
+        except (SyntaxError, re.error) as error:
+            raise ValueError(f"Invalid testthat filter in {path}. {error}") from error
+    return None
+
+
+def test_name(path: Path) -> str:
+    return re.sub(r"^test[-_]", "", path.stem)
+
+
+@dataclass(frozen=True)
+class PlannedTest:
+    shim: bool
+    skip_reason: str = ""
+
+
+def test_plan(source: Path, pin: Package) -> dict[str, PlannedTest]:
     directory = source / "tests"
     plan = {}
     if pin.test_runner == "shim":
-        plan.update((path.relative_to(directory).as_posix(), True) for path in
-                    (directory / "testthat").glob("*")
-                    if path.is_file() and re.fullmatch(r"test.*\.[rR]", path.name))
+        selection = check_filter(directory / "testthat.R")
+        for path in (directory / "testthat").glob("*"):
+            if path.is_file() and re.fullmatch(r"test.*\.[rR]", path.name):
+                reason = ""
+                if selection:
+                    pattern, invert = selection
+                    if bool(pattern.search(test_name(path))) == invert:
+                        reason = "excluded by tests/testthat.R filter"
+                plan[path.relative_to(directory).as_posix()] = PlannedTest(True, reason)
     for path in directory.glob("*"):
         if path.is_file() and path.suffix.lower() in (".r", ".rin"):
             if plan and path.name.lower() == "testthat.r":
                 continue
-            plan[path.name] = False
+            plan[path.name] = PlannedTest(False)
     return dict(sorted(plan.items()))
 
 
+def namespace_references(path: Path) -> dict[str, set[str]]:
+    references: dict[str, set[str]] = {}
+    tokens = r_tokens(path)
+    for package, operator, symbol in zip(tokens, tokens[1:], tokens[2:]):
+        if operator in ("::", ":::"):
+            references.setdefault(symbol.strip("`\"'"), set()).add(package.strip("`\"'"))
+    return references
+
+
+def optional_failures(output: BinaryIO, missing: set[str],
+                      references: dict[str, set[str]]) -> list[str]:
+    skipped = []
+    output.seek(0)
+    failure = False
+    for line in output:
+        if not line.startswith(b"  "):
+            failure = re.match(rb"not ok \d+ - ", line) is not None
+            continue
+        if not failure:
+            continue
+        message = line.decode("utf-8", errors="replace").strip()
+        package = MISSING_PACKAGE.search(message)
+        function = MISSING_FUNCTION.fullmatch(message)
+        providers = references.get(function[1], set()) if function else set()
+        if package and (name := package[1] or package[2]) in missing:
+            skipped.append(name)
+            failure = False
+        elif providers and providers <= missing:
+            skipped.append(", ".join(sorted(providers)))
+            failure = False
+    return skipped
+
+
 def test_file(engine: Engine, pin: Package, fields: dict[str, str],
-              path: Path, shim: bool) -> Test:
+              path: Path, shim: bool, corpus_packages: set[str]) -> Test:
     if path.suffix.lower() == ".rin":
         return Test("skip", skipped=1, log="This script needs R CMD check input processing.")
     seed = "set.seed(1L); "
+    reclassified = []
     if shim:
-        optional = ", ".join(literal(dep.split()[0]) for dep in clauses(fields, "Suggests"))
+        suggests = {match[1] for clause in clauses(fields, "Suggests")
+                    if (match := DEPENDENCY.fullmatch(clause))}
+        missing = suggests - corpus_packages
+        references = namespace_references(path) if missing else {}
+        target = test_name(path)
+        if target in missing and any(target in providers for providers in references.values()):
+            return Test("skip", skipped=1, log=f"Optional package {target} is unavailable.")
         edition = fields.get("Config/testthat/edition", "2")
+        optional = ", ".join(map(literal, sorted(missing)))
         options = (f"options(testthat.edition = {int(edition)}L, "
                    f"testthat.optional_packages = c({optional})); ")
         expression = (
@@ -193,7 +303,14 @@ def test_file(engine: Engine, pin: Package, fields: dict[str, str],
         )
     else:
         expression = f"{seed}source({literal(path.name)}, chdir = TRUE); "
-    result = engine.evaluate(expression + f'cat("{DONE}\\n")', path.parent)
+
+    def read_log(output: BinaryIO) -> str:
+        log = log_tail(output)
+        if shim and missing and (summary := SUMMARY.search(log)) and int(summary[1]):
+            reclassified.extend(optional_failures(output, missing, references))
+        return log
+
+    result = engine.evaluate(expression + f'cat("{DONE}\\n")', path.parent, read_log)
     if result.status != "pass" or not has_marker(result.log):
         return Test("error", errors=1, log=result.log)
     if not shim:
@@ -202,6 +319,11 @@ def test_file(engine: Engine, pin: Package, fields: dict[str, str],
     if len(summaries) != 1:
         return Test("error", errors=1, log="Expected one shim summary.\n" + result.log)
     failed, warnings, skipped, passed = map(int, summaries[0])
+    if 0 < len(reclassified) <= failed:
+        failed -= len(reclassified)
+        skipped += len(reclassified)
+        reasons = ", ".join(sorted(set(reclassified)))
+        result.log = f"Skipped tests that require unavailable optional packages ({reasons}).\n{result.log}"
     status = "fail" if failed else "pass" if passed else "skip"
     return Test(status, passed, failed, skipped, warnings=warnings, log=result.log)
 
@@ -219,6 +341,7 @@ def run_suite(engine: Engine, pins: list[Package], selected: set[str],
     descriptions = {}
     sources = engine.root / "sources"
     sources.mkdir()
+    corpus_packages = BASE | {pin.package for pin in pins} | {"testthat"}
     for pin in pins:
         print(f"{engine.name} {pin.package} {pin.version}", flush=True)
         descriptions[pin.package] = unpack(pin, cache / pin.filename, sources)
@@ -238,17 +361,21 @@ def run_suite(engine: Engine, pins: list[Package], selected: set[str],
             continue
         suite = results[pin.package]
         source = sources / pin.package
-        for name, use_shim in test_plan(source, pin).items():
+        for name, planned in test_plan(source, pin).items():
+            if planned.skip_reason:
+                suite.tests[name] = Test("skip", skipped=1, log=planned.skip_reason)
+                continue
             if suite.namespace.status != "pass":
                 suite.tests[name] = Test("skip", skipped=1, log="Package namespace is unavailable.")
                 continue
-            if use_shim and shim is None:
+            if planned.shim and shim is None:
                 shim = engine.install(SHIM)
-            if use_shim and shim.status != "pass":
+            if planned.shim and shim.status != "pass":
                 suite.tests[name] = Test("error", errors=1, log=shim.log)
             else:
                 suite.tests[name] = test_file(
-                    engine, pin, descriptions[pin.package], source / "tests" / name, use_shim)
+                    engine, pin, descriptions[pin.package], source / "tests" / name, planned.shim,
+                    corpus_packages)
     return results
 
 
