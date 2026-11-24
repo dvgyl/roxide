@@ -345,7 +345,20 @@ impl RSession {
 
     /// Run a complete two-phase GC cycle: mark, purge unmarked weak `CHARSXP` entries, then sweep.
     pub fn collect(&mut self, roots: &dyn RootSet) -> GcStats {
-        let marked = self.heap.mark(roots);
+        self.collect_with_hook(roots, |_| {})
+    }
+
+    /// Run a two-phase GC cycle, invoking `hook` between mark and weak-cache/sweep cleanup.
+    ///
+    /// Used by `roxide-eval` to run ephemeron finalizer fixpoint marking and resurrect dead
+    /// targets queued for finalization before sweeping.
+    pub fn collect_with_hook(
+        &mut self,
+        roots: &dyn RootSet,
+        hook: impl FnOnce(&mut roxide_gc::Marked<'_, RObject>),
+    ) -> GcStats {
+        let mut marked = self.heap.mark(roots);
+        hook(&mut marked);
         self.chars.retain(|_, cid| marked.is_marked(cid.as_sexp()));
         marked.sweep()
     }

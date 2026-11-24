@@ -550,6 +550,32 @@ impl<T: Trace + HeapSize> Marked<'_, T> {
             && self.marked.get(idx).copied().unwrap_or(false)
     }
 
+    /// Transitively mark `id` and every object reachable from it before [`Marked::sweep`].
+    ///
+    /// Used for ephemeron value marking and keeping objects queued for GC finalization alive
+    /// until their finalizer callback runs.
+    pub fn mark_transitive(&mut self, id: SexpId) {
+        let mut worklist = Vec::new();
+        {
+            let mut tracer = Tracer {
+                marked: &mut self.marked,
+                worklist: &mut worklist,
+                generations: &self.heap.generations,
+            };
+            tracer.edge(id);
+        }
+        while let Some(idx) = worklist.pop() {
+            if let Some(obj) = self.heap.slots[idx as usize].value.as_ref() {
+                let mut tracer = Tracer {
+                    marked: &mut self.marked,
+                    worklist: &mut worklist,
+                    generations: &self.heap.generations,
+                };
+                obj.trace(&mut tracer);
+            }
+        }
+    }
+
     /// Sweep all unmarked non-permanent slots, bump generations, and return [`GcStats`].
     pub fn sweep(self) -> GcStats {
         let mut freed = 0usize;

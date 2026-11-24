@@ -379,7 +379,7 @@ For each package, all four conditions must be true:
 | `crayon` | `methods`/`grDevices`/`utils` imports |
 | `praise` | No imports |
 | `magrittr` **1.5** | The last pure-R release, from the CRAN archive |
-| `assertthat`, `zeallot` | Extra pure-R coverage |
+| `zeallot` | Extra pure-R coverage (`assertthat` is GPL-3 and excluded per the clean-room licence wall) |
 
 **Moved to M4 Tier 3:** `magrittr` ≥ 2.0 and the real `testthat` (both compiled). In M3, the shim stands in for "testthat-core". Run the shim under both engines so that the test is still differential.
 

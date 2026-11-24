@@ -1,11 +1,14 @@
-use roxide_gc::{SexpId, Trace, Tracer};
+use roxide_gc::SexpId;
 use roxide_value::{
     BASE_ENV, BASE_NAMESPACE, EMPTY_ENV, GLOBAL_ENV, RLogical, SEXP_MISSING, SEXP_NIL,
     SEXP_UNBOUND, SexpType, Sym, ValueApi,
 };
 
 use crate::control::logical;
-use crate::{Args, Arity, Call, Ctx, EvalResult, Module};
+use crate::ctx::FinalizerEntry;
+use crate::{
+    ArgEval, Args, Arity, Call, Ctx, Dispatch, EvalResult, Module, PrimDef, PrimKind, Visibility,
+};
 
 pub(crate) const MODULE: Module = Module {
     prims: &[
@@ -113,8 +116,17 @@ pub(crate) const MODULE: Module = Module {
         primitive!("sys.nframe", sys_nframe, Eval, Arity::Exact(0), On),
         primitive!("::", namespace, Unevaluated, Arity::Exact(2), On),
         primitive!(":::", namespace, Unevaluated, Arity::Exact(2), On),
+        PrimDef {
+            name: "rox_gc",
+            fun: gc_internal,
+            kind: PrimKind::Internal,
+            args: ArgEval::Eval,
+            arity: Arity::Exact(3),
+            dispatch: Dispatch::None,
+            visibility: Visibility::On,
+        },
     ],
-    prelude: "",
+    prelude: "gc <- function(verbose = getOption(\"verbose\"), reset = FALSE, full = TRUE) .Internal(rox_gc(verbose, reset, full))",
 };
 
 impl Ctx {
@@ -563,20 +575,6 @@ fn is_function(ctx: &Ctx, value: SexpId) -> EvalResult<bool> {
     ))
 }
 
-#[derive(Default)]
-struct ExitFinalizers(Vec<(SexpId, SexpId)>);
-
-impl Trace for ExitFinalizers {
-    fn trace(&self, tracer: &mut Tracer<'_>) {
-        for &(env, fun) in &self.0 {
-            tracer.edge(env);
-            tracer.edge(fun);
-        }
-    }
-}
-
-impl crate::CtxExt for ExitFinalizers {}
-
 fn register_finalizer(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     let matched = ctx.match_names(args, &["e", "f", "onexit"], call.err_call())?;
     let env = ctx.matched_arg(args, &matched, 0).unwrap_or(SEXP_NIL);
@@ -590,26 +588,88 @@ fn register_finalizer(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult
     if !is_function(ctx, fun)? {
         return Err(ctx.stop(call.err_call(), "second argument must be a function"));
     }
-    if scalar_flag(ctx, ctx.matched_arg(args, &matched, 2), false, call)? {
-        ctx.ext::<ExitFinalizers>().0.push((env, fun));
-    }
+    let onexit = scalar_flag(ctx, ctx.matched_arg(args, &matched, 2), false, call)?;
+    ctx.finalizers.push(FinalizerEntry {
+        target: env,
+        fun,
+        onexit,
+    });
     Ok(SEXP_NIL)
 }
 
+fn gc_internal(ctx: &mut Ctx, _call: &Call, _args: &mut Args) -> EvalResult {
+    let stats = ctx.collect_gc();
+    ctx.run_pending_finalizers();
+    let ncells = stats.live_objects as f64;
+    let vcells = (stats.live_bytes as f64 / 8.0).ceil();
+    let mb_n = (ncells * 56.0) / (1024.0 * 1024.0);
+    let mb_v = stats.live_bytes as f64 / (1024.0 * 1024.0);
+    let data = [
+        ncells,
+        vcells,
+        (mb_n * 10.0).round() / 10.0,
+        (mb_v * 10.0).round() / 10.0,
+        ncells.max(1.0),
+        vcells.max(1.0),
+        (mb_n * 10.0).round() / 10.0,
+        (mb_v * 10.0).round() / 10.0,
+        roxide_value::NA_REAL,
+        roxide_value::NA_REAL,
+        ncells,
+        vcells,
+        (mb_n * 10.0).round() / 10.0,
+        (mb_v * 10.0).round() / 10.0,
+    ];
+    ctx.scoped(|ctx| {
+        let mat = ctx.session.alloc_real_from(&data)?;
+        ctx.protect(mat);
+        let dim = ctx.session.alloc_int_from(&[2, 7])?;
+        ctx.protect(dim);
+        let dim_sym = ctx.session.intern("dim")?;
+        ctx.session.set_attrib(mat, dim_sym, dim)?;
+        let rows = ctx.strings(["Ncells", "Vcells"])?;
+        ctx.protect(rows);
+        let cols = ctx.strings([
+            "used",
+            "(Mb)",
+            "gc trigger",
+            "(Mb)",
+            "limit (Mb)",
+            "max used",
+            "(Mb)",
+        ])?;
+        ctx.protect(cols);
+        let dimnames = ctx.session.alloc_list(2)?;
+        ctx.protect(dimnames);
+        ctx.session.list_set(dimnames, 0, rows)?;
+        ctx.session.list_set(dimnames, 1, cols)?;
+        let dn_sym = ctx.session.intern("dimnames")?;
+        ctx.session.set_attrib(mat, dn_sym, dimnames)?;
+        Ok(mat)
+    })
+}
+
 impl Ctx {
-    /// Run registered exit finalizers once, in reverse registration order.
+    /// Run pending GC finalizers and any remaining `onexit = TRUE` finalizers once,
+    /// in reverse registration order.
     pub fn run_exit_finalizers(&mut self) {
-        let finalizers = std::mem::take(&mut self.ext::<ExitFinalizers>().0);
-        if finalizers.is_empty() {
+        self.run_pending_finalizers();
+        let remaining = std::mem::take(&mut self.finalizers);
+        let exit_only: Vec<_> = remaining
+            .into_iter()
+            .filter(|entry| entry.onexit)
+            .map(|entry| (entry.target, entry.fun))
+            .collect();
+        if exit_only.is_empty() {
             return;
         }
         let _ = self.scoped(|ctx| {
             let visible = ctx.visible;
-            for &(env, fun) in &finalizers {
+            for &(env, fun) in &exit_only {
                 ctx.protect(env);
                 ctx.protect(fun);
             }
-            for (env, fun) in finalizers.into_iter().rev() {
+            for (env, fun) in exit_only.into_iter().rev() {
                 let _ = ctx.apply(fun, &[(None, env)], SEXP_NIL, GLOBAL_ENV);
             }
             ctx.visible = visible;

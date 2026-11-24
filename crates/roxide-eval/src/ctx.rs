@@ -121,6 +121,14 @@ pub(crate) struct ExtEntry {
     trace_fn: fn(&dyn Any, &mut Tracer<'_>),
 }
 
+/// Weak-keyed ephemeron finalizer entry registered via `reg.finalizer()`.
+#[derive(Clone, Copy)]
+pub(crate) struct FinalizerEntry {
+    pub(crate) target: SexpId,
+    pub(crate) fun: SexpId,
+    pub(crate) onexit: bool,
+}
+
 /// Core Roxide execution context owning the [`RSession`], [`Host`], frames, and primitive table.
 pub struct Ctx {
     pub(crate) session: RSession,
@@ -151,6 +159,9 @@ pub struct Ctx {
     pub(crate) visible: bool,
     pub(crate) pending_warnings: Vec<(Option<Vec<String>>, String)>,
     pub(crate) extensions: HashMap<TypeId, ExtEntry>,
+    pub(crate) finalizers: Vec<FinalizerEntry>,
+    pub(crate) pending_finalizers: Vec<(SexpId, SexpId)>,
+    pub(crate) running_finalizers: bool,
     pub(crate) s4_hooks: Option<&'static dyn S4Hooks>,
     pub(crate) interactive: bool,
 }
@@ -158,6 +169,7 @@ pub struct Ctx {
 type StreamSink = Box<dyn FnMut(&mut Ctx, &[u8]) -> EvalResult<()>>;
 
 struct StreamCapture {
+    id: u64,
     capture_out: bool,
     capture_err: bool,
     split: bool,
@@ -172,6 +184,7 @@ struct StreamCapture {
 pub(crate) struct HostStack {
     base: Box<dyn Host>,
     captures: Vec<StreamCapture>,
+    next_capture_id: u64,
 }
 
 impl HostStack {
@@ -329,6 +342,7 @@ struct CtxRoots<'a> {
     autoloads: SexpId,
     namespaces: &'a [NsRecord],
     pending_s3: &'a [DeferredS3],
+    pending_finalizers: &'a [(SexpId, SexpId)],
     extensions: &'a HashMap<TypeId, ExtEntry>,
 }
 
@@ -361,6 +375,10 @@ impl RootSet for CtxRoots<'_> {
         for entry in self.pending_s3 {
             entry.trace(tracer);
         }
+        for &(target, fun) in self.pending_finalizers {
+            tracer.edge(target);
+            tracer.edge(fun);
+        }
         for &(_, value) in self.options {
             tracer.edge(value);
         }
@@ -392,6 +410,7 @@ impl Ctx {
             host: HostStack {
                 base: host,
                 captures: Vec::new(),
+                next_capture_id: 1,
             },
             sources: SourceMap::new(),
             opts,
@@ -419,6 +438,9 @@ impl Ctx {
             visible: true,
             pending_warnings: Vec::new(),
             extensions: HashMap::new(),
+            finalizers: Vec::new(),
+            pending_finalizers: Vec::new(),
+            running_finalizers: false,
             s4_hooks: None,
             interactive: false,
         };
@@ -663,7 +685,10 @@ impl Ctx {
         split: bool,
         sink: impl FnMut(&mut Self, &[u8]) -> EvalResult<()> + 'static,
     ) {
+        let id = self.host.next_capture_id;
+        self.host.next_capture_id += 1;
         self.host.captures.push(StreamCapture {
+            id,
             capture_out,
             capture_err,
             split,
@@ -706,7 +731,10 @@ impl Ctx {
         sink: Option<StreamSink>,
         f: impl FnOnce(&mut Self) -> EvalResult<R>,
     ) -> EvalResult<(R, Vec<u8>)> {
+        let id = self.host.next_capture_id;
+        self.host.next_capture_id += 1;
         self.host.captures.push(StreamCapture {
+            id,
             capture_out,
             capture_err,
             split,
@@ -718,12 +746,7 @@ impl Ctx {
             flushing: false,
         });
         let result = f(self);
-        let Some(pos) = self
-            .host
-            .captures
-            .iter()
-            .rposition(|capture| !capture.persistent)
-        else {
+        let Some(pos) = self.host.captures.iter().rposition(|c| c.id == id) else {
             return Err(self.stop(SEXP_NIL, "missing output capture"));
         };
         let capture = self.host.captures.remove(pos);
@@ -744,8 +767,17 @@ impl Ctx {
         if self.host.captures.iter().any(|capture| capture.flushing) {
             return Ok(());
         }
-        for i in (0..self.host.captures.len()).rev() {
-            let capture = &mut self.host.captures[i];
+        let ids: Vec<u64> = self
+            .host
+            .captures
+            .iter()
+            .rev()
+            .map(|capture| capture.id)
+            .collect();
+        for id in ids {
+            let Some(capture) = self.host.captures.iter_mut().find(|c| c.id == id) else {
+                continue;
+            };
             if capture.bytes.is_empty() {
                 continue;
             }
@@ -757,9 +789,10 @@ impl Ctx {
             let visible = self.visible;
             let result = sink(self, &bytes);
             self.visible = visible;
-            let capture = &mut self.host.captures[i];
-            capture.flushing = false;
-            capture.sink = Some(sink);
+            if let Some(capture) = self.host.captures.iter_mut().find(|c| c.id == id) {
+                capture.flushing = false;
+                capture.sink = Some(sink);
+            }
             result?;
         }
         Ok(())
@@ -963,20 +996,79 @@ impl Ctx {
     /// Explicit GC safepoint (ADR-0002): runs collection only if policy requests it.
     pub fn safepoint(&mut self) {
         if self.session.heap.wants_collection() {
-            let roots = CtxRoots {
-                frames: &self.frames,
-                calls: &self.calls,
-                loops: &self.loops,
-                eval_env: self.eval_env,
-                conditions: &self.conditions,
-                options: &self.options,
-                autoloads: self.autoloads,
-                namespaces: &self.namespaces,
-                pending_s3: &self.pending_s3,
-                extensions: &self.extensions,
-            };
-            let _ = self.session.collect(&roots);
+            let _ = self.collect_gc();
         }
+    }
+
+    /// Force an immediate full mark-sweep garbage collection, queuing dead ephemeron finalizers.
+    pub fn collect_gc(&mut self) -> roxide_gc::GcStats {
+        let roots = CtxRoots {
+            frames: &self.frames,
+            calls: &self.calls,
+            loops: &self.loops,
+            eval_env: self.eval_env,
+            conditions: &self.conditions,
+            options: &self.options,
+            autoloads: self.autoloads,
+            namespaces: &self.namespaces,
+            pending_s3: &self.pending_s3,
+            pending_finalizers: &self.pending_finalizers,
+            extensions: &self.extensions,
+        };
+        let finalizers = &mut self.finalizers;
+        let mut newly_dead = Vec::new();
+        let stats = self.session.collect_with_hook(&roots, |marked| {
+            // Ephemeron fixpoint: if a finalizer's target is reachable, keep its callback alive
+            // without letting the callback alone keep the target alive.
+            loop {
+                let mut changed = false;
+                for entry in finalizers.iter() {
+                    if marked.is_marked(entry.target) && !marked.is_marked(entry.fun) {
+                        marked.mark_transitive(entry.fun);
+                        changed = true;
+                    }
+                }
+                if !changed {
+                    break;
+                }
+            }
+            // Partition all newly unreachable targets before resurrecting them so one
+            // dead finalizer's closure cannot mask another dead target in the same cycle.
+            let mut alive = Vec::with_capacity(finalizers.len());
+            for entry in finalizers.drain(..) {
+                if marked.is_marked(entry.target) {
+                    alive.push(entry);
+                } else {
+                    newly_dead.push((entry.target, entry.fun));
+                }
+            }
+            *finalizers = alive;
+            for &(target, fun) in &newly_dead {
+                marked.mark_transitive(target);
+                marked.mark_transitive(fun);
+            }
+        });
+        self.pending_finalizers.extend(newly_dead);
+        stats
+    }
+
+    /// Execute any GC finalizers queued by completed collections (re-entrancy safe).
+    pub fn run_pending_finalizers(&mut self) {
+        if self.running_finalizers || self.pending_finalizers.is_empty() {
+            return;
+        }
+        self.running_finalizers = true;
+        let visible = self.visible;
+        while let Some((target, fun)) = self.pending_finalizers.pop() {
+            let _ = self.scoped(|ctx| {
+                ctx.protect(target);
+                ctx.protect(fun);
+                let _ = ctx.apply(fun, &[(None, target)], SEXP_NIL, GLOBAL_ENV);
+                Ok(())
+            });
+        }
+        self.visible = visible;
+        self.running_finalizers = false;
     }
 
     /// Record a deferred warning (not a safepoint; flushed at expression/error boundary).
@@ -1123,6 +1215,7 @@ impl Ctx {
                         Ok(v)
                     })?;
                     let _ = val;
+                    self.run_pending_finalizers();
                     let _ = self.flush_stream_captures();
                     self.flush_warnings();
                     let _ = self.flush_stream_captures();
