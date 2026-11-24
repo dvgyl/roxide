@@ -1,9 +1,11 @@
 //! Safe low-level [`RSession`] accessors supporting `roxide-capi` and `roxide-eval::vm`
 //! while keeping `roxide-value` strictly `#![forbid(unsafe_code)]` (ADRs 0017–0020).
 
+use std::rc::Rc;
+
 use roxide_gc::{FinalizerKind, HeapError, SexpId, WeakRefEntry};
 
-use crate::alt::AltMaterialized;
+use crate::alt::{AltKind, AltMaterialized, Sortedness};
 use crate::api::ValueError;
 use crate::na::{RComplex, RLogical};
 use crate::object::{Attrs, Body, CharId, ExtPtrData, RObject, RVec, SexpType, Sym, WeakRefData};
@@ -608,6 +610,234 @@ impl RSession {
         Ok(())
     }
 
+    /// Validate that `x` is a `CHARSXP` and return it as a typed [`CharId`].
+    pub fn sexp_as_char(&self, x: SexpId) -> Result<CharId, ValueError> {
+        let obj = self.heap.get(x)?;
+        match obj.body {
+            Body::Char(_) => Ok(CharId(x)),
+            _ => Err(ValueError::TypeMismatch {
+                expected: "char",
+                actual: obj.sexp_type().type_name(obj.flags.s4),
+            }),
+        }
+    }
+
+    /// Read character element `i` from a dense or `AltString` `STRSXP` (`STRING_ELT`).
+    pub fn str_get(&mut self, x: SexpId, i: usize) -> Result<CharId, ValueError> {
+        let alt_class = {
+            let obj = self.heap.get(x)?;
+            match &obj.body {
+                Body::Str(v) => {
+                    let slice = v.as_slice();
+                    return slice.get(i).copied().ok_or(ValueError::IndexOutOfBounds {
+                        index: i,
+                        len: slice.len(),
+                    });
+                }
+                Body::Alt(alt) => match (&alt.materialized, &alt.kind) {
+                    (Some(AltMaterialized::Str(v)), _) => {
+                        let slice = v.as_slice();
+                        return slice.get(i).copied().ok_or(ValueError::IndexOutOfBounds {
+                            index: i,
+                            len: slice.len(),
+                        });
+                    }
+                    (None, AltKind::Str(c)) => Rc::clone(c),
+                    _ => {
+                        return Err(ValueError::TypeMismatch {
+                            expected: "character",
+                            actual: obj.sexp_type().type_name(obj.flags.s4),
+                        });
+                    }
+                },
+                _ => {
+                    return Err(ValueError::TypeMismatch {
+                        expected: "character",
+                        actual: obj.sexp_type().type_name(obj.flags.s4),
+                    });
+                }
+            }
+        };
+        alt_class.elt(self, i)
+    }
+
+    /// Write character element `i` in a dense or `AltString` `STRSXP` (`SET_STRING_ELT`),
+    /// maintaining `CHARSXP` reference counts cleanly.
+    pub fn str_set(&mut self, x: SexpId, i: usize, val: CharId) -> Result<(), ValueError> {
+        // Validate target CharId is a live CHARSXP before mutating.
+        self.sexp_as_char(val.as_sexp())?;
+        let alt_class = {
+            let obj = self.heap.get(x)?;
+            if let Body::Alt(alt) = &obj.body
+                && alt.materialized.is_none()
+            {
+                if let AltKind::Str(c) = &alt.kind {
+                    Some(Rc::clone(c))
+                } else {
+                    return Err(ValueError::TypeMismatch {
+                        expected: "character",
+                        actual: obj.sexp_type().type_name(obj.flags.s4),
+                    });
+                }
+            } else {
+                None
+            }
+        };
+        if let Some(class) = alt_class {
+            return class.set_elt(self, i, val);
+        }
+        let old = {
+            let obj = self.heap.get_mut(x)?;
+            let ty = obj.sexp_type().type_name(obj.flags.s4);
+            let slice = match &mut obj.body {
+                Body::Str(v) => v.as_mut_slice(),
+                Body::Alt(alt) => match &mut alt.materialized {
+                    Some(AltMaterialized::Str(v)) => v.as_mut_slice(),
+                    _ => {
+                        return Err(ValueError::TypeMismatch {
+                            expected: "character",
+                            actual: ty,
+                        });
+                    }
+                },
+                _ => {
+                    return Err(ValueError::TypeMismatch {
+                        expected: "character",
+                        actual: ty,
+                    });
+                }
+            };
+            let len = slice.len();
+            let slot = slice
+                .get_mut(i)
+                .ok_or(ValueError::IndexOutOfBounds { index: i, len })?;
+            std::mem::replace(slot, val)
+        };
+        self.heap.inc_ref(val.as_sexp());
+        self.heap.dec_ref(old.as_sexp());
+        Ok(())
+    }
+
+    /// Return a contiguous read-only `&[CharId]` slice for a `STRSXP` (`STRING_PTR_RO`),
+    /// materializing `AltString` vectors on demand into a pinned buffer.
+    pub fn str_dataptr_ro(&mut self, x: SexpId) -> Result<&[CharId], ValueError> {
+        let to_materialize = {
+            let obj = self.heap.get(x)?;
+            match &obj.body {
+                Body::Str(_) => None,
+                Body::Alt(alt) => match (&alt.materialized, &alt.kind) {
+                    (Some(AltMaterialized::Str(_)), _) => None,
+                    (None, AltKind::Str(c)) => Some(Rc::clone(c)),
+                    _ => {
+                        return Err(ValueError::TypeMismatch {
+                            expected: "character",
+                            actual: obj.sexp_type().type_name(obj.flags.s4),
+                        });
+                    }
+                },
+                _ => {
+                    return Err(ValueError::TypeMismatch {
+                        expected: "character",
+                        actual: obj.sexp_type().type_name(obj.flags.s4),
+                    });
+                }
+            }
+        };
+        if let Some(class) = to_materialize {
+            let len = class.length(&self.heap);
+            let mut buf = Vec::new();
+            buf.try_reserve_exact(len)
+                .map_err(|_| HeapError::OutOfMemory {
+                    requested: len.saturating_mul(std::mem::size_of::<CharId>()),
+                })?;
+            buf.resize(len, CharId::BLANK);
+            let mark = self.heap.protect_mark();
+            self.heap.protect(x);
+            let tmp = match self
+                .heap
+                .alloc(RObject::new(Body::Str(RVec::from_vec(buf))))
+            {
+                Ok(id) => id,
+                Err(err) => {
+                    self.heap.unprotect_to(mark);
+                    return Err(err.into());
+                }
+            };
+            self.heap.protect(tmp);
+            for i in 0..len {
+                let cid = match class.elt(self, i) {
+                    Ok(c) => c,
+                    Err(err) => {
+                        self.heap.unprotect_to(mark);
+                        return Err(err);
+                    }
+                };
+                if let Body::Str(v) = &mut self.heap.get_mut(tmp)?.body {
+                    v.as_mut_slice()[i] = cid;
+                }
+            }
+            let rvec = match std::mem::replace(&mut self.heap.get_mut(tmp)?.body, Body::Nil) {
+                Body::Str(v) => v,
+                _ => RVec::from_vec(Vec::new()),
+            };
+            let _ = self.heap.update_size(tmp);
+            self.heap.unprotect_to(mark);
+            if let Body::Alt(alt) = &mut self.heap.get_mut(x)?.body
+                && alt.materialized.is_none()
+            {
+                alt.materialized = Some(AltMaterialized::Str(rvec));
+            }
+            self.heap.update_size(x)?;
+        }
+        let obj = self.heap.get(x)?;
+        match &obj.body {
+            Body::Str(v) => Ok(v.as_slice()),
+            Body::Alt(alt) => match &alt.materialized {
+                Some(AltMaterialized::Str(v)) => Ok(v.as_slice()),
+                _ => Err(ValueError::TypeMismatch {
+                    expected: "character",
+                    actual: obj.sexp_type().type_name(obj.flags.s4),
+                }),
+            },
+            _ => Err(ValueError::TypeMismatch {
+                expected: "character",
+                actual: obj.sexp_type().type_name(obj.flags.s4),
+            }),
+        }
+    }
+
+    /// Return known ALTREP sortedness metadata (`*_IS_SORTED`; `Sortedness::Unknown` for non-ALTREP).
+    pub fn alt_is_sorted(&self, x: SexpId) -> Result<Sortedness, ValueError> {
+        let obj = self.heap.get(x)?;
+        Ok(match &obj.body {
+            Body::Alt(alt) if alt.materialized.is_none() => match &alt.kind {
+                AltKind::Lgl(c) => c.is_sorted(&self.heap),
+                AltKind::Int(c) => c.is_sorted(&self.heap),
+                AltKind::Real(c) => c.is_sorted(&self.heap),
+                AltKind::Cplx(c) => c.is_sorted(&self.heap),
+                AltKind::Raw(c) => c.is_sorted(&self.heap),
+                AltKind::Str(c) => c.is_sorted(),
+            },
+            _ => Sortedness::Unknown,
+        })
+    }
+
+    /// Return known ALTREP no-NA guarantee (`*_NO_NA`; `false` for non-ALTREP).
+    pub fn alt_no_na(&self, x: SexpId) -> Result<bool, ValueError> {
+        let obj = self.heap.get(x)?;
+        Ok(match &obj.body {
+            Body::Alt(alt) if alt.materialized.is_none() => match &alt.kind {
+                AltKind::Lgl(c) => c.no_na(&self.heap),
+                AltKind::Int(c) => c.no_na(&self.heap),
+                AltKind::Real(c) => c.no_na(&self.heap),
+                AltKind::Cplx(c) => c.no_na(&self.heap),
+                AltKind::Raw(c) => c.no_na(&self.heap),
+                AltKind::Str(c) => c.no_na(),
+            },
+            _ => false,
+        })
+    }
+
     /// Validate that `x` is a `SYMSXP` and return it as a typed [`Sym`] without re-interning.
     pub fn sexp_as_sym(&self, x: SexpId) -> Result<Sym, ValueError> {
         let obj = self.heap.get(x)?;
@@ -741,6 +971,90 @@ mod tests {
         s.collect(&EmptyRoots);
         assert_eq!(s.weakref_key(wr).unwrap(), SEXP_NIL);
         assert_eq!(s.weakref_value(wr).unwrap(), SEXP_NIL);
+        s.heap.unprotect_to(m);
+    }
+
+    #[test]
+    fn str_helpers_and_alt_metadata_under_torture_gc() {
+        use crate::alt::{AltClass, AltString, CompactIntSeq};
+        use crate::object::Encoding;
+        use roxide_gc::Trace;
+
+        #[derive(Debug)]
+        struct TestAltStr(usize);
+        impl Trace for TestAltStr {
+            fn trace(&self, _t: &mut Tracer<'_>) {}
+        }
+        impl AltClass for TestAltStr {
+            fn class_name(&self) -> &'static str {
+                "test_alt_str"
+            }
+            fn package_name(&self) -> &'static str {
+                "test"
+            }
+            fn length(&self, _heap: &crate::session::RHeap) -> usize {
+                self.0
+            }
+        }
+        impl AltString for TestAltStr {
+            fn elt(&self, session: &mut RSession, i: usize) -> Result<CharId, ValueError> {
+                session.mk_char(format!("e{i}").as_bytes(), Encoding::Utf8)
+            }
+            fn set_elt(
+                &self,
+                _session: &mut RSession,
+                _i: usize,
+                _val: CharId,
+            ) -> Result<(), ValueError> {
+                Err(ValueError::InvalidAttribute("read-only alt string".into()))
+            }
+            fn is_sorted(&self) -> Sortedness {
+                Sortedness::Increasing
+            }
+            fn no_na(&self) -> bool {
+                true
+            }
+        }
+
+        let mut s = RSession::new(GcPolicy::Torture).unwrap();
+        let m = s.heap.protect_mark();
+        let a = s.mk_char(b"alpha", Encoding::Utf8).unwrap();
+        s.heap.protect(a.as_sexp());
+        let b = s.mk_char(b"beta", Encoding::Utf8).unwrap();
+        s.heap.protect(b.as_sexp());
+        assert_eq!(s.sexp_as_char(a.as_sexp()).unwrap(), a);
+        assert!(s.sexp_as_char(SEXP_NIL).is_err());
+
+        let dense = s.alloc_str_from(&[a, a]).unwrap();
+        s.heap.protect(dense);
+        assert_eq!(s.str_get(dense, 1).unwrap(), a);
+        s.str_set(dense, 1, b).unwrap();
+        assert_eq!(s.str_get(dense, 1).unwrap(), b);
+        assert_eq!(s.str_dataptr_ro(dense).unwrap(), &[a, b]);
+
+        let alt_str = s.alloc_alt_str(Rc::new(TestAltStr(3))).unwrap();
+        s.heap.protect(alt_str);
+        assert_eq!(s.alt_is_sorted(alt_str).unwrap(), Sortedness::Increasing);
+        assert!(s.alt_no_na(alt_str).unwrap());
+        let e2 = s.str_get(alt_str, 2).unwrap();
+        assert_eq!(s.char_bytes(e2).unwrap(), b"e2");
+        let ptr_slice = s.str_dataptr_ro(alt_str).unwrap().to_vec();
+        assert_eq!(ptr_slice.len(), 3);
+        assert_eq!(s.char_bytes(ptr_slice[0]).unwrap(), b"e0");
+        assert_eq!(s.char_bytes(ptr_slice[2]).unwrap(), b"e2");
+        // After materialization, str_set mutates the materialized buffer cleanly.
+        s.str_set(alt_str, 0, b).unwrap();
+        assert_eq!(s.str_get(alt_str, 0).unwrap(), b);
+
+        let seq = s
+            .alloc_alt_int(Rc::new(CompactIntSeq {
+                start: 1,
+                len: 5,
+                incr: 1,
+            }))
+            .unwrap();
+        assert_eq!(s.alt_is_sorted(seq).unwrap(), Sortedness::Increasing);
+        assert!(s.alt_no_na(seq).unwrap());
         s.heap.unprotect_to(m);
     }
 }

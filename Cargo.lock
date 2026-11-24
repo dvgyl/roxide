@@ -286,6 +286,7 @@ dependencies = [
  "roxide-gc",
  "roxide-host",
  "roxide-math",
+ "roxide-syntax",
  "roxide-value",
 ]
 
