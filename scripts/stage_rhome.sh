@@ -95,7 +95,8 @@ defined = {
 }
 manifest = json.loads(Path("tools/capi/manifest.json").read_text())
 allowed = {row["name"] for row in manifest["symbols"]
-           if row["apitype"] in {"api", "eapi", "emb", "for", "data"}}
+           if row["apitype"] in {"api", "eapi", "emb", "for", "data"}
+           or row.get("exported_in_libr")}
 exports = defined & allowed
 if not exports:
     sys.exit(f"No manifest C API symbols found in {archive}")

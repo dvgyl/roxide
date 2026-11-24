@@ -64,7 +64,7 @@ def main() -> int:
     allowed_names = {
         row["name"]
         for row in manifest["symbols"]
-        if row["apitype"] in {"api", "eapi", "emb", "for", "data"}
+        if row["apitype"] in {"api", "eapi", "emb", "for", "data"} or row.get("exported_in_libr")
     }
     present = list_exports(args.libr)
     missing = sorted(set(required) - set(present))
