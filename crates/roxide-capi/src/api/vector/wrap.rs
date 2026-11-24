@@ -8,7 +8,8 @@ use roxide_value::{Encoding, SEXP_NIL, SYM_DIM, SexpType, Sortedness, ValueApi};
 
 use super::{allocating, api, id, is_atomic, is_vector, is_vector_list, length, require_type};
 use crate::abi::*;
-use crate::api::attrib::{copy_attrs, inherits};
+use crate::api::altrep::c_flags;
+use crate::api::attrib::inherits;
 use crate::api::pairlist::cells;
 use crate::api::string::c_text;
 
@@ -55,20 +56,6 @@ impl Trace for LegacyLengths {
 }
 
 api! {
-    /// Wrap an atomic vector in an ALTREP object when possible.
-    fn R_tryWrap(x: Sexp) -> Sexp = Sexp::NULL; |ctx| {
-        let value = id(ctx, x, "R_tryWrap")?;
-        let ty = ctx.session().type_of(value)?;
-        if !is_atomic(ty) {
-            return Ok(x);
-        }
-        allocating(ctx, &[value], |ctx| {
-            if ty == SexpType::Str { ctx.session_mut().str_dataptr_ro(value)?; }
-            let result = ctx.session_mut().alloc_alt_wrapper(value)?;
-            copy_attrs(ctx, value, result, false)?;
-            Ok(Sexp::from_id(result))
-        })
-    }
     /// Return the type code of an R object.
     fn TYPEOF(x: Sexp) -> c_int = 0; |ctx| {
         let x = id(ctx, x, "TYPEOF")?;
@@ -146,12 +133,14 @@ macro_rules! metadata {
             fn $sorted(x: Sexp) -> c_int = c_int::MIN; |ctx| {
                 let x = id(ctx, x, stringify!($sorted))?;
                 require_type(ctx, x, SexpType::$ty, stringify!($sorted))?;
+                if let Some(flag) = c_flags(ctx, x, true)? { return Ok(flag); }
                 Ok(sorted_code(ctx.session().alt_is_sorted(x)?))
             }
             /// Test whether the representation guarantees no missing elements.
             fn $no_na(x: Sexp) -> c_int = 0; |ctx| {
                 let x = id(ctx, x, stringify!($no_na))?;
                 require_type(ctx, x, SexpType::$ty, stringify!($no_na))?;
+                if let Some(flag) = c_flags(ctx, x, false)? { return Ok(flag); }
                 Ok(c_int::from(ctx.session().alt_no_na(x)?))
             }
         )+}
@@ -233,7 +222,6 @@ predicates!(
     Rf_isObject => |ctx, x| ctx.session().is_object(x)?,
     IS_S4_OBJECT => |ctx, x| ctx.session().is_s4(x)?,
     Rf_isS4 => |ctx, x| ctx.session().is_s4(x)?,
-    ALTREP => |ctx, x| ctx.session().is_altrep(x)?,
     MAYBE_REFERENCED => |ctx, x| ctx.session().heap.maybe_referenced(x),
     MAYBE_SHARED => |ctx, x| ctx.session().heap.maybe_shared(x),
     NOT_SHARED => |ctx, x| !ctx.session().heap.maybe_shared(x),

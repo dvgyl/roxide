@@ -10,6 +10,7 @@ use roxide_value::{SEXP_NIL, SexpType};
 
 use crate::abi::Sexp;
 
+pub use super::altrep::{ALTREP, R_tryWrap};
 pub use access::*;
 pub use alloc::*;
 pub use wrap::*;
@@ -41,6 +42,9 @@ pub(crate) fn signal_value_error<T>(
     f: impl FnOnce(&mut Ctx) -> EvalResult<T>,
 ) -> EvalResult<T> {
     match f(ctx) {
+        request @ Err(roxide_eval::Unwind::Value(roxide_value::ValueError::ForeignAltrep {
+            ..
+        })) => request,
         Err(roxide_eval::Unwind::Value(err)) => {
             Err(ctx.signal_error_at(SEXP_NIL, &err.to_string()))
         }

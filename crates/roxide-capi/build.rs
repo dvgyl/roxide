@@ -42,4 +42,14 @@ fn main() {
         .file("csrc/shim.cc")
         .cargo_metadata(false)
         .compile("roxide_capi_fixture");
+
+    let altrep_fixture = "../../tests/capi/fixtures/07_altrep.c";
+    println!("cargo:rerun-if-changed={altrep_fixture}");
+    cc::Build::new()
+        .std("c11")
+        .include("include")
+        .define("ROXIDE_ALTREP_TEST", None)
+        .file(altrep_fixture)
+        .cargo_metadata(false)
+        .compile("roxide_capi_altrep_fixture");
 }

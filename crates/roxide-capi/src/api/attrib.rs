@@ -511,12 +511,13 @@ macro_rules! dimnames_exports {
 dimnames_exports!(Rf_GetMatrixDimnames, Rf_GetArrayDimnames);
 
 macro_rules! duplicates {
-    ($($name:ident => $method:ident),+ $(,)?) => {
+    ($($name:ident => $method:ident, $deep:expr);+ $(;)?) => {
         api! {$(
             /// Duplicate an R object.
             fn $name(x: Sexp) -> Sexp = Sexp::NULL; |ctx| {
                 let x = id(ctx, x, stringify!($name))?;
                 allocating(ctx, &[x], |ctx| {
+                    if let Some(value) = super::altrep::c_duplicate(ctx, x, $deep)? { return Ok(Sexp::from_id(value)); }
                     Ok(Sexp::from_id(ctx.session_mut().$method(x)?))
                 })
             }
@@ -524,7 +525,7 @@ macro_rules! duplicates {
     }
 }
 
-duplicates!(Rf_shallow_duplicate => shallow_duplicate, Rf_duplicate => deep_duplicate);
+duplicates!(Rf_shallow_duplicate => shallow_duplicate, false; Rf_duplicate => deep_duplicate, true);
 
 api! {
     /// Mark an object as shared and return it.

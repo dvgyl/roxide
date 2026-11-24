@@ -1,6 +1,7 @@
 //! Public GNU R 4.6.2 C API entry points grouped by function.
 
 // Wave 1-A: core vector, attribute, coercion, pairlist, string, symbol, and resizable vector APIs.
+pub mod altrep;
 pub mod attrib;
 pub mod coerce;
 pub mod pairlist;

@@ -2,7 +2,7 @@
 
 use std::ffi::{c_char, c_int};
 
-use roxide_eval::{Ctx, EvalResult};
+use roxide_eval::{AltOp, AltReply, Ctx, EvalResult};
 use roxide_gc::SexpId;
 use roxide_value::{
     CharId, Encoding, NA_INTEGER, NA_REAL, RComplex, RLogical, SEXP_NIL, SYM_LEVELS, SYM_NAMES,
@@ -145,6 +145,17 @@ fn coerce_vector(ctx: &mut Ctx, x: SexpId, to: SexpType) -> EvalResult<SexpId> {
     let from = ctx.session().type_of(x)?;
     if from == to || to == Any {
         return Ok(x);
+    }
+    if ctx
+        .session()
+        .foreign_alt(x)?
+        .is_some_and(|info| !info.owned)
+    {
+        if let AltReply::Value(Some(value)) = super::altrep::dispatch(ctx, AltOp::Coerce { x, to })?
+        {
+            return Ok(value);
+        }
+        super::altrep::materialize(ctx, x, super::altrep::Access::Evaluate)?;
     }
     if from == Str {
         ctx.session_mut().str_dataptr_ro(x)?;

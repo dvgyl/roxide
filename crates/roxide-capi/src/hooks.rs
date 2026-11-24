@@ -2,14 +2,20 @@
 
 use std::path::Path;
 
-use roxide_eval::{Args, Call, Ctx, DotCOpts, EvalResult, NativeCallKind, NativeHooks};
+use roxide_eval::{
+    AltOp, AltReply, Args, Call, Ctx, DotCOpts, EvalResult, NativeCallKind, NativeHooks,
+};
 use roxide_gc::SexpId;
 
-use crate::{dll, dotcall};
+use crate::{api::altrep, dll, dotcall, jump};
 
 struct CapiNativeHooks;
 
 impl NativeHooks for CapiNativeHooks {
+    fn altrep(&self, ctx: &mut Ctx, op: AltOp) -> EvalResult<AltReply> {
+        altrep::dispatch(ctx, op)
+    }
+
     fn call_native(
         &self,
         ctx: &mut Ctx,
@@ -98,4 +104,5 @@ impl NativeHooks for CapiNativeHooks {
 /// Install the C API native hooks on this context.
 pub fn install(ctx: &mut Ctx) {
     ctx.set_native_hooks(&CapiNativeHooks);
+    jump::set_altrep_resolver(ctx, Some(altrep::resolve_for_boundary));
 }

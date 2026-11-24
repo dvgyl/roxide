@@ -444,9 +444,7 @@ api! {
     /// Read an interned string from a character vector.
     fn STRING_ELT(x: Sexp, i: R_xlen_t) -> Sexp = Sexp::NULL; |ctx| {
         let x = id(ctx, x, "STRING_ELT")?;
-        require_type(ctx, x, SexpType::Str, "STRING_ELT")?;
-        let i = index(ctx, i, ctx.session().xlength(x)?)?;
-        Ok(Sexp::from_id(ctx.session_mut().str_get(x, i)?.as_sexp()))
+        Ok(Sexp::from_id(super::altrep::string_elt(ctx, x, i, "STRING_ELT")?))
     }
     /// Set an interned string in a character vector.
     fn SET_STRING_ELT(x: Sexp, i: R_xlen_t, value: Sexp) -> () = (); |ctx| {
@@ -455,6 +453,7 @@ api! {
         require_type(ctx, x, SexpType::Str, "SET_STRING_ELT")?;
         let ch = ctx.session().sexp_as_char(value)?;
         let i = index(ctx, i, ctx.session().xlength(x)?)?;
+        if super::altrep::c_set_elt(ctx, x, SexpType::Str, i, value)? { return Ok(()); }
         Ok(ctx.session_mut().str_set(x, i, ch)?)
     }
     /// Return a read-only pointer to the elements of a character vector.

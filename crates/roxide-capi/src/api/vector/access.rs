@@ -7,6 +7,7 @@ use roxide_value::{Elem, RComplex, RLogical, SEXP_NIL, SYM_DIM, SexpType, ValueA
 
 use super::{allocating, api, check_capacity, checked_len, id, is_atomic, is_vector};
 use crate::abi::*;
+use crate::api::altrep;
 use crate::api::attrib::inherits;
 use crate::api::pairlist::cells;
 use crate::api::resizable::element_width;
@@ -117,6 +118,9 @@ pub(crate) fn index(ctx: &mut Ctx, i: R_xlen_t, len: usize) -> EvalResult<usize>
 }
 
 pub(crate) fn read_ptr(ctx: &mut Ctx, x: SexpId, ty: SexpType) -> EvalResult<*const c_void> {
+    if let Some(ptr) = altrep::c_dataptr(ctx, x, 0)? {
+        return Ok(ptr as *const c_void);
+    }
     let s = ctx.session();
     if s.is_altrep(x)? && s.data_ptr_ro(x).is_err() {
         let n = s.xlength(x)?;
@@ -138,7 +142,10 @@ pub(crate) fn read_ptr(ctx: &mut Ctx, x: SexpId, ty: SexpType) -> EvalResult<*co
     Ok(ptr)
 }
 
-pub(super) fn write_ptr(ctx: &mut Ctx, x: SexpId) -> EvalResult<usize> {
+pub(crate) fn write_ptr(ctx: &mut Ctx, x: SexpId) -> EvalResult<usize> {
+    if let Some(ptr) = altrep::c_dataptr(ctx, x, 1)? {
+        return Ok(ptr);
+    }
     let ty = ctx.session().type_of(x)?;
     if !is_atomic(ty) || ty == SexpType::Str {
         return Err(ctx.stop(
@@ -184,7 +191,7 @@ unsafe fn copy_region<T: Elem>(
 }
 
 macro_rules! atomic {
-    ($ty:ident, $engine:ty, $c:ty, $view:ident, $get:expr, $put:expr, $fill:expr;
+    ($ty:ident, $engine:ty, $c:ty, $view:ident, $foreign_elt:ident, $get:expr, $put:expr, $fill:expr;
      $rw:ident, $ro:ident, $or_null:ident, $elt:ident, $set:ident, $region:ident) => {
         api! {
             /// Return a writable pointer to the vector elements.
@@ -206,6 +213,7 @@ macro_rules! atomic {
                 let name = stringify!($or_null);
                 let x = id(ctx, x, name)?;
                 require_type(ctx, x, SexpType::$ty, name)?;
+                if let Some(ptr) = altrep::c_or_null(ctx, x)? { return Ok(ptr.cast()); }
                 Ok(ctx.session().$view(x)?.as_slice().map_or(null(), |s| s.as_ptr().cast()))
             }
             /// Return one element without materializing an ALTREP vector.
@@ -214,6 +222,8 @@ macro_rules! atomic {
                 let x = id(ctx, x, name)?;
                 require_type(ctx, x, SexpType::$ty, name)?;
                 let i = index(ctx, i, ctx.session().xlength(x)?)?;
+                if let Some(elt) = altrep::$foreign_elt(ctx, x, i)? { return Ok(elt); }
+                altrep::c_dataptr(ctx, x, 0)?;
                 Ok(($get)(ctx.session().$view(x)?.get(i)))
             }
             /// Set an element of an atomic vector.
@@ -233,27 +243,31 @@ macro_rules! atomic {
                 require_type(ctx, x, SexpType::$ty, name)?;
                 let start = checked_len(ctx, start)?;
                 let count = checked_len(ctx, count)?;
-                let view = ctx.session().$view(x)?;
-                let count = count.min(view.len().saturating_sub(start));
+                let count = count.min(ctx.session().xlength(x)?.saturating_sub(start));
                 if count == 0 { return Ok(0); }
                 if out.is_null() {
                     return Err(ctx.stop(SEXP_NIL, format!("invalid NULL buffer passed to {name}")));
                 }
+                if let Some(got) = altrep::c_region(ctx, x, SexpType::$ty, start, count, out)? {
+                    return Ok(got);
+                }
+                altrep::c_dataptr(ctx, x, 0)?;
+                let view = ctx.session().$view(x)?;
                 Ok(copy_region(view, start, count, out.cast::<$engine>(), $fill) as R_xlen_t)
             }
         }
     };
 }
 
-atomic!(Int, i32, c_int, int, std::convert::identity, std::convert::identity, 0;
+atomic!(Int, i32, c_int, int, int_elt, std::convert::identity, std::convert::identity, 0;
     INTEGER, INTEGER_RO, INTEGER_OR_NULL, INTEGER_ELT, SET_INTEGER_ELT, INTEGER_GET_REGION);
-atomic!(Real, f64, f64, real, std::convert::identity, std::convert::identity, 0.0;
+atomic!(Real, f64, f64, real, real_elt, std::convert::identity, std::convert::identity, 0.0;
     REAL, REAL_RO, REAL_OR_NULL, REAL_ELT, SET_REAL_ELT, REAL_GET_REGION);
-atomic!(Lgl, RLogical, c_int, lgl, RLogical::raw, RLogical::from_raw, RLogical::NA;
+atomic!(Lgl, RLogical, c_int, lgl, lgl_elt, RLogical::raw, RLogical::from_raw, RLogical::NA;
     LOGICAL, LOGICAL_RO, LOGICAL_OR_NULL, LOGICAL_ELT, SET_LOGICAL_ELT, LOGICAL_GET_REGION);
-atomic!(Cplx, RComplex, Rcomplex, cplx, complex_to_c, complex_from_c, RComplex::NA;
+atomic!(Cplx, RComplex, Rcomplex, cplx, cplx_elt, complex_to_c, complex_from_c, RComplex::NA;
     COMPLEX, COMPLEX_RO, COMPLEX_OR_NULL, COMPLEX_ELT, SET_COMPLEX_ELT, COMPLEX_GET_REGION);
-atomic!(Raw, u8, Rbyte, raw, std::convert::identity, std::convert::identity, 0;
+atomic!(Raw, u8, Rbyte, raw, raw_elt, std::convert::identity, std::convert::identity, 0;
     RAW, RAW_RO, RAW_OR_NULL, RAW_ELT, SET_RAW_ELT, RAW_GET_REGION);
 
 pub(crate) fn complex_to_c(v: RComplex) -> Rcomplex {
@@ -277,7 +291,7 @@ api! {
         let ty = ctx.session().type_of(x)?;
         read_ptr(ctx, x, ty)
     }
-    /// Return writable data for an atomic numeric, logical or raw vector.
+    /// Return writable data for a vector with writable element storage.
     fn DATAPTR_RW(x: Sexp) -> *mut c_void = null_mut(); |ctx| {
         let x = id(ctx, x, "DATAPTR_RW")?;
         Ok(write_ptr(ctx, x)? as *mut c_void)
@@ -285,6 +299,7 @@ api! {
     /// Return available data without materializing a vector.
     fn DATAPTR_OR_NULL(x: Sexp) -> *const c_void = null(); |ctx| {
         let x = id(ctx, x, "DATAPTR_OR_NULL")?;
+        if let Some(ptr) = altrep::c_or_null(ctx, x)? { return Ok(ptr); }
         let s = ctx.session();
         Ok(match s.type_of(x)? {
             SexpType::Int => slice_ptr(s.int(x)?),
@@ -298,11 +313,22 @@ api! {
     /// Return read-only data for a list or expression vector.
     fn VECTOR_PTR_RO(x: Sexp) -> *const Sexp = null(); |ctx| {
         let x = id(ctx, x, "VECTOR_PTR_RO")?;
+        if ctx.session().type_of(x)? == SexpType::Vec
+            && let Some(ptr) = altrep::c_dataptr(ctx, x, 0)?
+        {
+            return Ok(ptr as *const Sexp);
+        }
         Ok(ctx.session().list_slice(x)?.as_ptr().cast())
     }
     /// Read one element of a list or expression vector.
     fn VECTOR_ELT(x: Sexp, i: R_xlen_t) -> Sexp = Sexp::NULL; |ctx| {
         let x = id(ctx, x, "VECTOR_ELT")?;
+        if ctx.session().type_of(x)? == SexpType::Vec {
+            let i = index(ctx, i, ctx.session().xlength(x)?)?;
+            if let Some(elt) = altrep::object_elt(ctx, x, SexpType::Vec, i)? {
+                return Ok(Sexp::from_id(elt));
+            }
+        }
         let i = index(ctx, i, ctx.session().list_slice(x)?.len())?;
         Ok(Sexp::from_id(ctx.session().list_get(x, i)?))
     }
@@ -310,6 +336,10 @@ api! {
     fn SET_VECTOR_ELT(x: Sexp, i: R_xlen_t, value: Sexp) -> Sexp = Sexp::NULL; |ctx| {
         let x = id(ctx, x, "SET_VECTOR_ELT")?;
         let element = id(ctx, value, "SET_VECTOR_ELT")?;
+        if ctx.session().type_of(x)? == SexpType::Vec {
+            let i = index(ctx, i, ctx.session().xlength(x)?)?;
+            if altrep::c_set_elt(ctx, x, SexpType::Vec, i, element)? { return Ok(value); }
+        }
         let i = index(ctx, i, ctx.session().list_slice(x)?.len())?;
         ctx.session_mut().list_set(x, i, element)?;
         Ok(value)
