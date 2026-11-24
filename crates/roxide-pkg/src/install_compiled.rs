@@ -1,5 +1,6 @@
 //! Build native package code in the installation lock.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use roxide_eval::{Ctx, EvalResult, api::CAPI_ABI_VERSION};
@@ -7,11 +8,12 @@ use roxide_host::HostErrorKind;
 use roxide_value::{SEXP_NIL, ValueApi};
 
 use crate::description::{Dependency, Description, valid_package, version_parts};
-use crate::install::{PackageTree, copy_tree, create_dir};
-use crate::lazyload::cache_rds;
+use crate::install::{NAMESPACE_WORKER, PackageTree, copy_tree, create_dir};
+use crate::lazyload::{DataCompression, cache_rds};
 use crate::library::{check_dependency, find};
 use crate::loader::values::{base_call, list, named, names, strings};
 use crate::makeconf::{Makeconf, env_text, is_file, r_home};
+use crate::nsfile::NsSpec;
 use crate::shlib::{
     self, ShlibOptions, make_args, make_program, path_text, run_process, shared_extension,
 };
@@ -37,13 +39,17 @@ impl CompiledPackage {
         let conf = Makeconf::read(ctx.host(), &home).map_err(|error| ctx.stop(SEXP_NIL, error))?;
         let stage = lock.join("source");
         copy_tree(ctx, source, &stage, PackageTree::Source { lock })?;
+        if !crate::description::is_windows(ctx) {
+            preserve_executable_bits(source, &stage, lock, ctx.host())
+                .map_err(|error| ctx.stop(SEXP_NIL, error))?;
+        }
         if !no_configure && is_file(ctx.host(), &stage.join("configure")) {
             let configure = (|| {
                 let mut args = build_env(&home, &conf)?;
                 args.extend([
                     "sh".into(),
                     "-c".into(),
-                    "cd \"$1\" && exec sh ./configure".into(),
+                    "cd \"$1\" && if [ -x ./configure ]; then exec ./configure; fi; exec sh ./configure".into(),
                     "configure".into(),
                     path_text(&stage)?,
                 ]);
@@ -146,6 +152,45 @@ impl CompiledPackage {
     }
 }
 
+fn preserve_executable_bits(
+    source: &Path,
+    stage: &Path,
+    lock: &Path,
+    host: &mut dyn roxide_host::Host,
+) -> Result<(), String> {
+    let lock_pattern = path_text(lock)?
+        .replace('\\', "\\\\")
+        .replace('[', "\\[")
+        .replace('*', "\\*")
+        .replace('?', "\\?");
+    let script = r#"
+for mode in 100 010 001; do
+    case "$mode" in 100) who=u;; 010) who=g;; 001) who=o;; esac
+    find "$1" \( -name .git -o -path "$3" \) -prune -o -type f -perm "-$mode" \
+        -exec sh -ec '
+            source=$1 stage=$2 who=$3
+            shift 3
+            for file do
+                copy=$stage/${file#"$source"/}
+                if [ -f "$copy" ]; then chmod "$who+x" "$copy"; fi
+            done
+        ' chmod "$1" "$2" "$who" {} +
+done
+"#;
+    run_process(
+        host,
+        "sh",
+        vec![
+            "-ec".into(),
+            script.into(),
+            "preserve-modes".into(),
+            path_text(source)?,
+            path_text(stage)?,
+            lock_pattern,
+        ],
+    )
+}
+
 fn build_env(home: &Path, conf: &Makeconf) -> Result<Vec<String>, String> {
     let include = conf
         .get("R_INCLUDE_DIR")
@@ -238,38 +283,133 @@ fn write_stamp(ctx: &mut Ctx, dest: &Path, built: &str) -> EvalResult<()> {
 }
 
 pub(super) fn test_load(ctx: &mut Ctx, package: &str, paths: &[PathBuf]) -> EvalResult<()> {
-    let result = (|| {
-        let host = ctx.host();
-        let home = r_home(host)?;
-        let executable = [home.join("bin/R"), home.join("bin/exec/R")]
-            .into_iter()
-            .find(|path| is_file(host, path))
-            .map_or_else(
-                || std::env::current_exe().map_err(|error| error.to_string()),
-                Ok,
-            )?;
-        let mut args = vec![
-            "--vanilla".into(),
-            "--slave".into(),
-            "-e".into(),
-            "args <- commandArgs(TRUE); .libPaths(args[-1L]); invisible(loadNamespace(args[[1L]]))"
-                .into(),
-            "--args".into(),
-            package.into(),
-        ];
-        args.extend(
-            paths
-                .iter()
-                .map(|path| path_text(path))
-                .collect::<Result<Vec<_>, _>>()?,
-        );
-        run_process(host, &path_text(&executable)?, args)
-    })();
-    result.map_err(|error| {
+    let args = vec![
+        "--vanilla".into(),
+        "--slave".into(),
+        "-e".into(),
+        "args <- commandArgs(TRUE); .libPaths(args[-1L]); invisible(loadNamespace(args[[1L]]))"
+            .into(),
+        "--args".into(),
+        package.into(),
+    ];
+    run_r(ctx.host(), args, paths).map_err(|error| {
         ctx.stop(
             SEXP_NIL,
             format!("test load failed for package '{package}': {error}"),
         )
+    })
+}
+
+pub(super) fn build_database(
+    ctx: &mut Ctx,
+    source: &Path,
+    dest: &Path,
+    paths: &[PathBuf],
+    compression: DataCompression,
+) -> EvalResult<()> {
+    let result = (|| {
+        let compression = match compression {
+            DataCompression::None => "none",
+            DataCompression::Gzip => "gzip",
+            DataCompression::Bzip2 => "bzip2",
+            DataCompression::Xz => "xz",
+        };
+        let args = vec![
+            "CMD".into(),
+            "INSTALL".into(),
+            NAMESPACE_WORKER.into(),
+            compression.into(),
+            path_text(source)?,
+            path_text(dest)?,
+        ];
+        run_r(ctx.host(), args, paths)
+    })();
+    result.map_err(|error| ctx.stop(SEXP_NIL, format!("namespace build failed: {error}")))
+}
+
+fn run_r(
+    host: &mut dyn roxide_host::Host,
+    mut args: Vec<String>,
+    paths: &[PathBuf],
+) -> Result<(), String> {
+    let home = r_home(host)?;
+    let executable = [home.join("bin/R"), home.join("bin/exec/R")]
+        .into_iter()
+        .find(|path| is_file(host, path))
+        .map_or_else(
+            || std::env::current_exe().map_err(|error| error.to_string()),
+            Ok,
+        )?;
+    args.extend(
+        paths
+            .iter()
+            .map(|path| path_text(path))
+            .collect::<Result<Vec<_>, _>>()?,
+    );
+    run_process(host, &path_text(&executable)?, args)
+}
+
+pub(super) fn has_native_dependencies(
+    ctx: &mut Ctx,
+    source: &Path,
+    description: &Description,
+    paths: &[PathBuf],
+) -> EvalResult<bool> {
+    let mut seen = HashSet::from([description.package.clone()]);
+    let mut pending = dependency_names(ctx, source, description)?;
+    while let Some(name) = pending.pop() {
+        if name == "R"
+            || ctx.ns_record(&name).is_some_and(|record| record.builtin)
+            || !seen.insert(name.clone())
+        {
+            continue;
+        }
+        let Some(path) = find(ctx, &name, paths) else {
+            continue;
+        };
+        match ctx.host().metadata(&path.join("libs"), true) {
+            Ok(meta) if meta.is_dir => return Ok(true),
+            Ok(_) => {}
+            Err(error) if error.kind == HostErrorKind::NotFound => {}
+            Err(error) => return Err(ctx.stop(SEXP_NIL, error.to_string())),
+        }
+        let description = Description::read(ctx, &path)?;
+        pending.extend(dependency_names(ctx, &path, &description)?);
+    }
+    Ok(false)
+}
+
+fn dependency_names(
+    ctx: &mut Ctx,
+    path: &Path,
+    description: &Description,
+) -> EvalResult<Vec<String>> {
+    ctx.scoped(|ctx| {
+        let (linking_to, _) = build_fields(ctx, path)?;
+        let mut names = description
+            .imports
+            .iter()
+            .chain(&description.depends)
+            .map(|dependency| dependency.package.clone())
+            .chain(linking_to.into_iter().map(|dependency| dependency.package))
+            .collect::<Vec<_>>();
+        let cache = path.join("Meta/nsInfo.rds");
+        let namespace = path.join("NAMESPACE");
+        let spec = if is_file(ctx.host(), &cache) {
+            NsSpec::from_cache(ctx, &cache)?
+        } else if is_file(ctx.host(), &namespace) {
+            NsSpec::read(ctx, &namespace)?
+        } else {
+            return Ok(names);
+        };
+        names.extend(
+            spec.imports
+                .into_iter()
+                .chain(spec.import_classes)
+                .chain(spec.import_methods)
+                .map(|import| import.package),
+        );
+        Ok(names)
     })
 }
 

@@ -149,7 +149,7 @@ fn load_new(
         builtin: false,
     };
     let mut cached_meta = false;
-    let mut loaded_dlls = Vec::new();
+    let mut newly_loaded = Vec::new();
     let result = (|| {
         if installed {
             // The byte stream can refer to the namespace that owns it.
@@ -173,7 +173,7 @@ fn load_new(
         define(ctx, info, "dynlibs", dynlibs)?;
         let native = spec.native_routines(ctx)?;
         define(ctx, info, "nativeRoutines", native)?;
-        dynlib::load(ctx, ns, info, &path, dynlibs, native, &mut loaded_dlls)?;
+        dynlib::load(ctx, ns, info, &path, dynlibs, native, &mut newly_loaded)?;
         let registrations = crate::s3reg::resolve(ctx, ns, &spec)?;
         if !installed {
             ctx.ns_register(record)?;
@@ -198,7 +198,7 @@ fn load_new(
     })();
     if result.is_err() {
         ctx.protect_eval_result(&result);
-        dynlib::rollback(ctx, &loaded_dlls);
+        dynlib::rollback(ctx, &newly_loaded);
         if cached_meta {
             let _ = uncache_methods_metadata(ctx, ns);
         }

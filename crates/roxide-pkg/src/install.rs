@@ -14,6 +14,8 @@ use crate::lazyload::{DataCompression, cache_rds, write_lazyload_db, write_names
 use crate::library::{R_VERSION, libraries};
 use crate::loader::{build_namespace, values::*};
 
+pub(super) const NAMESPACE_WORKER: &str = "--roxide-build-namespace";
+
 type Boot<'a> = &'a dyn Fn(Box<dyn Host>) -> Result<Ctx, InternalError>;
 
 /// Execute `R CMD INSTALL` using fresh evaluator contexts from `boot`.
@@ -27,6 +29,33 @@ pub fn run_with_host(
     host: &mut dyn FnMut() -> Box<dyn Host>,
     boot: Boot<'_>,
 ) -> i32 {
+    if let [worker, compression, source, dest, paths @ ..] = args
+        && worker == NAMESPACE_WORKER
+        && let Some(compression) = parse_data_compression(compression)
+    {
+        let result = boot(host()).map_err(Unwind::Internal).and_then(|mut ctx| {
+            let dest = Path::new(dest);
+            let description = Description::read(&mut ctx, dest)?;
+            let paths = paths.iter().map(PathBuf::from).collect::<Vec<_>>();
+            build_database(
+                &mut ctx,
+                Path::new(source),
+                dest,
+                &description,
+                &paths,
+                compression,
+            )
+        });
+        return match result {
+            Ok(()) => 0,
+            Err(error) => {
+                if !matches!(error, Unwind::TopLevel) {
+                    let _ = host().write_err(format!("Error: {error:?}\n").as_bytes());
+                }
+                1
+            }
+        };
+    }
     let options = match Options::parse(args) {
         Ok(options) => options,
         Err(error) => {
@@ -120,17 +149,10 @@ impl Options {
                 | "--no-libs"
                 | "--no-build-vignettes"
                     if !positional => {}
-                "--data-compress=none" if !positional => {
-                    options.data_compression = DataCompression::None
-                }
-                "--data-compress=gzip" if !positional => {
-                    options.data_compression = DataCompression::Gzip
-                }
-                "--data-compress=bzip2" if !positional => {
-                    options.data_compression = DataCompression::Bzip2
-                }
-                "--data-compress=xz" if !positional => {
-                    options.data_compression = DataCompression::Xz
+                arg if !positional && arg.starts_with("--data-compress=") => {
+                    options.data_compression =
+                        parse_data_compression(&arg["--data-compress=".len()..])
+                            .ok_or_else(|| format!("unknown INSTALL option '{arg}'"))?;
                 }
                 arg if !positional && arg.starts_with('-') => {
                     return Err(format!("unknown INSTALL option '{arg}'"));
@@ -142,6 +164,16 @@ impl Options {
             return Err("no packages specified".into());
         }
         Ok(options)
+    }
+}
+
+fn parse_data_compression(name: &str) -> Option<DataCompression> {
+    match name {
+        "none" => Some(DataCompression::None),
+        "gzip" => Some(DataCompression::Gzip),
+        "bzip2" => Some(DataCompression::Bzip2),
+        "xz" => Some(DataCompression::Xz),
+        _ => None,
     }
 }
 
@@ -252,9 +284,11 @@ fn install_source(
             description: &description,
             compiled: compiled.as_ref(),
         };
-        build(ctx, source, &path, paths, options)?;
+        let isolate = has_compiled
+            || install_compiled::has_native_dependencies(ctx, source.path, &description, paths)?;
+        build(ctx, source, &path, paths, options, isolate)?;
         if !options.no_test && !options.no_staged_install && !options.no_lock {
-            test_load(ctx, package, &stage_paths, has_compiled, host, boot)?;
+            test_load(ctx, package, &stage_paths, isolate, host, boot)?;
         }
 
         let previous = match ctx.host().metadata(&target, false) {
@@ -273,7 +307,7 @@ fn install_source(
             if options.no_test {
                 Ok(())
             } else {
-                test_load(ctx, package, paths, has_compiled, host, boot)
+                test_load(ctx, package, paths, isolate, host, boot)
             }
         });
         if result.is_err() {
@@ -315,6 +349,7 @@ fn build(
     dest: &Path,
     paths: &[PathBuf],
     options: &Options,
+    isolate: bool,
 ) -> EvalResult<()> {
     let InstallSource {
         path,
@@ -358,10 +393,7 @@ fn build(
                 PackageTree::Files,
             )?;
         }
-        set_library_paths(ctx, paths)?;
-        if description.lazy_data == Some(true) {
-            crate::data::install_lazy_data(ctx, source, dest, options.data_compression)?;
-        } else {
+        if description.lazy_data != Some(true) {
             copy_tree(
                 ctx,
                 &source.join("data"),
@@ -370,25 +402,20 @@ fn build(
             )?;
         }
 
-        let sysdata = ctx.session_mut().alloc_env(EMPTY_ENV)?;
-        ctx.protect(sysdata);
-        crate::data::load_source_sysdata(ctx, source, sysdata)?;
-        let prev_cwd = ctx.host().cwd().ok();
-        let _ = ctx.host().set_cwd(source);
-        let ns_res = build_namespace(ctx, source, description, paths, sysdata);
-        if let Some(dir) = prev_cwd {
-            let _ = ctx.host().set_cwd(&dir);
+        if isolate {
+            install_compiled::build_database(ctx, source, dest, paths, options.data_compression)?;
+        } else {
+            build_database(
+                ctx,
+                source,
+                dest,
+                description,
+                paths,
+                options.data_compression,
+            )?;
         }
-        let ns = ns_res?;
-        if !ctx.session().env_entries(sysdata)?.is_empty() {
-            write_lazyload_db(ctx, &dest.join("R/sysdata"), sysdata)?;
-        }
-        let package = &description.package;
-        let filebase = dest.join("R").join(package);
-        write_namespace_db(ctx, &filebase, ns, sysdata)?;
-        write_file(ctx, &filebase, STUB.as_bytes())?;
 
-        let name = ctx.session_mut().scalar_str(package)?;
+        let name = ctx.session_mut().scalar_str(&description.package)?;
         let lib = dest
             .parent()
             .ok_or_else(|| ctx.stop(SEXP_NIL, "missing staging directory"))?;
@@ -397,6 +424,42 @@ fn build(
         cache_rds(ctx, &dest.join("Meta/nsInfo.rds"), info)?;
         let linking_to = compiled.map_or(&[][..], |package| package.linking_to.as_slice());
         write_metadata(ctx, dest, &date, os, description, linking_to)
+    })
+}
+
+fn build_database(
+    ctx: &mut Ctx,
+    source: &Path,
+    dest: &Path,
+    description: &Description,
+    paths: &[PathBuf],
+    compression: DataCompression,
+) -> EvalResult<()> {
+    ctx.scoped(|ctx| {
+        set_library_paths(ctx, paths)?;
+        if description.lazy_data == Some(true) {
+            crate::data::install_lazy_data(ctx, source, dest, compression)?;
+        }
+        let sysdata = ctx.session_mut().alloc_env(EMPTY_ENV)?;
+        ctx.protect(sysdata);
+        crate::data::load_source_sysdata(ctx, source, sysdata)?;
+        let cwd = ctx
+            .host()
+            .cwd()
+            .map_err(|error| ctx.stop(SEXP_NIL, error.to_string()))?;
+        ctx.host()
+            .set_cwd(source)
+            .map_err(|error| ctx.stop(SEXP_NIL, error.to_string()))?;
+        let namespace = build_namespace(ctx, source, description, paths, sysdata);
+        let restored = ctx.host().set_cwd(&cwd);
+        let namespace = namespace?;
+        restored.map_err(|error| ctx.stop(SEXP_NIL, error.to_string()))?;
+        if !ctx.session().env_entries(sysdata)?.is_empty() {
+            write_lazyload_db(ctx, &dest.join("R/sysdata"), sysdata)?;
+        }
+        let filebase = dest.join("R").join(&description.package);
+        write_namespace_db(ctx, &filebase, namespace, sysdata)?;
+        write_file(ctx, &filebase, STUB.as_bytes())
     })
 }
 
@@ -556,11 +619,11 @@ fn test_load(
     ctx: &mut Ctx,
     package: &str,
     paths: &[PathBuf],
-    has_compiled: bool,
+    isolate: bool,
     host: &mut dyn FnMut() -> Box<dyn Host>,
     boot: Boot<'_>,
 ) -> EvalResult<()> {
-    if has_compiled {
+    if isolate {
         return install_compiled::test_load(ctx, package, paths);
     }
     let mut test = boot(host()).map_err(Unwind::Internal)?;

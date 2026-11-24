@@ -1,5 +1,6 @@
 //! Check the native ABI stamp and bind DLLs to a package namespace.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use roxide_eval::{Ctx, EvalResult, api::NativeHooks};
@@ -58,7 +59,7 @@ pub(super) fn load(
     path: &Path,
     dynlibs: SexpId,
     native: SexpId,
-    loaded: &mut Vec<(PathBuf, SexpId)>,
+    newly_loaded: &mut Vec<PathBuf>,
 ) -> EvalResult<()> {
     let libraries = chars(ctx, dynlibs)?;
     if libraries.is_empty() {
@@ -77,6 +78,12 @@ pub(super) fn load(
     .map_err(|error| ctx.stop(SEXP_NIL, error))?;
     let labels = attr(ctx, dynlibs, "names")?;
     let aliases = chars(ctx, labels)?;
+    let loaded = hooks.get_loaded_dlls(ctx)?;
+    ctx.protect(loaded);
+    let mut loaded = dll_paths(ctx, loaded)?
+        .into_iter()
+        .zip(ctx.session().list_slice(loaded)?.iter().copied())
+        .collect::<HashMap<_, _>>();
     let mut dlls = Vec::new();
     for (index, lib) in libraries.iter().enumerate() {
         if lib.is_empty()
@@ -95,17 +102,19 @@ pub(super) fn load(
             .host()
             .canonicalize(&shared)
             .map_err(|error| ctx.stop(SEXP_NIL, format!("{}: {error}", shared.display())))?;
-        let dll = if let Some((_, dll)) = loaded.iter().find(|(file, _)| file == &shared) {
+        let key = shared.to_string_lossy();
+        let dll = if let Some(dll) = loaded.get(key.as_ref()) {
             *dll
         } else {
             let dll = hooks.dyn_load(ctx, &shared, true, true, SEXP_NIL)?;
             ctx.protect(dll);
-            loaded.push((shared, dll));
+            loaded.insert(key.into_owned(), dll);
+            newly_loaded.push(shared);
             dll
         };
         dlls.push(dll);
         if let Some(map) = field(ctx, native, lib)? {
-            bind_routines(ctx, ns, hooks, dll, lib, map)?;
+            bind_routines(ctx, ns, hooks, dll, map)?;
         }
         if let Some(alias) = aliases.get(index).filter(|alias| !alias.is_empty()) {
             define(ctx, ns, alias, dll)?;
@@ -133,18 +142,20 @@ fn bind_routines(
     ns: SexpId,
     hooks: &dyn NativeHooks,
     dll: SexpId,
-    lib: &str,
     map: SexpId,
 ) -> EvalResult<()> {
     let registration = field(ctx, map, "useRegistration")?.unwrap_or(SEXP_NIL);
     let registration = flag(ctx, registration)?;
-    if registration {
+    let symbols = field(ctx, map, "symbolNames")?.unwrap_or(SEXP_NIL);
+    let names = chars(ctx, symbols)?;
+    let mut registered = HashMap::new();
+    if registration || !names.is_empty() {
+        let groups = hooks.get_dll_registered_routines(ctx, dll, true, SEXP_NIL)?;
+        ctx.protect(groups);
         let fixes = field(ctx, map, "registrationFixes")?.unwrap_or(SEXP_NIL);
         let fixes = chars(ctx, fixes)?;
         let prefix = fixes.first().map_or("", String::as_str);
         let suffix = fixes.get(1).map_or("", String::as_str);
-        let groups = hooks.get_dll_registered_routines(ctx, dll, true, SEXP_NIL)?;
-        ctx.protect(groups);
         for group in ctx.session().list_slice(groups)?.to_vec() {
             if group == SEXP_NIL {
                 continue;
@@ -153,12 +164,13 @@ fn bind_routines(
             let labels = chars(ctx, labels)?;
             for (i, name) in labels.iter().enumerate() {
                 let symbol = ctx.session().list_get(group, i)?;
-                define(ctx, ns, &format!("{prefix}{name}{suffix}"), symbol)?;
+                if registration {
+                    define(ctx, ns, &format!("{prefix}{name}{suffix}"), symbol)?;
+                }
+                registered.entry(name.clone()).or_insert(symbol);
             }
         }
     }
-    let symbols = field(ctx, map, "symbolNames")?.unwrap_or(SEXP_NIL);
-    let names = chars(ctx, symbols)?;
     let labels = if symbols == SEXP_NIL {
         SEXP_NIL
     } else {
@@ -170,16 +182,31 @@ fn bind_routines(
             .get(i)
             .filter(|label| !label.is_empty())
             .unwrap_or(name);
-        let symbol = hooks.get_native_symbol_info(ctx, name, Some(lib), registration, SEXP_NIL)?;
+        let symbol = if let Some(&symbol) = registered.get(name) {
+            symbol
+        } else {
+            let dll_name = field(ctx, dll, "name")?.unwrap_or(SEXP_NIL);
+            let dll_name = string(ctx, dll_name)?;
+            let symbol =
+                hooks.get_native_symbol_info(ctx, name, Some(&dll_name), registration, SEXP_NIL)?;
+            ctx.protect(symbol);
+            if field(ctx, symbol, "dll")? != Some(dll) {
+                return Err(ctx.stop(
+                    SEXP_NIL,
+                    format!("cannot resolve symbol '{name}' in the requested DLL '{dll_name}'"),
+                ));
+            }
+            symbol
+        };
         ctx.protect(symbol);
         define(ctx, ns, label, symbol)?;
     }
     Ok(())
 }
 
-pub(super) fn rollback(ctx: &mut Ctx, paths: &[(PathBuf, SexpId)]) {
+pub(super) fn rollback(ctx: &mut Ctx, paths: &[PathBuf]) {
     if let Some(hooks) = ctx.native_hooks() {
-        for (path, _) in paths.iter().rev() {
+        for path in paths.iter().rev() {
             let _ = ctx.with_native_error_handler(
                 |ctx| {
                     hooks.dyn_unload(ctx, path, SEXP_NIL)?;

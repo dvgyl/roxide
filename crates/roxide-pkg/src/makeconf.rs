@@ -217,14 +217,12 @@ fn config(arg: &str, host: &mut dyn Host) -> Result<String, String> {
     let conf = Makeconf::read(host, &home).map_err(|error| format!("ERROR: {error}"))?;
     let value = match arg {
         "--all" => return Ok(conf.dump()),
-        "--cppflags" => Some(format!(
-            "-I{}",
-            crate::shlib::shell_word(
-                conf.get("R_INCLUDE_DIR")
-                    .unwrap_or_else(|| home.join("include").to_string_lossy().into_owned())
-                    .as_str()
-            )
-        )),
+        "--cppflags" => conf.get("R_XTRA_CPPFLAGS").or_else(|| {
+            let include = conf
+                .get("R_INCLUDE_DIR")
+                .unwrap_or_else(|| home.join("include").to_string_lossy().into_owned());
+            Some(format!("-I{}", crate::shlib::shell_word(&include)))
+        }),
         "--ldflags" => conf.get("LIBR"),
         key => conf.get(key),
     };

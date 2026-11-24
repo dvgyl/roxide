@@ -12,7 +12,16 @@ use roxide_value::ValueApi;
 
 const ROOT: &str = "/library/nativepkg";
 
-fn context(namespace: &str, stamp: Option<&str>) -> Result<Ctx, Unwind> {
+const ON_LOAD: &str = r#"
+.onLoad <- function(lib, pkg) {
+    stopifnot(identical(C_registered_end$name, "registered"))
+    stopifnot(identical(explicit$name, "lookup"))
+    stopifnot(identical(getNamespaceInfo(pkg, "DLLs")$nativepkg$path,
+                        "/library/nativepkg/libs/nativepkg.so"))
+}
+"#;
+
+fn context(namespace: &str, stamp: Option<&str>, code: &str) -> Result<Ctx, Unwind> {
     let mut host = PureHost::new();
     for dir in ["/library", "/library/nativepkg/Meta"] {
         host.create_dir(Path::new(dir), true, 0o755)
@@ -26,17 +35,10 @@ fn context(namespace: &str, stamp: Option<&str>) -> Result<Ctx, Unwind> {
         ("DESCRIPTION", "Package: nativepkg\nVersion: 1.0\n"),
         ("NAMESPACE", namespace),
         ("libs/nativepkg.so", ""),
-        (
-            "R/source.R",
-            r#"
-.onLoad <- function(lib, pkg) {
-    stopifnot(identical(C_registered_end$name, "registered"))
-    stopifnot(identical(explicit$name, "lookup"))
-    stopifnot(identical(getNamespaceInfo(pkg, "DLLs")$nativepkg$path,
-                        "/library/nativepkg/libs/nativepkg.so"))
-}
-"#,
-        ),
+        ("libs/native.pkg.so", ""),
+        ("libs/other.so", ""),
+        ("other/native_pkg.so", ""),
+        ("R/source.R", code),
     ] {
         host.insert_file(Path::new(ROOT).join(path), data.as_bytes());
     }
@@ -73,7 +75,7 @@ fn rejects_foreign_stamps_before_loading_a_dll() -> EvalResult<()> {
         Some("list(capi_abi = 999L)"),
         Some("list(capi_abi = 1.0)"),
     ] {
-        let mut ctx = context("useDynLib(nativepkg)", stamp)?;
+        let mut ctx = context("useDynLib(nativepkg)", stamp, ON_LOAD)?;
         ctx.run_global("load", r#"
 message <- tryCatch(loadNamespace("nativepkg"), error = conditionMessage)
 stopifnot(identical(message, "package 'nativepkg' was installed by a different R implementation; reinstall it from source with Roxide"))
@@ -88,10 +90,15 @@ fn binds_symbols_before_on_load_and_unloads_the_dll() -> EvalResult<()> {
     let mut ctx = context(
         "useDynLib(nativepkg, explicit = lookup, .registration = TRUE, .fixes = c('C_', '_end'))",
         Some(&valid_stamp()),
+        ON_LOAD,
     )?;
     ctx.run_global("load", "loadNamespace('nativepkg')")?;
     assert_eq!(
-        ctx.ext::<Loaded>().0,
+        ctx.ext::<Loaded>()
+            .0
+            .iter()
+            .map(|(path, _)| path)
+            .collect::<Vec<_>>(),
         ["/library/nativepkg/libs/nativepkg.so"]
     );
     ctx.run_global("unload", "unloadNamespace('nativepkg')")?;
@@ -102,7 +109,7 @@ fn binds_symbols_before_on_load_and_unloads_the_dll() -> EvalResult<()> {
 
 #[test]
 fn rolls_back_the_dll_if_namespace_loading_fails() -> EvalResult<()> {
-    let mut ctx = context("useDynLib(nativepkg)", Some(&valid_stamp()))?;
+    let mut ctx = context("useDynLib(nativepkg)", Some(&valid_stamp()), ON_LOAD)?;
     ctx.run_global(
         "load",
         r#"
@@ -115,11 +122,59 @@ stopifnot(grepl(".onLoad failed", message, fixed = TRUE))
     Ok(())
 }
 
+#[test]
+fn rollback_preserves_a_dll_loaded_before_the_namespace() -> EvalResult<()> {
+    let mut ctx = context(
+        "useDynLib(nativepkg)\nuseDynLib(other)",
+        Some(&valid_stamp()),
+        ON_LOAD,
+    )?;
+    ctx.run_global(
+        "load",
+        r#"
+existing <- dyn.load("/library/nativepkg/libs/nativepkg.so")
+message <- tryCatch(loadNamespace("nativepkg"), error = conditionMessage)
+stopifnot(grepl(".onLoad failed", message, fixed = TRUE))
+stopifnot(identical(unclass(getLoadedDLLs()), list(existing)))
+"#,
+    )?;
+    assert!(ctx.ns_lookup("nativepkg").is_none());
+    Ok(())
+}
+
+#[test]
+fn binds_explicit_symbols_from_the_requested_dotted_dll() -> EvalResult<()> {
+    let mut ctx = context(
+        "useDynLib(native.pkg, explicit = lookup, dynamic)",
+        Some(&valid_stamp()),
+        r#"
+.onLoad <- function(lib, pkg) {
+    dll <- getNamespaceInfo(pkg, "DLLs")[["native.pkg"]]
+    stopifnot(identical(explicit$dll, dll), identical(dynamic$dll, dll))
+    stopifnot(identical(dll$path, "/library/nativepkg/libs/native.pkg.so"))
+}
+"#,
+    )?;
+    ctx.run_global(
+        "load",
+        r#"
+dyn.load("/library/nativepkg/libs/native.pkg.so")
+dyn.load("/library/nativepkg/other/native_pkg.so")
+loadNamespace("nativepkg")
+"#,
+    )?;
+    Ok(())
+}
+
 #[derive(Default)]
-struct Loaded(Vec<String>);
+struct Loaded(Vec<(String, SexpId)>);
 
 impl Trace for Loaded {
-    fn trace(&self, _: &mut Tracer<'_>) {}
+    fn trace(&self, tracer: &mut Tracer<'_>) {
+        for (_, dll) in &self.0 {
+            tracer.edge(*dll);
+        }
+    }
 }
 
 impl CtxExt for Loaded {}
@@ -129,12 +184,18 @@ struct Hooks;
 impl NativeHooks for Hooks {
     fn dyn_load(&self, ctx: &mut Ctx, file: &Path, _: bool, _: bool, _: SexpId) -> EvalResult {
         let file = file.to_string_lossy().into_owned();
-        ctx.ext::<Loaded>().0.push(file.clone());
-        scalar_field(ctx, "path", &file)
+        let name = ctx.session_mut().scalar_str(&dll_name(&file))?;
+        ctx.protect(name);
+        let path = ctx.session_mut().scalar_str(&file)?;
+        let dll = named_list(ctx, &[("name", name), ("path", path)])?;
+        ctx.ext::<Loaded>().0.push((file, dll));
+        Ok(dll)
     }
 
     fn dyn_unload(&self, ctx: &mut Ctx, file: &Path, _: SexpId) -> EvalResult<()> {
-        ctx.ext::<Loaded>().0.retain(|path| Path::new(path) != file);
+        ctx.ext::<Loaded>()
+            .0
+            .retain(|(path, _)| Path::new(path) != file);
         Ok(())
     }
 
@@ -142,8 +203,7 @@ impl NativeHooks for Hooks {
         let paths = ctx.ext::<Loaded>().0.clone();
         let dlls = ctx.session_mut().alloc_list(paths.len())?;
         ctx.protect(dlls);
-        for (index, path) in paths.iter().enumerate() {
-            let dll = scalar_field(ctx, "path", path)?;
+        for (index, (_, dll)) in paths.into_iter().enumerate() {
             ctx.session_mut().list_set(dlls, index, dll)?;
         }
         Ok(dlls)
@@ -153,39 +213,74 @@ impl NativeHooks for Hooks {
         &self,
         ctx: &mut Ctx,
         name: &str,
-        _: Option<&str>,
+        package: Option<&str>,
         _: bool,
         _: SexpId,
     ) -> EvalResult {
-        scalar_field(ctx, "name", name)
+        let entries = ctx.ext::<Loaded>().0.clone();
+        for (path, dll) in entries.into_iter().rev() {
+            if package == Some(dll_name(&path).as_str())
+                && (name != "dynamic" || !path.ends_with("/other/native_pkg.so"))
+            {
+                return symbol(ctx, name, dll);
+            }
+        }
+        Err(ctx.stop(roxide_value::SEXP_NIL, "symbol not found"))
     }
 
     fn get_dll_registered_routines(
         &self,
         ctx: &mut Ctx,
-        _: SexpId,
+        dll: SexpId,
         names: bool,
         _: SexpId,
     ) -> EvalResult {
         assert!(names);
-        let symbol = scalar_field(ctx, "name", "registered")?;
-        let routines = named_list(ctx, "registered", symbol)?;
-        named_list(ctx, ".Call", routines)
+        let entries = &ctx.ext::<Loaded>().0;
+        let name = if entries
+            .iter()
+            .any(|(path, id)| *id == dll && dll_name(path) == "native_pkg")
+        {
+            "lookup"
+        } else {
+            "registered"
+        };
+        let symbol = symbol(ctx, name, dll)?;
+        let routines = named_list(ctx, &[(name, symbol)])?;
+        named_list(ctx, &[(".Call", routines)])
     }
 }
 
-fn scalar_field(ctx: &mut Ctx, key: &str, value: &str) -> EvalResult {
-    let value = ctx.session_mut().scalar_str(value)?;
-    named_list(ctx, key, value)
+fn dll_name(path: &str) -> String {
+    Path::new(path)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or_default()
+        .replace('.', "_")
 }
 
-fn named_list(ctx: &mut Ctx, key: &str, value: SexpId) -> EvalResult {
-    ctx.protect(value);
-    let list = ctx.session_mut().alloc_list(1)?;
+fn symbol(ctx: &mut Ctx, name: &str, dll: SexpId) -> EvalResult {
+    let name = ctx.session_mut().scalar_str(name)?;
+    named_list(ctx, &[("name", name), ("dll", dll)])
+}
+
+fn named_list(ctx: &mut Ctx, fields: &[(&str, SexpId)]) -> EvalResult {
+    for &(_, value) in fields {
+        ctx.protect(value);
+    }
+    let list = ctx.session_mut().alloc_list(fields.len())?;
     ctx.protect(list);
-    ctx.session_mut().list_set(list, 0, value)?;
-    let key = ctx.session_mut().scalar_str(key)?;
+    let mut labels = Vec::with_capacity(fields.len());
+    for (index, &(key, value)) in fields.iter().enumerate() {
+        ctx.session_mut().list_set(list, index, value)?;
+        labels.push(
+            ctx.session_mut()
+                .mk_char(key.as_bytes(), roxide_value::Encoding::Native)?,
+        );
+    }
+    let labels = ctx.session_mut().alloc_str_from(&labels)?;
+    ctx.protect(labels);
     let names = ctx.session_mut().intern("names")?;
-    ctx.session_mut().set_attrib(list, names, key)?;
+    ctx.session_mut().set_attrib(list, names, labels)?;
     Ok(list)
 }

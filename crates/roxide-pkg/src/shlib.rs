@@ -145,8 +145,9 @@ impl ShlibOptions {
             format!("SHLIB={target}"),
             format!("ROXIDE_DEFAULT_OBJECTS={}", inputs.objects.join(" ")),
             format!("ROXIDE_SOURCE_RULES={}", inputs.rules.join("\n")),
-            format!("ROXIDE_CLEAN_OBJECTS={}", inputs.generated.join(" ")),
-            format!("ROXIDE_HAS_CXX={}", if inputs.cxx { "yes" } else { "no" }),
+            format!("ROXIDE_PREBUILT_OBJECTS={}", inputs.prebuilt.join(" ")),
+            format!("ROXIDE_SOURCE_OBJECTS={}", inputs.generated.join(" ")),
+            format!("ROXIDE_CXX_OBJECTS={}", inputs.cxx.join(" ")),
             format!(
                 "ROXIDE_DEFAULT_CXX_STD={}",
                 cxx_standard.unwrap_or_default()
@@ -225,8 +226,9 @@ struct BuildInputs {
     sources: HashSet<PathBuf>,
     objects: Vec<String>,
     generated: Vec<String>,
+    prebuilt: Vec<String>,
     rules: Vec<String>,
-    cxx: bool,
+    cxx: Vec<String>,
 }
 
 impl BuildInputs {
@@ -248,12 +250,13 @@ impl BuildInputs {
                 return Err(format!("input '{}' is not a file", path.display()));
             }
             inputs.sources.insert(canonical);
-            inputs.cxx |= matches!(extension, "cc" | "cpp" | "cxx" | "mm");
             let object = make_path(&path.with_extension("o"))?;
             if inputs.objects.contains(&object) {
                 return Err(format!("duplicate SHLIB object '{object}'"));
             }
-            if extension != "o" {
+            if extension == "o" {
+                inputs.prebuilt.push(object.clone());
+            } else {
                 let source = make_path(path)?;
                 inputs.rules.push(format!(
                     "$(call roxide_rule,{},{},{extension})",
@@ -261,6 +264,9 @@ impl BuildInputs {
                     source.replace(',', "$(roxide_comma)"),
                 ));
                 inputs.generated.push(object.clone());
+                if matches!(extension, "cc" | "cpp" | "cxx" | "mm") {
+                    inputs.cxx.push(object.clone());
+                }
             }
             inputs.objects.push(object);
         }

@@ -12,9 +12,8 @@ F77 = $(FC)
 endif
 F77 ?= $(FC)
 
-roxide_cxx_standard = $(if $(filter CXX11 CXX14 CXX17 CXX20 CXX23 CXX26,$(CXX_STD)),$(CXX_STD))
-ROXIDE_CXX = $(if $($(roxide_cxx_standard)),$($(roxide_cxx_standard)) $($(roxide_cxx_standard)STD),$(CXX))
-roxide_cxx_flags = $(if $(and $(roxide_cxx_standard),$(filter-out undefined,$(origin $(roxide_cxx_standard)$(1)))),$($(roxide_cxx_standard)$(1)),$(CXX$(1)))
+ROXIDE_CXX = $(if $(CXX_STD),$($(CXX_STD)) $($(CXX_STD)STD),$(CXX))
+roxide_cxx_flags = $(if $(and $(CXX_STD),$(filter-out undefined,$(origin $(CXX_STD)$(1)))),$($(CXX_STD)$(1)),$(CXX$(1)))
 ALL_CXXFLAGS = $(call roxide_cxx_flags,PICFLAGS) $(PKG_CXXFLAGS) $(call roxide_cxx_flags,FLAGS) $(ROXIDE_LTO_C)
 
 ifeq ($(ROXIDE_USE_LTO),yes)
@@ -38,7 +37,8 @@ define roxide_rule
 $(1): $(2)
 	$$(ROXIDE_COMPILE_$(3)) "$$<" -o "$$@"
 endef
-$(foreach ext,c cc cpp cxx m mm f f90 f95,$(eval $(call roxide_rule,%.o,%.$(ext),$(ext))))
+roxide_source_extensions := c cc cpp cxx m mm f f90 f95
+$(foreach ext,$(roxide_source_extensions),$(eval $(call roxide_rule,%.o,%.$(ext),$(ext))))
 $(eval $(ROXIDE_SOURCE_RULES))
 
 ifneq ($(ROXIDE_PACKAGE_MAKEVARS),)
@@ -50,31 +50,64 @@ endif
 
 OBJECTS ?= $(ROXIDE_DEFAULT_OBJECTS)
 
+ifneq ($(strip $(CXX_STD)),)
+ifeq ($(and $(filter CXX11 CXX14 CXX17 CXX20 CXX23 CXX26,$(CXX_STD)),$(strip $($(CXX_STD)))),)
+$(error unsupported CXX_STD '$(CXX_STD)' or empty compiler variable)
+endif
+endif
+
+ifneq ($(ROXIDE_PREBUILT_OBJECTS),)
+$(ROXIDE_PREBUILT_OBJECTS): ;
+endif
+
+define roxide_object_kind
+roxide_object_kind() { \
+	for input in $(ROXIDE_PREBUILT_OBJECTS); do \
+		if [ "$$1" = "$$input" ] || [ "$$1" -ef "$$input" ]; then return; fi; \
+	done; \
+	for input in $(ROXIDE_SOURCE_OBJECTS); do \
+		if [ "$$1" = "$$input" ]; then \
+			for cxx in $(ROXIDE_CXX_OBJECTS); do \
+				if [ "$$1" = "$$cxx" ]; then echo cxx; return; fi; \
+			done; \
+			echo c; return; \
+		fi; \
+	done; \
+	case "$$1" in *.o) \
+		for ext in $(roxide_source_extensions); do \
+			if [ -f "$${1%.o}.$$ext" ]; then echo "$$ext"; return; fi; \
+		done ;; \
+	esac; \
+}
+endef
+
 .PHONY: all clean preclean
 all: $(SHLIB)
 
-roxide_ld = $(SHLIB_LD)
-roxide_ldflags = $(SHLIB_LDFLAGS)
-ifeq ($(ROXIDE_HAS_CXX),yes)
-roxide_ld = $(or $(SHLIB_CXXLD),$(ROXIDE_CXX))
-roxide_ldflags = $(SHLIB_CXXLDFLAGS)
-ifneq ($(strip $($(roxide_cxx_standard))),)
+roxide_object_kinds = $(shell $(roxide_object_kind); for object in $(OBJECTS); do roxide_object_kind "$$object"; done)
+roxide_cxx_ld = $(or $(SHLIB_CXXLD),$(ROXIDE_CXX))
+roxide_cxx_ldflags = $(or $(SHLIB_CXXLDFLAGS),$(SHLIB_LDFLAGS))
+ifneq ($(strip $(CXX_STD)),)
 ifeq ($(strip $(SHLIB_CXXLD)),$(strip $(CXX)))
-roxide_ld = $(or $($(roxide_cxx_standard)LD),$(ROXIDE_CXX))
+roxide_cxx_ld = $(or $($(CXX_STD)LD),$(ROXIDE_CXX))
 endif
 endif
 ifneq ($(roxide_config_shlib_ld),$(value SHLIB_LD))
-roxide_ld = $(SHLIB_LD)
+roxide_cxx_ld = $(SHLIB_LD)
 endif
 ifeq ($(origin SHLIB_LD),command line)
-roxide_ld = $(SHLIB_LD)
+roxide_cxx_ld = $(SHLIB_LD)
 endif
-endif
+
+roxide_link = $(if $(filter cc cpp cxx mm,$(roxide_object_kinds)),$(roxide_cxx_ld) $(roxide_cxx_ldflags),$(SHLIB_LD) $(SHLIB_LDFLAGS))
 
 $(SHLIB): $(OBJECTS)
-	$(roxide_ld) $(roxide_ldflags) $(ROXIDE_LTO_LINK) -o "$@" $(OBJECTS) $(PKG_LIBS) $(ROXIDE_LINK_FLAGS) $(LIBR)
+	$(roxide_link) $(ROXIDE_LTO_LINK) -o "$@" $(OBJECTS) $(PKG_LIBS) $(ROXIDE_LINK_FLAGS) $(LIBR)
 
 RM ?= rm -f
-ROXIDE_CLEAN_OBJECTS ?= $(OBJECTS)
 clean preclean:
-	$(RM) -- $(ROXIDE_CLEAN_OBJECTS)
+	@$(roxide_object_kind); set --; \
+	for object in $(OBJECTS); do \
+		if [ -n "$$(roxide_object_kind "$$object")" ]; then set -- "$$@" "$$object"; fi; \
+	done; \
+	if [ "$$#" -gt 0 ]; then $(RM) -- "$$@"; fi
