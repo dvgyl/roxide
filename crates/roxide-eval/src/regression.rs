@@ -495,3 +495,37 @@ dput(tryCatch(roxideMissingPackage::value, error = function(e) class(e)))
         "",
     );
 }
+
+#[test]
+fn forced_promises_returning_missing_symbol_do_not_error() {
+    check(
+        r#"
+maybe_missing <- function(x, default = substitute()) {
+    if (missing(x)) default else x
+}
+dput(identical(maybe_missing(), quote(expr = )))
+dput(maybe_missing(42L))
+f <- function(d = quote(expr = )) {
+    a <- d
+    c(
+        identical(d, quote(expr = )),
+        identical(get("d"), quote(expr = )),
+        tryCatch({ a; "ok" }, error = function(e) conditionMessage(e))
+    )
+}
+dput(f())
+g <- function(x) identical(x, quote(expr = ))
+dput(g(quote(expr = )))
+h <- function(x) x
+dput(tryCatch(h(), error = function(e) conditionMessage(e)))
+"#,
+        concat!(
+            "TRUE\n",
+            "42L\n",
+            "c(\"TRUE\", \"TRUE\", \"argument \\\"a\\\" is missing, with no default\"\n)\n",
+            "TRUE\n",
+            "\"argument \\\"x\\\" is missing, with no default\"\n",
+        ),
+        "",
+    );
+}

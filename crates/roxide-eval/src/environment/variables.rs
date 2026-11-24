@@ -8,6 +8,11 @@ use crate::{Args, Call, Ctx, EvalResult};
 
 use super::{is_function, scalar_flag};
 
+enum LookupResult {
+    MissingBinding,
+    Value(SexpId),
+}
+
 impl Ctx {
     fn binding_env(&self, sym: Sym, mut env: SexpId, inherits: bool) -> EvalResult<Option<SexpId>> {
         while env != SEXP_NIL {
@@ -33,14 +38,18 @@ impl Ctx {
         mode: &str,
         inherits: bool,
         exists: bool,
-    ) -> EvalResult<Option<SexpId>> {
+    ) -> EvalResult<Option<LookupResult>> {
         while let Some(found) = self.binding_env(sym, env, inherits)? {
             if exists && mode == "any" {
-                return Ok(Some(SEXP_NIL));
+                return Ok(Some(LookupResult::Value(SEXP_NIL)));
             }
-            let Some(value) = self.get_local(sym, found)? else {
+            let Some(binding) = self.session.env_get(found, sym) else {
                 return Ok(None);
             };
+            if !binding.active && binding.value == SEXP_MISSING {
+                return Ok(Some(LookupResult::MissingBinding));
+            }
+            let value = self.read_binding(binding, found)?;
             let ty = self.session.type_of(value)?;
             let compatible = match mode {
                 "any" => true,
@@ -48,8 +57,8 @@ impl Ctx {
                 "numeric" => matches!(ty, SexpType::Int | SexpType::Real),
                 mode => ty.type_name(false) == mode,
             };
-            if compatible || value == SEXP_MISSING {
-                return Ok(Some(value));
+            if compatible {
+                return Ok(Some(LookupResult::Value(value)));
             }
             if !inherits {
                 break;
@@ -135,22 +144,20 @@ pub(super) fn get(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     if exists {
         return Ok(ctx.session.scalar_lgl(logical(found.is_some()))?);
     }
-    if found == Some(SEXP_MISSING) {
-        return Err(ctx.stop(
+    match found {
+        Some(LookupResult::MissingBinding) => Err(ctx.stop(
             call.err_call(),
             format!("argument \"{name}\" is missing, with no default"),
-        ));
+        )),
+        Some(LookupResult::Value(value)) => Ok(value),
+        None if kind == "get0" => Ok(fallback.unwrap_or(SEXP_NIL)),
+        None => {
+            let mode = mode
+                .filter(|mode| mode != "any")
+                .map_or(String::new(), |mode| format!(" of mode '{mode}'"));
+            Err(ctx.stop(call.err_call(), format!("object '{name}'{mode} not found")))
+        }
     }
-    if let Some(value) = found {
-        return Ok(value);
-    }
-    if kind == "get0" {
-        return Ok(fallback.unwrap_or(SEXP_NIL));
-    }
-    let mode = mode
-        .filter(|mode| mode != "any")
-        .map_or(String::new(), |mode| format!(" of mode '{mode}'"));
-    Err(ctx.stop(call.err_call(), format!("object '{name}'{mode} not found")))
 }
 
 pub(super) fn mget(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
@@ -198,7 +205,8 @@ pub(super) fn mget(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
             String::from_utf8_lossy(ctx.session.char_bytes(modes[i % modes.len()])?).into_owned()
         };
         let value = match ctx.lookup_mode(sym, env, &mode, inherits, false)? {
-            Some(value) => value,
+            Some(LookupResult::Value(value)) => value,
+            Some(LookupResult::MissingBinding) => SEXP_MISSING,
             None => {
                 let Some(fallback) = &fallback else {
                     return Err(ctx.stop(call.err_call(), format!("value for ‘{name}’ not found")));

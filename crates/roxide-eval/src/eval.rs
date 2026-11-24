@@ -127,12 +127,12 @@ impl Ctx {
             }
             return self.eval(value, env);
         }
-        let Some(val) = self.get_var(sym, env)? else {
+        let Some((binding_env, binding)) = self.lookup_binding(sym, env)? else {
             let name = self.session.sym_name(sym)?.to_owned();
             let call = self.frame(env).map_or(SEXP_NIL, |frame| frame.call);
             return Err(self.stop(call, format!("object '{name}' not found")));
         };
-        if val == SEXP_MISSING {
+        if !binding.active && binding.value == SEXP_MISSING {
             let name = self.session.sym_name(sym)?.to_owned();
             let call = self.frame(env).map_or(SEXP_NIL, |frame| frame.call);
             return Err(self.stop(
@@ -140,7 +140,7 @@ impl Ctx {
                 format!("argument \"{name}\" is missing, with no default"),
             ));
         }
-        Ok(val)
+        self.read_binding(binding, binding_env)
     }
 
     /// Force a lazy promise (`PROMSXP`) implementing ADR-0006's 4-state lifecycle.
@@ -195,21 +195,27 @@ impl Ctx {
         }
     }
 
-    /// Look up symbol `sym` along the lexical environment chain starting at `env`, forcing promises.
-    pub fn get_var(&mut self, sym: Sym, env: SexpId) -> EvalResult<Option<SexpId>> {
-        let mut cur = env;
-        while cur != SEXP_NIL {
-            if let Some(binding) = self.session.env_get(cur, sym) {
-                let val = binding.value;
-                if val == SEXP_UNBOUND {
-                    cur = self.session.env_enclos(cur)?;
-                    continue;
-                }
-                return self.read_binding(binding, cur).map(Some);
+    fn lookup_binding(
+        &self,
+        sym: Sym,
+        mut env: SexpId,
+    ) -> EvalResult<Option<(SexpId, roxide_value::Binding)>> {
+        while env != SEXP_NIL {
+            if let Some(binding) = self.session.env_get(env, sym)
+                && binding.value != SEXP_UNBOUND
+            {
+                return Ok(Some((env, binding)));
             }
-            cur = self.session.env_enclos(cur)?;
+            env = self.session.env_enclos(env)?;
         }
         Ok(None)
+    }
+
+    /// Look up symbol `sym` along the lexical environment chain starting at `env`, forcing promises.
+    pub fn get_var(&mut self, sym: Sym, env: SexpId) -> EvalResult<Option<SexpId>> {
+        self.lookup_binding(sym, env)?
+            .map(|(cur, binding)| self.read_binding(binding, cur))
+            .transpose()
     }
 
     /// Read a binding in one environment, forcing a promise or calling an active getter.
@@ -249,8 +255,7 @@ impl Ctx {
                     cur = self.session.env_enclos(cur)?;
                     continue;
                 }
-                let val = self.read_binding(binding, cur)?;
-                if val == SEXP_MISSING {
+                if !binding.active && val == SEXP_MISSING {
                     let name = self.session.sym_name(sym)?.to_owned();
                     let call = self.frame(env).map_or(SEXP_NIL, |frame| frame.call);
                     return Err(self.stop(
@@ -258,6 +263,7 @@ impl Ctx {
                         format!("argument \"{name}\" is missing, with no default"),
                     ));
                 }
+                let val = self.read_binding(binding, cur)?;
                 if matches!(
                     self.session.type_of(val)?,
                     SexpType::Clo | SexpType::Builtin | SexpType::Special

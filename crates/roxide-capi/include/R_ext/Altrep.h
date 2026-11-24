@@ -15,6 +15,10 @@ typedef struct { SEXP ptr; } R_altrep_class_t;
 
 SEXP R_new_altrep(R_altrep_class_t klass, SEXP data1, SEXP data2);
 Rboolean R_altrep_inherits(SEXP x, R_altrep_class_t klass);
+R_xlen_t ALTREP_LENGTH(SEXP x);
+SEXP ALTSTRING_ELT(SEXP x, R_xlen_t i);
+void *ALTVEC_DATAPTR(SEXP x);
+const void *ALTVEC_DATAPTR_RO(SEXP x);
 R_altrep_class_t R_make_altstring_class(const char *name, const char *package, DllInfo *info);
 R_altrep_class_t R_make_altinteger_class(const char *name, const char *package, DllInfo *info);
 R_altrep_class_t R_make_altreal_class(const char *name, const char *package, DllInfo *info);
