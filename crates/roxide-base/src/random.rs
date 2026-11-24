@@ -14,7 +14,6 @@ pub const MODULE: Module = bindings::MODULE;
 
 #[derive(Default)]
 struct RngExt {
-    bm_saved: Option<f64>,
     revision: u64,
 }
 
@@ -115,10 +114,12 @@ pub fn get_rng(ctx: &mut Ctx, call: &Call) -> EvalResult<Rng> {
                 ctx.ext::<LastKinds>().0 = kinds;
                 let view = ctx.session().int(value)?;
                 if view.len() == 1 {
+                    ctx.clear_box_muller_spare();
                     return Ok(Rng::seeded(time_seed(ctx), kinds));
                 }
                 // A seed can be a compact vector. Only the longest generator state is needed.
                 let words: Vec<_> = (0..view.len().min(626)).map(|i| view.get(i)).collect();
+                let spare = ctx.box_muller_spare(value, &words);
                 let mut rng = match Rng::decode_with_seed(&words, time_seed(ctx)) {
                     Ok(rng) => rng,
                     Err(error) => {
@@ -127,16 +128,18 @@ pub fn get_rng(ctx: &mut Ctx, call: &Call) -> EvalResult<Rng> {
                     }
                 };
                 if kinds.normal == NormalKind::BoxMuller {
-                    rng.bm_saved = ctx.ext::<RngExt>().bm_saved;
+                    rng.bm_saved = spare;
                 }
                 return Ok(rng);
             }
             Err(error) => {
+                ctx.clear_box_muller_spare();
                 seed_warning(ctx, call, value, error)?;
                 return Ok(Rng::seeded(time_seed(ctx), Kinds::default()));
             }
         }
     }
+    ctx.clear_box_muller_spare();
     let kinds = ctx.ext::<LastKinds>().0;
     Ok(Rng::seeded(time_seed(ctx), kinds))
 }
@@ -146,8 +149,12 @@ pub fn put_rng(ctx: &mut Ctx, rng: &Rng) -> EvalResult<()> {
     let mut words = Vec::new();
     rng.encode(&mut words);
     let (symbol, value) = seed_binding(ctx)?;
+    let spare = match value {
+        Some(value) if header(ctx, value)?.is_ok_and(|old| old != rng.kinds) => None,
+        _ => rng.bm_saved,
+    };
     let session = ctx.session_mut();
-    if let Some(value) = value
+    let seed = if let Some(value) = value
         && session
             .env_get(GLOBAL_ENV, symbol)
             .is_some_and(|binding| !binding.locked && !binding.active)
@@ -158,12 +165,14 @@ pub fn put_rng(ctx: &mut Ctx, rng: &Rng) -> EvalResult<()> {
         && let Ok(target) = session.int_mut(value)
     {
         target.copy_from_slice(&words);
+        value
     } else {
         let value = session.alloc_int_from(&words)?;
         ctx.assign(symbol, value, GLOBAL_ENV)?;
-    }
+        value
+    };
+    ctx.save_box_muller_spare(seed, words, spare);
     let state = ctx.ext::<RngExt>();
-    state.bm_saved = rng.bm_saved;
     state.revision = state.revision.wrapping_add(1);
     ctx.ext::<LastKinds>().0 = rng.kinds;
     Ok(())

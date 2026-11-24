@@ -1,14 +1,16 @@
 //! Character string interning, encoding, UTF-8 translation, and `STRING_ELT`.
 
 use std::borrow::Cow;
-use std::collections::HashSet;
-use std::ffi::{CStr, CString, c_char, c_int};
+use std::ffi::{CStr, c_char, c_int};
+use std::io::Write;
 use std::ptr::null;
 
-use roxide_eval::{Ctx, CtxExt, EvalResult};
-use roxide_gc::{SexpId, Trace, Tracer};
+use roxide_eval::{Ctx, EvalResult};
+use roxide_gc::SexpId;
+use roxide_value::na::NA_REAL_QUIET_BITS;
 use roxide_value::{CharId, Encoding, SEXP_NIL, SexpType, ValueApi};
 
+use super::memory::transient_string;
 use super::vector::{allocating, api, check_capacity, checked_len, id, index, require_type};
 use crate::abi::{R_xlen_t, Rboolean, Sexp};
 
@@ -91,48 +93,96 @@ pub(crate) fn utf8(bytes: &[u8], enc: Encoding) -> Cow<'_, [u8]> {
     }
 }
 
-// Keep converted buffers stable for the session, including across collection.
-#[derive(Default)]
-struct Translations {
-    strings: HashSet<CString>,
-    bytes: usize,
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NativeEncoding {
+    Utf8,
+    Latin1,
+    Ascii,
 }
 
-impl CtxExt for Translations {}
-impl Trace for Translations {
-    fn trace(&self, _: &mut Tracer<'_>) {}
-}
-
-fn translated_ptr(ctx: &mut Ctx, bytes: Vec<u8>) -> EvalResult<*const c_char> {
-    const MAX_TRANSLATION_BYTES: usize = 64 * 1024 * 1024;
-    let text = CString::new(bytes).map_err(|err| ctx.stop(SEXP_NIL, err.to_string()))?;
-    let cache = ctx.ext::<Translations>();
-    if let Some(text) = cache.strings.get(&text) {
-        return Ok(text.as_ptr());
+impl NativeEncoding {
+    fn current(ctx: &mut Ctx) -> Self {
+        let locale = ctx.host().locale();
+        if locale.utf8 {
+            return Self::Utf8;
+        }
+        let ctype = locale.ctype.to_ascii_uppercase();
+        let codeset = ctype.rsplit('.').next().unwrap_or(&ctype);
+        let codeset = codeset.split('@').next().unwrap_or(codeset);
+        if matches!(codeset, "ISO8859-1" | "ISO-8859-1" | "LATIN1") {
+            Self::Latin1
+        } else {
+            Self::Ascii
+        }
     }
-    let size = text.as_bytes_with_nul().len() + size_of::<CString>();
-    if size > MAX_TRANSLATION_BYTES.saturating_sub(cache.bytes) {
-        return Err(ctx.stop(SEXP_NIL, "character translation storage limit exceeded"));
-    }
-    let ptr = text.as_ptr();
-    cache.strings.insert(text);
-    cache.bytes += size;
-    Ok(ptr)
 }
 
-fn translate(ctx: &mut Ctx, x: SexpId) -> EvalResult<*const c_char> {
+fn escape_bytes(bytes: &[u8]) -> Vec<u8> {
+    let mut result = Vec::with_capacity(bytes.len());
+    for &byte in bytes {
+        if byte.is_ascii() {
+            result.push(byte);
+        } else {
+            let _ = write!(result, "<{byte:02x}>");
+        }
+    }
+    result
+}
+
+fn utf8_to_native(bytes: &[u8], latin1: bool) -> Vec<u8> {
+    let mut result = Vec::with_capacity(bytes.len());
+    for chunk in bytes.utf8_chunks() {
+        for ch in chunk.valid().chars() {
+            let code = u32::from(ch);
+            if code <= if latin1 { 255 } else { 127 } {
+                result.push(code as u8);
+            } else {
+                let width = if code <= 0xffff { 4 } else { 8 };
+                let _ = write!(result, "<U+{code:0width$X}>");
+            }
+        }
+        result.extend(escape_bytes(chunk.invalid()));
+    }
+    result
+}
+
+fn translation(
+    bytes: &[u8],
+    from: Encoding,
+    target_utf8: bool,
+    native: NativeEncoding,
+) -> Cow<'_, [u8]> {
+    use Encoding::{Latin1, Native, Utf8};
+
+    if bytes.is_ascii() {
+        return Cow::Borrowed(bytes);
+    }
+    match (target_utf8, native, from) {
+        (true, _, Latin1)
+        | (true, NativeEncoding::Latin1, Native)
+        | (false, NativeEncoding::Utf8, Latin1) => utf8(bytes, Latin1),
+        (true, NativeEncoding::Ascii, Native) | (false, NativeEncoding::Ascii, Latin1) => {
+            Cow::Owned(escape_bytes(bytes))
+        }
+        (false, NativeEncoding::Ascii, Utf8) => Cow::Owned(utf8_to_native(bytes, false)),
+        (false, NativeEncoding::Latin1, Utf8) => Cow::Owned(utf8_to_native(bytes, true)),
+        _ => Cow::Borrowed(bytes),
+    }
+}
+
+const BYTES_TRANSLATION_ERROR: &str = "translating strings with \"bytes\" encoding is not allowed";
+
+fn translate(ctx: &mut Ctx, x: SexpId, target_utf8: bool) -> EvalResult<*const c_char> {
+    let native = NativeEncoding::current(ctx);
     let s = ctx.session();
     let ch = s.sexp_as_char(x)?;
     let enc = s.char_encoding(ch)?;
     if enc == Encoding::Bytes {
-        return Err(ctx.stop(
-            SEXP_NIL,
-            "translating strings with \"bytes\" encoding is not allowed",
-        ));
+        return Err(ctx.stop(SEXP_NIL, BYTES_TRANSLATION_ERROR));
     }
-    match utf8(s.char_bytes(ch)?, enc) {
+    match translation(s.char_bytes(ch)?, enc, target_utf8, native) {
         Cow::Borrowed(_) => Ok(s.char_cstr_ptr(ch)?.0 as *const c_char),
-        Cow::Owned(bytes) => translated_ptr(ctx, bytes),
+        Cow::Owned(bytes) => transient_string(ctx, &bytes),
     }
 }
 
@@ -151,7 +201,7 @@ fn reencode(
     if to != Encoding::Latin1 {
         return match bytes {
             Cow::Borrowed(_) => Ok(text),
-            Cow::Owned(bytes) => translated_ptr(ctx, bytes),
+            Cow::Owned(bytes) => transient_string(ctx, &bytes),
         };
     }
     let Ok(value) = std::str::from_utf8(&bytes) else {
@@ -175,7 +225,197 @@ fn reencode(
             }
         }
     }
-    translated_ptr(ctx, out)
+    transient_string(ctx, &out)
+}
+
+fn partial_match(text: &[u8], pattern: &[u8], exact: Rboolean) -> Rboolean {
+    c_int::from(if exact == 0 {
+        text.starts_with(pattern)
+    } else {
+        text == pattern
+    })
+}
+
+fn match_char(ctx: &mut Ctx, x: SexpId) -> EvalResult<CharId> {
+    match ctx.session().type_of(x)? {
+        SexpType::Char => Ok(ctx.session().sexp_as_char(x)?),
+        SexpType::Str if ctx.session().xlength(x)? == 1 => Ok(ctx.session_mut().str_get(x, 0)?),
+        SexpType::Sym => super::sym::print_name(ctx, x),
+        _ => Err(ctx.stop(SEXP_NIL, "invalid partial string match")),
+    }
+}
+
+fn c_whitespace(byte: u8) -> bool {
+    byte.is_ascii_whitespace() || byte == b'\x0b'
+}
+
+fn digit_count(text: &[u8], hex: bool) -> usize {
+    text.iter()
+        .take_while(|byte| {
+            if hex {
+                byte.is_ascii_hexdigit()
+            } else {
+                byte.is_ascii_digit()
+            }
+        })
+        .count()
+}
+
+fn exponent(text: &[u8], marker: u8) -> Option<(i64, usize)> {
+    if !text
+        .first()
+        .is_some_and(|byte| byte.eq_ignore_ascii_case(&marker))
+    {
+        return Some((0, 0));
+    }
+    let text = &text[1..];
+    let start = usize::from(matches!(text.first(), Some(b'+' | b'-')));
+    let digits = &text[start..];
+    let count = digit_count(digits, false);
+    if count == 0 {
+        return None;
+    }
+    let value = digits[..count].iter().fold(0i64, |value, &byte| {
+        value
+            .saturating_mul(10)
+            .saturating_add(i64::from(byte - b'0'))
+    });
+    let sign = if text[0] == b'-' { -1 } else { 1 };
+    Some((sign * value, 1 + start + count))
+}
+
+fn hex_real(whole: &[u8], fraction: &[u8], binary_exponent: i64) -> f64 {
+    let mut significand = 0u64;
+    let mut stored = 0;
+    let mut omitted = 0i64;
+    let mut sticky = false;
+    for &byte in whole
+        .iter()
+        .chain(fraction)
+        .skip_while(|&&byte| byte == b'0')
+    {
+        let digit = match byte {
+            b'0'..=b'9' => byte - b'0',
+            b'A'..=b'F' => byte - b'A' + 10,
+            _ => byte - b'a' + 10,
+        };
+        if stored < 16 {
+            significand = (significand << 4) | u64::from(digit);
+            stored += 1;
+        } else {
+            omitted += 1;
+            sticky |= digit != 0;
+        }
+    }
+    if significand == 0 {
+        return 0.0;
+    }
+    let power = binary_exponent.saturating_add((omitted - fraction.len() as i64).saturating_mul(4));
+    let top_bit = i64::from(significand.ilog2());
+    let unbiased_exponent = power.saturating_add(top_bit);
+    if unbiased_exponent > 1023 {
+        return f64::INFINITY;
+    }
+    let target_power = unbiased_exponent.max(-1022) - 52;
+    let shift = target_power.saturating_sub(power);
+    let rounded = match shift {
+        65.. => 0,
+        64 => u64::from(significand > 1 << 63 || (significand == 1 << 63 && sticky)),
+        1..=63 => {
+            let high = significand >> shift;
+            let low = significand & ((1 << shift) - 1);
+            let half = 1 << (shift - 1);
+            high + u64::from(low > half || (low == half && (sticky || high & 1 != 0)))
+        }
+        _ => significand << (-shift),
+    };
+    let unit = if target_power < -1022 {
+        f64::from_bits(1 << (target_power + 1074))
+    } else {
+        f64::from_bits(((target_power + 1023) as u64) << 52)
+    };
+    rounded as f64 * unit
+}
+
+fn parse_c_real(text: &[u8]) -> Option<(f64, usize)> {
+    let start = text.iter().position(|&byte| !c_whitespace(byte))?;
+    let negative = text[start] == b'-';
+    let sign = usize::from(matches!(text[start], b'+' | b'-'));
+    let body_start = start + sign;
+    let body = &text[body_start..];
+    for (name, value) in [
+        (b"infinity".as_slice(), f64::INFINITY),
+        (b"inf".as_slice(), f64::INFINITY),
+        (b"nan".as_slice(), f64::NAN),
+    ] {
+        if body
+            .get(..name.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(name))
+        {
+            let value = if negative && value.is_infinite() {
+                -value
+            } else {
+                value
+            };
+            return Some((value, body_start + name.len()));
+        }
+    }
+    let hex = body.len() > 2 && (body.starts_with(b"0x") || body.starts_with(b"0X"));
+    let prefix = if hex { 2 } else { 0 };
+    let body = &body[prefix..];
+    let whole = digit_count(body, hex);
+    let dot = usize::from(body.get(whole) == Some(&b'.'));
+    let fraction_start = whole + dot;
+    let fraction = if dot == 0 {
+        0
+    } else {
+        digit_count(&body[fraction_start..], hex)
+    };
+    let mantissa_end = fraction_start + fraction;
+    if !hex && whole + fraction == 0 {
+        return None;
+    }
+    let (power, exponent_end) = exponent(&body[mantissa_end..], if hex { b'p' } else { b'e' })?;
+    let end = body_start + prefix + mantissa_end + exponent_end;
+    let value = if hex {
+        let magnitude = hex_real(&body[..whole], &body[fraction_start..mantissa_end], power);
+        if negative { -magnitude } else { magnitude }
+    } else {
+        std::str::from_utf8(&text[start..end]).ok()?.parse().ok()?
+    };
+    Some((value, end))
+}
+
+/// Parse a C string as an R real number and report where conversion stopped.
+///
+/// # Safety
+/// `text` must point to a readable C string. If `end` is nonnull, it must be writable.
+#[allow(non_snake_case)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn R_strtod(text: *const c_char, end: *mut *mut c_char) -> f64 {
+    let parsed = if text.is_null() {
+        None
+    } else {
+        // SAFETY: The caller supplies a readable NUL-terminated string.
+        parse_c_real(unsafe { CStr::from_ptr(text) }.to_bytes())
+    };
+    let (value, consumed) = parsed.unwrap_or((f64::from_bits(NA_REAL_QUIET_BITS), 0));
+    if !end.is_null() {
+        // SAFETY: The reported offset is within the string, and end is writable.
+        unsafe { end.write(text.wrapping_add(consumed).cast_mut()) };
+    }
+    value
+}
+
+/// Parse a C string as an R real number.
+///
+/// # Safety
+/// `text` must point to a readable C string.
+#[allow(non_snake_case)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn R_atof(text: *const c_char) -> f64 {
+    // SAFETY: The caller supplies the C string. R_strtod accepts a NULL end pointer.
+    unsafe { R_strtod(text, std::ptr::null_mut()) }
 }
 
 api! {
@@ -232,12 +472,12 @@ api! {
     /// Return the string bytes in the native encoding.
     fn Rf_translateChar(x: Sexp) -> *const c_char = null(); |ctx| {
         let x = id(ctx, x, "Rf_translateChar")?;
-        allocating(ctx, &[x], |ctx| translate(ctx, x))
+        allocating(ctx, &[x], |ctx| translate(ctx, x, false))
     }
     /// Return the string bytes in UTF-8.
     fn Rf_translateCharUTF8(x: Sexp) -> *const c_char = null(); |ctx| {
         let x = id(ctx, x, "Rf_translateCharUTF8")?;
-        allocating(ctx, &[x], |ctx| translate(ctx, x))
+        allocating(ctx, &[x], |ctx| translate(ctx, x, true))
     }
     /// Convert a C string between encodings.
     fn Rf_reEnc(text: *const c_char, from: c_int, to: c_int, substitute: c_int) -> *const c_char = null(); |ctx| {
@@ -256,6 +496,70 @@ api! {
         Ok(c_int::from(x == CharId::NA.as_sexp()))
     }
 
+    /// Test whether a C string is empty or consists of whitespace.
+    fn Rf_isBlankString(x: *const c_char) -> Rboolean = 0; |ctx| {
+        let text = c_text(ctx, x, "Rf_isBlankString")?;
+        Ok(c_int::from(text.iter().copied().all(c_whitespace)))
+    }
+
+    /// Test whether the object is R NULL, an empty string, or a scalar missing string.
+    fn Rf_StringBlank(x: Sexp) -> Rboolean = 0; |ctx| {
+        let x = id(ctx, x, "Rf_StringBlank")?;
+        let s = ctx.session();
+        let blank = match s.type_of(x)? {
+            SexpType::Nil => true,
+            SexpType::Char => s.char_bytes(s.sexp_as_char(x)?)?.is_empty(),
+            SexpType::Str if s.xlength(x)? == 1 => {
+                let ch = ctx.session_mut().str_get(x, 0)?;
+                ch == CharId::NA || ctx.session().char_bytes(ch)?.is_empty()
+            }
+            _ => false,
+        };
+        Ok(c_int::from(blank))
+    }
+
+    /// Test whether a C string is one of R's spellings of logical false.
+    fn Rf_StringFalse(x: *const c_char) -> Rboolean = 0; |ctx| {
+        let text = c_text(ctx, x, "Rf_StringFalse")?;
+        Ok(c_int::from(matches!(text, b"F" | b"FALSE" | b"False" | b"false")))
+    }
+
+    /// Test whether a C string is one of R's spellings of logical true.
+    fn Rf_StringTrue(x: *const c_char) -> Rboolean = 0; |ctx| {
+        let text = c_text(ctx, x, "Rf_StringTrue")?;
+        Ok(c_int::from(matches!(text, b"T" | b"TRUE" | b"True" | b"true")))
+    }
+
+    /// Match the second object against the first as a name or a prefix.
+    fn Rf_pmatch(x: Sexp, table: Sexp, exact: Rboolean) -> Rboolean = 0; |ctx| {
+        let x = id(ctx, x, "Rf_pmatch")?;
+        let table = id(ctx, table, "Rf_pmatch")?;
+        allocating(ctx, &[x, table], |ctx| {
+            let text = match_char(ctx, x)?;
+            ctx.protect(text.as_sexp());
+            let pattern = match_char(ctx, table)?;
+            if text == pattern {
+                return Ok(1);
+            }
+            let native = NativeEncoding::current(ctx);
+            let s = ctx.session();
+            let text_encoding = s.char_encoding(text)?;
+            let pattern_encoding = s.char_encoding(pattern)?;
+            if text_encoding == Encoding::Bytes || pattern_encoding == Encoding::Bytes {
+                return Err(ctx.stop(SEXP_NIL, BYTES_TRANSLATION_ERROR));
+            }
+            let text = translation(s.char_bytes(text)?, text_encoding, true, native);
+            let pattern = translation(s.char_bytes(pattern)?, pattern_encoding, true, native);
+            Ok(partial_match(&text, &pattern, exact))
+        })
+    }
+
+    /// Match the second C string against the first as a string or a prefix.
+    fn Rf_psmatch(x: *const c_char, table: *const c_char, exact: Rboolean) -> Rboolean = 0; |ctx| {
+        let text = c_text(ctx, x, "Rf_psmatch")?;
+        let pattern = c_text(ctx, table, "Rf_psmatch")?;
+        Ok(partial_match(text, pattern, exact))
+    }
 }
 
 macro_rules! encoding_predicates {
@@ -276,3 +580,35 @@ encoding_predicates!(
     Rf_charIsLatin1, |s: &roxide_value::RSession, ch| s.char_encoding(ch).map(|e| e == Encoding::Latin1);
     Rf_charIsUTF8, |s: &roxide_value::RSession, ch| s.char_encoding(ch).map(|e| e == Encoding::Utf8);
 );
+
+#[cfg(test)]
+mod tests {
+    use super::{Encoding, NativeEncoding, translation};
+
+    #[test]
+    fn native_and_utf8_translation_use_the_requested_encoding() {
+        let ascii = NativeEncoding::Ascii;
+        let latin1 = NativeEncoding::Latin1;
+        let bytes = b"\xc3\xa9\xf0\x9f\x98\x83";
+        assert_eq!(
+            translation(bytes, Encoding::Utf8, true, ascii).as_ref(),
+            bytes
+        );
+        assert_eq!(
+            translation(bytes, Encoding::Utf8, false, ascii).as_ref(),
+            b"<U+00E9><U+0001F603>"
+        );
+        assert_eq!(
+            translation(bytes, Encoding::Utf8, false, latin1).as_ref(),
+            b"\xe9<U+0001F603>"
+        );
+        assert_eq!(
+            translation(b"\xe9", Encoding::Latin1, false, ascii).as_ref(),
+            b"<e9>"
+        );
+        assert_eq!(
+            translation(b"\xe9", Encoding::Native, true, latin1).as_ref(),
+            b"\xc3\xa9"
+        );
+    }
+}

@@ -16,6 +16,7 @@ use roxide_value::{
 use crate::abi::Sexp;
 
 use super::eval::eval;
+use super::vector::{allocating, id};
 use super::{api, root};
 
 const PARSE_OK: c_int = 1;
@@ -251,6 +252,38 @@ pub unsafe extern "C" fn R_ParseEvalString(text: *const c_char, rho: Sexp) -> Se
             ctx.safepoint();
             let expr = parse_string(ctx, text)?;
             eval(ctx, expr, env).map(Sexp::from_id)
+        })
+    }
+}
+
+super::vector::api! {
+    /// Return the source reference of an enclosing closure.
+    fn R_GetCurrentSrcref(skip: c_int) -> Sexp = Sexp::NULL; |ctx| {
+        let mut frame = ctx.current_frame_id();
+        if skip < 0 { return Ok(Sexp::from_id(SEXP_NIL)); }
+        for _ in 0..=skip {
+            frame = frame.and_then(|id| ctx.parent_frame_id(id));
+            if frame.is_none() { break; }
+        }
+        let value = frame.and_then(|id| ctx.frame_info(id))
+            .map_or(SEXP_NIL, |(_, _, fun, _)| ctx.session().attr(fun, SYM_SRCREF));
+        Ok(Sexp::from_id(value))
+    }
+
+    /// Read the file name recorded for a source reference.
+    fn R_GetSrcFilename(srcref: Sexp) -> Sexp = Sexp::NULL; |ctx| {
+        let srcref = id(ctx, srcref, "R_GetSrcFilename")?;
+        allocating(ctx, &[srcref], |ctx| {
+            let srcfile = ctx.session().attr(srcref, SYM_SRCFILE);
+            if ctx.session().type_of(srcfile)? == SexpType::Env {
+                let name = ctx.session_mut().intern("filename")?;
+                if let Some(value) = ctx.get_local(name, srcfile)?
+                    && ctx.session().type_of(value)? == SexpType::Str
+                {
+                    return Ok(Sexp::from_id(value));
+                }
+            }
+            Ok(Sexp::from_id(ctx.session_mut().scalar_str("")?))
         })
     }
 }

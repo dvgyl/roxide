@@ -1,4 +1,4 @@
-//! Environment lookup, assignment, locks, and active bindings.
+//! Environment lookup, bindings, and variadic arguments.
 
 #![allow(non_snake_case)]
 
@@ -7,10 +7,13 @@ use std::ffi::{CStr, c_char, c_int};
 use roxide_eval::{Ctx, EvalResult, Unwind};
 use roxide_gc::SexpId;
 use roxide_value::{
-    BASE_NAMESPACE, Binding, CharId, Encoding, GLOBAL_ENV, SEXP_MISSING, SEXP_NIL, SEXP_UNBOUND,
-    SYM_NAME, SYM_NAMESPACE_ENV, SYM_SPEC, SexpType, Sym, ValueApi, ValueError,
+    BASE_ENV, BASE_NAMESPACE, Binding, CharId, EMPTY_ENV, Encoding, GLOBAL_ENV, PromiseState,
+    SEXP_MISSING, SEXP_NIL, SEXP_UNBOUND, SYM_DOT_PACKAGE_NAME, SYM_DOTS, SYM_NAME,
+    SYM_NAMESPACE_ENV, SYM_SPEC, SexpType, Sym, ValueApi, ValueError,
 };
 
+use super::sym::print_name;
+use super::vector::alloc_vector;
 use super::{api, environment, root, symbol};
 use crate::abi::{Rboolean, Sexp};
 
@@ -265,6 +268,84 @@ pub unsafe extern "C" fn R_ParentEnv(rho: Sexp) -> Sexp {
             Ok(Sexp::from_id(ctx.session().env_enclos(env)?))
         })
     }
+}
+
+/// Find the first top-level environment or the requested target in the parent chain.
+///
+/// # Safety
+/// Call inside an active native trampoline.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Rf_topenv(target: Sexp, rho: Sexp) -> Sexp {
+    // SAFETY: The caller provides an active native trampoline.
+    unsafe {
+        api(Sexp::NULL, |ctx| {
+            let target = root(ctx, target)?;
+            let mut env = root(ctx, rho)?;
+            if env == SEXP_NIL {
+                return if target == env {
+                    Ok(Sexp::from_id(SEXP_NIL))
+                } else {
+                    Err(ctx.stop(SEXP_NIL, "use of NULL environment is defunct"))
+                };
+            }
+            for _ in 0..ctx.session().heap.live_objects() {
+                if env == EMPTY_ENV || env == SEXP_NIL {
+                    return Ok(Sexp::from_id(GLOBAL_ENV));
+                }
+                if env == target
+                    || matches!(env, GLOBAL_ENV | BASE_ENV | BASE_NAMESPACE)
+                    || package_name(ctx, env)?.is_some()
+                    || has_namespace_spec(ctx, env)?
+                    || ctx
+                        .session()
+                        .env_get(env, SYM_DOT_PACKAGE_NAME)
+                        .is_some_and(|binding| binding.value != SEXP_UNBOUND)
+                {
+                    return Ok(Sexp::from_id(env));
+                }
+                env = ctx.session().env_enclos(env)?;
+            }
+            Err(ctx.stop(SEXP_NIL, "cyclic environment chain"))
+        })
+    }
+}
+
+/// Return a list vector of the symbols bound in one frame.
+///
+/// # Safety
+/// Call inside an active native trampoline.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn R_envSymbols(rho: Sexp) -> Sexp {
+    // SAFETY: The caller provides an active native trampoline.
+    unsafe {
+        api(Sexp::NULL, |ctx| {
+            let env = root(ctx, rho)?;
+            if ctx.session().type_of(env)? != SexpType::Env {
+                return Err(ctx.stop(SEXP_NIL, "invalid 'envir' argument"));
+            }
+            ctx.safepoint();
+            let mut entries = ctx.session().env_entries(env)?;
+            entries.retain(|(_, binding)| binding.value != SEXP_UNBOUND);
+            let symbols = alloc_vector(ctx, SexpType::Vec, entries.len())?;
+            let session = ctx.session_mut();
+            for (i, (sym, _)) in entries.into_iter().rev().enumerate() {
+                session.list_set(symbols, i, sym.as_sexp())?;
+            }
+            Ok(Sexp::from_id(symbols))
+        })
+    }
+}
+
+fn has_namespace_spec(ctx: &mut Ctx, env: SexpId) -> EvalResult<bool> {
+    let info = legacy_lookup(ctx, SYM_NAMESPACE_ENV, env)?;
+    if ctx.session().type_of(info)? != SexpType::Env {
+        return Ok(false);
+    }
+    let spec = legacy_lookup(ctx, SYM_SPEC, info)?;
+    Ok(ctx
+        .session()
+        .str_slice(spec)
+        .is_ok_and(|parts| !parts.is_empty()))
 }
 
 fn package_name(ctx: &Ctx, env: SexpId) -> EvalResult<Option<SexpId>> {
@@ -568,6 +649,492 @@ pub unsafe extern "C" fn R_MakeActiveBinding(sym: Sexp, fun: Sexp, rho: Sexp) {
                     "cannot change active binding if binding is locked",
                 )),
                 other => Ok(other?),
+            }
+        })
+    }
+}
+
+enum BindingValue {
+    Unbound,
+    Value,
+    Missing,
+    Delayed { expr: SexpId, env: SexpId },
+    Forced { expr: SexpId },
+    Active,
+}
+
+fn binding_value(ctx: &Ctx, value: SexpId) -> EvalResult<BindingValue> {
+    Ok(match value {
+        SEXP_UNBOUND => BindingValue::Unbound,
+        SEXP_MISSING => BindingValue::Missing,
+        _ if ctx.session().type_of(value)? == SexpType::Prom => {
+            let (expr, env, _, state) = ctx.session().promise_parts(value)?;
+            if state == PromiseState::Forced {
+                BindingValue::Forced { expr }
+            } else {
+                BindingValue::Delayed { expr, env }
+            }
+        }
+        _ => BindingValue::Value,
+    })
+}
+
+fn binding_api_key(ctx: &mut Ctx, sym: Sexp, rho: Sexp) -> EvalResult<(Sym, SexpId)> {
+    let sym = root(ctx, sym)?;
+    let sym = ctx
+        .session()
+        .sexp_as_sym(sym)
+        .map_err(|_| ctx.stop(SEXP_NIL, "not a symbol"))?;
+    Ok((sym, binding_api_env(ctx, rho)?))
+}
+
+fn binding_api_env(ctx: &mut Ctx, rho: Sexp) -> EvalResult {
+    let env = root(ctx, rho)?;
+    if ctx.session().type_of(env)? != SexpType::Env {
+        return Err(ctx.stop(SEXP_NIL, "not an environment"));
+    }
+    Ok(env)
+}
+
+fn inspect_binding(ctx: &mut Ctx, sym: Sexp, rho: Sexp) -> EvalResult<BindingValue> {
+    let (sym, env) = binding_api_key(ctx, sym, rho)?;
+    match ctx.session().env_get(env, sym) {
+        Some(binding) if binding.active => Ok(BindingValue::Active),
+        Some(binding) => binding_value(ctx, binding.value),
+        None => Ok(BindingValue::Unbound),
+    }
+}
+
+fn promise_expression(ctx: &mut Ctx, mut expr: SexpId) -> EvalResult<Sexp> {
+    let session = ctx.session();
+    for _ in 0..session.heap.live_objects() {
+        if session.type_of(expr)? != SexpType::Prom {
+            return Ok(Sexp::from_id(expr));
+        }
+        expr = session.promise_parts(expr)?.0;
+    }
+    Err(ctx.stop(SEXP_NIL, "cyclic promise expression"))
+}
+
+/// Binding types in the order of `R_BindingType_t` in `Rinternals.h`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub enum RBindingType {
+    /// The frame has no binding for the symbol.
+    Unbound,
+    /// The frame binds the symbol to a value.
+    Value,
+    /// The frame binds the symbol to a missing argument.
+    Missing,
+    /// The frame binds the symbol to a promise that has no cached value.
+    Delayed,
+    /// The frame binds the symbol to a promise with a cached value.
+    Forced,
+    /// The frame binds the symbol to an active binding function.
+    Active,
+}
+
+/// Get the type of a binding without evaluating it.
+///
+/// # Safety
+/// Call inside an active native trampoline.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn R_GetBindingType(sym: Sexp, rho: Sexp) -> RBindingType {
+    // SAFETY: The caller provides an active native trampoline.
+    unsafe {
+        api(RBindingType::Unbound, |ctx| {
+            Ok(match inspect_binding(ctx, sym, rho)? {
+                BindingValue::Unbound => RBindingType::Unbound,
+                BindingValue::Value => RBindingType::Value,
+                BindingValue::Missing => RBindingType::Missing,
+                BindingValue::Delayed { .. } => RBindingType::Delayed,
+                BindingValue::Forced { .. } => RBindingType::Forced,
+                BindingValue::Active => RBindingType::Active,
+            })
+        })
+    }
+}
+
+/// Get the expression of a forced binding.
+///
+/// # Safety
+/// Call inside an active native trampoline.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn R_ForcedBindingExpression(sym: Sexp, rho: Sexp) -> Sexp {
+    // SAFETY: The caller provides an active native trampoline.
+    unsafe {
+        api(Sexp::NULL, |ctx| match inspect_binding(ctx, sym, rho)? {
+            BindingValue::Forced { expr } => promise_expression(ctx, expr),
+            _ => Err(ctx.stop(SEXP_NIL, "not a forced binding")),
+        })
+    }
+}
+
+/// Get the expression of a delayed binding.
+///
+/// # Safety
+/// Call inside an active native trampoline.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn R_DelayedBindingExpression(sym: Sexp, rho: Sexp) -> Sexp {
+    // SAFETY: The caller provides an active native trampoline.
+    unsafe {
+        api(Sexp::NULL, |ctx| match inspect_binding(ctx, sym, rho)? {
+            BindingValue::Delayed { expr, .. } => promise_expression(ctx, expr),
+            _ => Err(ctx.stop(SEXP_NIL, "not a delayed binding")),
+        })
+    }
+}
+
+/// Get the evaluation environment of a delayed binding.
+///
+/// # Safety
+/// Call inside an active native trampoline.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn R_DelayedBindingEnvironment(sym: Sexp, rho: Sexp) -> Sexp {
+    // SAFETY: The caller provides an active native trampoline.
+    unsafe {
+        api(Sexp::NULL, |ctx| match inspect_binding(ctx, sym, rho)? {
+            BindingValue::Delayed { env, .. } => Ok(Sexp::from_id(env)),
+            BindingValue::Unbound => Err(ctx.stop(SEXP_NIL, "unbound variable")),
+            BindingValue::Active => {
+                Err(ctx.stop(SEXP_NIL, "BINDING_OR_SYMBOL_VALUE called on active binding"))
+            }
+            _ => Err(ctx.stop(SEXP_NIL, "not a delayed binding")),
+        })
+    }
+}
+
+fn assign_promise(ctx: &mut Ctx, sym: Sym, env: SexpId, promise: SexpId) -> EvalResult<()> {
+    if let Some(binding) = ctx.session().env_get(env, sym)
+        && binding.active
+        && !binding.locked
+    {
+        ctx.protect(binding.value);
+        let value = ctx.force(promise)?;
+        return ctx
+            .apply(binding.value, &[(None, value)], SEXP_NIL, env)
+            .map(|_| ());
+    }
+    ctx.assign(sym, promise, env)
+}
+
+/// Bind a symbol to a promise with a cached value.
+///
+/// # Safety
+/// Call inside an active native trampoline.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn R_MakeForcedBinding(sym: Sexp, expr: Sexp, value: Sexp, rho: Sexp) {
+    // SAFETY: The caller provides an active native trampoline.
+    unsafe {
+        api((), |ctx| {
+            let (sym, env) = binding_api_key(ctx, sym, rho)?;
+            let expr = root(ctx, expr)?;
+            let value = root(ctx, value)?;
+            ctx.safepoint();
+            let session = ctx.session_mut();
+            let promise = session.alloc_promise(expr, SEXP_NIL)?;
+            if value != SEXP_UNBOUND {
+                session.set_promise_state(promise, PromiseState::Forced, SEXP_NIL, value)?;
+            }
+            assign_promise(ctx, sym, env, promise)
+        })
+    }
+}
+
+/// Bind a symbol to a promise with an expression and an evaluation environment.
+///
+/// # Safety
+/// Call inside an active native trampoline.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn R_MakeDelayedBinding(sym: Sexp, expr: Sexp, eval_env: Sexp, rho: Sexp) {
+    // SAFETY: The caller provides an active native trampoline.
+    unsafe {
+        api((), |ctx| {
+            let (sym, env) = binding_api_key(ctx, sym, rho)?;
+            let expr = root(ctx, expr)?;
+            let eval_env = binding_api_env(ctx, eval_env)?;
+            ctx.safepoint();
+            let promise = ctx.session_mut().alloc_promise(expr, eval_env)?;
+            assign_promise(ctx, sym, env, promise)
+        })
+    }
+}
+
+/// Bind a symbol to a missing argument.
+///
+/// # Safety
+/// Call inside an active native trampoline.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn R_MakeMissingBinding(sym: Sexp, rho: Sexp) {
+    // SAFETY: The caller provides an active native trampoline.
+    unsafe {
+        api((), |ctx| {
+            let (sym, env) = binding_api_key(ctx, sym, rho)?;
+            ctx.assign(sym, SEXP_MISSING, env)
+        })
+    }
+}
+
+fn is_dots(ctx: &Ctx, value: SexpId) -> EvalResult<bool> {
+    Ok(value == SEXP_MISSING || ctx.session().type_of(value)? == SexpType::Dot)
+}
+
+/// Find the first frame with a dots binding. Return the empty environment if absent.
+///
+/// # Safety
+/// Call inside an active native trampoline.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn R_findDotsEnv(rho: Sexp) -> Sexp {
+    // SAFETY: The caller provides an active native trampoline.
+    unsafe {
+        api(Sexp::NULL, |ctx| {
+            let mut env = binding_api_env(ctx, rho)?;
+            for _ in 0..ctx.session().heap.live_objects() {
+                if env == EMPTY_ENV || env == SEXP_NIL {
+                    return Ok(Sexp::from_id(EMPTY_ENV));
+                }
+                let dots = legacy_lookup(ctx, SYM_DOTS, env)?;
+                if is_dots(ctx, dots)? {
+                    return Ok(Sexp::from_id(env));
+                }
+                env = ctx.session().env_enclos(env)?;
+            }
+            Err(ctx.stop(SEXP_NIL, "cyclic environment chain"))
+        })
+    }
+}
+
+/// Test for a dots binding in one frame.
+///
+/// # Safety
+/// Call inside an active native trampoline.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn R_DotsExist(rho: Sexp) -> Rboolean {
+    // SAFETY: The caller provides an active native trampoline.
+    unsafe {
+        api(0, |ctx| {
+            let env = binding_api_env(ctx, rho)?;
+            let dots = legacy_lookup(ctx, SYM_DOTS, env)?;
+            Ok(Rboolean::from(is_dots(ctx, dots)?))
+        })
+    }
+}
+
+fn local_dots(ctx: &mut Ctx, rho: Sexp) -> EvalResult {
+    let env = binding_api_env(ctx, rho)?;
+    let dots = legacy_lookup(ctx, SYM_DOTS, env)?;
+    if dots == SEXP_UNBOUND {
+        return Err(ctx.stop(
+            SEXP_NIL,
+            "incorrect context: the current call has no '...' to look in",
+        ));
+    }
+    Ok(if ctx.session().type_of(dots)? == SexpType::Dot {
+        dots
+    } else {
+        SEXP_NIL
+    })
+}
+
+fn dots_length(ctx: &mut Ctx, dots: SexpId) -> EvalResult<usize> {
+    let limit = ctx.session().heap.live_objects();
+    let len = ctx
+        .session()
+        .pairlist_iter(dots)
+        .take(limit.saturating_add(1))
+        .count();
+    if len > limit {
+        return Err(ctx.stop(SEXP_NIL, "cyclic ... list"));
+    }
+    Ok(len)
+}
+
+/// Count the dots arguments in one frame.
+///
+/// # Safety
+/// Call inside an active native trampoline.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn R_DotsLength(rho: Sexp) -> c_int {
+    // SAFETY: The caller provides an active native trampoline.
+    unsafe {
+        api(0, |ctx| {
+            let dots = local_dots(ctx, rho)?;
+            c_int::try_from(dots_length(ctx, dots)?)
+                .map_err(|_| ctx.stop(SEXP_NIL, "too many ... arguments"))
+        })
+    }
+}
+
+/// Get the names of the dots arguments in one frame. Return R NULL if none have names.
+///
+/// # Safety
+/// Call inside an active native trampoline.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn R_DotsNames(rho: Sexp) -> Sexp {
+    // SAFETY: The caller provides an active native trampoline.
+    unsafe {
+        api(Sexp::NULL, |ctx| {
+            let mut dots = local_dots(ctx, rho)?;
+            let len = dots_length(ctx, dots)?;
+            if !ctx
+                .session()
+                .pairlist_iter(dots)
+                .any(|(tag, _)| tag.is_some())
+            {
+                return Ok(Sexp::from_id(SEXP_NIL));
+            }
+            ctx.protect(dots);
+            ctx.safepoint();
+            let names = alloc_vector(ctx, SexpType::Str, len)?;
+            for i in 0..len {
+                let (_, rest, tag) = ctx.session().cons_parts(dots)?;
+                if tag != SEXP_NIL {
+                    let name = print_name(ctx, tag)?;
+                    ctx.session_mut().str_set(names, i, name)?;
+                }
+                dots = rest;
+            }
+            Ok(Sexp::from_id(names))
+        })
+    }
+}
+
+fn dot_value(ctx: &mut Ctx, i: c_int, rho: Sexp) -> EvalResult {
+    if i <= 0 {
+        return Err(ctx.stop(
+            SEXP_NIL,
+            format!("indexing '...' with non-positive index {i}"),
+        ));
+    }
+    let env = binding_api_env(ctx, rho)?;
+    let dots = legacy_lookup(ctx, SYM_DOTS, env)?;
+    if dots == SEXP_UNBOUND {
+        return Err(ctx.stop(
+            SEXP_NIL,
+            format!("..{i} used in an incorrect context, no ... to look in"),
+        ));
+    }
+    if !is_dots(ctx, dots)? {
+        return Err(ctx.stop(SEXP_NIL, "bad ... value"));
+    }
+    let index = (i - 1) as usize;
+    let limit = ctx.session().heap.live_objects();
+    if index < limit
+        && let Some((_, value)) = ctx.session().pairlist_iter(dots).nth(index)
+    {
+        return Ok(value);
+    }
+    let elements = if i == 1 { "element" } else { "elements" };
+    Err(ctx.stop(
+        SEXP_NIL,
+        format!("the ... list contains fewer than {i} {elements}"),
+    ))
+}
+
+/// Dots argument types in the order of `R_DotType_t` in `Rinternals.h`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub enum RDotType {
+    /// The argument holds a value.
+    Value,
+    /// The argument is missing.
+    Missing,
+    /// The argument holds a promise without a cached value.
+    Delayed,
+    /// The argument holds a promise with a cached value.
+    Forced,
+}
+
+/// Get the type of a dots argument without evaluating it.
+///
+/// # Safety
+/// Call inside an active native trampoline.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn R_GetDotType(i: c_int, rho: Sexp) -> RDotType {
+    // SAFETY: The caller provides an active native trampoline.
+    unsafe {
+        api(RDotType::Value, |ctx| {
+            let value = dot_value(ctx, i, rho)?;
+            Ok(match binding_value(ctx, value)? {
+                BindingValue::Missing => RDotType::Missing,
+                BindingValue::Delayed { .. } => RDotType::Delayed,
+                BindingValue::Forced { .. } => RDotType::Forced,
+                _ => RDotType::Value,
+            })
+        })
+    }
+}
+
+/// Get the value of a dots argument. Force its promise if necessary.
+///
+/// # Safety
+/// Call inside an active native trampoline.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn R_DotsElt(i: c_int, rho: Sexp) -> Sexp {
+    // SAFETY: The caller provides an active native trampoline.
+    unsafe {
+        api(Sexp::NULL, |ctx| {
+            let value = dot_value(ctx, i, rho)?;
+            if value == SEXP_MISSING {
+                return Err(ctx.stop(SEXP_NIL, "argument is missing, with no default"));
+            }
+            if ctx.session().type_of(value)? == SexpType::Prom {
+                return ctx.force(value).map(Sexp::from_id);
+            }
+            Ok(Sexp::from_id(value))
+        })
+    }
+}
+
+/// Get the expression of a forced dots argument.
+///
+/// # Safety
+/// Call inside an active native trampoline.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn R_DotForcedExpression(i: c_int, rho: Sexp) -> Sexp {
+    // SAFETY: The caller provides an active native trampoline.
+    unsafe {
+        api(Sexp::NULL, |ctx| {
+            let value = dot_value(ctx, i, rho)?;
+            match binding_value(ctx, value)? {
+                BindingValue::Forced { expr } => promise_expression(ctx, expr),
+                _ => Err(ctx.stop(SEXP_NIL, "not a forced ... element")),
+            }
+        })
+    }
+}
+
+/// Get the expression of a delayed dots argument.
+///
+/// # Safety
+/// Call inside an active native trampoline.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn R_DotDelayedExpression(i: c_int, rho: Sexp) -> Sexp {
+    // SAFETY: The caller provides an active native trampoline.
+    unsafe {
+        api(Sexp::NULL, |ctx| {
+            let value = dot_value(ctx, i, rho)?;
+            match binding_value(ctx, value)? {
+                BindingValue::Delayed { expr, .. } => promise_expression(ctx, expr),
+                _ => Err(ctx.stop(SEXP_NIL, "not a delayed ... element")),
+            }
+        })
+    }
+}
+
+/// Get the evaluation environment of a delayed dots argument.
+///
+/// # Safety
+/// Call inside an active native trampoline.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn R_DotDelayedEnvironment(i: c_int, rho: Sexp) -> Sexp {
+    // SAFETY: The caller provides an active native trampoline.
+    unsafe {
+        api(Sexp::NULL, |ctx| {
+            let value = dot_value(ctx, i, rho)?;
+            match binding_value(ctx, value)? {
+                BindingValue::Delayed { env, .. } => Ok(Sexp::from_id(env)),
+                _ => Err(ctx.stop(SEXP_NIL, "not a delayed ... element")),
             }
         })
     }

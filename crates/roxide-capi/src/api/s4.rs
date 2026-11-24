@@ -10,7 +10,7 @@ use super::eval::current_env;
 use super::string::{c_text, utf8};
 use super::sym::install;
 use super::vector::{allocating, api, id};
-use crate::abi::Sexp;
+use crate::abi::{Rboolean, Sexp};
 
 fn slot_name(ctx: &mut Ctx, name: Sexp, api_name: &str) -> EvalResult<Sym> {
     let name = id(ctx, name, api_name)?;
@@ -32,8 +32,7 @@ fn slot_name(ctx: &mut Ctx, name: Sexp, api_name: &str) -> EvalResult<Sym> {
 
 fn slot_value(ctx: &mut Ctx, object: SexpId, name: Sym) -> EvalResult<SexpId> {
     if ctx.session().sym_name(name)? == ".Data" && ctx.session().is_s4(object)? {
-        let env = current_env(ctx);
-        return ctx.call_function("@", &[(None, object), (None, name.as_sexp())], env);
+        return Ok(ctx.s4_data_part(object)?.unwrap_or(SEXP_NIL));
     }
     let value = ctx.session().attr(object, name);
     match value {
@@ -108,13 +107,36 @@ api! {
     fn R_has_slot(x: Sexp, name: Sexp) -> c_int = 0; |ctx| {
         let x = id(ctx, x, "R_has_slot")?;
         let name = slot_name(ctx, name, "R_has_slot")?;
-        let present = ctx.session().attr(x, name) != SEXP_NIL;
-        if !present && ctx.session().sym_name(name)? == ".Data" {
-            let xdata = ctx.session_mut().intern(".xData")?;
-            return Ok(c_int::from(ctx.session().is_s4(x)?
-                && (ctx.session().type_of(x)? != SexpType::Obj || ctx.session().attr(x, xdata) != SEXP_NIL)));
+        if ctx.session().sym_name(name)? == ".Data" && ctx.session().is_s4(x)? {
+            return Ok(c_int::from(ctx.s4_data_source(x)?.is_some()));
         }
-        Ok(c_int::from(present))
+        Ok(c_int::from(ctx.session().attr(x, name) != SEXP_NIL))
+    }
+
+    /// Set or clear the S4 flag, with optional conversion to the data part.
+    fn Rf_asS4(x: Sexp, flag: Rboolean, complete: c_int) -> Sexp = Sexp::NULL; |ctx| {
+        let value = id(ctx, x, "Rf_asS4")?;
+        let flag = flag != 0;
+        if ctx.session().is_s4(value)? == flag {
+            return Ok(x);
+        }
+        allocating(ctx, &[value], |ctx| {
+            if !flag && complete != 0 {
+                if ctx.session().type_of(value)? != SexpType::Obj
+                    && let Some(data) = ctx.s4_data_part(value)?
+                    && !ctx.session().is_s4(data)?
+                {
+                    return Ok(Sexp::from_id(data));
+                }
+                if complete == 1 {
+                    return Err(ctx.stop(SEXP_NIL, "object does not correspond to a valid S3 object"));
+                }
+                return Ok(x);
+            }
+            let copy = ctx.session_mut().shallow_duplicate(value)?;
+            ctx.session_mut().set_s4_flag(copy, flag)?;
+            Ok(Sexp::from_id(copy))
+        })
     }
 
     /// Find a class definition by name.

@@ -124,6 +124,7 @@ pub(crate) struct ExtEntry {
 /// Core Roxide execution context owning the [`RSession`], [`Host`], frames, and primitive table.
 pub struct Ctx {
     pub(crate) session: RSession,
+    box_muller_spare: Option<BoxMullerSpare>,
     pub(crate) host: HostStack,
     pub(crate) sources: SourceMap,
     pub(crate) opts: OptionsCache,
@@ -157,6 +158,12 @@ pub struct Ctx {
     pub(crate) native_hooks: Option<&'static dyn NativeHooks>,
     pub(crate) jit_level: u8,
     pub(crate) interactive: bool,
+}
+
+struct BoxMullerSpare {
+    seed: SexpId,
+    words: Vec<i32>,
+    value: f64,
 }
 
 type StreamSink = Box<dyn FnMut(&mut Ctx, &[u8]) -> EvalResult<()>>;
@@ -377,6 +384,28 @@ impl RootSet for CtxRoots<'_> {
 }
 
 impl Ctx {
+    /// Return a spare normal if the seed binding and its contents still match.
+    pub fn box_muller_spare(&mut self, seed: SexpId, words: &[i32]) -> Option<f64> {
+        if let Some(spare) = &self.box_muller_spare
+            && spare.seed == seed
+            && spare.words == words
+        {
+            return Some(spare.value);
+        }
+        self.box_muller_spare = None;
+        None
+    }
+
+    /// Replace the spare normal after saving the random stream.
+    pub fn save_box_muller_spare(&mut self, seed: SexpId, words: Vec<i32>, spare: Option<f64>) {
+        self.box_muller_spare = spare.map(|value| BoxMullerSpare { seed, words, value });
+    }
+
+    /// Discard the spare normal when the seed binding is absent or invalid.
+    pub fn clear_box_muller_spare(&mut self) {
+        self.box_muller_spare = None;
+    }
+
     /// Construct a new [`Ctx`] with the given [`Host`] and [`GcPolicy`], registering core M0 primitives.
     pub fn new(host: Box<dyn Host>, policy: GcPolicy) -> Result<Self, InternalError> {
         let mut session = RSession::new(policy)?;
@@ -400,6 +429,7 @@ impl Ctx {
         };
         let mut ctx = Self {
             session,
+            box_muller_spare: None,
             host: HostStack {
                 base: host,
                 captures: Vec::new(),

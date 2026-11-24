@@ -87,3 +87,20 @@ pub unsafe extern "C" fn Rf_onintrNoResume() {
     // SAFETY: The caller provides an active native trampoline.
     unsafe { api((), |ctx| ctx.signal_native_interrupt(false)) }
 }
+
+/// Signal an interrupt condition if the host has a pending user interrupt.
+///
+/// # Safety
+/// Call inside an active native trampoline.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn R_CheckUserInterrupt() {
+    // SAFETY: The caller provides an active native trampoline.
+    unsafe {
+        api((), |ctx| {
+            if ctx.host().poll_interrupt() {
+                ctx.signal_native_interrupt(true)?;
+            }
+            Ok(())
+        })
+    }
+}

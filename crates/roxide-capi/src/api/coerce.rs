@@ -16,7 +16,7 @@ use super::vector::{
     allocating, api, check_capacity, complex_from_c, complex_to_c, decode_type, id, is_atomic,
     is_vector,
 };
-use crate::abi::{Rbyte, Rcomplex, Sexp};
+use crate::abi::{Rboolean, Rbyte, Rcomplex, Sexp};
 
 pub(crate) fn scalar_element(
     ctx: &mut Ctx,
@@ -233,6 +233,22 @@ fn as_logical(ctx: &mut Ctx, x: SexpId) -> EvalResult<c_int> {
     })
 }
 
+fn as_bool(ctx: &mut Ctx, x: SexpId) -> EvalResult<bool> {
+    if is_atomic(ctx.session().type_of(x)?) {
+        let len = ctx.session().xlength(x)?;
+        if len > 1 {
+            return Err(ctx.stop(
+                SEXP_NIL,
+                format!("'length = {len}' in coercion to 'logical(1)'"),
+            ));
+        }
+    }
+    match as_logical(ctx, x)? {
+        NA_INTEGER => Err(ctx.stop(SEXP_NIL, "NA in coercion to boolean")),
+        value => Ok(value != 0),
+    }
+}
+
 macro_rules! as_scalars {
     ($($name:ident => $ty:ident, $result:ty, $view:ident, $missing:expr, $get:expr);+ $(;)?) => {
         api! {$(
@@ -269,6 +285,25 @@ api! {
     fn Rf_asLogical(x: Sexp) -> c_int = NA_INTEGER; |ctx| {
         let x = id(ctx, x, "Rf_asLogical")?;
         as_logical(ctx, x)
+    }
+    /// Test whether the object is a logical vector with one TRUE element.
+    fn R_isTRUE(x: Sexp) -> bool = false; |ctx| {
+        let x = id(ctx, x, "R_isTRUE")?;
+        if ctx.session().type_of(x)? != SexpType::Lgl {
+            return Ok(false);
+        }
+        let value = ctx.session().lgl(x)?;
+        Ok(value.len() == 1 && value.get(0) == RLogical::TRUE)
+    }
+    /// Coerce an R value to a two-state C boolean.
+    fn Rf_asBool(x: Sexp) -> bool = false; |ctx| {
+        let x = id(ctx, x, "Rf_asBool")?;
+        as_bool(ctx, x)
+    }
+    /// Coerce an R value to a two-state Rboolean.
+    fn Rf_asRboolean(x: Sexp) -> Rboolean = 0; |ctx| {
+        let x = id(ctx, x, "Rf_asRboolean")?;
+        Ok(c_int::from(as_bool(ctx, x)?))
     }
     /// Convert the first element to a logical value, with optional length checking.
     fn Rf_asLogical2(x: Sexp, checking: c_int, call: Sexp) -> c_int = NA_INTEGER; |ctx| {

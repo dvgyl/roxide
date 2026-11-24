@@ -1,6 +1,6 @@
 //! Attribute getters, setters, names, dim, dimnames, class, and inherits.
 
-use std::ffi::{c_char, c_int};
+use std::ffi::{c_char, c_int, c_void};
 
 use roxide_eval::{Ctx, EvalResult};
 use roxide_gc::SexpId;
@@ -186,7 +186,12 @@ fn dimnames(ctx: &mut Ctx, x: SexpId, value: SexpId) -> EvalResult<SexpId> {
     Ok(out)
 }
 
-fn copy_attrs(ctx: &mut Ctx, source: SexpId, target: SexpId, most: bool) -> EvalResult<()> {
+pub(super) fn copy_attrs(
+    ctx: &mut Ctx,
+    source: SexpId,
+    target: SexpId,
+    most: bool,
+) -> EvalResult<()> {
     if target == SEXP_NIL || source == target {
         return Ok(());
     }
@@ -238,6 +243,79 @@ fn attr_names(ctx: &mut Ctx, attrs: &[(Sym, SexpId)]) -> EvalResult<SexpId> {
     Ok(ctx.session_mut().alloc_str_from(&names)?)
 }
 
+type MapFn = unsafe extern "C" fn(Sexp, Sexp, *mut c_void) -> Sexp;
+
+struct AttrCall {
+    fun: MapFn,
+    name: Sexp,
+    value: Sexp,
+    data: *mut c_void,
+    result: Sexp,
+}
+
+unsafe extern "C" fn invoke_map(data: *mut c_void) {
+    // SAFETY: The trampoline passes an exclusive pointer to its live call record.
+    let call = unsafe { &mut *data.cast::<AttrCall>() };
+    // SAFETY: The caller supplies the callback and its data. The handles are rooted.
+    call.result = unsafe { (call.fun)(call.name, call.value, call.data) };
+}
+
+fn map_attributes(ctx: &mut Ctx, x: SexpId, fun: MapFn, data: *mut c_void) -> EvalResult<Sexp> {
+    allocating(ctx, &[x], |ctx| {
+        let attrs = ctx.session().attrs(x)?;
+        for &(name, value) in &attrs {
+            ctx.protect(name.as_sexp());
+            ctx.protect(value);
+        }
+        for (name, value) in attrs {
+            let mut call = AttrCall {
+                fun,
+                name: Sexp::from_id(name.as_sexp()),
+                value: Sexp::from_id(value),
+                data,
+                result: Sexp::NULL,
+            };
+            // SAFETY: The call record is live until the callback returns or jumps.
+            unsafe {
+                crate::jump::enter_trampoline_with(
+                    ctx,
+                    crate::jump::FrameKind::Callback,
+                    invoke_map,
+                    std::ptr::from_mut(&mut call).cast(),
+                )?
+            };
+            if call.result != Sexp::NULL {
+                return Ok(call.result);
+            }
+        }
+        Ok(Sexp::NULL)
+    })
+}
+
+fn class(ctx: &mut Ctx, x: SexpId) -> EvalResult<SexpId> {
+    let s = ctx.session_mut();
+    let explicit = s.attr(x, SYM_CLASS);
+    if explicit != SEXP_NIL && s.xlength(explicit)? > 0 {
+        return Ok(explicit);
+    }
+    let names: &[&str] = match s.xlength(s.attr(x, SYM_DIM))? {
+        0 => &[match s.type_of(x)? {
+            SexpType::Real => "numeric",
+            SexpType::Clo | SexpType::Builtin | SexpType::Special => "function",
+            SexpType::Lang => s.call_class(x)?,
+            SexpType::Sym => "name",
+            ty => ty.type_name(s.is_s4(x)?),
+        }],
+        2 => &["matrix", "array"],
+        _ => &["array"],
+    };
+    let names = names
+        .iter()
+        .map(|name| s.mk_char(name.as_bytes(), roxide_value::Encoding::Native))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(s.alloc_str_from(&names)?)
+}
+
 api! {
     /// Read an attribute by name and expand compact row names.
     fn Rf_getAttrib(x: Sexp, key: Sexp) -> Sexp = Sexp::NULL; |ctx| {
@@ -245,7 +323,6 @@ api! {
         let key = id(ctx, key, "Rf_getAttrib")?;
         let ty = ctx.session().type_of(key)?;
         let tag_names = has_tag_names(ctx.session().type_of(x)?);
-        // An ordinary symbol lookup can return the stored attribute directly.
         if ty == SexpType::Sym && key != SYM_ROW_NAMES.as_sexp()
             && !(key == SYM_NAMES.as_sexp() && tag_names)
         {
@@ -345,6 +422,47 @@ api! {
         let x = id(ctx, x, "Rf_GetRowNames")?;
         allocating(ctx, &[x], |ctx| {
             Ok(Sexp::from_id(ctx.session_mut().attr_row_names(x)?))
+        })
+    }
+    /// Return the second component of a dimension names list.
+    fn Rf_GetColNames(x: Sexp) -> Sexp = Sexp::NULL; |ctx| {
+        let x = id(ctx, x, "Rf_GetColNames")?;
+        if x == SEXP_NIL {
+            return Ok(Sexp::from_id(SEXP_NIL));
+        }
+        Ok(Sexp::from_id(ctx.session().list_get(x, 1)?))
+    }
+    /// Return explicit or implicit class names.
+    fn R_class(x: Sexp) -> Sexp = Sexp::NULL; |ctx| {
+        let x = id(ctx, x, "R_class")?;
+        allocating(ctx, &[x], |ctx| class(ctx, x).map(Sexp::from_id))
+    }
+    /// Visit attributes until the callback returns a non-null pointer.
+    fn R_mapAttrib(x: Sexp, fun: Option<MapFn>, data: *mut c_void) -> Sexp = Sexp::NULL; |ctx| {
+        let x = id(ctx, x, "R_mapAttrib")?;
+        let fun = fun.ok_or_else(|| ctx.stop(SEXP_NIL, "invalid NULL attribute callback"))?;
+        map_attributes(ctx, x, fun, data)
+    }
+    /// Copy the attribute list and share its values.
+    fn SHALLOW_DUPLICATE_ATTRIB(target: Sexp, source: Sexp) -> () = (); |ctx| {
+        let target = id(ctx, target, "SHALLOW_DUPLICATE_ATTRIB")?;
+        let source = id(ctx, source, "SHALLOW_DUPLICATE_ATTRIB")?;
+        allocating(ctx, &[target, source], |ctx| copy_attrs(ctx, source, target, false))
+    }
+    /// Copy the attribute list and duplicate its values.
+    fn DUPLICATE_ATTRIB(target: Sexp, source: Sexp) -> () = (); |ctx| {
+        let target = id(ctx, target, "DUPLICATE_ATTRIB")?;
+        let source = id(ctx, source, "DUPLICATE_ATTRIB")?;
+        allocating(ctx, &[target, source], |ctx| {
+            if target == source || target == SEXP_NIL { return Ok(()); }
+            let s = ctx.session_mut();
+            let mut entries = s.attrs(source)?;
+            for (_, value) in &mut entries {
+                *value = s.deep_duplicate(*value)?;
+            }
+            s.replace_attributes(target, entries)?;
+            s.set_object_flag(target, s.is_object(source)?)?;
+            Ok(s.set_s4_flag(target, s.is_s4(source)?)?)
         })
     }
     /// Return the explicit S3 class.

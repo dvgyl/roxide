@@ -9,12 +9,13 @@ use std::ptr::{null, null_mut};
 use roxide_eval::{Ctx, CtxExt, EvalResult};
 use roxide_gc::{SexpId, Trace, Tracer};
 use roxide_value::{
-    CharId, Elem, Encoding, RComplex, RLogical, SEXP_NIL, SYM_DIM, SexpType, Sortedness, ValueApi,
-    VecView,
+    CharId, Elem, Encoding, RComplex, RLogical, SEXP_NIL, SYM_DIM, SYM_NAMES, SexpType, Sortedness,
+    ValueApi, VecView,
 };
 
-use super::attrib::inherits;
+use super::attrib::{copy_attrs, inherits};
 use super::pairlist::{alloc_cells, cells};
+use super::string::c_text;
 use crate::abi::*;
 
 macro_rules! api {
@@ -121,7 +122,6 @@ pub(crate) fn checked_len(ctx: &mut Ctx, n: R_xlen_t) -> EvalResult<usize> {
     Ok(n as usize)
 }
 
-// Limit allocations initiated by C. Several value constructors copy an input buffer.
 pub(crate) const MAX_VECTOR_BYTES: usize = 1 << 30;
 
 pub(crate) fn check_capacity(ctx: &mut Ctx, n: usize, width: usize) -> EvalResult<()> {
@@ -223,6 +223,166 @@ fn by_dimension(ctx: &mut Ctx, x: SexpId, i: usize) -> EvalResult<c_int> {
     if i == 0 { short_len(ctx, x) } else { Ok(1) }
 }
 
+fn matrix_extent(ctx: &mut Ctx, x: SexpId, axis: usize) -> EvalResult<c_int> {
+    if inherits(ctx, x, b"data.frame")? {
+        let axis_value = if axis == 0 {
+            ctx.session_mut().attr_row_names(x)?
+        } else {
+            x
+        };
+        return short_len(ctx, axis_value);
+    }
+    let ty = ctx.session().type_of(x)?;
+    if x != SEXP_NIL && !is_vector(ty) && ty != SexpType::List {
+        return Err(ctx.stop(SEXP_NIL, "object is not a matrix"));
+    }
+    by_dimension(ctx, x, axis)
+}
+
+unsafe fn named_vector(
+    ctx: &mut Ctx,
+    ty: SexpType,
+    names: *const *const c_char,
+) -> EvalResult<Sexp> {
+    if names.is_null() {
+        return Err(ctx.stop(SEXP_NIL, "invalid NULL names array"));
+    }
+    allocating(ctx, &[], |ctx| {
+        let mut labels = Vec::new();
+        loop {
+            // SAFETY: The caller supplies pointers through the terminating empty string.
+            let name = unsafe { names.add(labels.len()).read() };
+            if name.is_null() {
+                break;
+            }
+            // SAFETY: Each entry is a readable NUL-terminated string.
+            let bytes = unsafe { c_text(ctx, name, "Rf_mkNamed")? };
+            if bytes.is_empty() {
+                break;
+            }
+            check_capacity(ctx, labels.len() + 1, size_of::<CharId>())?;
+            let name = ctx.session_mut().mk_char(bytes, Encoding::Native)?;
+            labels.push(name);
+        }
+        let value = alloc_vector(ctx, ty, labels.len())?;
+        let s = ctx.session_mut();
+        let names = s.alloc_str_from(&labels)?;
+        s.set_attrib(value, SYM_NAMES, names)?;
+        Ok(Sexp::from_id(value))
+    })
+}
+
+#[derive(Clone, Copy)]
+enum CopyOrder {
+    Linear,
+    ByRow,
+}
+
+fn matrix_dimensions(ctx: &mut Ctx, target: SexpId, size: usize) -> EvalResult<(usize, usize)> {
+    let dims = ctx.session().int(ctx.session().attr(target, SYM_DIM))?;
+    if dims.len() != 2
+        || dims.get(0) <= 0
+        || dims.get(1) <= 0
+        || (dims.get(0) as usize).checked_mul(dims.get(1) as usize) != Some(size)
+    {
+        return Err(ctx.stop(SEXP_NIL, "invalid matrix dimensions"));
+    }
+    Ok((dims.get(0) as usize, dims.get(1) as usize))
+}
+
+fn recycle_index(i: usize, count: usize, dimensions: Option<(usize, usize)>) -> usize {
+    match dimensions {
+        Some((rows, columns)) => ((i % rows) * columns + i / rows) % count,
+        None => i % count,
+    }
+}
+
+fn copy_list_matrix(ctx: &mut Ctx, target: SexpId, source: SexpId, byrow: bool) -> EvalResult<()> {
+    if target == SEXP_NIL {
+        return Ok(());
+    }
+    require_type(ctx, target, SexpType::List, "Rf_copyListMatrix")?;
+    require_type(ctx, source, SexpType::List, "Rf_copyListMatrix")?;
+    let target_cells = cells(ctx, target)?;
+    let source_cells = cells(ctx, source)?;
+    let dims = if byrow {
+        Some(matrix_dimensions(ctx, target, target_cells.len())?)
+    } else {
+        None
+    };
+    // GNU R copies alternate positions of the row-filled matrix into the start of the pairlist.
+    let stride = if byrow { 2 } else { 1 };
+    for ((cell, _, _), i) in target_cells
+        .iter()
+        .zip((0..target_cells.len()).step_by(stride))
+    {
+        let (_, value, _) = source_cells[recycle_index(i, source_cells.len(), dims)];
+        let s = ctx.session_mut();
+        let value = s.deep_duplicate(value)?;
+        s.set_car(*cell, value)?;
+    }
+    Ok(())
+}
+
+fn copy_vector(ctx: &mut Ctx, target: SexpId, source: SexpId, order: CopyOrder) -> EvalResult<()> {
+    let ty = ctx.session().type_of(target)?;
+    if !is_vector(ty) || ctx.session().type_of(source)? != ty {
+        return Err(ctx.stop(SEXP_NIL, "vector types must match"));
+    }
+    let size = ctx.session().xlength(target)?;
+    let count = ctx.session().xlength(source)?;
+    if size == 0 {
+        return Ok(());
+    }
+    if count == 0 {
+        return Err(ctx.stop(SEXP_NIL, "cannot recycle a vector of length zero"));
+    }
+    let dimensions = match order {
+        CopyOrder::Linear => None,
+        CopyOrder::ByRow => Some(matrix_dimensions(ctx, target, size)?),
+    };
+    let index = |i| recycle_index(i, count, dimensions);
+    if target == source && dimensions.is_none() {
+        return Ok(());
+    }
+    let width = super::resizable::element_width(ty);
+    check_capacity(ctx, count, width)?;
+    check_capacity(ctx, size, width)?;
+    match ty {
+        SexpType::Vec | SexpType::Expr => {
+            let s = ctx.session_mut();
+            let values = s.list_slice(source)?.to_vec();
+            for i in 0..size {
+                s.list_set(target, i, values[index(i)])?;
+            }
+        }
+        SexpType::Str => {
+            let s = ctx.session_mut();
+            let values = s.str_dataptr_ro(source)?.to_vec();
+            for i in 0..size {
+                s.str_set(target, i, values[index(i)])?;
+            }
+        }
+        _ => {
+            let ptr = read_ptr(ctx, source, ty)?.cast::<u8>();
+            // SAFETY: read_ptr provides count initialized elements of this atomic type.
+            let bytes = unsafe { std::slice::from_raw_parts(ptr, count * width) }.to_vec();
+            let ptr = write_ptr(ctx, target)? as *mut u8;
+            for i in 0..size {
+                // SAFETY: Each offset is within its buffer. The source is an independent copy.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        bytes.as_ptr().add(index(i) * width),
+                        ptr.add(i * width),
+                        width,
+                    )
+                };
+            }
+        }
+    }
+    Ok(())
+}
+
 #[derive(Default)]
 struct LegacyLengths(HashMap<SexpId, R_xlen_t>);
 impl CtxExt for LegacyLengths {}
@@ -261,6 +421,54 @@ api! {
     /// Allocate a three-dimensional array.
     fn Rf_alloc3DArray(ty: SEXPTYPE, rows: c_int, cols: c_int, planes: c_int) -> Sexp = Sexp::NULL; |ctx| {
         allocating(ctx, &[], |ctx| alloc_array(ctx, ty, &[rows, cols, planes]))
+    }
+    /// Allocate a vector with names from a terminated C string array.
+    fn Rf_mkNamed(ty: SEXPTYPE, names: *mut *const c_char) -> Sexp = Sexp::NULL; |ctx| {
+        let ty = decode_type(ctx, ty)?;
+        named_vector(ctx, ty, names)
+    }
+    /// Copy and recycle the elements of one vector into another.
+    fn Rf_copyVector(target: Sexp, source: Sexp) -> () = (); |ctx| {
+        let target = id(ctx, target, "Rf_copyVector")?;
+        let source = id(ctx, source, "Rf_copyVector")?;
+        allocating(ctx, &[target, source], |ctx| copy_vector(ctx, target, source, CopyOrder::Linear))
+    }
+    /// Fill a matrix by row or column and recycle its source elements.
+    fn Rf_copyMatrix(target: Sexp, source: Sexp, byrow: Rboolean) -> () = (); |ctx| {
+        let target = id(ctx, target, "Rf_copyMatrix")?;
+        let source = id(ctx, source, "Rf_copyMatrix")?;
+        let order = if byrow == 0 { CopyOrder::Linear } else { CopyOrder::ByRow };
+        allocating(ctx, &[target, source], |ctx| copy_vector(ctx, target, source, order))
+    }
+    /// Fill a list matrix by row or column and recycle its source elements.
+    fn Rf_copyListMatrix(target: Sexp, source: Sexp, byrow: Rboolean) -> () = (); |ctx| {
+        let target = id(ctx, target, "Rf_copyListMatrix")?;
+        let source = id(ctx, source, "Rf_copyListMatrix")?;
+        allocating(ctx, &[target, source], |ctx| copy_list_matrix(ctx, target, source, byrow != 0))
+    }
+    /// Wrap an atomic vector in an ALTREP object when possible.
+    fn R_tryWrap(x: Sexp) -> Sexp = Sexp::NULL; |ctx| {
+        let value = id(ctx, x, "R_tryWrap")?;
+        let ty = ctx.session().type_of(value)?;
+        if !is_atomic(ty) {
+            return Ok(x);
+        }
+        allocating(ctx, &[value], |ctx| {
+            if ty == SexpType::Str { ctx.session_mut().str_dataptr_ro(value)?; }
+            let result = ctx.session_mut().alloc_alt_wrapper(value)?;
+            copy_attrs(ctx, value, result, false)?;
+            Ok(Sexp::from_id(result))
+        })
+    }
+    /// Return the row count of a vector, array, or data frame.
+    fn R_nrow(x: Sexp) -> c_int = 0; |ctx| {
+        let x = id(ctx, x, "R_nrow")?;
+        allocating(ctx, &[x], |ctx| matrix_extent(ctx, x, 0))
+    }
+    /// Return the column count of a vector, array, or data frame.
+    fn R_ncol(x: Sexp) -> c_int = 0; |ctx| {
+        let x = id(ctx, x, "R_ncol")?;
+        matrix_extent(ctx, x, 1)
     }
     /// Return the type code of an R object.
     fn TYPEOF(x: Sexp) -> c_int = 0; |ctx| {
@@ -418,6 +626,37 @@ pub(crate) fn sorted_code(sorted: Sortedness) -> c_int {
     }
 }
 
+unsafe fn write_element<T>(ptr: usize, i: usize, value: T) {
+    // SAFETY: The caller checked the type and index against this writable vector.
+    unsafe { (ptr as *mut T).add(i).write(value) };
+}
+
+unsafe fn copy_region<T: Elem>(
+    view: VecView<'_, T>,
+    start: usize,
+    count: usize,
+    out: *mut T,
+    fill: T,
+) -> usize {
+    match view {
+        VecView::Slice(values) => {
+            // SAFETY: The caller checked the input range and supplies a writable output buffer.
+            unsafe { std::ptr::copy(values.as_ptr().add(start), out, count) };
+            count
+        }
+        VecView::Alt { class, heap, .. } => {
+            // SAFETY: The caller supplies count writable elements, which can be uninitialized.
+            let buffer = unsafe {
+                std::slice::from_raw_parts_mut(out.cast::<std::mem::MaybeUninit<T>>(), count)
+            };
+            buffer.fill(std::mem::MaybeUninit::new(fill));
+            // SAFETY: The previous fill initialized every element of the exclusive buffer.
+            let out = unsafe { std::slice::from_raw_parts_mut(out, count) };
+            class.get_region(heap, start, out)
+        }
+    }
+}
+
 macro_rules! atomic {
     ($ty:ident, $engine:ty, $c:ty, $view:ident, $get:expr, $put:expr, $fill:expr;
      $rw:ident, $ro:ident, $or_null:ident, $elt:ident, $set:ident, $region:ident) => {
@@ -458,8 +697,7 @@ macro_rules! atomic {
                 require_type(ctx, x, SexpType::$ty, name)?;
                 let i = index(ctx, i, ctx.session().xlength(x)?)?;
                 let ptr = write_ptr(ctx, x)?;
-                // The type and index checks establish the valid element address.
-                (ptr as *mut $engine).add(i).write(($put)(value));
+                write_element::<$engine>(ptr, i, ($put)(value));
                 Ok(())
             }
             /// Copy a range of elements to the caller's buffer.
@@ -475,20 +713,7 @@ macro_rules! atomic {
                 if out.is_null() {
                     return Err(ctx.stop(SEXP_NIL, format!("invalid NULL buffer passed to {name}")));
                 }
-                // Each ABI element has the same layout and valid bits as its engine element.
-                let out = out.cast::<$engine>();
-                match view {
-                    VecView::Slice(values) => {
-                        std::ptr::copy(values.as_ptr().add(start), out, count);
-                        Ok(count as R_xlen_t)
-                    }
-                    VecView::Alt { class, heap, .. } => {
-                        let buffer = std::slice::from_raw_parts_mut(out.cast::<std::mem::MaybeUninit<$engine>>(), count);
-                        buffer.fill(std::mem::MaybeUninit::new($fill));
-                        let out = std::slice::from_raw_parts_mut(out, count);
-                        Ok(class.get_region(heap, start, out) as R_xlen_t)
-                    }
-                }
+                Ok(copy_region(view, start, count, out.cast::<$engine>(), $fill) as R_xlen_t)
             }
         }
     };

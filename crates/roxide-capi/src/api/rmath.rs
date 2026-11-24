@@ -2,6 +2,7 @@
 
 use std::ffi::c_int;
 
+use roxide_eval::{Ctx, EvalResult};
 use roxide_math::dist::{continuous, discrete, normal};
 use roxide_math::special::{self, aux};
 use roxide_math::{Flags, Tail};
@@ -176,6 +177,25 @@ scalar! {
     fn Rtanpi(x: f64) -> f64 = aux::tanpi(x);
     fn R_pow(x: f64, y: f64) -> f64 = power(x, y);
     fn R_pow_di(x: f64, n: c_int) -> f64 = if x.is_nan() { x } else if n == NA_INTEGER { NA_REAL } else if x.is_infinite() { power(x, f64::from(n)) } else { x.powi(n) };
+    fn Rf_pow1p(x: f64, y: f64) -> f64 = power_one_plus(x, y);
+    fn pow1p(x: f64, y: f64) -> f64 = power_one_plus(x, y);
+}
+
+fn power_one_plus(x: f64, y: f64) -> f64 {
+    if x == 0.0 || y == 0.0 {
+        return 1.0;
+    }
+    if x.is_nan() || y.is_nan() {
+        return nan_propagate(x, y);
+    }
+    let base = 1.0 + x;
+    if y == 1.0 {
+        base
+    } else if x <= -1.0 || base - 1.0 == x {
+        base.powf(y)
+    } else {
+        (y * x.ln_1p()).exp()
+    }
 }
 
 fn power(x: f64, y: f64) -> f64 {
@@ -315,6 +335,37 @@ pub unsafe extern "C" fn Rf_pnorm_both(
     }
 }
 
+unsafe fn multinomial(
+    ctx: &mut Ctx,
+    n: c_int,
+    probabilities: *mut f64,
+    count: c_int,
+    out: *mut c_int,
+) -> EvalResult<()> {
+    if count < 0 || probabilities.is_null() || out.is_null() {
+        return Err(ctx.stop(roxide_value::SEXP_NIL, "invalid multinomial buffers"));
+    }
+    if count == 0 {
+        return Ok(());
+    }
+    let count = count as usize;
+    super::vector::check_capacity(ctx, count, size_of::<f64>())?;
+    let mut counts = Vec::new();
+    counts
+        .try_reserve_exact(count)
+        .map_err(|_| ctx.stop(roxide_value::SEXP_NIL, "cannot allocate multinomial counts"))?;
+    counts.resize(count, 0);
+    // SAFETY: C supplies count initialized probabilities.
+    let probabilities = unsafe { std::slice::from_raw_parts(probabilities, count) };
+    draw(ctx, |rng| {
+        discrete::rmultinom(rng, n, probabilities, &mut counts)
+    })?
+    .map_err(|err| ctx.stop(roxide_value::SEXP_NIL, err.to_string()))?;
+    // SAFETY: C supplies storage for count elements. The source is a separate allocation.
+    unsafe { std::ptr::copy_nonoverlapping(counts.as_ptr(), out, count) };
+    Ok(())
+}
+
 api! {
     /// Draw an exponential variate with the specified scale.
     fn Rf_rexp(scale: f64) -> f64 = f64::NAN; |ctx| {
@@ -329,16 +380,7 @@ api! {
 
     /// Write multinomial counts to the output array.
     fn Rf_rmultinom(n: c_int, probabilities: *mut f64, count: c_int, out: *mut c_int) -> () = (); |ctx| {
-        if count <= 0 || probabilities.is_null() || out.is_null() {
-            return Err(ctx.stop(roxide_value::SEXP_NIL, "invalid multinomial buffers"));
-        }
-        let count = count as usize;
-        super::vector::check_capacity(ctx, count, size_of::<f64>())?;
-        // SAFETY: C supplies separate readable and writable arrays of count elements.
-        let probabilities = std::slice::from_raw_parts(probabilities, count);
-        let out = std::slice::from_raw_parts_mut(out, count);
-        draw(ctx, |rng| discrete::rmultinom(rng, n, probabilities, out))?
-            .map_err(|err| ctx.stop(roxide_value::SEXP_NIL, err.to_string()))
+        multinomial(ctx, n, probabilities, count, out)
     }
 }
 

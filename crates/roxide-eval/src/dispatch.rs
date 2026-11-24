@@ -845,6 +845,53 @@ fn first_class_name(ctx: &mut Ctx, obj: SexpId) -> EvalResult<String> {
     }))
 }
 
+impl Ctx {
+    /// Find the object that supplies the data part of an S4 object.
+    pub fn s4_data_source(&mut self, object: SexpId) -> EvalResult<Option<SexpId>> {
+        if !self.session.is_s4(object)? {
+            return Ok(None);
+        }
+        for name in [".Data", ".xData"] {
+            let key = self.session.intern(name)?;
+            let value = self.session.attr(object, key);
+            if value != SEXP_NIL {
+                return Ok(Some(if value == SEXP_S4_NULL {
+                    SEXP_NIL
+                } else {
+                    value
+                }));
+            }
+        }
+        Ok((self.session.type_of(object)? != SexpType::Obj).then_some(object))
+    }
+
+    /// Read an S4 data part. Clear the S4 flag on the returned data.
+    pub fn s4_data_part(&mut self, object: SexpId) -> EvalResult<Option<SexpId>> {
+        let Some(source) = self.s4_data_source(object)? else {
+            return Ok(None);
+        };
+        if source != object {
+            return Ok(Some(source));
+        }
+        self.scoped(|ctx| {
+            ctx.protect(object);
+            let copy = ctx.session.shallow_duplicate(object)?;
+            if copy != object {
+                ctx.protect(copy);
+                ctx.session.clear_attrs(copy)?;
+                for key in [roxide_value::SYM_DIM, roxide_value::SYM_DIMNAMES] {
+                    let value = ctx.session.attr(object, key);
+                    if value != SEXP_NIL {
+                        ctx.session.set_attrib(copy, key, value)?;
+                    }
+                }
+            }
+            ctx.session.set_s4_flag(copy, false)?;
+            Ok(Some(copy))
+        })
+    }
+}
+
 fn slot_get(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     let obj = args.get(0);
     let name = slot_name(ctx, args.get(1), call.err_call())?;
@@ -887,27 +934,7 @@ fn slot_get(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
         ));
     }
     if name == ".Data" {
-        if ctx.session.type_of(obj)? == SexpType::Obj {
-            return Ok(SEXP_NIL);
-        }
-        return ctx.scoped(|ctx| {
-            ctx.protect(obj);
-            let dim_sym = ctx.session.intern("dim")?;
-            let dimnames_sym = ctx.session.intern("dimnames")?;
-            let dim = ctx.session.attr(obj, dim_sym);
-            let dimnames = ctx.session.attr(obj, dimnames_sym);
-            let copy = ctx.session.shallow_duplicate(obj)?;
-            ctx.protect(copy);
-            ctx.session.clear_attrs(copy)?;
-            if dim != SEXP_NIL {
-                ctx.session.set_attrib(copy, dim_sym, dim)?;
-                if dimnames != SEXP_NIL {
-                    ctx.session.set_attrib(copy, dimnames_sym, dimnames)?;
-                }
-            }
-            ctx.session.set_s4_flag(copy, false)?;
-            Ok(copy)
-        });
+        return Ok(ctx.s4_data_part(obj)?.unwrap_or(SEXP_NIL));
     }
     let sym = ctx.session.intern(&name)?;
     let val = ctx.session.attr(obj, sym);

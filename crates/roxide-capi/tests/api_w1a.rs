@@ -10,7 +10,8 @@ use std::sync::OnceLock;
 use libloading::Library;
 use roxide_capi::abi::*;
 use roxide_capi::api::{
-    attrib::*, coerce::*, pairlist::*, resizable::*, string::*, sym::*, vector::*,
+    attrib::*, coerce::*, error::R_CheckUserInterrupt, memory::*, pairlist::*, resizable::*,
+    string::*, sym::*, vector::*,
 };
 use roxide_capi::globals::{R_ClassSymbol, R_NaString, R_NamesSymbol, R_NilValue};
 use roxide_capi::jump::{Rf_protect, Rf_unprotect, VoidFn, enter_trampoline};
@@ -32,7 +33,7 @@ macro_rules! fixture_api {
         static API: Api = Api { $($name,)+ };
 
         const C_API: &str = concat!(
-            "#define R_NO_REMAP\n#include <Rinternals.h>\nstruct Api {\n",
+            "#define R_NO_REMAP\n#include <Rinternals.h>\n#include <R_ext/Utils.h>\nstruct Api {\n",
             $("__typeof__(&", stringify!($name), ") ", stringify!($name), ";\n",)+
             "};\n",
         );
@@ -83,6 +84,26 @@ fixture_api! {
     MARK_NOT_MUTABLE(Sexp);
     MAYBE_SHARED(Sexp) -> c_int;
     Rf_mkCharLenCE(*const c_char, c_int, c_int) -> Sexp;
+    Rf_translateChar(Sexp) -> *const c_char;
+    vmaxget() -> *mut c_void;
+    vmaxset(*const c_void);
+    R_alloc(usize, c_int) -> *mut c_char;
+    Rf_isBlankString(*const c_char) -> Rboolean;
+    Rf_StringBlank(Sexp) -> Rboolean;
+    Rf_StringTrue(*const c_char) -> Rboolean;
+    Rf_StringFalse(*const c_char) -> Rboolean;
+    Rf_pmatch(Sexp, Sexp, Rboolean) -> Rboolean;
+    Rf_psmatch(*const c_char, *const c_char, Rboolean) -> Rboolean;
+    R_chk_memcpy(*mut c_void, *const c_void, usize) -> *mut c_void;
+    R_chk_memset(*mut c_void, c_int, usize) -> *mut c_void;
+    R_ExpandFileName(*const c_char) -> *const c_char;
+    R_strtod(*const c_char, *mut *mut c_char) -> f64;
+    R_atof(*const c_char) -> f64;
+    R_tmpnam(*const c_char, *const c_char) -> *mut c_char;
+    R_tmpnam2(*const c_char, *const c_char, *const c_char) -> *mut c_char;
+    R_free_tmpnam(*mut c_char);
+    acopy_string(*const c_char) -> *const c_char;
+    R_CheckUserInterrupt();
     Rf_getCharCE(Sexp) -> c_int;
     Rf_mkChar(*const c_char) -> Sexp;
     R_CHAR(Sexp) -> *const c_char;
@@ -158,6 +179,7 @@ struct State {
 }
 
 const C_FIXTURE: &str = r#"
+#include <math.h>
 #include <string.h>
 
 struct State {
@@ -260,6 +282,105 @@ void strings_and_symbols(void *data) {
     SEXP ordinary = A->Rf_mkChar("argument");
     CHECK(A->Rf_installChar(ordinary) == A->Rf_install("argument"));
     UNPROTECT(1);
+}
+
+void translation_storage(void *data) {
+    struct State *s = data;
+    CHECK(A->vmaxget() == NULL);
+    SEXP text = PROTECT(A->Rf_mkCharLenCE("\xe9", 1, CE_LATIN1));
+    SEXP ascii = PROTECT(A->Rf_mkChar("plain"));
+    char *older = A->R_alloc(5, 1);
+    strcpy(older, "keep");
+    void *mark = A->vmaxget();
+    CHECK(A->Rf_translateChar(ascii) == A->R_CHAR(ascii));
+    CHECK(A->Rf_translateCharUTF8(ascii) == A->R_CHAR(ascii));
+    CHECK(A->vmaxget() == mark);
+    const char *native = A->Rf_translateChar(text);
+    CHECK(strcmp(native, "\xc3\xa9") == 0 && A->vmaxget() != mark);
+    void *translated = A->vmaxget();
+    const char *utf8 = A->Rf_translateCharUTF8(text);
+    CHECK(A->vmaxget() != translated && strcmp(utf8, native) == 0);
+    A->vmaxset(mark);
+    CHECK(A->vmaxget() == mark && strcmp(older, "keep") == 0);
+    CHECK(strcmp(A->Rf_translateCharUTF8(text), "\xc3\xa9") == 0);
+    CHECK(A->vmaxget() != mark);
+    UNPROTECT(2);
+}
+
+void translation_error(void *data) {
+    struct State *s = data;
+    CHECK(A->vmaxget() == NULL);
+    SEXP text = PROTECT(A->Rf_mkCharLenCE("\xe9", 1, CE_LATIN1));
+    CHECK(strcmp(A->Rf_translateCharUTF8(text), "\xc3\xa9") == 0);
+    CHECK(A->vmaxget() != NULL);
+    SEXP bytes = A->Rf_mkCharLenCE("\xe9", 1, CE_BYTES);
+    (void)A->Rf_translateCharUTF8(bytes);
+    s->line = __LINE__;
+}
+
+void string_utilities(void *data) {
+    struct State *s = data;
+    CHECK(A->Rf_isBlankString("") && A->Rf_isBlankString(" \t\n\v\f\r"));
+    CHECK(!A->Rf_isBlankString(" x "));
+    CHECK(A->Rf_StringBlank(s->nil) && A->Rf_StringBlank(A->Rf_mkChar("")));
+    CHECK(!A->Rf_StringBlank(s->missing_string) && !A->Rf_StringBlank(A->Rf_mkChar(" ")));
+    CHECK(A->Rf_StringBlank(A->Rf_ScalarString(s->missing_string)));
+    CHECK(!A->Rf_StringBlank(A->Rf_allocVector(STRSXP, 2)));
+    CHECK(A->Rf_StringTrue("T") && A->Rf_StringTrue("true") && !A->Rf_StringTrue("t"));
+    CHECK(A->Rf_StringFalse("F") && A->Rf_StringFalse("False") && !A->Rf_StringFalse("FaLsE"));
+    CHECK(A->Rf_psmatch("alpha", "al", FALSE) && !A->Rf_psmatch("al", "alpha", FALSE));
+    CHECK(!A->Rf_psmatch("alpha", "al", TRUE) && A->Rf_psmatch("alpha", "alpha", TRUE));
+    SEXP symbol = A->Rf_install("alpha");
+    SEXP pattern = PROTECT(A->Rf_mkString("al"));
+    CHECK(A->Rf_pmatch(symbol, pattern, FALSE) && !A->Rf_pmatch(symbol, pattern, TRUE));
+    SEXP latin1 = PROTECT(A->Rf_mkCharLenCE("\xe9", 1, CE_LATIN1));
+    SEXP utf8 = PROTECT(A->Rf_mkCharLenCE("\xc3\xa9", 2, CE_UTF8));
+    CHECK(A->Rf_pmatch(latin1, utf8, TRUE));
+    UNPROTECT(3);
+}
+
+void c_utilities(void *data) {
+    struct State *s = data;
+    char target[6] = {0};
+    CHECK(A->R_chk_memset(target, 'x', 5) == target);
+    CHECK(A->R_chk_memcpy(target + 1, "ab", 2) == target + 1);
+    CHECK(strcmp(target, "xabxx") == 0);
+    CHECK(strcmp(A->R_ExpandFileName("~/file"), "/work/file") == 0);
+    CHECK(strcmp(A->R_ExpandFileName("dir/file"), "dir/file") == 0);
+    void *mark = A->vmaxget();
+    const char *copy = A->acopy_string(target);
+    CHECK(A->vmaxget() != mark && copy != target);
+    target[0] = 'y';
+    CHECK(strcmp(copy, "xabxx") == 0);
+    A->vmaxset(mark);
+
+    const char *number = "  +1.25e2#";
+    char *end;
+    CHECK(A->R_strtod(number, &end) == 125.0 && *end == '#');
+    CHECK(A->R_atof("-0x1.8p+2tail") == -6.0);
+    CHECK(A->R_atof("0x1p-1074") == 0x1p-1074);
+    CHECK(A->R_atof("0x1p-1075") == 0.0);
+    CHECK(A->R_atof("0x1.000000000000001p-1075") == 0x1p-1074);
+    CHECK(A->R_atof("0x1.00000000000008p0") == 1.0);
+    CHECK(A->R_atof("0x1.0000000000000801p0") == 0x1.0000000000001p0);
+    const char *invalid = "1e+";
+    CHECK(isnan(A->R_strtod(invalid, &end)) && end == invalid);
+    CHECK(isnan(A->R_strtod("nAn(rest)", &end)) && *end == '(');
+
+    char *plain = A->R_tmpnam("check", "/work");
+    char *ext = A->R_tmpnam2("check", "/work", ".txt");
+    CHECK(strncmp(plain, "/work/check", 11) == 0);
+    CHECK(strncmp(ext, "/work/check", 11) == 0);
+    CHECK(strlen(ext) >= 15 && strcmp(ext + strlen(ext) - 4, ".txt") == 0);
+    A->R_free_tmpnam(plain);
+    A->R_free_tmpnam(ext);
+    A->R_CheckUserInterrupt();
+}
+
+void check_interrupt(void *data) {
+    struct State *s = data;
+    CHECK(A->vmaxget() == NULL);
+    A->R_CheckUserInterrupt();
 }
 
 void pairlists(void *data) {
@@ -508,6 +629,28 @@ fn compact_altrep_access() {
 #[test]
 fn character_and_symbol_access() {
     each_policy(|ctx| run(ctx, b"strings_and_symbols", Sexp::NULL).unwrap());
+}
+
+#[test]
+fn translated_storage_is_released_on_reset_and_frame_exit() {
+    each_policy(|ctx| {
+        run(ctx, b"translation_storage", Sexp::NULL).unwrap();
+        assert!(run(ctx, b"translation_error", Sexp::NULL).is_err());
+        run(ctx, b"translation_storage", Sexp::NULL).unwrap();
+    });
+}
+
+#[test]
+fn string_and_c_utilities() {
+    each_policy(|ctx| {
+        run(ctx, b"string_utilities", Sexp::NULL).unwrap();
+        run(ctx, b"c_utilities", Sexp::NULL).unwrap();
+    });
+}
+
+#[test]
+fn check_user_interrupt_returns_when_none_is_pending() {
+    each_policy(|ctx| run(ctx, b"check_interrupt", Sexp::NULL).unwrap());
 }
 
 #[test]

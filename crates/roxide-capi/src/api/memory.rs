@@ -1,12 +1,16 @@
 //! Object roots, transient storage, and C heap allocation.
 
 use std::ffi::{c_char, c_int, c_long, c_void};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::ptr::{NonNull, null_mut};
 
 use roxide_eval::{Ctx, CtxExt, EvalResult};
 use roxide_gc::{SexpId, Trace, Tracer};
+use roxide_host::OpenMode;
 use roxide_value::{SEXP_NIL, SexpType, ValueApi};
 
+use super::string::c_text;
 use super::vector::{alloc_vector, allocating, api, id, require_type};
 use crate::{abi::Sexp, cx};
 
@@ -39,6 +43,26 @@ impl Trace for Arena {
 }
 
 impl CtxExt for Arena {}
+
+const PATH_BUFFER_SIZE: usize = if cfg!(target_os = "macos") {
+    1024
+} else {
+    4096
+};
+
+struct ExpandedPath([u8; PATH_BUFFER_SIZE]);
+
+impl Default for ExpandedPath {
+    fn default() -> Self {
+        Self([0; PATH_BUFFER_SIZE])
+    }
+}
+
+impl Trace for ExpandedPath {
+    fn trace(&self, _: &mut Tracer<'_>) {}
+}
+
+impl CtxExt for ExpandedPath {}
 
 pub(crate) fn save_transient_frame(ctx: &mut Ctx) {
     let arena = ctx.ext::<Arena>();
@@ -87,6 +111,101 @@ fn transient(ctx: &mut Ctx, bytes: usize) -> EvalResult<*mut c_void> {
         .allocations
         .push(Allocation { ptr, bytes });
     Ok(ptr.as_ptr())
+}
+
+pub(crate) fn transient_string(ctx: &mut Ctx, text: &[u8]) -> EvalResult<*const c_char> {
+    let size = text
+        .len()
+        .checked_add(1)
+        .ok_or_else(|| ctx.stop(SEXP_NIL, "allocation size is too large"))?;
+    let target = transient(ctx, size)?.cast::<u8>();
+    // SAFETY: The new zero-filled buffer has space for the bytes and their terminator.
+    unsafe { std::ptr::copy_nonoverlapping(text.as_ptr(), target, text.len()) };
+    Ok(target.cast())
+}
+
+#[cfg(unix)]
+fn path_from_bytes(path: &[u8]) -> &Path {
+    use std::os::unix::ffi::OsStrExt;
+    Path::new(std::ffi::OsStr::from_bytes(path))
+}
+
+#[cfg(not(unix))]
+fn path_from_bytes(path: &[u8]) -> &Path {
+    Path::new(std::str::from_utf8(path).unwrap_or_default())
+}
+
+fn user_home(ctx: &mut Ctx, user: &[u8]) -> Option<PathBuf> {
+    let host = ctx.host();
+    if user.is_empty() || host.env_var("USER").is_some_and(|name| name == user) {
+        return host.home_dir();
+    }
+    let mut passwd = host
+        .open(Path::new("/etc/passwd"), OpenMode::read_only())
+        .ok()?
+        .take(1024 * 1024);
+    let mut records = Vec::new();
+    passwd.read_to_end(&mut records).ok()?;
+    for record in records.split(|&byte| byte == b'\n') {
+        let mut fields = record.split(|&byte| byte == b':');
+        if fields.next() == Some(user)
+            && let Some(home) = fields.nth(4).filter(|home| home.starts_with(b"/"))
+        {
+            return Some(path_from_bytes(home).to_owned());
+        }
+    }
+    None
+}
+
+fn home_expansion(ctx: &mut Ctx, path: &[u8]) -> Option<Vec<u8>> {
+    let rest = path.strip_prefix(b"~")?;
+    let user_len = rest
+        .iter()
+        .position(|&byte| byte == b'/')
+        .unwrap_or(rest.len());
+    let home = user_home(ctx, &rest[..user_len])?;
+    let mut output = home.into_os_string().into_encoded_bytes();
+    output.extend_from_slice(&rest[user_len..]);
+    Some(output)
+}
+
+fn temporary_name(
+    ctx: &mut Ctx,
+    prefix: &[u8],
+    directory: &[u8],
+    extension: &[u8],
+) -> EvalResult<*mut c_char> {
+    const MAX_ATTEMPTS: usize = 256;
+    let size = directory
+        .len()
+        .saturating_add(prefix.len())
+        .saturating_add(extension.len());
+    let pid = ctx.host().pid();
+    let mut path = Vec::new();
+    path.try_reserve_exact(size.saturating_add(18))
+        .map_err(|_| ctx.stop(SEXP_NIL, "cannot allocate temporary file name"))?;
+    path.extend_from_slice(directory);
+    path.push(b'/');
+    path.extend_from_slice(prefix);
+    let prefix_len = path.len();
+    for _ in 0..MAX_ATTEMPTS {
+        let mut entropy = [0; 4];
+        ctx.host().fill_entropy(&mut entropy);
+        let sequence = u32::from_ne_bytes(entropy) & (u32::MAX >> 1);
+        let _ = write!(path, "{pid:x}{sequence:x}");
+        path.extend_from_slice(extension);
+        if ctx.host().metadata(path_from_bytes(&path), false).is_err() {
+            // SAFETY: The C heap buffer has space for the path and a terminator.
+            let ptr = checked_pointer(ctx, unsafe { calloc(1, path.len() + 1) })?
+                .as_ptr()
+                .cast();
+            // SAFETY: The new C heap buffer and path are disjoint.
+            unsafe { std::ptr::copy_nonoverlapping(path.as_ptr(), ptr, path.len()) };
+            return Ok(ptr.cast());
+        }
+        path.truncate(prefix_len);
+    }
+    Err(ctx.stop(SEXP_NIL, "cannot find an unused temporary file name"))
 }
 
 fn mset(ctx: &mut Ctx, value: Sexp, set: Sexp, name: &str) -> EvalResult<(SexpId, SexpId, SexpId)> {
@@ -166,6 +285,47 @@ api! {
     fn R_alloc(count: usize, size: c_int) -> *mut c_char = null_mut(); |ctx| {
         let bytes = array_bytes(ctx, count, size)?;
         Ok(transient(ctx, bytes)?.cast())
+    }
+
+    /// Copy a C string into the transient allocation stack.
+    fn acopy_string(text: *const c_char) -> *const c_char = std::ptr::null(); |ctx| {
+        let text = c_text(ctx, text, "acopy_string")?;
+        transient_string(ctx, text)
+    }
+
+    /// Expand a leading tilde in a path. The next call can replace the result.
+    fn R_ExpandFileName(path: *const c_char) -> *const c_char = std::ptr::null(); |ctx| {
+        let input = c_text(ctx, path, "R_ExpandFileName")?;
+        let expanded = home_expansion(ctx, input);
+        let expanded = expanded.as_deref().unwrap_or(input);
+        if expanded.len() >= PATH_BUFFER_SIZE {
+            ctx.warning_at(SEXP_NIL, &format!(
+                "expanded path length {} would be too long for\n{}",
+                expanded.len(),
+                String::from_utf8_lossy(input),
+            ))?;
+            return Ok(path);
+        }
+        let expanded = expanded.to_vec();
+        let result = &mut ctx.ext::<ExpandedPath>().0;
+        result[..expanded.len()].copy_from_slice(&expanded);
+        result[expanded.len()] = 0;
+        Ok(result.as_ptr().cast())
+    }
+
+    /// Return an unused temporary file name in the specified directory.
+    fn R_tmpnam(prefix: *const c_char, directory: *const c_char) -> *mut c_char = null_mut(); |ctx| {
+        let prefix = if prefix.is_null() { b"" } else { c_text(ctx, prefix, "R_tmpnam")? };
+        let directory = c_text(ctx, directory, "R_tmpnam")?;
+        temporary_name(ctx, prefix, directory, b"")
+    }
+
+    /// Return an unused temporary file name with the specified extension.
+    fn R_tmpnam2(prefix: *const c_char, directory: *const c_char, extension: *const c_char) -> *mut c_char = null_mut(); |ctx| {
+        let prefix = if prefix.is_null() { b"" } else { c_text(ctx, prefix, "R_tmpnam2")? };
+        let directory = c_text(ctx, directory, "R_tmpnam2")?;
+        let extension = if extension.is_null() { b"" } else { c_text(ctx, extension, "R_tmpnam2")? };
+        temporary_name(ctx, prefix, directory, extension)
     }
 
     /// Allocate transient storage aligned for C long double.
@@ -328,4 +488,51 @@ pub unsafe extern "C" fn R_chk_realloc(ptr: *mut c_void, size: usize) -> *mut c_
 pub unsafe extern "C" fn R_chk_free(ptr: *mut c_void) {
     // SAFETY: The caller supplies a pointer accepted by free.
     unsafe { free(ptr) };
+}
+
+/// Free a name allocated by `R_tmpnam` or `R_tmpnam2`.
+///
+/// # Safety
+/// Pass NULL or a live pointer returned by one of those functions.
+#[allow(non_snake_case)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn R_free_tmpnam(name: *mut c_char) {
+    // SAFETY: The caller supplies NULL or a live allocation from the C heap.
+    unsafe { free(name.cast()) };
+}
+
+/// Copy bytes between disjoint C buffers.
+///
+/// # Safety
+/// For a nonzero size, both ranges must be valid for that size and must not overlap.
+#[allow(non_snake_case)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn R_chk_memcpy(
+    target: *mut c_void,
+    source: *const c_void,
+    size: usize,
+) -> *mut c_void {
+    if size != 0 {
+        // SAFETY: The caller supplies two disjoint ranges of the specified size.
+        unsafe { std::ptr::copy_nonoverlapping(source.cast::<u8>(), target.cast(), size) };
+    }
+    target
+}
+
+/// Fill a C buffer with a byte.
+///
+/// # Safety
+/// For a nonzero size, the destination must be valid for that size.
+#[allow(non_snake_case)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn R_chk_memset(
+    target: *mut c_void,
+    value: c_int,
+    size: usize,
+) -> *mut c_void {
+    if size != 0 {
+        // SAFETY: The caller supplies a writable range of the specified size.
+        unsafe { std::ptr::write_bytes(target.cast::<u8>(), value as u8, size) };
+    }
+    target
 }

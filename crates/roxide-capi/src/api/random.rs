@@ -3,7 +3,7 @@
 use std::sync::atomic::{AtomicI32, Ordering};
 
 use roxide_eval::{Ctx, CtxExt, EvalResult};
-use roxide_gc::{SexpId, Trace, Tracer};
+use roxide_gc::{Trace, Tracer};
 use roxide_math::rng::{Kinds, NormalKind, Rng, SeedError};
 use roxide_value::{GLOBAL_ENV, SEXP_NIL, SEXP_UNBOUND, Sym, ValueApi};
 
@@ -17,7 +17,6 @@ pub static N01_kind: AtomicI32 = AtomicI32::new(NormalKind::Inversion as i32);
 struct NativeRng {
     stream: Option<Rng>,
     kinds: Kinds,
-    saved_spare: Option<(SexpId, f64)>,
 }
 
 impl Trace for NativeRng {
@@ -38,35 +37,36 @@ fn load(ctx: &mut Ctx) -> EvalResult<Rng> {
         .get_local(name, GLOBAL_ENV)?
         .filter(|&seed| seed != SEXP_UNBOUND)
     else {
+        ctx.clear_box_muller_spare();
         return Ok(Rng::seeded(fallback, ctx.ext::<NativeRng>().kinds));
     };
     let words = match ctx.session().int(seed) {
         Ok(words) => words,
         Err(_) => {
+            ctx.clear_box_muller_spare();
             ctx.warn_now(SEXP_NIL, "'.Random.seed' is not an integer vector")?;
             return Ok(Rng::seeded(fallback, Kinds::default()));
         }
     };
     let words: Vec<_> = (0..words.len().min(626)).map(|i| words.get(i)).collect();
+    let spare = ctx.box_muller_spare(seed, &words);
     match Rng::decode_with_seed(&words, fallback) {
         Ok(mut rng) => {
-            if rng.kinds.normal == NormalKind::BoxMuller
-                && let Some((previous, spare)) = ctx.ext::<NativeRng>().saved_spare
-                && previous == seed
-            {
-                rng.bm_saved = Some(spare);
+            if rng.kinds.normal == NormalKind::BoxMuller {
+                rng.bm_saved = spare;
             }
             Ok(rng)
         }
         Err(SeedError::WrongLength) => Err(ctx.stop(SEXP_NIL, "'.Random.seed' has wrong length")),
         Err(_) => {
+            ctx.clear_box_muller_spare();
             ctx.warn_now(SEXP_NIL, "'.Random.seed' has an invalid RNG kind")?;
             Ok(Rng::seeded(fallback, Kinds::default()))
         }
     }
 }
 
-fn get_state(ctx: &mut Ctx) -> EvalResult<()> {
+pub(super) fn get_state(ctx: &mut Ctx) -> EvalResult<()> {
     let rng = load(ctx)?;
     N01_kind.store(rng.kinds.normal as i32, Ordering::Relaxed);
     let state = ctx.ext::<NativeRng>();
@@ -86,6 +86,24 @@ pub(super) fn draw<T>(ctx: &mut Ctx, f: impl FnOnce(&mut Rng) -> T) -> EvalResul
         .ok_or_else(|| ctx.stop(SEXP_NIL, "cannot initialize the random stream"))
 }
 
+pub(super) fn put_state(ctx: &mut Ctx) -> EvalResult<()> {
+    let Some(rng) = ctx.ext::<NativeRng>().stream.as_ref() else {
+        return Ok(());
+    };
+    let mut words = Vec::new();
+    rng.encode(&mut words);
+    let spare = rng.bm_saved;
+    let name = seed_symbol(ctx)?;
+    let seed = ctx.session_mut().alloc_int_from(&words)?;
+    ctx.scoped(|ctx| {
+        ctx.protect(seed);
+        ctx.assign(name, seed, GLOBAL_ENV)
+    })?;
+    ctx.save_box_muller_spare(seed, words, spare);
+    ctx.ext::<NativeRng>().stream = None;
+    Ok(())
+}
+
 api! {
     /// Read the global seed into the native random stream.
     fn GetRNGstate() -> () = (); |ctx| {
@@ -94,22 +112,7 @@ api! {
 
     /// Write the native random stream back to the global seed.
     fn PutRNGstate() -> () = (); |ctx| {
-        let Some(rng) = ctx.ext::<NativeRng>().stream.as_ref() else {
-            return Ok(());
-        };
-        let mut words = Vec::new();
-        rng.encode(&mut words);
-        let spare = rng.bm_saved;
-        let name = seed_symbol(ctx)?;
-        let seed = ctx.session_mut().alloc_int_from(&words)?;
-        ctx.scoped(|ctx| {
-            ctx.protect(seed);
-            ctx.assign(name, seed, GLOBAL_ENV)
-        })?;
-        let state = ctx.ext::<NativeRng>();
-        state.saved_spare = spare.map(|spare| (seed, spare));
-        state.stream = None;
-        Ok(())
+        put_state(ctx)
     }
 
     /// Draw a uniform variate.
