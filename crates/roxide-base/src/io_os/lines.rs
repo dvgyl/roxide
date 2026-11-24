@@ -66,10 +66,10 @@ pub(super) fn read_lines(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalRes
             );
         }
         if incomplete {
-            ctx.warn(
+            ctx.warn_now(
                 call.err_call(),
                 format!("incomplete final line found on '{label}'"),
-            );
+            )?;
         }
     }
     strings(ctx, lines.into_iter().map(Some), encoding)

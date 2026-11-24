@@ -1,7 +1,8 @@
 use std::time::Duration;
 
 use roxide_eval::{Args, Call, Ctx, EvalResult};
-use roxide_host::CommandSpec;
+use roxide_gc::SexpId;
+use roxide_host::{CommandSpec, HostErrorKind, ProcessOutput};
 use roxide_value::{Encoding, RLogical, SEXP_NIL, SexpType, ValueApi};
 
 use super::{attr, bytes, check_limit, flag, logical, string, strings, text, texts};
@@ -145,6 +146,128 @@ fn quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
+pub(super) fn system(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    let value = args.get(0);
+    if ctx.session().type_of(value)? != SexpType::Str {
+        return Err(ctx.stop(call.err_call(), "non-empty character argument expected"));
+    }
+    let command = texts(ctx, call, value, "command")?;
+    let command = command
+        .first()
+        .map(|v| v.as_deref().unwrap_or("NA"))
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| ctx.stop(call.err_call(), "non-empty character argument expected"))?;
+    let capture = flag(ctx, call, args.get(1), "intern")?;
+    let ignore_stdout = flag(ctx, call, args.get(2), "ignore.stdout")?;
+    let ignore_stderr = flag(ctx, call, args.get(3), "ignore.stderr")?;
+    let wait = flag(ctx, call, args.get(4), "wait")? || capture;
+    let timeout = super::integer(ctx, args.get(6))?;
+    if timeout < 0 {
+        return Err(ctx.stop(call.err_call(), "invalid 'timeout' argument"));
+    }
+    if !wait && timeout != 0 {
+        return Err(ctx.stop(
+            call.err_call(),
+            "Timeout with background running processes is not supported.",
+        ));
+    }
+    let input = args.get(5);
+    if input != SEXP_NIL && ctx.session().type_of(input)? != SexpType::Str {
+        return Err(ctx.stop(
+            call.err_call(),
+            "'input' must be a character vector or 'NULL'",
+        ));
+    }
+    let stdin = shell_input(ctx, call, input)?;
+    let mut script = command.to_owned();
+    if ignore_stdout {
+        script.push_str(" >/dev/null");
+    }
+    if ignore_stderr {
+        script.push_str(" 2>/dev/null");
+    }
+    let script = if wait {
+        script
+    } else {
+        format!("exec 3<&0\n(\n{script}\n) <&3 3<&- >/dev/null 2>&1 &")
+    };
+    let spec = CommandSpec {
+        program: "sh".to_owned(),
+        args: vec!["-c".to_owned(), script],
+        stdin,
+        timeout: (timeout > 0).then(|| Duration::from_secs(timeout as u64)),
+    };
+    let (output, timed_out) = match ctx.host().spawn(&spec) {
+        Ok(output) => (output, false),
+        Err(err) if err.kind == HostErrorKind::TimedOut => {
+            ctx.warn_now(
+                call.err_call(),
+                format!("command '{}' timed out after {timeout}s", spec.args[1]),
+            )?;
+            (
+                ProcessOutput {
+                    status: 124,
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                },
+                true,
+            )
+        }
+        Err(err) => return Err(ctx.stop(call.err_call(), err.to_string())),
+    };
+    ctx.host()
+        .write_err(&output.stderr)
+        .map_err(|err| ctx.stop(call.err_call(), err.to_string()))?;
+    if output.status == 127 {
+        if capture {
+            return Err(ctx.stop(call.err_call(), "error in running command"));
+        }
+        ctx.warn_now(call.err_call(), "error in running command")?;
+    }
+    if !capture {
+        ctx.host()
+            .write_out(&output.stdout)
+            .map_err(|err| ctx.stop(call.err_call(), err.to_string()))?;
+        ctx.set_visible(false);
+        return Ok(ctx.session_mut().scalar_int(output.status)?);
+    }
+    let result = captured_lines(ctx, call, &output.stdout)?;
+    if output.status != 0 {
+        ctx.protect(result);
+        let status = ctx.session_mut().scalar_int(output.status)?;
+        attr(ctx, result, "status", status)?;
+        if !timed_out {
+            ctx.warn_now(
+                call.err_call(),
+                format!(
+                    "running command '{}' had status {}",
+                    spec.args[1], output.status
+                ),
+            )?;
+        }
+    }
+    ctx.set_visible(true);
+    Ok(result)
+}
+
+fn shell_input(ctx: &mut Ctx, call: &Call, input: SexpId) -> EvalResult<Option<Vec<u8>>> {
+    if input == SEXP_NIL {
+        return Ok(None);
+    }
+    let mut data = Vec::new();
+    for line in bytes(ctx, call, input)? {
+        let line = line.as_deref().unwrap_or(b"NA");
+        check_limit(
+            ctx,
+            call,
+            data.len().saturating_add(line.len()).saturating_add(1),
+        )?;
+        data.extend_from_slice(line);
+        data.push(b'\n');
+    }
+    Ok(Some(data))
+}
+
 pub(super) fn system2(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     let program = text(ctx, call, args.get(0), "command")?;
     let argv = texts(ctx, call, args.get(1), "args")?;
@@ -179,25 +302,10 @@ pub(super) fn system2(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult
     } else {
         stderr.apply(&mut script, 2, wait);
     }
-    let input = if input != SEXP_NIL {
-        let mut data = Vec::new();
-        for line in bytes(ctx, call, input)? {
-            let line = line.as_deref().unwrap_or(b"NA");
-            check_limit(
-                ctx,
-                call,
-                data.len().saturating_add(line.len()).saturating_add(1),
-            )?;
-            data.extend_from_slice(line);
-            data.push(b'\n');
-        }
-        Some(data)
-    } else {
-        if !stdin.is_empty() {
-            script.push_str(&format!(" <{}", quote(&stdin)));
-        }
-        None
-    };
+    let input = shell_input(ctx, call, input)?;
+    if input.is_none() && !stdin.is_empty() {
+        script.push_str(&format!(" <{}", quote(&stdin)));
+    }
     if !wait {
         script.push_str(" &");
     }
@@ -225,15 +333,7 @@ pub(super) fn system2(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult
         ctx.set_visible(false);
         return Ok(ctx.session_mut().scalar_int(output.status)?);
     }
-    check_limit(ctx, call, output.stdout.len())?;
-    let lines = output
-        .stdout
-        .split_inclusive(|&ch| ch == b'\n')
-        .map(|line| {
-            let line = line.strip_suffix(b"\n").unwrap_or(line);
-            Some(line.strip_suffix(b"\r").unwrap_or(line))
-        });
-    let result = strings(ctx, lines, Encoding::Native)?;
+    let result = captured_lines(ctx, call, &output.stdout)?;
     if output.status != 0 {
         let status = ctx.session_mut().scalar_int(output.status)?;
         attr(ctx, result, "status", status)?;
@@ -243,6 +343,15 @@ pub(super) fn system2(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult
         );
     }
     Ok(result)
+}
+
+fn captured_lines(ctx: &mut Ctx, call: &Call, output: &[u8]) -> EvalResult {
+    check_limit(ctx, call, output.len())?;
+    let lines = output.split_inclusive(|&ch| ch == b'\n').map(|line| {
+        let line = line.strip_suffix(b"\n").unwrap_or(line);
+        Some(line.strip_suffix(b"\r").unwrap_or(line))
+    });
+    strings(ctx, lines, Encoding::Native)
 }
 
 pub(super) fn versions(ctx: &mut Ctx, _: &Call, _: &mut Args) -> EvalResult {

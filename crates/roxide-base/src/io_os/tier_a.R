@@ -1,3 +1,33 @@
+open <- function(con, ...) UseMethod("open")
+open.connection <- function(con, open = "r", blocking = TRUE, ...)
+    .Internal(rox_io_open(con, open, blocking))
+
+url <- function(description, open = "", blocking = TRUE, encoding = getOption("encoding"),
+                method = getOption("url.method", default = "default"), headers = NULL) {
+    method <- match.arg(method, c("default", "internal", "libcurl", "wininet"))
+    if (length(headers) &&
+        (is.null(names(headers)) || anyNA(names(headers)) || any(!nzchar(names(headers))) || anyNA(headers)))
+        stop("'headers' must have names and must not be NA")
+    if (!is.character(description) || length(description) != 1L || is.na(description))
+        stop("invalid 'description' argument")
+    if (method == "wininet" && .Platform$OS.type != "windows")
+        stop('method = "wininet" is only supported on Windows')
+    if (startsWith(description, "file://"))
+        return(file(substring(description, 8L), open, blocking, encoding))
+    if (!grepl("^(https?|ftps?)://", description))
+        stop("URL scheme unsupported by this method")
+    if (method == "internal")
+        stop(paste0(sub("://.*$", "://", description),
+                    ' URLs are not supported by the "internal" method'))
+    .Internal(rox_io_url(description, open))
+}
+
+system <- function(command, intern = FALSE, ignore.stdout = FALSE, ignore.stderr = FALSE,
+                   wait = TRUE, input = NULL, show.output.on.console = TRUE,
+                   minimized = FALSE, invisible = TRUE, timeout = 0) {
+    .Internal(rox_io_system(command, intern, ignore.stdout, ignore.stderr, wait, input, timeout))
+}
+
 path.expand <- function(path) .Internal(rox_path_expand(as.character(path)))
 file.remove <- function(...) .Internal(rox_file_remove(as.character(c(...))))
 file.copy <- function(from, to, overwrite = recursive, recursive = FALSE, copy.mode = TRUE, copy.date = FALSE)
@@ -47,7 +77,7 @@ Sys.glob <- function(paths, dirmark = FALSE) {
     out
 }
 
-Sys.time <- function() structure(.Internal(rox_sys_time()), class = c("POSIXct", "POSIXt"))
+Sys.time <- function() structure(.Internal(Sys.time()), class = c("POSIXct", "POSIXt"))
 Sys.Date <- function() as.Date(Sys.time(), tz = Sys.timezone())
 Sys.sleep <- function(time) .Internal(rox_sys_sleep(time))
 Sys.getpid <- function() .Internal(rox_sys_pid())

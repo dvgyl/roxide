@@ -20,7 +20,7 @@ pub(crate) const MODULE: Module = Module {
         internal("rox_file_remove", file_remove, 1, Visibility::On),
         internal("rox_file_append", file_append, 2, Visibility::On),
         internal("rox_file_access", file_access, 2, Visibility::On),
-        internal("rox_sys_time", sys_time, 0, Visibility::On),
+        internal("Sys.time", sys_time, 0, Visibility::On),
         internal("rox_sys_sleep", sys_sleep, 1, Visibility::Off),
         internal("rox_sys_pid", sys_pid, 0, Visibility::On),
         internal("rox_sys_locale", sys_locale, 0, Visibility::On),

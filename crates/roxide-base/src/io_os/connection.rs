@@ -45,10 +45,29 @@ struct Connection {
     description: String,
     kind: String,
     open_mode: String,
-    path: Option<FilePath>,
+    source: Source,
     mode: Mode,
     stream: Option<Stream>,
     pushback: Cursor<Vec<u8>>,
+}
+
+#[derive(Clone)]
+enum Source {
+    File(FilePath),
+    Url,
+    Memory,
+}
+
+impl Source {
+    fn open(&self, ctx: &mut Ctx, call: &Call, mode: Mode) -> EvalResult<Stream> {
+        match self {
+            Self::File(path) => path.open(ctx, call, mode),
+            Self::Url => {
+                Err(ctx.stop(call.err_call(), "network URL connections are not supported"))
+            }
+            Self::Memory => Err(ctx.stop(call.err_call(), "invalid connection")),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -330,12 +349,65 @@ pub(super) fn file(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
                 open.to_owned()
             },
             kind,
-            path: Some(path),
+            source: Source::File(path),
             mode,
             stream,
             pushback: Cursor::default(),
         },
     )
+}
+
+pub(super) fn url(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    let description = super::text(ctx, call, args.get(0), "description")?;
+    let open = super::text(ctx, call, args.get(1), "open")?;
+    if !open.is_empty() {
+        return Err(ctx.stop(call.err_call(), "network URL connections are not supported"));
+    }
+    register(
+        ctx,
+        call,
+        Connection {
+            description,
+            kind: "url".to_owned(),
+            open_mode: "r".to_owned(),
+            source: Source::Url,
+            mode: Mode::read(false),
+            stream: None,
+            pushback: Cursor::default(),
+        },
+    )
+}
+
+pub(super) fn open(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    let id = id(ctx, call, args.get(0))?;
+    let open = super::text(ctx, call, args.get(1), "open")?;
+    flag(ctx, call, args.get(2), "blocking")?;
+    if standard_name(id).is_some() {
+        return Err(ctx.stop(call.err_call(), "cannot open standard connections"));
+    }
+    let Some(connection) = ctx.ext::<ConnTable>().entries.get(&id) else {
+        return Err(ctx.stop(call.err_call(), "invalid connection"));
+    };
+    if connection.stream.is_some() {
+        ctx.warn_now(call.err_call(), "connection is already open")?;
+        return Ok(SEXP_NIL);
+    }
+    let source = connection.source.clone();
+    let open = if open.is_empty() {
+        connection.open_mode.clone()
+    } else {
+        open
+    };
+    let mode = Mode::parse(&open)
+        .ok_or_else(|| ctx.stop(call.err_call(), "cannot open the connection"))?;
+    let stream = source.open(ctx, call, mode)?;
+    let Some(connection) = ctx.ext::<ConnTable>().entries.get_mut(&id) else {
+        return Err(ctx.stop(call.err_call(), "invalid connection"));
+    };
+    connection.mode = mode;
+    connection.open_mode = open;
+    connection.stream = Some(stream);
+    Ok(SEXP_NIL)
 }
 
 pub(super) fn raw(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
@@ -374,7 +446,7 @@ pub(super) fn raw(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
             description,
             kind: "rawConnection".into(),
             open_mode: open,
-            path: None,
+            source: Source::Memory,
             mode,
             stream: Some(Stream::Raw(buffer)),
             pushback: Cursor::default(),
@@ -404,6 +476,11 @@ pub(super) fn text(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     check_slot(ctx, call)?;
     let object = args.get(0);
     let open = super::text(ctx, call, args.get(1), "open")?;
+    let open = if open.is_empty() {
+        "r".to_owned()
+    } else {
+        open
+    };
     let encoding = args.get(3);
     let encoding = if encoding == SEXP_NIL {
         ByteEncoding::native(ctx)
@@ -489,7 +566,7 @@ pub(super) fn text(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
             description,
             kind: "textConnection".into(),
             open_mode: open,
-            path: None,
+            source: Source::Memory,
             mode,
             stream: Some(stream),
             pushback: Cursor::default(),
@@ -534,7 +611,9 @@ fn close_connection(ctx: &mut Ctx, call: &Call, id: i32) -> EvalResult<()> {
     let result = connection
         .stream
         .map_or(Ok(()), |stream| finish(ctx, stream));
-    if let Some(path) = connection.path.filter(|path| path.temporary) {
+    if let Source::File(path) = connection.source
+        && path.temporary
+    {
         let _ = ctx.host().remove(&path.name, false);
     }
     io_result(ctx, call, result)
@@ -588,7 +667,11 @@ pub(super) fn summary(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult
         let open = connection.stream.is_some();
         (
             connection.description.clone(),
-            connection.kind.clone(),
+            if matches!(connection.source, Source::Url) {
+                "url-libcurl".to_owned()
+            } else {
+                connection.kind.clone()
+            },
             connection.open_mode.clone(),
             connection.mode.binary,
             open,
@@ -858,10 +941,8 @@ fn operate<T>(
         if access == Access::Serialized(Serialization::Stream) {
             return Err(ctx.stop(call.err_call(), "connection is not open"));
         }
-        let Some(path) = connection.path.clone() else {
-            return Err(ctx.stop(call.err_call(), "invalid connection"));
-        };
-        let mut stream = path.open(ctx, call, mode)?;
+        let source = connection.source.clone();
+        let mut stream = source.open(ctx, call, mode)?;
         if let Some(connection) = ctx.ext::<ConnTable>().entries.get_mut(&id) {
             connection.mode = mode;
         }
@@ -924,7 +1005,10 @@ pub(super) fn label(ctx: &mut Ctx, call: &Call, value: SexpId) -> EvalResult<Str
         .ext::<ConnTable>()
         .entries
         .get(&id)
-        .and_then(|connection| connection.path.as_ref())
+        .and_then(|connection| match &connection.source {
+            Source::File(path) => Some(path),
+            _ => None,
+        })
         .map_or_else(
             || String::from("connection"),
             |path| path.name.to_string_lossy().into_owned(),

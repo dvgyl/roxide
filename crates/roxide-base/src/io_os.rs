@@ -20,6 +20,8 @@ use roxide_value::{CharId, Encoding, NA_INTEGER, SexpType, ValueApi};
 pub const MODULE: Module = Module {
     prims: &[
         internal("rox_io_file", connection::file, 6, Visibility::On),
+        internal("rox_io_url", connection::url, 2, Visibility::On),
+        internal("rox_io_open", connection::open, 3, Visibility::Off),
         internal("rox_io_text", connection::text, 5, Visibility::On),
         internal("rox_io_raw", connection::raw, 3, Visibility::On),
         internal("rox_io_raw_value", connection::raw_value, 1, Visibility::On),
@@ -93,6 +95,7 @@ pub const MODULE: Module = Module {
         internal("rox_io_setenv", system::setenv, 1, Visibility::Off),
         internal("rox_io_unsetenv", system::unsetenv, 1, Visibility::Off),
         internal("rox_io_system2", system::system2, 10, Visibility::On),
+        internal("rox_io_system", system::system, 7, Visibility::SetByFn),
         internal("rox_io_versions", system::versions, 0, Visibility::On),
         internal("rox_io_dump_lines", dump_lines, 2, Visibility::On),
     ],

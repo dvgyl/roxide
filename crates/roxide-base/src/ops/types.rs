@@ -4,7 +4,7 @@ use roxide_eval::{Args, Call, Ctx, EvalResult};
 use roxide_gc::SexpId;
 use roxide_value::{
     CharId, Encoding, IdenticalOpts, NA_INTEGER, RComplex, RLogical, RSession, SEXP_MISSING,
-    SEXP_NIL, SexpType, ValueApi, ValueError, identical as same, is_nan_not_na,
+    SEXP_NIL, SexpType, Sym as Symbol, ValueApi, ValueError, identical as same, is_nan_not_na,
 };
 
 use super::common::{
@@ -396,7 +396,40 @@ macro_rules! coercion {
     )*};
 }
 coercion!(as_logical:Lgl, as_integer:Int, as_double:Real, as_complex:Cplx,
-    as_character:Str, as_raw:Raw, as_list:Vec);
+    as_character:Str, as_raw:Raw);
+
+pub(super) fn as_list(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
+    let x = args.get(0);
+    let s = ctx.session_mut();
+    if s.type_of(x)? != Clo {
+        return convert(ctx, call, x, Vec);
+    }
+    let (formals, body, _) = s.closure_parts(x)?;
+    let pairs = s
+        .pairlist_iter(formals)
+        .chain(std::iter::once((None, body)));
+    let (tags, values) = pairs.unzip();
+    tagged_list(s, tags, values)
+}
+
+fn tagged_list(
+    s: &mut RSession,
+    tags: std::vec::Vec<Option<Symbol>>,
+    values: std::vec::Vec<SexpId>,
+) -> EvalResult {
+    let out = list(s, &values)?;
+    if tags.iter().any(Option::is_some) {
+        let names = tags
+            .into_iter()
+            .map(|n| {
+                let name = tag(s, n).unwrap_or("").to_owned();
+                ch(s, &name)
+            })
+            .collect::<Result<std::vec::Vec<_>, _>>()?;
+        common::set_names(s, out, &names)?;
+    }
+    Ok(out)
+}
 
 pub(super) fn convert(ctx: &mut Ctx, call: &Call, x: SexpId, ty: SexpType) -> EvalResult {
     let s = ctx.session_mut();
@@ -416,19 +449,8 @@ pub(super) fn convert(ctx: &mut Ctx, call: &Call, x: SexpId, ty: SexpType) -> Ev
                 .collect(),
             _ => s.pairlist_iter(x).collect(),
         };
-        let (tags, values): (std::vec::Vec<_>, std::vec::Vec<_>) = pairs.into_iter().unzip();
-        let out = list(s, &values)?;
-        if tags.iter().any(Option::is_some) {
-            let names = tags
-                .into_iter()
-                .map(|n| {
-                    let name = tag(s, n).unwrap_or("").to_owned();
-                    ch(s, &name)
-                })
-                .collect::<Result<std::vec::Vec<_>, _>>()?;
-            common::set_names(s, out, &names)?;
-        }
-        return Ok(out);
+        let (tags, values) = pairs.into_iter().unzip();
+        return tagged_list(s, tags, values);
     }
     if ty == Str && has_class(s, x, "factor") {
         let levels = chars(s, get(s, x, "levels"));

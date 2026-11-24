@@ -6,8 +6,8 @@ use roxide_value::{SEXP_NIL, SexpType, ValueApi};
 
 use super::super::{filesystem, flag, io_result, text};
 use super::{
-    ConnTable, Connection, FilePath, Mode, check_slot, close_connection, finish, id, is_connection,
-    register, take, with_open_stream, write_to,
+    ConnTable, Connection, FilePath, Mode, Source, check_slot, close_connection, finish, id,
+    is_connection, register, take, with_open_stream, write_to,
 };
 
 #[derive(Default)]
@@ -138,12 +138,9 @@ fn push_output_sink(
                 }
                 SinkClose::Keep
             } else {
-                let path = connection
-                    .path
-                    .clone()
-                    .ok_or_else(|| ctx.stop(call.err_call(), "invalid connection"))?;
+                let source = connection.source.clone();
                 let mode = Mode::write(false);
-                let stream = path.open(ctx, call, mode)?;
+                let stream = source.open(ctx, call, mode)?;
                 let mut connection = take(ctx, call.err_call(), id)?;
                 connection.mode = mode;
                 connection.stream = Some(stream);
@@ -173,7 +170,7 @@ fn push_output_sink(
                 description,
                 kind: "file".into(),
                 open_mode: if append { "a" } else { "w" }.into(),
-                path: Some(path),
+                source: Source::File(path),
                 mode,
                 stream: Some(stream),
                 pushback: Cursor::default(),

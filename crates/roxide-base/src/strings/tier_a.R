@@ -79,6 +79,42 @@ iconv <- function(x, from = "", to = "", sub = NA, mark = TRUE, toRaw = FALSE)
 make.unique <- function(names, sep = ".") .Internal(rox_make_unique(names, sep))
 strtoi <- function(x, base = 0L) .Internal(rox_strtoi(x, base))
 
+as.hexmode <- function(x) {
+    if (is.integer(x)) {
+        y <- x
+    } else if (is.character(x)) {
+        y <- strtoi(x, 16L)
+        if (anyNA(y) || any(y < 0L))
+            stop("'x' cannot be coerced to class \"hexmode\"")
+    } else if (is.double(x)) {
+        y <- as.integer(x)
+        if (!all(is.na(x) | (!is.na(y) & x == y)))
+            stop("'x' cannot be coerced to class \"hexmode\"")
+    } else {
+        stop("'x' cannot be coerced to class \"hexmode\"")
+    }
+    class(y) <- "hexmode"
+    y
+}
+
+format.hexmode <- function(x, width = NULL, upper.case = FALSE, ...) {
+    values <- as.integer(x)
+    conversion <- if (upper.case) "X" else "x"
+    if (is.null(width)) {
+        fields <- sprintf(paste0("%", conversion), values)
+        width <- max(c(0L, nchar(fields[!is.na(x)])))
+    }
+    y <- sprintf(paste0("%0", width, conversion), values)
+    y[is.na(x)] <- NA_character_
+    attrs <- attributes(x)
+    attrs <- attrs[names(attrs) %in% c("names", "dim", "dimnames")]
+    if (length(attrs)) attributes(y) <- attrs
+    y
+}
+
+as.character.hexmode <- function(x, ...) as.vector(format.hexmode(x, width = 0L))
+as.list.function <- function(x, ...) c(as.list(formals(x)), list(body(x)))
+
 encodeString <- function(x, width = 0L, quote = "", na.encode = TRUE, justify = "left") {
     x <- .Internal(rox_encode_string(as.character(x), quote))
     if (na.encode) x[is.na(x)] <- if (nzchar(quote)) "NA" else "<NA>"
@@ -99,8 +135,17 @@ prettyNum <- function(x, big.mark = "", big.interval = 3L, small.mark = "", smal
                       decimal.mark = getOption("OutDec", "."), input.d.mark = decimal.mark,
                       preserve.width = c("common", "individual", "none"), zero.print = NULL,
                       drop0trailing = FALSE, is.cmplx = NA, ...) {
-    if (!is.character(x)) return(format(x, big.mark = big.mark, big.interval = big.interval,
-                                       decimal.mark = decimal.mark, drop0trailing = drop0trailing, ...))
+    if (!is.character(x)) {
+        format_value <- function(value)
+            format(value, big.mark = big.mark, big.interval = big.interval,
+                   decimal.mark = decimal.mark, drop0trailing = drop0trailing, ...)
+        if (is.numeric(x) || is.complex(x) || is.logical(x)) {
+            y <- vapply(x, format_value, "", USE.NAMES = FALSE)
+            names(y) <- names(x)
+            return(y)
+        }
+        return(format_value(x))
+    }
     pad <- nchar(x)
     y <- trimws(x)
     if (nzchar(big.mark)) {
