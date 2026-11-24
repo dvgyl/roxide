@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use roxide_eval::AltOp;
 use roxide_gc::SexpId;
 use roxide_host::Limits;
 use roxide_value::{
@@ -9,7 +10,7 @@ use roxide_value::{
 };
 
 use super::{
-    ACTIVE_BINDING, ALTREP, ASCII, ATTR, BASE, BASE_NS, BYTES, EMPTY, GLOBAL, LATIN1,
+    ACTIVE_BINDING, ALTREP, ASCII, ATTR, BASE, BASE_NS, BYTES, EMPTY, Format, GLOBAL, LATIN1,
     LOCKED_BINDING, MAX_INLINE_REF, MISSING, NAMESPACE, NIL, OBJECT, PACKAGE, PERSIST, REF,
     Registry, S4, TAG, UNBOUND, UTF8, WireResult, invalid,
 };
@@ -17,71 +18,17 @@ use super::{
 use super::session::CodecSession;
 
 pub(super) fn encode(
-    session: &mut RSession,
-    value: SexpId,
-    version: u32,
-    workspace: bool,
-    limits: &Limits,
-    registry: &Registry,
-) -> WireResult<Vec<u8>> {
-    encode_with_session(
-        &mut CodecSession::Plain(session),
-        value,
-        version,
-        workspace,
-        false,
-        limits,
-        registry,
-    )
-}
-
-pub(super) fn encode_hook(
-    ctx: &mut roxide_eval::Ctx,
-    value: SexpId,
-    version: u32,
-    limits: &Limits,
-    registry: &Registry,
-    hook: &mut dyn super::PersistHook,
-) -> roxide_eval::EvalResult<Vec<u8>> {
-    ctx.scoped(|ctx| {
-        ctx.protect(value);
-        let mut session = CodecSession::Hook {
-            ctx,
-            hook,
-            error: None,
-        };
-        let result =
-            encode_with_session(&mut session, value, version, false, false, limits, registry);
-        session.finish(result)
-    })
-}
-
-pub(super) fn encode_ascii_workspace(
-    session: &mut RSession,
-    value: SexpId,
-    limits: &Limits,
-    registry: &Registry,
-) -> WireResult<Vec<u8>> {
-    encode_with_session(
-        &mut CodecSession::Plain(session),
-        value,
-        3,
-        true,
-        true,
-        limits,
-        registry,
-    )
-}
-
-fn encode_with_session(
     session: &mut CodecSession<'_, '_>,
     value: SexpId,
-    version: u32,
-    workspace: bool,
-    ascii: bool,
+    Format {
+        version,
+        workspace,
+        ascii,
+    }: Format,
     limits: &Limits,
     registry: &Registry,
 ) -> WireResult<Vec<u8>> {
+    session.root(value);
     if !matches!(version, 2 | 3) {
         return Err(invalid("unsupported serialization version"));
     }
@@ -94,14 +41,15 @@ fn encode_with_session(
         version,
         limits,
     };
-    if ascii {
-        writer.push(b"RDA3\nA\n")?;
-    } else {
-        if workspace {
-            writer.push(if version == 2 { b"RDX2\n" } else { b"RDX3\n" })?;
-        }
-        writer.push(b"X\n")?;
+    if workspace {
+        writer.push(match (ascii, version) {
+            (true, 2) => b"RDA2\n",
+            (true, _) => b"RDA3\n",
+            (false, 2) => b"RDX2\n",
+            (false, _) => b"RDX3\n",
+        })?;
     }
+    writer.push(if ascii { b"A\n" } else { b"X\n" })?;
     writer.word(version)?;
     writer.word(0x0004_0602)?;
     writer.word(if version == 2 {
@@ -159,7 +107,7 @@ impl Writer<'_> {
                 x if x.is_nan() => self.push(b"NaN\n"),
                 f64::INFINITY => self.push(b"Inf\n"),
                 f64::NEG_INFINITY => self.push(b"-Inf\n"),
-                x => self.push(format!("{x:e}\n").as_bytes()),
+                x => self.push(super::ascii::format_real(x)?.as_bytes()),
             };
         }
         self.push(&value.to_be_bytes())
@@ -255,6 +203,10 @@ impl Writer<'_> {
                 return self.word(singleton);
             }
             let ty = session.type_of(id)?;
+            let foreign = session.foreign_alt_seen() && session.foreign_alt(id)?.is_some();
+            if foreign && self.write_foreign(session, id, ty, depth + 1)? {
+                return Ok(());
+            }
             let registry = self.registry;
             let registered = if ty == SexpType::Env {
                 registry
@@ -271,10 +223,11 @@ impl Writer<'_> {
                 session.root(key);
                 return self.persistent(session, key);
             }
-            if matches!(ty, SexpType::Sym | SexpType::Env | SexpType::ExtPtr)
-                && self.reference(id)?
-            {
-                return Ok(());
+            if matches!(ty, SexpType::Sym | SexpType::Env | SexpType::ExtPtr) {
+                if self.reference(id)? {
+                    return Ok(());
+                }
+                session.root(id);
             }
             if ty == SexpType::Sym {
                 self.word(ty as u32)?;
@@ -288,6 +241,9 @@ impl Writer<'_> {
             }
 
             let attrs = session.attrs(id)?;
+            for &(_, value) in &attrs {
+                session.root(value);
+            }
             if ty == SexpType::Env {
                 if let Some((name, namespace, _)) = registered {
                     if id == *namespace {
@@ -311,6 +267,9 @@ impl Writer<'_> {
             match ty {
                 SexpType::List | SexpType::Lang | SexpType::Dot => {
                     let (car, cdr, tag) = session.cons_parts(id)?;
+                    for value in [car, cdr, tag] {
+                        session.root(value);
+                    }
                     self.word(flags | if tag == SEXP_NIL { 0 } else { TAG })?;
                     if !attrs.is_empty() {
                         self.attributes(session, &attrs, depth + 1)?;
@@ -334,6 +293,9 @@ impl Writer<'_> {
                             expr,
                         )
                     };
+                    for value in [car, cdr, tag] {
+                        session.root(value);
+                    }
                     self.word(flags | if tag == SEXP_NIL { 0 } else { TAG })?;
                     if !attrs.is_empty() {
                         self.attributes(session, &attrs, depth + 1)?;
@@ -344,7 +306,19 @@ impl Writer<'_> {
                     self.item(session, car, depth + 1)?;
                     return self.item(session, cdr, depth + 1);
                 }
-                _ => return self.leaf(session, id, ty, flags, &attrs, depth + 1),
+                _ => {
+                    if !foreign && self.version >= 3 && attrs.is_empty() {
+                        let sequence = match ty {
+                            SexpType::Int => compact(session.int(id)?, "compact_intseq", f64::from),
+                            SexpType::Real => compact(session.real(id)?, "compact_realseq", |x| x),
+                            _ => None,
+                        };
+                        if let Some((class, state)) = sequence {
+                            return self.altrep(session, class, ty, state, depth + 1);
+                        }
+                    }
+                    return self.leaf(session, id, ty, flags, &attrs, depth + 1);
+                }
             }
         }
     }
@@ -358,16 +332,6 @@ impl Writer<'_> {
         attrs: &[(Sym, SexpId)],
         depth: usize,
     ) -> WireResult<()> {
-        if self.version == 3 && attrs.is_empty() {
-            let sequence = match ty {
-                SexpType::Int => compact(session.int(id)?, "compact_intseq", f64::from),
-                SexpType::Real => compact(session.real(id)?, "compact_realseq", |x| x),
-                _ => None,
-            };
-            if let Some((class, state)) = sequence {
-                return self.altrep(session, class, ty, state, depth);
-            }
-        }
         self.word(flags)?;
         match ty {
             SexpType::Lgl => {
@@ -408,7 +372,8 @@ impl Writer<'_> {
                 let len = session.list_slice(id)?.len();
                 self.length(len)?;
                 for i in 0..len {
-                    let child = session.list_slice(id)?[i];
+                    let child = session.list_get(id, i)?;
+                    session.root(child);
                     self.item(session, child, depth)?;
                 }
             }
@@ -426,6 +391,8 @@ impl Writer<'_> {
             SexpType::ExtPtr => {
                 let prot = session.extptr_prot(id)?;
                 let tag = session.extptr_tag(id)?;
+                session.root(tag);
+                session.root(prot);
                 self.item(session, prot, depth)?;
                 self.item(session, tag, depth)?;
             }
@@ -502,7 +469,11 @@ impl Writer<'_> {
         self.word(u32::from(locked))?;
         self.item(session, session.env_enclos(env)?, depth)?;
         // R stores non-hashed bindings in reverse insertion order.
-        for (tag, binding) in session.env_entries(env)?.into_iter().rev() {
+        let entries = session.env_entries(env)?;
+        for (_, binding) in &entries {
+            session.root(binding.value);
+        }
+        for (tag, binding) in entries.into_iter().rev() {
             let locked = if binding.locked { LOCKED_BINDING } else { 0 };
             let active = if binding.active { ACTIVE_BINDING } else { 0 };
             self.word(
@@ -516,6 +487,39 @@ impl Writer<'_> {
         self.attributes(session, attrs, depth)
     }
 
+    fn write_foreign(
+        &mut self,
+        session: &mut CodecSession<'_, '_>,
+        id: SexpId,
+        ty: SexpType,
+        depth: usize,
+    ) -> WireResult<bool> {
+        if self.version >= 3
+            && let Some(state) = session
+                .eval(|ctx, _| ctx.altrep_method(AltOp::SerializedState(id)))?
+                .filter(|&state| state != SEXP_NIL)
+        {
+            session.root(state);
+            let (class, package) = session
+                .alt_class_names(id)?
+                .ok_or_else(|| invalid("missing foreign ALTREP class"))?;
+            let flags = ALTREP
+                | if session.is_object(id)? { OBJECT } else { 0 }
+                | if session.is_s4(id)? { S4 } else { 0 }
+                | (u32::from(session.gp(id)?) << 12);
+            self.altrep_header(session, flags, [class, package], ty, depth)?;
+            let attrs = session.attrs(id)?;
+            for &(_, value) in &attrs {
+                session.root(value);
+            }
+            self.item(session, state, depth)?;
+            self.attributes(session, &attrs, depth)?;
+            return Ok(true);
+        }
+        session.eval(|ctx, _| ctx.resolve_altrep(id))?;
+        Ok(false)
+    }
+
     fn altrep(
         &mut self,
         session: &mut CodecSession<'_, '_>,
@@ -524,22 +528,34 @@ impl Writer<'_> {
         [len, start, step]: [f64; 3],
         depth: usize,
     ) -> WireResult<()> {
-        self.word(ALTREP)?;
-        for name in [class, "base"] {
-            self.word(SexpType::List as u32)?;
-            let sym = session.intern(name)?;
-            self.item(session, sym.as_sexp(), depth)?;
-        }
-        self.word(SexpType::List as u32)?;
-        self.word(SexpType::Int as u32)?;
-        self.word(1)?;
-        self.word(ty as u32)?;
-        self.word(NIL)?;
+        let class = session.intern(class)?;
+        let package = session.intern("base")?;
+        self.altrep_header(session, ALTREP, [class, package], ty, depth)?;
         self.word(SexpType::Real as u32)?;
         self.word(3)?;
         for elt in [len, start, step] {
             self.real(elt)?;
         }
+        self.word(NIL)
+    }
+
+    fn altrep_header(
+        &mut self,
+        session: &mut CodecSession<'_, '_>,
+        flags: u32,
+        names: [Sym; 2],
+        ty: SexpType,
+        depth: usize,
+    ) -> WireResult<()> {
+        self.word(flags)?;
+        for name in names {
+            self.word(SexpType::List as u32)?;
+            self.item(session, name.as_sexp(), depth)?;
+        }
+        self.word(SexpType::List as u32)?;
+        self.word(SexpType::Int as u32)?;
+        self.word(1)?;
+        self.word(ty as u32)?;
         self.word(NIL)
     }
 }

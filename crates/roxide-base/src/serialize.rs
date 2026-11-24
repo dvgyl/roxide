@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-//! XDR v2 and v3 serialization for raw vectors, RDS files, and R workspaces.
+//! XDR and ASCII v2 and v3 serialization for raw vectors, RDS files, and R workspaces.
 
 mod ascii;
 mod files;
@@ -27,6 +27,7 @@ use roxide_value::{
 use crate::io_os::connection::{self, Serialization};
 
 use files::Compression;
+use session::CodecSession;
 
 const REF: u32 = 255;
 const NIL: u32 = 254;
@@ -76,12 +77,30 @@ fn invalid(message: impl fmt::Display) -> CodecError {
 /// Primitives and R wrappers for serialization and workspace I/O.
 pub const MODULE: Module = Module {
     prims: &[
-        internal("rox_serialize", serialize, 6, Visibility::On),
-        internal("rox_unserialize", unserialize, 2, Visibility::On),
-        internal("rox_save_rds", save_rds, 7, Visibility::Off),
-        internal("rox_read_rds", read_rds, 2, Visibility::On),
-        internal("rox_save", save, 7, Visibility::Off),
-        internal("rox_load", load, 3, Visibility::Off),
+        internal(
+            "rox_serialize",
+            serialize,
+            6,
+            Visibility::On,
+            ArgEval::Unevaluated,
+        ),
+        internal(
+            "rox_unserialize",
+            unserialize,
+            2,
+            Visibility::On,
+            ArgEval::Eval,
+        ),
+        internal(
+            "rox_save_rds",
+            save_rds,
+            7,
+            Visibility::Off,
+            ArgEval::Unevaluated,
+        ),
+        internal("rox_read_rds", read_rds, 2, Visibility::On, ArgEval::Eval),
+        internal("rox_save", save, 7, Visibility::Off, ArgEval::Eval),
+        internal("rox_load", load, 3, Visibility::Off, ArgEval::Eval),
     ],
     prelude: r#"
 serialize <- function(object, connection, ascii = FALSE, xdr = TRUE, version = NULL, refhook = NULL)
@@ -105,12 +124,18 @@ load <- function(file, envir = parent.frame(), verbose = FALSE)
 "#,
 };
 
-const fn internal(name: &'static str, fun: PrimFn, n: usize, visibility: Visibility) -> PrimDef {
+const fn internal(
+    name: &'static str,
+    fun: PrimFn,
+    n: usize,
+    visibility: Visibility,
+    args: ArgEval,
+) -> PrimDef {
     PrimDef {
         name,
         fun,
         kind: PrimKind::Internal,
-        args: ArgEval::Eval,
+        args,
         arity: Arity::Exact(n),
         dispatch: Dispatch::None,
         visibility,
@@ -157,13 +182,6 @@ fn version(ctx: &mut Ctx, call: &Call, value: SexpId) -> EvalResult<u32> {
         }
     })();
     checked(ctx, call, result)
-}
-
-fn validate_format(ctx: &mut Ctx, call: &Call, ascii: SexpId) -> EvalResult<()> {
-    if flag(ctx, call, ascii)? {
-        return Err(ctx.stop(call.err_call(), "ASCII serialization is unavailable"));
-    }
-    Ok(())
 }
 
 pub(crate) fn path(ctx: &mut Ctx, call: &Call, value: SexpId) -> EvalResult<PathBuf> {
@@ -237,38 +255,44 @@ impl PersistHook for RHook {
     }
 }
 
+struct Format {
+    version: u32,
+    workspace: bool,
+    ascii: bool,
+}
+
+fn r_hook(call: &Call, function: SexpId) -> Option<RHook> {
+    (function != SEXP_NIL).then_some(RHook {
+        function,
+        call: *call,
+    })
+}
+
 fn encode_object(
     ctx: &mut Ctx,
     call: &Call,
     value: SexpId,
-    version: u32,
+    format: Format,
     hook: SexpId,
 ) -> EvalResult<Vec<u8>> {
-    if hook == SEXP_NIL {
-        return encode(ctx, call, value, version, false);
-    }
-    serialize_bytes(
+    let mut hook = r_hook(call, hook);
+    encode(
         ctx,
+        call.err_call(),
         value,
-        version,
-        Some(&mut RHook {
-            function: hook,
-            call: *call,
-        }),
+        format,
+        hook.as_mut().map(|hook| hook as _),
     )
 }
 
 fn decode_object(ctx: &mut Ctx, call: &Call, bytes: &[u8], hook: SexpId) -> EvalResult {
-    if hook == SEXP_NIL {
-        return decode(ctx, call, bytes, false);
-    }
-    unserialize_bytes(
+    let mut hook = r_hook(call, hook);
+    decode(
         ctx,
+        call.err_call(),
         bytes,
-        Some(&mut RHook {
-            function: hook,
-            call: *call,
-        }),
+        false,
+        hook.as_mut().map(|hook| hook as _),
     )
 }
 
@@ -279,28 +303,26 @@ pub fn serialize_bytes(
     version: u32,
     hook: Option<&mut dyn PersistHook>,
 ) -> EvalResult<Vec<u8>> {
-    let limits = limits(ctx);
-    let registry = Registry::for_write(ctx).map_err(|error| ctx.stop(SEXP_NIL, error.0))?;
-    if let Some(hook) = hook {
-        return write::encode_hook(ctx, x, version, &limits, &registry, hook);
-    }
-    let result = write::encode(ctx.session_mut(), x, version, false, &limits, &registry);
-    result.map_err(|error| ctx.stop(SEXP_NIL, error.0))
+    encode(
+        ctx,
+        SEXP_NIL,
+        x,
+        Format {
+            version,
+            workspace: false,
+            ascii: false,
+        },
+        hook,
+    )
 }
 
-/// Decode raw XDR bytes into an R object, optionally resolving `PERSISTSXP` via `hook` (ADR-0014).
+/// Decode raw serialization bytes into an R object, optionally resolving `PERSISTSXP` via `hook` (ADR-0014).
 pub fn unserialize_bytes(
     ctx: &mut Ctx,
     bytes: &[u8],
     hook: Option<&mut dyn PersistHook>,
 ) -> EvalResult<SexpId> {
-    let limits = limits(ctx);
-    let registry = Registry::new(ctx);
-    if let Some(hook) = hook {
-        return read::decode_hook(ctx, bytes, &limits, &registry, hook);
-    }
-    let result = read::decode(ctx.session_mut(), bytes, false, &limits, &registry);
-    result.map_err(|error| ctx.stop(SEXP_NIL, error.0))
+    decode(ctx, SEXP_NIL, bytes, false, hook)
 }
 
 struct Registry {
@@ -348,15 +370,17 @@ pub(crate) fn write_compiler_file(
     value: SexpId,
     ascii: bool,
 ) -> EvalResult<()> {
-    let bytes = if ascii {
-        let limits = limits(ctx);
-        let result = Registry::for_write(ctx).and_then(|registry| {
-            write::encode_ascii_workspace(ctx.session_mut(), value, &limits, &registry)
-        });
-        checked(ctx, call, result)?
-    } else {
-        encode(ctx, call, value, 3, true)?
-    };
+    let bytes = encode(
+        ctx,
+        call.err_call(),
+        value,
+        Format {
+            version: 3,
+            workspace: true,
+            ascii,
+        },
+        None,
+    )?;
     let result = files::write(ctx.host(), path, &bytes, Compression::None, None);
     checked(ctx, call, result)
 }
@@ -367,43 +391,65 @@ pub(crate) fn read_compiler_file(ctx: &mut Ctx, call: &Call, path: &Path) -> Eva
 
 fn encode(
     ctx: &mut Ctx,
-    call: &Call,
+    call: SexpId,
     value: SexpId,
-    version: u32,
-    workspace: bool,
+    format: Format,
+    hook: Option<&mut dyn PersistHook>,
 ) -> EvalResult<Vec<u8>> {
     let limits = limits(ctx);
-    let result = Registry::for_write(ctx).and_then(|registry| {
-        write::encode(
-            ctx.session_mut(),
-            value,
-            version,
-            workspace,
-            &limits,
-            &registry,
-        )
-    });
-    checked(ctx, call, result)
+    let registry = Registry::for_write(ctx).map_err(|error| ctx.stop(call, error.0))?;
+    CodecSession::run(ctx, call, hook, |session| {
+        write::encode(session, value, format, &limits, &registry)
+    })
 }
 
-fn decode(ctx: &mut Ctx, call: &Call, bytes: &[u8], workspace: bool) -> EvalResult {
+fn decode(
+    ctx: &mut Ctx,
+    call: SexpId,
+    bytes: &[u8],
+    workspace: bool,
+    hook: Option<&mut dyn PersistHook>,
+) -> EvalResult {
     let limits = limits(ctx);
     let registry = Registry::new(ctx);
-    let result = read::decode(ctx.session_mut(), bytes, workspace, &limits, &registry);
-    checked(ctx, call, result)
+    CodecSession::run(ctx, call, hook, |session| {
+        read::decode(session, bytes, workspace, &limits, &registry)
+    })
+}
+
+fn eval_args_preserving_object<const N: usize>(
+    ctx: &mut Ctx,
+    call: &Call,
+    args: &Args,
+) -> EvalResult<[SexpId; N]> {
+    let mut values = [SEXP_NIL; N];
+    for (index, value) in values.iter_mut().enumerate() {
+        *value = ctx.eval(args.get(index), call.env)?;
+        ctx.protect(*value);
+    }
+    for &value in values.iter().skip(1) {
+        ctx.resolve_altrep(value)?;
+    }
+    Ok(values)
 }
 
 fn serialize(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
-    validate_format(ctx, call, args.get(2))?;
-    if !flag(ctx, call, args.get(3))? {
+    let [object, dest, ascii, xdr, format_version, hook] =
+        eval_args_preserving_object(ctx, call, args)?;
+    let ascii = flag(ctx, call, ascii)?;
+    if !ascii && !flag(ctx, call, xdr)? {
         return Err(ctx.stop(
             call.err_call(),
             "native binary serialization is unavailable",
         ));
     }
-    let dest = args.get(1);
-    let version = version(ctx, call, args.get(4))?;
-    let bytes = encode_object(ctx, call, args.get(0), version, args.get(5))?;
+    let version = version(ctx, call, format_version)?;
+    let format = Format {
+        version,
+        workspace: false,
+        ascii,
+    };
+    let bytes = encode_object(ctx, call, object, format, hook)?;
     if dest == SEXP_NIL {
         return Ok(ctx.session_mut().alloc_raw_from(&bytes)?);
     }
@@ -432,7 +478,7 @@ fn unserialize(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
 fn read_file(ctx: &mut Ctx, call: &Call, path: &Path, workspace: bool) -> EvalResult {
     let result = files::read(ctx.host(), path);
     let bytes = checked(ctx, call, result)?;
-    decode(ctx, call, &bytes, workspace)
+    decode(ctx, call.err_call(), &bytes, workspace, None)
 }
 
 fn read_connection(
@@ -443,16 +489,18 @@ fn read_connection(
 ) -> EvalResult {
     let limits = limits(ctx);
     let registry = Registry::new(ctx);
-    connection::read_serialized(ctx, call, source, serialization, |session, input| {
-        read::decode_stream(
-            session,
-            input,
-            serialization == Serialization::Workspace,
-            &limits,
-            &registry,
-        )
-        .map_err(|error| io::Error::other(error.0))
-    })
+    let workspace = serialization == Serialization::Workspace;
+    let object =
+        connection::read_serialized(ctx, call, source, serialization, |session, input| {
+            read::decode_stream_or_buffer(session, input, workspace, &limits, &registry)
+                .map_err(|error| io::Error::other(error.0))
+        })?;
+    match object {
+        read::StreamObject::Decoded(value) => Ok(value),
+        read::StreamObject::Buffered(bytes) => {
+            decode(ctx, call.err_call(), &bytes, workspace, None)
+        }
+    }
 }
 
 fn read_object_connection(
@@ -481,22 +529,35 @@ fn read_object_connection(
 }
 
 fn save_rds(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
-    validate_format(ctx, call, args.get(2))?;
-    let dest = args.get(1);
-    let version = version(ctx, call, args.get(3))?;
+    let [
+        object,
+        dest,
+        ascii,
+        format_version,
+        compress,
+        hook,
+        explicit_compression,
+    ] = eval_args_preserving_object(ctx, call, args)?;
+    let ascii = flag(ctx, call, ascii)?;
+    let version = version(ctx, call, format_version)?;
+    let format = Format {
+        version,
+        workspace: false,
+        ascii,
+    };
     if connection::is_connection(ctx, dest)? {
-        if flag(ctx, call, args.get(6))? {
+        if flag(ctx, call, explicit_compression)? {
             ctx.warn(
                 call.err_call(),
                 "'compress' is ignored unless 'file' is a file name",
             );
         }
-        let bytes = encode_object(ctx, call, args.get(0), version, args.get(5))?;
+        let bytes = encode_object(ctx, call, object, format, hook)?;
         connection::write_serialized(ctx, call, dest, Serialization::Rds, &bytes)?;
     } else {
         let path = path(ctx, call, dest)?;
-        let compress = compression(ctx, call, args.get(4))?;
-        let bytes = encode_object(ctx, call, args.get(0), version, args.get(5))?;
+        let compress = compression(ctx, call, compress)?;
+        let bytes = encode_object(ctx, call, object, format, hook)?;
         let result = files::write(ctx.host(), &path, &bytes, compress, None);
         checked(ctx, call, result)?;
     }
@@ -529,7 +590,7 @@ fn compression_level(ctx: &mut Ctx, call: &Call, level: SexpId) -> EvalResult<Op
 
 fn save(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     let dest = args.get(2);
-    validate_format(ctx, call, args.get(3))?;
+    let ascii = flag(ctx, call, args.get(3))?;
     let version = version(ctx, call, args.get(4))?;
     let env = args.get(5);
     if ctx.session().type_of(env)? != SexpType::Env {
@@ -580,7 +641,12 @@ fn save(ctx: &mut Ctx, call: &Call, args: &mut Args) -> EvalResult {
     for (name, value) in values.into_iter().rev() {
         frame = ctx.session_mut().cons(value, frame, name.as_sexp())?;
     }
-    let bytes = encode(ctx, call, frame, version, true)?;
+    let format = Format {
+        version,
+        workspace: true,
+        ascii,
+    };
+    let bytes = encode(ctx, call.err_call(), frame, format, None)?;
     if let Some((path, compress, level)) = file {
         let result = files::write(ctx.host(), &path, &bytes, compress, level);
         checked(ctx, call, result)?;

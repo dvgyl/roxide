@@ -1,14 +1,16 @@
+use roxide_eval::{Ctx, EvalResult, Unwind};
 use roxide_gc::SexpId;
-use roxide_value::{RSession, SEXP_NIL};
+use roxide_value::RSession;
 
-use super::{WireResult, invalid};
+use super::{PersistHook, WireResult, invalid};
 
 pub(super) enum CodecSession<'a, 'h> {
-    Plain(&'a mut RSession),
-    Hook {
-        ctx: &'a mut roxide_eval::Ctx,
-        hook: &'h mut dyn super::PersistHook,
-        error: Option<roxide_eval::Unwind>,
+    Stream(&'a mut RSession),
+    Eval {
+        ctx: &'a mut Ctx,
+        call: SexpId,
+        hook: Option<&'h mut dyn PersistHook>,
+        error: &'a mut Option<Unwind>,
     },
 }
 
@@ -17,8 +19,8 @@ impl std::ops::Deref for CodecSession<'_, '_> {
 
     fn deref(&self) -> &Self::Target {
         match self {
-            Self::Plain(session) => session,
-            Self::Hook { ctx, .. } => ctx.session(),
+            Self::Stream(session) => session,
+            Self::Eval { ctx, .. } => ctx.session(),
         }
     }
 }
@@ -26,21 +28,65 @@ impl std::ops::Deref for CodecSession<'_, '_> {
 impl std::ops::DerefMut for CodecSession<'_, '_> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         match self {
-            Self::Plain(session) => session,
-            Self::Hook { ctx, .. } => ctx.session_mut(),
+            Self::Stream(session) => session,
+            Self::Eval { ctx, .. } => ctx.session_mut(),
         }
     }
 }
 
 impl CodecSession<'_, '_> {
+    pub(super) fn run<T>(
+        ctx: &mut Ctx,
+        call: SexpId,
+        hook: Option<&mut dyn PersistHook>,
+        codec: impl FnOnce(&mut CodecSession<'_, '_>) -> WireResult<T>,
+    ) -> EvalResult<T> {
+        ctx.scoped(|ctx| {
+            ctx.protect(call);
+            let mut error = None;
+            let result = codec(&mut CodecSession::Eval {
+                ctx,
+                call,
+                hook,
+                error: &mut error,
+            });
+            if let Some(error) = error {
+                return Err(error);
+            }
+            result.map_err(|error| ctx.stop(call, error.0))
+        })
+    }
+
     pub(super) fn root(&mut self, value: SexpId) {
-        if let Self::Hook { ctx, .. } = self {
+        if let Self::Eval { ctx, .. } = self {
             ctx.protect(value);
         }
     }
 
+    pub(super) fn eval<T>(
+        &mut self,
+        operation: impl FnOnce(&mut Ctx, SexpId) -> EvalResult<T>,
+    ) -> WireResult<T> {
+        let Self::Eval {
+            ctx, call, error, ..
+        } = self
+        else {
+            return Err(invalid("serialization context is unavailable"));
+        };
+        operation(ctx, *call).map_err(|unwind| {
+            **error = Some(unwind);
+            invalid("serialization callback failed")
+        })
+    }
+
     pub(super) fn restore(&mut self, key: SexpId) -> WireResult<SexpId> {
-        let Self::Hook { ctx, hook, error } = self else {
+        let Self::Eval {
+            ctx,
+            hook: Some(hook),
+            error,
+            ..
+        } = self
+        else {
             return Err(invalid("persistent reference requires a hook"));
         };
         ctx.scoped(|ctx| {
@@ -48,30 +94,24 @@ impl CodecSession<'_, '_> {
             hook.read(ctx, key)
         })
         .map_err(|unwind| {
-            *error = Some(unwind);
+            **error = Some(unwind);
             invalid("persistent reference hook failed")
         })
     }
 
     pub(super) fn persist(&mut self, value: SexpId) -> WireResult<Option<SexpId>> {
-        let Self::Hook { ctx, hook, error } = self else {
+        let Self::Eval {
+            ctx,
+            hook: Some(hook),
+            error,
+            ..
+        } = self
+        else {
             return Ok(None);
         };
         hook.write(ctx, value).map_err(|unwind| {
-            *error = Some(unwind);
+            **error = Some(unwind);
             invalid("persistent reference hook failed")
         })
-    }
-
-    pub(super) fn finish<T>(&mut self, result: WireResult<T>) -> roxide_eval::EvalResult<T> {
-        let Self::Hook { ctx, error, .. } = self else {
-            return result.map_err(|error| {
-                roxide_eval::Unwind::Internal(roxide_eval::InternalError { message: error.0 })
-            });
-        };
-        if let Some(error) = error.take() {
-            return Err(error);
-        }
-        result.map_err(|error| ctx.stop(SEXP_NIL, error.0))
     }
 }

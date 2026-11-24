@@ -2,6 +2,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::BufRead;
 
+use roxide_eval::{AltOp, Unwind};
 use roxide_gc::SexpId;
 use roxide_host::Limits;
 use roxide_value::{
@@ -12,8 +13,8 @@ use roxide_value::{
 
 use super::{
     ACTIVE_BINDING, ALTREP, ATTR, BASE, BASE_NS, BYTES, EMPTY, GLOBAL, LATIN1, LOCKED_BINDING,
-    MISSING, NAMESPACE, NIL, PACKAGE, PERSIST, REF, Registry, S4, TAG, UNBOUND, UTF8, WireResult,
-    invalid,
+    MISSING, NAMESPACE, NIL, OBJECT, PACKAGE, PERSIST, REF, Registry, S4, TAG, UNBOUND, UTF8,
+    WireResult, invalid,
 };
 
 use super::session::CodecSession;
@@ -25,22 +26,6 @@ const ATTRLANG: u32 = 240;
 const ATTRLIST: u32 = 239;
 
 pub(super) fn decode(
-    session: &mut RSession,
-    bytes: &[u8],
-    workspace: bool,
-    limits: &Limits,
-    registry: &Registry,
-) -> WireResult<SexpId> {
-    decode_bytes(
-        &mut CodecSession::Plain(session),
-        bytes,
-        workspace,
-        limits,
-        registry,
-    )
-}
-
-fn decode_bytes(
     session: &mut CodecSession<'_, '_>,
     bytes: &[u8],
     workspace: bool,
@@ -50,23 +35,35 @@ fn decode_bytes(
     if bytes.len() > limits.max_decompress_bytes {
         return Err(invalid("serialized input exceeds the decompression limit"));
     }
-    decode_from(session, Input::Slice(bytes), workspace, limits, registry)
+    decode_from(session, Input::Slice(bytes), workspace, limits, registry).map(|(value, _)| value)
 }
 
-pub(super) fn decode_stream(
+pub(super) enum StreamObject {
+    Decoded(SexpId),
+    Buffered(Vec<u8>),
+}
+
+pub(super) fn decode_stream_or_buffer(
     session: &mut RSession,
     input: &mut dyn BufRead,
     workspace: bool,
     limits: &Limits,
     registry: &Registry,
-) -> WireResult<SexpId> {
-    decode_from(
-        &mut CodecSession::Plain(session),
-        Input::Stream(input),
+) -> WireResult<StreamObject> {
+    let mut bytes = Vec::new();
+    let input = Input::Stream(input, &mut bytes);
+    let (value, replay) = decode_from(
+        &mut CodecSession::Stream(session),
+        input,
         workspace,
         limits,
         registry,
-    )
+    )?;
+    Ok(if replay {
+        StreamObject::Buffered(bytes)
+    } else {
+        StreamObject::Decoded(value)
+    })
 }
 
 fn decode_from(
@@ -75,10 +72,10 @@ fn decode_from(
     workspace: bool,
     limits: &Limits,
     registry: &Registry,
-) -> WireResult<SexpId> {
+) -> WireResult<(SexpId, bool)> {
     let remaining = match &input {
         Input::Slice(bytes) => bytes.len(),
-        Input::Stream(_) => limits.max_decompress_bytes,
+        Input::Stream(..) => limits.max_decompress_bytes,
     };
     let mut reader = Reader {
         input,
@@ -89,34 +86,32 @@ fn decode_from(
         env_parents: HashMap::new(),
         version: 0,
         ascii: false,
+        replay: false,
         heap_start: session.heap.live_bytes(),
         limits,
         registry,
     };
-    let workspace_version = if workspace {
-        let buffered = matches!(&reader.input, Input::Slice(_));
-        match reader.take(5)? {
-            b"RDX2\n" => Some(2),
-            b"RDX3\n" => Some(3),
-            b"RDA3\n" if buffered => {
-                reader.ascii = true;
-                Some(3)
-            }
+    let workspace_format = if workspace {
+        Some(match reader.take(5)? {
+            b"RDX2\n" => (2, false),
+            b"RDX3\n" => (3, false),
+            b"RDA2\n" => (2, true),
+            b"RDA3\n" => (3, true),
             _ => return Err(invalid("invalid R workspace header")),
-        }
+        })
     } else {
         None
     };
-    let header = if reader.ascii { b"A\n" } else { b"X\n" };
-    if reader.take(2)? != header {
-        return Err(invalid(if reader.ascii {
-            "invalid ASCII stream header"
-        } else {
-            "invalid XDR stream header"
-        }));
-    }
+    reader.ascii = match (reader.take(2)?, workspace_format) {
+        (b"A\n", None | Some((_, true))) => true,
+        (b"X\n", None | Some((_, false))) => false,
+        (_, Some((_, true))) => return Err(invalid("invalid ASCII stream header")),
+        _ => return Err(invalid("invalid XDR stream header")),
+    };
     reader.version = reader.word()?;
-    if !matches!(reader.version, 2 | 3) || workspace_version.is_some_and(|v| v != reader.version) {
+    if !matches!(reader.version, 2 | 3)
+        || workspace_format.is_some_and(|(version, _)| version != reader.version)
+    {
         return Err(invalid("unsupported serialization version"));
     }
     reader.word()?;
@@ -128,16 +123,17 @@ fn decode_from(
     let value = reader.item(session, 0)?;
     reader.check_heap(session)?;
     validate_parents(reader.env_parents)?;
-    Ok(value)
+    Ok((value, reader.replay))
 }
 
 enum Input<'a> {
     Slice(&'a [u8]),
-    Stream(&'a mut dyn BufRead),
+    Stream(&'a mut dyn BufRead, &'a mut Vec<u8>),
 }
 
 struct Reader<'a, 'limits> {
     ascii: bool,
+    replay: bool,
     input: Input<'a>,
     remaining: usize,
     scratch: Vec<u8>,
@@ -157,7 +153,7 @@ impl Reader<'_, '_> {
             .checked_sub(n)
             .ok_or_else(|| match self.input {
                 Input::Slice(_) => truncated(),
-                Input::Stream(_) => invalid("serialized input exceeds the decompression limit"),
+                Input::Stream(..) => invalid("serialized input exceeds the decompression limit"),
             })?;
         match &mut self.input {
             Input::Slice(bytes) => {
@@ -165,7 +161,7 @@ impl Reader<'_, '_> {
                 *bytes = rest;
                 Ok(head)
             }
-            Input::Stream(input) => {
+            Input::Stream(input, captured) => {
                 self.scratch.clear();
                 while self.scratch.len() < n {
                     let available = input.fill_buf()?;
@@ -177,23 +173,49 @@ impl Reader<'_, '_> {
                     self.scratch.extend_from_slice(&available[..count]);
                     input.consume(count);
                 }
+                captured.try_reserve(n).map_err(invalid)?;
+                captured.extend_from_slice(&self.scratch);
                 Ok(&self.scratch)
             }
         }
     }
 
     fn line(&mut self) -> WireResult<&str> {
-        let Input::Slice(bytes) = &mut self.input else {
-            return Err(invalid("ASCII serialization requires a file buffer"));
-        };
-        let end = bytes
-            .iter()
-            .position(|&byte| byte == b'\n')
-            .ok_or_else(truncated)?;
-        let line = &bytes[..end];
-        *bytes = &bytes[end + 1..];
-        self.remaining = bytes.len();
-        std::str::from_utf8(line).map_err(invalid)
+        match &mut self.input {
+            Input::Slice(bytes) => {
+                let end = bytes
+                    .iter()
+                    .position(|&byte| byte == b'\n')
+                    .ok_or_else(truncated)?;
+                let line = &bytes[..end];
+                *bytes = &bytes[end + 1..];
+                self.remaining = bytes.len();
+                std::str::from_utf8(line).map_err(invalid)
+            }
+            Input::Stream(input, captured) => {
+                self.scratch.clear();
+                loop {
+                    let available = input.fill_buf()?;
+                    if available.is_empty() {
+                        return Err(truncated());
+                    }
+                    let end = available.iter().position(|&byte| byte == b'\n');
+                    let count = end.map_or(available.len(), |i| i + 1);
+                    self.remaining = self.remaining.checked_sub(count).ok_or_else(|| {
+                        invalid("serialized input exceeds the decompression limit")
+                    })?;
+                    self.scratch.try_reserve(count).map_err(invalid)?;
+                    self.scratch.extend_from_slice(&available[..count]);
+                    input.consume(count);
+                    if end.is_some() {
+                        captured.try_reserve(self.scratch.len()).map_err(invalid)?;
+                        captured.extend_from_slice(&self.scratch);
+                        self.scratch.pop();
+                        return std::str::from_utf8(&self.scratch).map_err(invalid);
+                    }
+                }
+            }
+        }
     }
 
     fn string_bytes(&mut self, len: usize) -> WireResult<Cow<'_, [u8]>> {
@@ -241,7 +263,7 @@ impl Reader<'_, '_> {
         if len > self.remaining / width {
             return Err(match self.input {
                 Input::Slice(_) => truncated(),
-                Input::Stream(_) => invalid("serialized input exceeds the decompression limit"),
+                Input::Stream(..) => invalid("serialized input exceeds the decompression limit"),
             });
         }
         Ok(())
@@ -441,8 +463,22 @@ impl Reader<'_, '_> {
             session.root(value);
         }
         let attrs = self.optional_attributes(session, flags, depth)?;
-        apply_attributes(session, value, attrs, flags)?;
+        self.apply_attributes(session, value, attrs, flags)?;
         Ok(value)
+    }
+
+    fn apply_attributes(
+        &self,
+        session: &mut RSession,
+        value: SexpId,
+        attrs: SexpId,
+        flags: u32,
+    ) -> WireResult<()> {
+        if !self.replay {
+            let entries = attribute_entries(session, attrs)?;
+            set_attributes(session, value, entries, flags)?;
+        }
+        Ok(())
     }
 
     fn read_char(
@@ -569,7 +605,7 @@ impl Reader<'_, '_> {
                 self.binding_flags.try_reserve(1).map_err(invalid)?;
                 self.binding_flags.insert(tail, flags);
             }
-            apply_attributes(session, tail, attrs, flags)?;
+            self.apply_attributes(session, tail, attrs, flags)?;
         }
         Ok(tail)
     }
@@ -605,7 +641,7 @@ impl Reader<'_, '_> {
             }
             promise
         };
-        apply_attributes(session, value, attrs, flags)?;
+        self.apply_attributes(session, value, attrs, flags)?;
         Ok(value)
     }
 
@@ -643,7 +679,7 @@ impl Reader<'_, '_> {
                 self.define_frame(session, env, bucket)?;
             }
         }
-        apply_attributes(session, env, attrs, 0)?;
+        self.apply_attributes(session, env, attrs, 0)?;
         session.env_set_locked(env, locked)?;
         Ok(env)
     }
@@ -760,34 +796,138 @@ impl Reader<'_, '_> {
         flags: u32,
         depth: usize,
     ) -> WireResult<SexpId> {
-        let class = self.item(session, depth)?;
+        let info = self.item(session, depth)?;
         let state = self.item(session, depth)?;
         let attrs = self.item(session, depth)?;
-        let (class, rest, _) = session.cons_parts(class)?;
+        let (class, rest, _) = session.cons_parts(info)?;
         let (package, rest, _) = session.cons_parts(rest)?;
         let (kind, end, _) = session.cons_parts(rest)?;
-        if end != SEXP_NIL || session.sym_name_of(package)? != "base" {
-            return Err(invalid("unsupported serialized ALTREP class"));
-        }
         let kind = session.int(kind)?;
+        if end != SEXP_NIL || kind.len() != 1 {
+            return Err(invalid("invalid serialized ALTREP class info"));
+        }
+        let ty = match kind.get(0) {
+            10 => SexpType::Lgl,
+            13 => SexpType::Int,
+            14 => SexpType::Real,
+            15 => SexpType::Cplx,
+            16 => SexpType::Str,
+            19 => SexpType::Vec,
+            24 => SexpType::Raw,
+            _ => return Err(invalid("invalid serialized ALTREP vector type")),
+        };
+        let class = symbol(session, class)?;
+        let package = symbol(session, package)?;
+        let class_name = session.sym_name(class)?.to_owned();
+        let package_name = session.sym_name(package)?.to_owned();
+        let builtin = match (package_name.as_str(), class_name.as_str()) {
+            ("base", "compact_intseq") => Some(SexpType::Int),
+            ("base", "compact_realseq") => Some(SexpType::Real),
+            ("base", "wrap_logical") => Some(SexpType::Lgl),
+            ("base", "wrap_integer") => Some(SexpType::Int),
+            ("base", "wrap_real") => Some(SexpType::Real),
+            ("base", "wrap_complex") => Some(SexpType::Cplx),
+            ("base", "wrap_string") => Some(SexpType::Str),
+            ("base", "wrap_raw") => Some(SexpType::Raw),
+            _ => None,
+        };
+        if matches!(session, CodecSession::Stream(_)) && (self.replay || builtin.is_none()) {
+            self.replay = true;
+            return empty_vector(session, ty);
+        }
+
+        let entries = attribute_entries(session, attrs)?;
+        let value = if let Some(base_type) = builtin {
+            if ty != base_type {
+                return Err(invalid("invalid serialized ALTREP vector type"));
+            }
+            if class_name.starts_with("wrap_") {
+                let (target, metadata, _) = session.cons_parts(state)?;
+                if session.type_of(target)? != ty || session.int(metadata)?.len() != 2 {
+                    return Err(invalid("invalid serialized ALTREP wrapper state"));
+                }
+                session.alloc_alt_wrapper(target)?
+            } else {
+                self.compact_sequence(session, ty, state)?
+            }
+        } else {
+            let op = AltOp::Unserialize {
+                class,
+                package,
+                ty,
+                state,
+                attrs,
+                objf: i32::from(flags & OBJECT != 0),
+                levels: ((flags >> 12) & 0xffff) as i32,
+            };
+            let value = session.eval(|ctx, call| {
+                if let Some(value) = restore_altrep(ctx, op)? {
+                    return Ok(Some(value));
+                }
+                if ctx.ns_lookup(&package_name).is_none() {
+                    ctx.with_native_error_handler(
+                        |ctx| ctx.load_namespace(&package_name, call),
+                        |_, _| Ok(SEXP_NIL),
+                    )?;
+                    if let Some(value) = restore_altrep(ctx, op)? {
+                        return Ok(Some(value));
+                    }
+                }
+                ctx.warn_now(call, format!(
+                    "cannot unserialize ALTVEC object of class '{class_name}' from package '{package_name}'; returning length zero vector"
+                ))?;
+                Ok(None)
+            })?;
+            let Some(value) = value else {
+                return empty_vector(session, ty);
+            };
+            if value == SEXP_NIL
+                || !session.attrs(value)?.is_empty()
+                || session.is_object(value)?
+                || session.is_s4(value)?
+                || session.gp(value)? != 0
+            {
+                return Ok(value);
+            }
+            value
+        };
+        session.root(value);
+        if entries
+            .iter()
+            .any(|&(name, _)| session.sym_name(name).is_ok_and(|name| name == "names"))
+            && session
+                .foreign_alt(value)?
+                .is_some_and(|alt| !alt.owned && alt.len.is_none())
+        {
+            session.eval(|ctx, _| ctx.altrep_len(value))?;
+        }
+        set_attributes(session, value, entries, flags)?;
+        session.set_object_flag(value, flags & OBJECT != 0)?;
+        session.set_gp(value, ((flags >> 12) & 0xffff) as u16)?;
+        Ok(value)
+    }
+
+    fn compact_sequence(
+        &self,
+        session: &mut RSession,
+        ty: SexpType,
+        state: SexpId,
+    ) -> WireResult<SexpId> {
         let state = session.real(state)?;
-        if kind.len() != 1 || state.len() != 3 {
+        if state.len() != 3 {
             return Err(invalid("invalid serialized ALTREP state"));
         }
         let (len, start, step) = (state.get(0), state.get(1), state.get(2));
-        let (ty, int) = match (session.sym_name_of(class)?, kind.get(0)) {
-            ("compact_intseq", 13) => (size_of::<i32>(), true),
-            ("compact_realseq", 14) => (size_of::<f64>(), false),
-            (name, _) => {
-                return Err(invalid(format!(
-                    "unsupported serialized ALTREP class '{name}'"
-                )));
-            }
+        let int = ty == SexpType::Int;
+        let size = if int {
+            size_of::<i32>()
+        } else {
+            size_of::<f64>()
         };
         if !len.is_finite()
             || len < 0.0
             || len.fract() != 0.0
-            || len > (self.limits.max_vector_bytes / ty) as f64
+            || len > (self.limits.max_vector_bytes / size) as f64
         {
             return Err(invalid("invalid serialized compact sequence length"));
         }
@@ -802,7 +942,6 @@ impl Reader<'_, '_> {
         } else {
             session.alloc_compact_realseq(start, len as usize, step)?
         };
-        apply_attributes(session, value, attrs, flags)?;
         Ok(value)
     }
 
@@ -912,7 +1051,7 @@ impl Reader<'_, '_> {
                     session.cons(car, tail, tag)?
                 };
                 session.root(value);
-                apply_attributes(session, value, attrs, 0)?;
+                self.apply_attributes(session, value, attrs, 0)?;
                 Ok(value)
             }
             _ => Err(invalid("invalid bytecode child marker")),
@@ -966,28 +1105,33 @@ fn symbol(session: &mut RSession, id: SexpId) -> WireResult<Sym> {
     Ok(session.intern(&name)?)
 }
 
-fn apply_attributes(
-    session: &mut RSession,
-    id: SexpId,
-    mut attrs: SexpId,
-    flags: u32,
-) -> WireResult<()> {
+fn attribute_entries(session: &mut RSession, mut attrs: SexpId) -> WireResult<Vec<(Sym, SexpId)>> {
     let mut entries = Vec::new();
     while attrs != SEXP_NIL {
         if session.type_of(attrs)? != SexpType::List {
             return Err(invalid("invalid serialized attribute list"));
         }
         let (value, next, name) = session.cons_parts(attrs)?;
-        let name = symbol(session, name)?;
+        entries.try_reserve(1).map_err(invalid)?;
+        entries.push((symbol(session, name)?, value));
+        attrs = next;
+    }
+    Ok(entries)
+}
+
+fn set_attributes(
+    session: &mut RSession,
+    id: SexpId,
+    entries: Vec<(Sym, SexpId)>,
+    flags: u32,
+) -> WireResult<()> {
+    for &(name, value) in &entries {
         if session.sym_name(name)? == "names"
             && value != SEXP_NIL
             && session.str_slice(value)?.len() != session.xlength(id)?
         {
             return Err(invalid("invalid serialized names attribute length"));
         }
-        entries.try_reserve(1).map_err(invalid)?;
-        entries.push((name, value));
-        attrs = next;
     }
     if !entries.is_empty() {
         session.replace_attributes(id, entries)?;
@@ -998,24 +1142,34 @@ fn apply_attributes(
     Ok(())
 }
 
-fn truncated() -> super::CodecError {
-    invalid("truncated XDR stream")
+fn restore_altrep(
+    ctx: &mut roxide_eval::Ctx,
+    op: AltOp,
+) -> roxide_eval::EvalResult<Option<SexpId>> {
+    if ctx.native_hooks().is_none() {
+        return Ok(None);
+    }
+    match ctx.altrep_method(op) {
+        Err(Unwind::Internal(error)) if error.message == "foreign ALTREP hook not installed" => {
+            Ok(None)
+        }
+        result => result,
+    }
 }
 
-pub(super) fn decode_hook(
-    ctx: &mut roxide_eval::Ctx,
-    bytes: &[u8],
-    limits: &Limits,
-    registry: &Registry,
-    hook: &mut dyn super::PersistHook,
-) -> roxide_eval::EvalResult {
-    ctx.scoped(|ctx| {
-        let mut session = CodecSession::Hook {
-            ctx,
-            hook,
-            error: None,
-        };
-        let result = decode_bytes(&mut session, bytes, false, limits, registry);
-        session.finish(result)
+fn empty_vector(session: &mut RSession, ty: SexpType) -> WireResult<SexpId> {
+    Ok(match ty {
+        SexpType::Lgl => session.alloc_lgl_from(&[])?,
+        SexpType::Int => session.alloc_int_from(&[])?,
+        SexpType::Real => session.alloc_real_from(&[])?,
+        SexpType::Cplx => session.alloc_cplx_from(&[])?,
+        SexpType::Str => session.alloc_str_from(&[])?,
+        SexpType::Vec => session.alloc_list(0)?,
+        SexpType::Raw => session.alloc_raw_from(&[])?,
+        _ => return Err(invalid("invalid serialized ALTREP vector type")),
     })
+}
+
+fn truncated() -> super::CodecError {
+    invalid("truncated XDR stream")
 }
